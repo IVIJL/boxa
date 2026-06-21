@@ -120,6 +120,17 @@ headed. Please follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 To report a security vulnerability, do **not** open a public issue — see
 [SECURITY.md](SECURITY.md).
 
+## Acknowledgments
+
+boxa was built as a human + AI collaboration:
+
+- **[Claude Code](https://claude.com/claude-code)** (Opus 4.8) — pair-programmed
+  the implementation, end to end.
+- **[Codex](https://github.com/openai/codex)** — the independent reviewer that
+  kept every diff honest.
+- **[Matt Pocock](https://github.com/mattpocock)** — for the superb agent skills
+  that shaped how this was built.
+
 ## License
 
 Released under the [MIT License](LICENSE).
