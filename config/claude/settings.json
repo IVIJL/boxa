@@ -1,0 +1,56 @@
+{
+  "enableAllProjectMcpServers": true,
+  "env": {
+    "MCP_TIMEOUT": "60000"
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/node/.claude/hooks/success_notify.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/node/.claude/hooks/interaction_notify.sh"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/node/.claude/hooks/question_notify.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash /home/node/.claude/statusline-info.sh"
+  },
+  "alwaysThinkingEnabled": true,
+  "effortLevel": "medium",
+  "skipDangerousModePermissionPrompt": true,
+  "enabledPlugins": {
+    "codex@openai-codex": true
+  },
+  "extraKnownMarketplaces": {
+    "openai-codex": {
+      "source": {
+        "source": "github",
+        "repo": "openai/codex-plugin-cc"
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+# Repo docs, not a dotfile — without this chezmoi would apply it to ~/README.md.
+README.md
+
+# Inside a boxa container the host's git config dir is bind-mounted read-only,
+# so chezmoi cannot write ~/.config/git/ignore there. Skip it on apply; the file
+# is still kept in the repo for users who copy these dotfiles onto a host.
+.config/git/ignore

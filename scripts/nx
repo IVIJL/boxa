@@ -1,0 +1,10 @@
+#!/bin/bash
+if [ -z "$1" ]; then
+  echo "usage: nx <filename>"
+  exit 1
+fi
+if [ ! -e "$1" ]; then
+  echo -e "#!/usr/bin/env bash\n\nset -eo pipefail\n" > "$1"
+fi
+chmod -v 0755 "$1"
+exec nvim "$1"

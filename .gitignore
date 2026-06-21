@@ -1,0 +1,24 @@
+build.log
+*.log
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python bytecode caches (agent-browser-proxy.py, agent-browser-summarize.py)
+__pycache__/
+*.pyc
+
+# Local issue tracker (Matt Pocock skills convention)
+.scratch/
+
+# Local plans / scratch notes
+local-*

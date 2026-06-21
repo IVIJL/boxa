@@ -1,0 +1,256 @@
+#compdef boxa
+
+# Zsh completion for boxa
+# Install: copy to a directory in $fpath (e.g. /usr/local/share/zsh/site-functions/)
+
+_boxa_containers() {
+    # Shared infra (`boxa_traefik`, `boxa_dns`) uses underscore separator
+    # and is naturally excluded by the dash-prefix filter above. The grep
+    # below filters legacy dash-separator names that may still be running
+    # before `boxa update` migrates them away (see ADR 0007).
+    local -a containers
+    containers=(${(f)"$(docker ps --filter 'name=^boxa-' \
+        --format '{{.Names}}' 2>/dev/null \
+        | grep -vE '^boxa-(traefik|dns)$' | sed 's/^boxa-//')"})
+    _describe 'running boxa containers' containers
+}
+
+_boxa() {
+    local state
+    _arguments \
+        '1: :->cmd' \
+        '*: :->args'
+
+    case $state in
+        cmd)
+            local -a commands
+            commands=(
+                'help:Show help message'
+                'ls:List running containers'
+                'stop:Stop container (--clean removes volumes)'
+                'remove:Remove project data (volumes)'
+                'port:Expose port via Traefik'
+                'ports:List active port routes'
+                'connect:Forward inner containers to another boxa'
+                'connections:List cross-boxa TCP forwards'
+                'build:Build/rebuild the boxa image'
+                'update:Update boxa (pull repo + rebuild image)'
+                'uninstall:Remove everything (containers, volumes, image)'
+                'prune:Remove Docker build cache and dangling images'
+                'claude-token:Generate/regenerate Claude Code token'
+                'allow:List or add allowed firewall domain'
+                'deny:Remove allowed domain (interactive)'
+                'blocked:Show blocked DNS + agent-browser denials (interactive)'
+                'allow-for:Open a time-bounded Allow-for window (default 15 min)'
+                'agent-browser:Control Host agent Chrome (start/stop/status/open/allow-for/allow/deny/blocked)'
+                'cursor:Open Cursor attached to running boxa'
+                'code:Open VS Code attached to running boxa'
+                'clip:Grab clipboard image for container use'
+                'ssh-config:Manage boxa SSH config'
+                'sync-skills:Sync host skills to all running containers'
+                'dns-install:Configure host resolver for *.test (per-OS)'
+                'dns-status:Show DNS mode, resolver state, verification'
+                'dns-uninstall:Remove host resolver config + dns.conf'
+            )
+            _describe 'boxa commands' commands
+            ;;
+        args)
+            case $words[2] in
+                stop)
+                    if (( CURRENT == 3 )); then
+                        _boxa_containers
+                    elif (( CURRENT == 4 )); then
+                        local -a flags
+                        flags=('--clean:Stop and remove project volumes')
+                        _describe 'flags' flags
+                    fi
+                    ;;
+                cursor|code|remove)
+                    _boxa_containers
+                    ;;
+                allow-for)
+                    # Positionals can be in any order: minutes (numeric) or
+                    # project name. --stop is a flag.
+                    if (( CURRENT == 3 )) || (( CURRENT == 4 )); then
+                        _boxa_containers
+                        local -a flags
+                        flags=('--stop:Close the active window immediately')
+                        _describe 'flags' flags
+                    fi
+                    ;;
+                connect)
+                    if (( CURRENT == 3 )); then
+                        _boxa_containers
+                    elif (( CURRENT == 5 )); then
+                        local -a flags
+                        flags=('--from:Source boxa container')
+                        _describe 'flags' flags
+                    fi
+                    ;;
+                build)
+                    local -a flags
+                    flags=(
+                        '--clean:Full reset (volumes + cache) + rebuild'
+                        '--no-cache:Full rebuild without cache'
+                        '--progress=plain:Show full build log'
+                    )
+                    _describe 'build flags' flags
+                    ;;
+                ssh-config)
+                    local -a actions
+                    actions=(
+                        'add:Add SSH host to boxa config'
+                        'edit:Edit boxa SSH config'
+                    )
+                    _describe 'ssh-config actions' actions
+                    ;;
+                dns-install)
+                    local -a flags
+                    flags=(
+                        '--auto:Try local, fall back to external on failure (default)'
+                        '--local:Force local mode; fail loud if setup fails'
+                        '--external:Skip resolver setup; persist external sslip.io mode'
+                        '--enable-https:Install mkcert CA + flip https.conf active=true'
+                        '--disable-https:Flip https.conf active=false (CA stays installed)'
+                        '--purge-ca:Remove mkcert CA from trust stores + delete https.conf'
+                    )
+                    _describe 'dns-install flags' flags
+                    ;;
+                uninstall)
+                    local -a flags
+                    flags=(
+                        '--purge-ca:Also strip mkcert CA from native + Windows trust stores'
+                    )
+                    _describe 'uninstall flags' flags
+                    ;;
+                ports)
+                    local -a flags
+                    flags=(
+                        '--all:Include stopped containers and skip listening filter'
+                        '--external:Show sslip.io URL alongside the active URL'
+                    )
+                    _describe 'ports flags' flags
+                    ;;
+                agent-browser)
+                    # Layout: boxa agent-browser <sub> [args]
+                    #   CURRENT==3 → subcommand
+                    #   CURRENT==4 → container (start/stop/status) OR
+                    #                minutes/--stop (allow-for) OR
+                    #                --project flag / URL (open) OR
+                    #                domain (deny — from allowlist file)
+                    #   CURRENT==5 → container (allow-for only) OR
+                    #                project value / URL (open)
+                    #   CURRENT>=6 → URL (open)
+                    if (( CURRENT == 3 )); then
+                        local -a subs
+                        subs=(
+                            'start:Launch Host agent Chrome bound to container'
+                            'stop:Stop session and clean up resources'
+                            'status:Show session state (Chrome/proxy/watchdog PIDs)'
+                            'open:Open URL(s) as new tabs in the running session'
+                            'allow-for:Open time-bounded network window (default mode)'
+                            'allow:List or add agent-browser allowed domain'
+                            'deny:Remove agent-browser allowed domain'
+                            'blocked:Show agent-browser-denied hosts (interactive)'
+                            'help:Show agent-browser help'
+                        )
+                        _describe 'agent-browser subcommands' subs
+                    elif (( CURRENT == 4 )); then
+                        case $words[3] in
+                            start)
+                                local -a flags
+                                flags=(
+                                    '--no-open:Skip auto-opening listening-port tabs'
+                                )
+                                _describe 'start flags' flags
+                                _boxa_containers
+                                ;;
+                            stop|status)
+                                _boxa_containers
+                                ;;
+                            open)
+                                # All positionals are URLs; only
+                                # `--project`/`-p` overrides the CWD
+                                # default. Offer the flag plus a
+                                # container picker so tab works for
+                                # either path.
+                                local -a flags
+                                flags=(
+                                    '--project:Target a non-CWD container'
+                                    '-p:Target a non-CWD container'
+                                )
+                                _describe 'open flags' flags
+                                ;;
+                            allow-for)
+                                # First positional is minutes (numeric)
+                                # or --stop. Container resolution happens
+                                # at CURRENT==5 below.
+                                local -a flags
+                                flags=('--stop:Close the active window immediately')
+                                _describe 'allow-for flags' flags
+                                _boxa_containers
+                                ;;
+                            blocked)
+                                # `blocked` accepts -p/--project NAME just
+                                # like `open`. No positional URL/domain;
+                                # the broker drives an interactive picker.
+                                local -a flags
+                                flags=(
+                                    '--project:Target a non-CWD container'
+                                    '-p:Target a non-CWD container'
+                                )
+                                _describe 'blocked flags' flags
+                                ;;
+                            allow)
+                                # `allow` takes a domain to add. There is
+                                # no useful source for "things you might
+                                # want to add", so don't complete
+                                # (ADR 0012 § Shell completion).
+                                ;;
+                            deny)
+                                # `deny` removes an entry from the
+                                # agent-browser allowlist. Complete from
+                                # the current file contents — this is the
+                                # "help me find what to remove" path
+                                # promised in ADR 0012.
+                                local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/boxa/agent-browser-allowed-domains.conf"
+                                if [[ -f "$cfg" ]]; then
+                                    local -a entries
+                                    entries=(${(f)"$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$cfg" 2>/dev/null | grep -v '^$')"})
+                                    _describe 'agent-browser allowed domains' entries
+                                fi
+                                ;;
+                        esac
+                    elif (( CURRENT == 5 )); then
+                        case $words[3] in
+                            allow-for)
+                                _boxa_containers
+                                ;;
+                            start)
+                                # After `--no-open`, the next positional
+                                # is the project.
+                                if [ "$words[4]" = "--no-open" ]; then
+                                    _boxa_containers
+                                fi
+                                ;;
+                            open|blocked)
+                                # Container picker only after explicit
+                                # --project/-p flag; bare positionals are
+                                # URLs (open) or absent (blocked). Both
+                                # accept `-p NAME` per `cmd_agent_blocked`
+                                # in scripts/agent-browser-broker.sh and
+                                # the `open` parser in docker-run.sh.
+                                if [ "$words[4]" = "--project" ] \
+                                    || [ "$words[4]" = "-p" ]; then
+                                    _boxa_containers
+                                fi
+                                ;;
+                        esac
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_boxa "$@"

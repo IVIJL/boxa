@@ -1,0 +1,8 @@
+# Codex CLI managed config — registers the container-only identity
+# context hook (ADR 0011 Layer 3). SessionStart keeps the identity
+# reminder to one injection per Codex session; the script's identity-file
+# guard keeps the same managed config a no-op on host.
+[hooks]
+SessionStart = [
+    { hooks = [{ type = "command", command = "bash /usr/local/bin/boxa-identity-context.sh" }] }
+]

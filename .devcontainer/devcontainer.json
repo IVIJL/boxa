@@ -1,0 +1,69 @@
+{
+  "name": "Boxa",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "args": {
+      "TZ": "${localEnv:TZ:Europe/Prague}",
+      "CLAUDE_CODE_VERSION": "latest",
+      "GIT_DELTA_VERSION": "0.18.2",
+      "NVIM_VERSION": "v0.10.4",
+      "EZA_VERSION": "0.20.14"
+    }
+  },
+  "runArgs": [
+    "--user", "0",
+    "--security-opt", "seccomp=unconfined",
+    "--security-opt", "apparmor=unconfined",
+    "--security-opt", "systempaths=unconfined",
+    "--cap-add=SYS_ADMIN",
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW",
+    "--device=/dev/net/tun",
+    "--device=/dev/fuse"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "zsh": {
+            "path": "zsh"
+          }
+        }
+      }
+    }
+  },
+  "initializeCommand": "mkdir -p \"${localEnv:HOME}/.clipboard-images\" \"${localEnv:HOME}/.claude\" \"${localEnv:HOME}/.config/git\" && touch \"${localEnv:HOME}/.gitconfig\" \"${localEnv:HOME}/.config/git/ignore\"",
+  "remoteUser": "node",
+  "mounts": [
+    "source=${localEnv:HOME}/.gitconfig,target=/home/node/.gitconfig-host,type=bind,readonly",
+    "source=boxa-history-${devcontainerId},target=/home/node/.local/share/atuin,type=volume",
+    "source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind",
+    "source=boxa-docker-${devcontainerId},target=/home/node/.local/share/docker,type=volume",
+    "source=boxa-nvim-data-${devcontainerId},target=/home/node/.local/share/nvim,type=volume",
+    "source=boxa-cursor-server-${devcontainerId},target=/home/node/.cursor-server,type=volume",
+    "source=boxa-vscode-server-${devcontainerId},target=/home/node/.vscode-server,type=volume",
+    "source=${localEnv:HOME}/.config/git/ignore,target=/home/node/.config/git/ignore,type=bind,readonly",
+    "source=${localEnv:HOME}/.clipboard-images,target=/home/node/.clipboard-images,type=bind"
+  ],
+  "containerEnv": {
+    "NODE_OPTIONS": "--max-old-space-size=4096",
+    "CLAUDE_CONFIG_DIR": "/home/node/.claude",
+    "TZ": "${localEnv:TZ:Europe/Prague}",
+    "NTFY_TOKEN": "${localEnv:NTFY_TOKEN}",
+    "CHEZMOI_REPO": "${localEnv:CHEZMOI_REPO}",
+    "HOST_HOME": "${localEnv:HOME}",
+    "BOXA_PROJECT_HOST_PATH": "${localWorkspaceFolder}",
+    "BOXA_PROJECT_NAME": "${localWorkspaceFolderBasename}"
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind,consistency=delegated",
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "postStartCommand": "/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh",
+  "waitFor": "postStartCommand"
+}

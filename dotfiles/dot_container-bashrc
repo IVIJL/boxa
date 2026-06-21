@@ -1,0 +1,42 @@
+# shellcheck shell=bash
+# Container bashrc — copied into containers by dx/dcx helpers
+
+# --- shell options ---
+if [ -n "$BASH_VERSION" ]; then
+  shopt -s histappend
+  shopt -s checkwinsize
+  shopt -s cdspell
+fi
+
+HISTSIZE=10000
+HISTFILESIZE=20000
+HISTCONTROL=ignoreboth
+
+# --- prompt ---
+PS1='\[\e[36m\]🐳 \[\e[32m\]\u@\h\[\e[0m\]:\[\e[34m\]\w\[\e[0m\] \$ '
+
+# --- color support ---
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+alias fgrep='fgrep --color=auto'
+alias egrep='egrep --color=auto'
+
+# --- navigation ---
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias ..='cd ..'
+alias ...='cd ../..'
+
+# --- useful aliases (container-relevant subset) ---
+alias gs='git status'
+alias gp='git pull'
+alias pn=pnpm
+alias piup='pip install -U pip'
+
+pyclean() {
+    find . -type f -name '*.py[co]' -delete -o -type d -name __pycache__ -delete
+}
+
+# cleanup — already sourced into memory, file no longer needed
+rm -f /tmp/.container-bashrc

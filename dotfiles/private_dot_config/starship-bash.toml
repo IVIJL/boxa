@@ -1,0 +1,45 @@
+# ~/.config/starship-bash.toml
+# Bash-only starship config (dot_bashrc points STARSHIP_CONFIG here). The zsh
+# prompt keeps its own richer ~/.config/starship.toml; bash gets this clean
+# single-line Omarchy-inspired prompt: directory + git in cyan, plus a Python
+# virtualenv tag. (No distro icon here — that glyph is set by ~/.zshrc only.)
+
+add_newline = true
+command_timeout = 200
+
+format = "[$directory$git_branch$git_status]($style)${custom.venv}$character"
+
+[character]
+error_symbol = "[✗](bold cyan)"
+success_symbol = "[❯](bold cyan)"
+
+[directory]
+truncation_length = 2
+truncation_symbol = "…/"
+repo_root_style = "bold cyan"
+repo_root_format = "[$repo_root]($repo_root_style)[$path]($style)[$read_only]($read_only_style) "
+
+[git_branch]
+format = "[$branch]($style) "
+style = "italic cyan"
+
+[git_status]
+format     = '[$all_status]($style)'
+style      = "cyan"
+ahead      = "⇡${count} "
+diverged   = "⇕⇡${ahead_count}⇣${behind_count} "
+behind     = "⇣${count} "
+conflicted = " "
+up_to_date = " "
+untracked  = "? "
+modified   = " "
+stashed    = ""
+staged     = ""
+renamed    = ""
+deleted    = ""
+
+# Python virtualenv name (boxa is python-forward: pyenv/uv).
+[custom.venv]
+command = 'basename "$VIRTUAL_ENV"'
+when = '[ -n "$VIRTUAL_ENV" ]'
+format = '[\($output\)](bold yellow) '

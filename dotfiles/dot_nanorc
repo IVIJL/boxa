@@ -1,0 +1,8 @@
+#set linenumbers #numbers get selected in terminal with mouse:(
+set autoindent
+set softwrap
+set tabsize 2
+set tabstospaces
+set atblanks
+set constantshow
+bind ^Z suspend main

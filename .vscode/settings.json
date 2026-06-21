@@ -1,0 +1,26 @@
+{
+  "dev.containers.defaultAttachConfiguration": {
+    "workspaceFolder": "${workspaceFolder}",
+    "remoteUser": "node",
+    "customizations": {
+      "vscode": {
+        "extensions": [
+          "anthropic.claude-code",
+          "dbaeumer.vscode-eslint",
+          "esbenp.prettier-vscode",
+          "eamodio.gitlens",
+          "ms-python.python",
+          "ms-python.debugpy"
+        ],
+        "settings": {
+          "terminal.integrated.defaultProfile.linux": "zsh",
+          "terminal.integrated.profiles.linux": {
+            "zsh": {
+              "path": "zsh"
+            }
+          }
+        }
+      }
+    }
+  }
+}

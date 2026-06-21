@@ -1,0 +1,94 @@
+# shellcheck shell=bash
+# Extra aliases — sourced from ~/.zshrc if this file exists at ~/.extra_aliases
+
+# Claude Code CLI
+alias cc='claude'
+alias ccc='claude -c'
+alias cccd='claude -c --dangerously-skip-permissions'
+alias ccdd='claude --dangerously-skip-permissions'
+
+# Codex CLI
+alias cx='codex'
+alias cxc='codex resume --last'
+alias cxcd='codex resume --last -s danger-full-access -a never'
+alias cxdd='codex -s danger-full-access -a never'
+
+alias piup='pip install -U pip'
+
+pyclean () {
+    find . -type f -name '*.py[co]' -delete -o -type d -name __pycache__ -delete
+}
+
+alias gs='git status'
+alias gp='git pull'
+alias pn=pnpm
+alias dc='docker compose'
+alias dcu='docker compose up -d --build --force-recreate'
+
+# --- docker exec helper ---
+dx() {
+  local c="$1"
+  [ -z "$c" ] && { echo "Usage: dx <container>"; return 1; }
+
+  local rcfile="${DX_RCFILE:-$HOME/.container-bashrc}"
+  [ -f "$rcfile" ] || { echo "RC file not found: $rcfile" >&2; return 1; }
+
+  docker cp "$rcfile" "$c:/tmp/.container-bashrc" || return 1
+  if docker exec "$c" test -x /bin/bash 2>/dev/null; then
+    docker exec -it "$c" bash --rcfile /tmp/.container-bashrc -i
+  else
+    echo "bash not found in $c, using sh" >&2
+    docker exec -it -e ENV=/tmp/.container-bashrc "$c" sh -i
+  fi
+}
+
+# --- docker compose exec helper ---
+dcx() {
+  local service="$1"
+  [ -z "$service" ] && { echo "Usage: dcx <service>"; return 1; }
+
+  local rcfile="${DX_RCFILE:-$HOME/.container-bashrc}"
+  [ -f "$rcfile" ] || { echo "RC file not found: $rcfile" >&2; return 1; }
+
+  docker compose cp "$rcfile" "$service:/tmp/.container-bashrc" || return 1
+  if docker compose exec "$service" test -x /bin/bash 2>/dev/null; then
+    docker compose exec "$service" bash --rcfile /tmp/.container-bashrc -i
+  else
+    echo "bash not found in $service, using sh" >&2
+    docker compose exec -e ENV=/tmp/.container-bashrc "$service" sh -i
+  fi
+}
+
+# completions for dx/dcx — bash and zsh have different completion systems
+if [ -n "$BASH_VERSION" ]; then
+  _dx_completions() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local containers
+    containers=$(docker ps --format '{{.Names}}' 2>/dev/null)
+    mapfile -t COMPREPLY < <(compgen -W "$containers" -- "$cur")
+  }
+  _dcx_completions() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local services
+    services=$(docker compose config --services 2>/dev/null)
+    mapfile -t COMPREPLY < <(compgen -W "$services" -- "$cur")
+  }
+  complete -F _dx_completions dx
+  complete -F _dcx_completions dcx
+elif [ -n "$ZSH_VERSION" ]; then
+  # shellcheck disable=SC2296
+  _dx_completions() {
+    local containers
+    containers=("${(@f)$(docker ps --format '{{.Names}}' 2>/dev/null)}")
+    _describe 'container' containers
+  }
+  # shellcheck disable=SC2296
+  _dcx_completions() {
+    local services
+    services=("${(@f)$(docker compose config --services 2>/dev/null)}")
+    _describe 'service' services
+  }
+  compdef _dx_completions dx
+  compdef _dcx_completions dcx
+fi
+

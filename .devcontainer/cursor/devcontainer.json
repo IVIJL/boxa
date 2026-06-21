@@ -1,0 +1,57 @@
+{
+  "name": "Boxa (Cursor)",
+  "image": "ivijl/boxa:latest",
+  "runArgs": [
+    "--user", "0",
+    "--security-opt", "seccomp=unconfined",
+    "--security-opt", "apparmor=unconfined",
+    "--security-opt", "systempaths=unconfined",
+    "--cap-add=SYS_ADMIN",
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW",
+    "--device=/dev/net/tun",
+    "--device=/dev/fuse"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "eamodio.gitlens",
+        "ms-python.python",
+        "ms-python.debugpy"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "zsh": {
+            "path": "zsh"
+          }
+        }
+      }
+    }
+  },
+  "remoteUser": "node",
+  "mounts": [
+    "source=${localEnv:HOME}/.gitconfig,target=/home/node/.gitconfig-host,type=bind,readonly",
+    "source=boxa-history-${devcontainerId},target=/home/node/.local/share/atuin,type=volume",
+    "source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind",
+    "source=boxa-docker-${devcontainerId},target=/home/node/.local/share/docker,type=volume",
+    "source=boxa-nvim-data-${devcontainerId},target=/home/node/.local/share/nvim,type=volume",
+    "source=boxa-cursor-server-${devcontainerId},target=/home/node/.cursor-server,type=volume",
+    "source=boxa-vscode-server-${devcontainerId},target=/home/node/.vscode-server,type=volume"
+  ],
+  "containerEnv": {
+    "NODE_OPTIONS": "--max-old-space-size=4096",
+    "CLAUDE_CONFIG_DIR": "/home/node/.claude",
+    "TZ": "${localEnv:TZ:Europe/Prague}",
+    "NTFY_TOKEN": "${localEnv:NTFY_TOKEN}",
+    "BOXA_PROJECT_HOST_PATH": "${localWorkspaceFolder}",
+    "BOXA_PROJECT_NAME": "${localWorkspaceFolderBasename}"
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind,consistency=delegated",
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "postStartCommand": "/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh",
+  "waitFor": "postStartCommand"
+}
