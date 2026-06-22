@@ -5749,8 +5749,25 @@ _auto_open_listening_ports() {
         return 0
     fi
 
-    local opened=0 failed=0 url
+    # Reuse the blank tab Chrome opened on launch for the FIRST URL: navigate
+    # it in place via CDP `Page.navigate` (WebSocket) instead of opening a new
+    # tab and leaving the blank behind. Remaining URLs open as new tabs. The
+    # reuse attempt is consumed once; if there is no blank tab or the navigate
+    # fails, we fall back to a new-tab open so the project still comes up.
+    local reuse_id=""
+    reuse_id="$(_list_blank_tab_ids "$cdp_port" | head -n1 || true)"
+
+    local opened=0 failed=0 url reuse_consumed=0
     for url in "${urls[@]}"; do
+        if [ "$reuse_consumed" -eq 0 ] && [ -n "$reuse_id" ]; then
+            reuse_consumed=1
+            if _navigate_tab_via_cdp "$cdp_port" "$reuse_id" "$url"; then
+                opened=$((opened + 1))
+                _log "Auto-opened (reused initial blank tab): ${url}"
+                continue
+            fi
+            # navigate failed → fall through to a fresh new-tab open below
+        fi
         if _open_url_via_cdp "$cdp_port" "$url"; then
             opened=$((opened + 1))
             _log "Auto-opened: ${url}"
@@ -5759,6 +5776,7 @@ _auto_open_listening_ports() {
             _warn "Auto-open failed: ${url}"
         fi
     done
+
     if [ "$opened" -eq 0 ]; then
         _warn "Auto-open: 0/${#urls[@]} URLs opened; session is still up — use 'boxa agent-browser open' to retry."
     elif [ "$failed" -gt 0 ]; then
@@ -5791,6 +5809,177 @@ _open_url_via_cdp() {
         --fail \
         --output /dev/null \
         "http://127.0.0.1:${cdp_port}/json/new?${encoded}"
+}
+
+# Return the target IDs of "blank" page tabs (new-tab page / about:blank) in
+# the session, one per line. Auto-open reuses the first of these as the tab to
+# navigate to the project URL (via `_navigate_tab_via_cdp`), so Chrome is not
+# left with a leftover blank tab beside the project. The list fetch is HTTP +
+# python3 only (no jq hard-dep), mirroring `_open_url_via_cdp`.
+_list_blank_tab_ids() {
+    local cdp_port="$1"
+    [ -n "$cdp_port" ] || return 0
+    curl -sS -H "Host: localhost" --max-time 5 \
+        "http://127.0.0.1:${cdp_port}/json/list" 2>/dev/null \
+        | python3 -c '
+import sys, json
+try:
+    targets = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+blanks = {"chrome://newtab/", "about:blank", ""}
+for t in targets:
+    if t.get("type") == "page":
+        url = t.get("url", "")
+        if url in blanks or url.startswith("chrome://new-tab-page"):
+            print(t.get("id", ""))
+' 2>/dev/null
+}
+
+# Navigate an existing tab (by target ID) to a URL via CDP `Page.navigate`.
+# Unlike the HTTP `/json/*` endpoints — which only create/close/activate
+# targets — navigation is a Page-domain command that lives on the per-target
+# WebSocket, so this opens a short-lived WS to the target's debugger URL,
+# issues one JSON-RPC call, and exits. Self-contained (own minimal WS framing,
+# same shape as `_fit_chrome_window_to_work_area`); no external Python deps.
+# Best-effort: any failure returns non-zero and the caller falls back to a
+# new-tab open. Chrome's anti-DNS-rebinding guard does not apply to the WS
+# debugger endpoint, so no Host-header juggling is needed here.
+_navigate_tab_via_cdp() {
+    local cdp_port="$1" target_id="$2" url="$3"
+    [ -n "$cdp_port" ]  || return 2
+    [ -n "$target_id" ] || return 2
+    [ -n "$url" ]       || return 2
+    python3 - "$cdp_port" "$target_id" "$url" <<'PY'
+import base64
+import http.client
+import json
+import os
+import socket
+import struct
+import sys
+
+
+def http_get(port, path):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    conn.request("GET", path)
+    body = conn.getresponse().read().decode("utf-8")
+    conn.close()
+    return json.loads(body)
+
+
+def ws_connect(url):
+    rest = url[len("ws://"):]
+    host_port, path = rest.split("/", 1)
+    host, port_s = host_port.split(":")
+    port = int(port_s)
+    sock = socket.create_connection((host, port), timeout=3)
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    req = (
+        f"GET /{path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    sock.sendall(req.encode("ascii"))
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("websocket handshake aborted")
+        buf += chunk
+    if b"101" not in buf.split(b"\r\n", 1)[0]:
+        raise RuntimeError("websocket handshake refused")
+    return sock
+
+
+def ws_send(sock, payload):
+    data = payload.encode("utf-8")
+    header = bytearray([0x81])
+    mask = os.urandom(4)
+    if len(data) < 126:
+        header.append(0x80 | len(data))
+    elif len(data) < 65536:
+        header.append(0x80 | 126)
+        header += struct.pack(">H", len(data))
+    else:
+        header.append(0x80 | 127)
+        header += struct.pack(">Q", len(data))
+    header += mask
+    sock.sendall(bytes(header) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+
+def ws_recv(sock):
+    def must(n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise RuntimeError("websocket closed")
+            buf += chunk
+        return buf
+
+    while True:
+        b0, b1 = must(2)
+        opcode = b0 & 0x0F
+        plen = b1 & 0x7F
+        if plen == 126:
+            (plen,) = struct.unpack(">H", must(2))
+        elif plen == 127:
+            (plen,) = struct.unpack(">Q", must(8))
+        mask = must(4) if (b1 & 0x80) else None
+        data = must(plen)
+        if mask:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        if opcode == 0x1:
+            return data.decode("utf-8")
+        if opcode == 0x8:
+            raise RuntimeError("websocket closed by remote")
+
+
+def main():
+    port = int(sys.argv[1])
+    target_id = sys.argv[2]
+    url = sys.argv[3]
+
+    targets = http_get(port, "/json/list")
+    page = next((t for t in targets if t.get("id") == target_id), None)
+    if page is None or not page.get("webSocketDebuggerUrl"):
+        print("target not found or has no debugger URL", file=sys.stderr)
+        return 2
+
+    sock = ws_connect(page["webSocketDebuggerUrl"])
+    next_id = 0
+
+    def call(method, params=None):
+        nonlocal next_id
+        next_id += 1
+        msg = {"id": next_id, "method": method}
+        if params is not None:
+            msg["params"] = params
+        ws_send(sock, json.dumps(msg))
+        while True:
+            resp = json.loads(ws_recv(sock))
+            if resp.get("id") == next_id:
+                if "error" in resp:
+                    raise RuntimeError(resp["error"])
+                return resp.get("result", {})
+
+    result = call("Page.navigate", {"url": url})
+    if result.get("errorText"):
+        print(f"navigate error: {result['errorText']}", file=sys.stderr)
+        return 1
+    return 0
+
+
+try:
+    sys.exit(main())
+except Exception as exc:  # best-effort: caller falls back to a new tab
+    print(f"navigate failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 cmd_open() {
