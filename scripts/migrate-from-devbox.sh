@@ -28,12 +28,18 @@ set -euo pipefail
 #   4. Drops the stale /usr/local/bin/devbox symlink, completion files, the old
 #      ~/.local/share/devbox checkout, and the orphaned `devbox` agent skill.
 #   5. Re-renders MCP entries (devbox-* → boxa-*) when the boxa CLI is present.
-#   6. Reports leftover state that is deliberately NOT auto-removed: the
-#      `/var/log/devbox` dir (owned by the old `devbox-agent` UID — a rename
-#      would leave it unreadable by the freshly-created `boxa-agent`), the
-#      `devbox-agent` / `devbox-mcp` users, the `devbox-bridge` group, and the
-#      old `vlcak/devbox:latest` image (your rollback). Fresh equivalents are
-#      created by install.sh / `boxa doctor`; remove the old ones by hand.
+#   6. Docker cleanup: removes the legacy `vlcak/devbox:latest` image (the
+#      devbox rollback — its layers are largely shared with `ivijl/boxa`, so
+#      little unique space frees, but no stray devbox-branded image lingers)
+#      and prunes dangling images. Build cache is deliberately NOT pruned: a
+#      devbox build's cache layers are shared with boxa's (same Dockerfile
+#      lineage) and can't be isolated — `boxa prune` handles cache reclaim.
+#   7. Reports leftover state that is deliberately NOT auto-removed (UID-tied,
+#      not Docker): the `/var/log/devbox` dir (owned by the old `devbox-agent`
+#      UID — a rename would leave it unreadable by the freshly-created
+#      `boxa-agent`), the `devbox-agent` / `devbox-mcp` users, and the
+#      `devbox-bridge` group. Fresh equivalents are created by install.sh /
+#      `boxa doctor`; remove the old ones by hand (they need sudo).
 #
 # Run order for a migrating user (migrate + install order no longer matters —
 # the config dir is merged either way):
@@ -73,6 +79,12 @@ mapfile -t OLD_CONTAINERS < <(docker ps -a --format '{{.Names}}' 2>/dev/null \
     | grep -E '^devbox-|^devbox_traefik$|^devbox_dns$' || true)
 mapfile -t OLD_VOLUMES < <(docker volume ls --format '{{.Name}}' 2>/dev/null \
     | grep -E '^devbox-' || true)
+# The devbox rollback image (step 5). Detected here so it counts toward the
+# "anything to do?" check — otherwise an install whose ONLY remnant is this
+# image (everything else already migrated) would short-circuit at "nothing to
+# migrate" and never reach the Docker cleanup that removes it.
+OLD_IMAGE="vlcak/devbox:latest"
+docker image inspect "$OLD_IMAGE" >/dev/null 2>&1 && HAVE_OLD_IMAGE=1 || HAVE_OLD_IMAGE=0
 
 OLD_CFG="$HOME/.config/devbox"; NEW_CFG="$HOME/.config/boxa"
 OLD_LOG="/var/log/devbox"
@@ -96,6 +108,7 @@ echo "  config dir : $([ -d "$OLD_CFG" ] && echo "$OLD_CFG" || echo 'none')"
 echo "  log dir    : $([ -d "$OLD_LOG" ] && echo "$OLD_LOG" || echo 'none')"
 echo "  install dir: $([ -d "$OLD_SHARE" ] && echo "$OLD_SHARE" || echo 'none')"
 echo "  agent skill: ${#OLD_SKILLS[@]}"
+echo "  devbox image: $([ "$HAVE_OLD_IMAGE" = 1 ] && echo "$OLD_IMAGE" || echo 'none')"
 
 nothing=1
 [ "${#OLD_CONTAINERS[@]}" -gt 0 ] && nothing=0
@@ -104,6 +117,7 @@ nothing=1
 [ -d "$OLD_LOG" ] && nothing=0
 [ -d "$OLD_SHARE" ] && nothing=0
 [ "${#OLD_SKILLS[@]}" -gt 0 ] && nothing=0
+[ "$HAVE_OLD_IMAGE" = 1 ] && nothing=0
 if [ "$nothing" = 1 ]; then
     say "${c_grn}Nothing to migrate — no legacy 'devbox' state found.${c_rst}"
     exit 0
@@ -352,25 +366,44 @@ if [ "${#OLD_SKILLS[@]}" -gt 0 ]; then
     done
 fi
 
-# --- 5. report leftover state (deliberately not auto-moved) ------------------
+# --- 5. Docker cleanup: drop the legacy devbox image + dangling images -------
+# The old `vlcak/devbox:latest` image is the devbox rollback. We remove it
+# automatically: most of its layers are shared with `ivijl/boxa:latest` (same
+# Dockerfile lineage), so little unique disk frees, but it leaves no stray
+# devbox-branded image behind. Then prune dangling (untagged, unreferenced)
+# images. Build CACHE is intentionally left alone — devbox's cache layers are
+# shared with boxa's and can't be separated; `boxa prune` reclaims cache.
+# (Only reached in run/auto mode — --check exits earlier, before any mutation.)
+if [ "$HAVE_OLD_IMAGE" = 1 ]; then
+    say "Removing the legacy devbox image (rollback no longer kept)…"
+    if docker rmi "$OLD_IMAGE" >/dev/null 2>&1; then
+        did "removed image $OLD_IMAGE"
+    else
+        warn "could not remove $OLD_IMAGE — remove by hand: docker rmi $OLD_IMAGE"
+    fi
+fi
+if pruned="$(docker image prune -f 2>/dev/null)"; then
+    reclaimed="$(printf '%s\n' "$pruned" | sed -n 's/^Total reclaimed space: //p')"
+    case "$reclaimed" in 0B|"") ;; *) did "pruned dangling images (reclaimed $reclaimed)" ;; esac
+fi
+
+# --- 6. report leftover state (deliberately not auto-removed) ----------------
 # State tied to the old devbox-agent UID is NOT migrated: moving
 # /var/log/devbox would carry devbox-agent ownership/modes onto /var/log/boxa,
 # which boxa-agent (a freshly-created, different UID) then could not read. A
 # fresh boxa gets a clean /var/log/boxa with correct ownership via provisioning.
+# These need sudo to remove, so we report rather than auto-delete.
 leftovers=()
 [ -d "$OLD_LOG" ] && leftovers+=("$OLD_LOG (log/audit archives, owned by devbox-agent)")
 id devbox-agent >/dev/null 2>&1 && leftovers+=("devbox-agent (user)")
 id devbox-mcp   >/dev/null 2>&1 && leftovers+=("devbox-mcp (user)")
 getent group devbox-bridge >/dev/null 2>&1 && leftovers+=("devbox-bridge (group)")
-docker image inspect vlcak/devbox:latest >/dev/null 2>&1 \
-    && leftovers+=("vlcak/devbox:latest image (~7GB, your rollback to devbox)")
 if [ "${#leftovers[@]}" -gt 0 ]; then
     say "Leftover devbox state (left in place — install.sh / 'boxa doctor' create fresh equivalents):"
     for u in "${leftovers[@]}"; do echo "    - $u"; done
     echo "    Remove the old ones by hand once you're happy, e.g.:"
     echo "      sudo rm -rf $OLD_LOG"
     echo "      sudo userdel -r devbox-agent ; sudo userdel -r devbox-mcp ; sudo groupdel devbox-bridge"
-    echo "      docker rmi vlcak/devbox:latest"
 fi
 
 # --- MCP re-render (only if an MCP profile exists) ---------------------------
@@ -408,8 +441,8 @@ else
 fi
 
 # --- final verification ------------------------------------------------------
-# Audit the auto-migrated state at a glance (the sudo/rollback leftovers above
-# are reported separately by step 5).
+# Audit the auto-migrated state at a glance (the sudo-only leftovers above
+# are reported separately by step 6).
 say "Verification — auto-migrated state:"
 vol_left=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -cE '^devbox-' || true)
 ctr_left=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -cE '^devbox-|^devbox_traefik$|^devbox_dns$' || true)
@@ -420,6 +453,7 @@ if [ "$ctr_left" -eq 0 ]; then ok "no devbox containers left"; else no "$ctr_lef
 if [ -e "$OLD_CFG" ]; then no "$OLD_CFG still present"; else ok "config dir merged into $NEW_CFG"; fi
 if [ -e "$HOME/.local/share/devbox" ]; then no "old install dir (.local/share/devbox) left"; else ok "old install dir removed"; fi
 if [ -L /usr/local/bin/devbox ] || [ -e /usr/local/bin/devbox ]; then no "/usr/local/bin/devbox symlink left"; else ok "CLI symlink removed"; fi
+if docker image inspect "$OLD_IMAGE" >/dev/null 2>&1; then no "$OLD_IMAGE image still present"; else ok "legacy devbox image removed"; fi
 
 # --- summary -----------------------------------------------------------------
 echo
