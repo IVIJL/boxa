@@ -22,7 +22,9 @@ set -euo pipefail
 #      rewrites carried-over Traefik routes + `connect` records to the new
 #      `boxa-<project>` container names. Merging (not a plain rename) makes this
 #      step order-independent: it works whether it runs before OR after
-#      install.sh has seeded ~/.config/boxa.
+#      install.sh has seeded ~/.config/boxa. Then (3b) lays the host resolver
+#      drop-in as `boxa.conf` (Linux/WSL2; what `boxa update` self-heals) and
+#      removes the legacy `devbox.conf` one, so no follow-up update is needed.
 #   4. Drops the stale /usr/local/bin/devbox symlink, completion files, the old
 #      ~/.local/share/devbox checkout, and the orphaned `devbox` agent skill.
 #   5. Re-renders MCP entries (devbox-* → boxa-*) when the boxa CLI is present.
@@ -231,6 +233,65 @@ if [ -d "$OLD_CFG" ]; then
             fi
         done
         shopt -u nullglob
+    fi
+fi
+
+# --- 3b. host resolver drop-in: bring devbox.conf → boxa.conf forward ---------
+# The merged dns.conf still selects the host resolver (local mode), but on
+# Linux/WSL2 the systemd-resolved (or NetworkManager) drop-in — and the WSL2
+# NRPT rule — were written under the OLD tool name (`devbox.conf`). Boxa's
+# resolver self-heal keys on a `boxa.conf` drop-in, so without this a migrated
+# user hits a surprise sudo/UAC prompt (drop-in reinstall + mkcert CA) on their
+# first `boxa update` — the exact gap this step closes. Lay the boxa-named
+# drop-in now, exactly as `boxa update` does (docker-run.sh
+# _boxa::self_heal_resolver_drop_in): dns-install with --local — not --auto —
+# so a port-53 conflict surfaces as an error instead of silently flipping the
+# user to external mode. macOS needs nothing here: its /etc/resolver/<tld> file
+# is named by TLD, not by tool, so it survives the rename untouched.
+#
+# Gated on the `boxa` CLI being present (same convention as the MCP re-render
+# below): a pre-install migration leaves the resolver to install.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BOXA_DIR="$(dirname "$SCRIPT_DIR")"
+legacy_dropins=(
+    /etc/systemd/resolved.conf.d/devbox.conf
+    /etc/NetworkManager/dnsmasq.d/devbox.conf
+)
+if command -v boxa >/dev/null 2>&1 && [ -x "$BOXA_DIR/scripts/dns-install.sh" ]; then
+    # Heal when a legacy devbox drop-in lingers, OR a local-mode user has no
+    # boxa drop-in yet. active_domain defaults to `test` (local) when unset.
+    need_resolver_heal=0
+    for d in "${legacy_dropins[@]}"; do [ -f "$d" ] && need_resolver_heal=1; done
+    active_domain="$(awk -F= \
+        '/^[[:space:]]*active_domain[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2}' \
+        "$NEW_CFG/dns.conf" 2>/dev/null || true)"
+    if { [ -z "$active_domain" ] || [ "$active_domain" = "test" ]; } \
+        && [ ! -f /etc/systemd/resolved.conf.d/boxa.conf ] \
+        && [ ! -f /etc/NetworkManager/dnsmasq.d/boxa.conf ]; then
+        need_resolver_heal=1
+    fi
+
+    if [ "$need_resolver_heal" = 1 ]; then
+        say "Bringing the host resolver drop-in forward (devbox → boxa)…"
+        if "$BOXA_DIR/scripts/dns-install.sh" install --local; then
+            did "host resolver drop-in installed as boxa.conf (+ mkcert CA when HTTPS is on)"
+        else
+            warn "dns-install failed — run 'boxa dns-install install --local' by hand"
+        fi
+        # Drop the now-superseded devbox-named drop-ins so the host resolver
+        # only carries boxa's. systemd-resolved must reload to forget the old one.
+        for d in "${legacy_dropins[@]}"; do
+            [ -f "$d" ] || continue
+            if sudo rm -f "$d" 2>/dev/null; then
+                did "removed legacy resolver drop-in $d"
+                case "$d" in
+                    */resolved.conf.d/*)
+                        sudo systemctl reload-or-restart systemd-resolved 2>/dev/null || true ;;
+                esac
+            else
+                warn "could not remove legacy drop-in $d (remove by hand)"
+            fi
+        done
     fi
 fi
 
