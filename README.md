@@ -1,11 +1,17 @@
 # boxa
 
-**A throwaway dev box for your AI agent — sealed off from your machine, and gone without a trace.**
+**A throwaway dev box for you and your AI agent — sealed off from your machine, and gone without a trace.**
 
 Run Claude Code (or any agent) with `--dangerously-skip-permissions` and mean
-it: boxa is a Dev Container with a default-deny firewall, a hardened browser
-that can't touch your keys, and full Docker-in-Docker — so the agent gets a real
-machine to work on while your host stays clean.
+it. boxa is a Dev Container with a default-deny firewall, a hardened browser
+that can't touch your keys, and full Docker-in-Docker — so you and your agent
+get a real machine to work on while your host stays clean.
+
+It's also a blast radius. A malicious `npm install` — or a poisoned pip, cargo,
+or any link in the dependency supply chain — lands in a box that holds none of
+your secrets and can't phone home: **nothing worth stealing, and nowhere to send
+it anyway.** Whatever the agent runs stays sealed behind the firewall and dies
+with the box.
 
 <!-- DEMO PLACEHOLDER — issue 12 fills this with an asciinema cast / GIF of
      install → start → firewall in action. -->
