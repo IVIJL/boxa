@@ -46,6 +46,13 @@ source "$BOXA_DIR/lib/allowlist.sh"
 # reconcile after a container stop or a host crash on the next `start`.
 SESSIONS_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/boxa/agent-browser/sessions"
 
+# The X server's UNIX-socket directory — the X11 standard `/tmp/.X11-unix`.
+# Overridable ONLY so the test suite can point the X-session-identity probes at a
+# writable scratch dir on hosts where `/tmp/.X11-unix` is a read-only mount (e.g.
+# WSLg, where it is a WSLg-managed `ro` tmpfs and throwaway sockets can't be
+# bound). Production always uses the default.
+X11_SOCKET_DIR="${BOXA_X11_SOCKET_DIR:-/tmp/.X11-unix}"
+
 # Ephemeral Chrome profiles + downloads live under a boxa-agent-owned
 # parent so the OS-identity boundary covers them too (ADR 0010 § Actor 1).
 # /var/lib is the FHS-canonical location for service-owned mutable state;
@@ -1445,7 +1452,7 @@ _display_resolves_to_local_server() {
         case "$dnum" in
             ''|*[!0-9]*) return 1 ;;
         esac
-        [ -S "/tmp/.X11-unix/X${dnum}" ] && return 0
+        [ -S "${X11_SOCKET_DIR}/X${dnum}" ] && return 0
     fi
     return 1
 }
@@ -1526,9 +1533,9 @@ _x_session_token() {
     dnum="${canon##*:}"
 
     local sock_id="" boot_id=""
-    if [ -n "$dnum" ] && [ -S "/tmp/.X11-unix/X${dnum}" ]; then
+    if [ -n "$dnum" ] && [ -S "${X11_SOCKET_DIR}/X${dnum}" ]; then
         # inode:mtime of the X socket — changes across an X server restart.
-        sock_id="$(stat -c '%i:%Y' "/tmp/.X11-unix/X${dnum}" 2>/dev/null || true)"
+        sock_id="$(stat -c '%i:%Y' "${X11_SOCKET_DIR}/X${dnum}" 2>/dev/null || true)"
     fi
 
     # The socket IS the X-instance discriminator. Without it, boot id alone is

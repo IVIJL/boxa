@@ -450,6 +450,13 @@ unset -f command
 
 X_SESSIONS_DIR="$(mktemp -d)"
 SESSIONS_DIR="$X_SESSIONS_DIR"
+# Redirect the broker's X-socket probes (`_x_session_token`,
+# `_display_resolves_to_local_server`) at a writable scratch dir. The F1/F24
+# blocks bind THROWAWAY UNIX sockets on high display numbers to drive these
+# probes; the real `/tmp/.X11-unix` is a read-only WSLg mount on the dev host
+# (so binding there fails) and we must never clobber a real X server's socket
+# anyway. Both the broker and the F1/F24 helpers key off this single var.
+X11_SOCKET_DIR="$(mktemp -d)"
 # The broker derives XHOST_GRANT_LOCKFILE from SESSIONS_DIR at source time (when
 # it still points at the real ~/.local/state path). Re-point it at the scratch
 # dir so the X-grant flock (finding 1) is taken against a writable test path —
@@ -463,7 +470,7 @@ XHOST_GRANT_LOCKFILE="$X_SESSIONS_DIR/.xhost-grant.lock"
 # the exact selector. SC2317: the mock body is reached only via the helpers
 # under test, not called directly from this script.
 XHOST_CALL_LOG="$(mktemp)"
-trap 'rm -f "$TMP" "$XHOST_CALL_LOG"; rm -rf "$X_SESSIONS_DIR"' EXIT
+trap 'rm -f "$TMP" "$XHOST_CALL_LOG"; rm -rf "$X_SESSIONS_DIR" "$X11_SOCKET_DIR"' EXIT
 xhost_calls() { grep -c . "$XHOST_CALL_LOG" 2>/dev/null || true; }
 xhost_last()  { tail -n1 "$XHOST_CALL_LOG" 2>/dev/null || true; }
 reset_xhost_log() { : > "$XHOST_CALL_LOG"; }
@@ -1674,14 +1681,15 @@ xhost() { printf 'xhost %s\n' "$*" >> "$XHOST_CALL_LOG"; return 0; }
 #       marker (safe default), never a confident clear and never a confident
 #       match. We restore the REAL `_x_session_token` for this section and drive
 #       its filesystem dependencies with a REAL throwaway UNIX socket under
-#       `/tmp/.X11-unix/` on a high, collision-unlikely display number.
+#       `$X11_SOCKET_DIR/` (a writable test scratch dir; see its definition near
+#       the top of this file) on a high, collision-unlikely display number.
 # ----------------------------------------------------------------------------
 eval "_x_session_token() $(declare -f _real_x_session_token | sed '1d')"
 
-# Helper: create a real UNIX socket at /tmp/.X11-unix/X<n>. Returns 0 on success.
+# Helper: create a real UNIX socket at $X11_SOCKET_DIR/X<n>. Returns 0 on success.
 # Tries python3 (always present in this repo's host env); the test asserts that
 # it succeeded so a silent skip can't hide a regression.
-F24_XDIR="/tmp/.X11-unix"
+F24_XDIR="$X11_SOCKET_DIR"
 make_x_socket() {
     local n="$1"
     mkdir -p "$F24_XDIR" 2>/dev/null || return 1
@@ -2928,7 +2936,7 @@ assert_eq "F22 canon: real-remote 'host:0.1' → 'host:0'"    "host:0" "$(_canon
 #     socket, the TCP forms keep their own key (SSH-forwarded case), while
 #     `:N`/`unix:N` stay `:N`. A FOREIGN host never collapses. Use HIGH display
 #     numbers with a controllable throwaway socket so we never touch real X0. ---
-F1_XDIR="/tmp/.X11-unix"
+F1_XDIR="$X11_SOCKET_DIR"
 f1_make_socket() {
     local n="$1"
     mkdir -p "$F1_XDIR" 2>/dev/null || return 1
@@ -3114,7 +3122,7 @@ assert_eq "F22 backcompat: old non-canonical ':0.0' file normalizes & matches ':
 #     with such a peer alive. They are separate transport ends, each with its own
 #     grant/marker/refcount. Ensure NO `X10` socket exists so `localhost:10` does
 #     NOT collapse to `:10` (it would, server-wide, if a local X10 were up). ---
-rm -f "/tmp/.X11-unix/X10" 2>/dev/null || true
+rm -f "$X11_SOCKET_DIR/X10" 2>/dev/null || true
 clear_sessions
 broker_owns_display ":10"            # broker owns the :10 (local-unix) grant
 ALIVE_PIDS=" 4242 "
