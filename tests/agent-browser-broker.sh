@@ -456,7 +456,13 @@ SESSIONS_DIR="$X_SESSIONS_DIR"
 # probes; the real `/tmp/.X11-unix` is a read-only WSLg mount on the dev host
 # (so binding there fails) and we must never clobber a real X server's socket
 # anyway. Both the broker and the F1/F24 helpers key off this single var.
-X11_SOCKET_DIR="$(mktemp -d)"
+#
+# Anchor at a SHORT, fixed `/tmp` path — NOT a TMPDIR-respecting bare
+# `mktemp -d`. A UNIX socket path must fit `sun_path` (108 bytes); under a long
+# `$TMPDIR` (e.g. a Codex/CI sandbox workdir) `mktemp -d` returns a deep path and
+# `$dir/X<n>` overruns the limit → `AF_UNIX path too long` → the very
+# "could not create test UNIX socket" failure this redirect exists to avoid.
+X11_SOCKET_DIR="$(mktemp -d /tmp/boxa-xtest.XXXXXX)"
 # The broker derives XHOST_GRANT_LOCKFILE from SESSIONS_DIR at source time (when
 # it still points at the real ~/.local/state path). Re-point it at the scratch
 # dir so the X-grant flock (finding 1) is taken against a writable test path —
