@@ -137,6 +137,14 @@ boxa was built as a human + AI collaboration:
 - **[Matt Pocock](https://github.com/mattpocock)** — for the superb agent skills
   that shaped how this was built.
 
+## Support
+
+If Boxa helps you build safer with AI agents, you can support the project here:
+
+[❤️ Sponsor Boxa / Milos on GitHub](https://github.com/sponsors/IVIJL)
+
+Your support helps me keep improving Boxa and continue building open-source tools from home.
+
 ## License
 
 Released under the [MIT License](LICENSE).
