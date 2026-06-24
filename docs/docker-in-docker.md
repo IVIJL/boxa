@@ -77,8 +77,18 @@ To uninstall:
 powershell -ExecutionPolicy Bypass -File scripts\windows\uninstall-shutdown-hook.ps1
 ```
 
+## Reaching another box from an inner container
+
+Inner DinD containers run on their own nested network and cannot resolve other
+boxes on `devproxy` directly. To let an inner compose service reach a published
+TCP port in *another* box, use `boxa connect` and dial `10.0.2.2:<local-port>`
+from the inner container. See
+[Cross-boxa connections](networking.md#cross-boxa-connections).
+
 ## See also
 
+- [Cross-boxa connections](networking.md#cross-boxa-connections) — reach a TCP
+  service in another box from an inner container.
 - [ADR 0003](adr/0003-privileged-entrypoint-no-sudo-in-container.md) — privileged
   entrypoint instead of in-container sudo.
 - [ADR 0018](adr/0018-local-first-no-prebuilt-image.md) — local-first: no

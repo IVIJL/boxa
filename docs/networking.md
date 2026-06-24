@@ -33,6 +33,61 @@ edited.
 See [ADR 0007](adr/0007-local-dns-with-external-fallback.md) for the local-DNS
 + external-fallback design.
 
+## Cross-boxa connections
+
+`boxa port` publishes a port to your **browser** over HTTP(S). `boxa connect`
+solves the other direction: letting code in **one box reach a TCP service in
+another box** — typically an app in project `web` talking to a Postgres or API
+that lives in project `api`.
+
+Boxa containers already share the `devproxy` network, so a process running
+*directly* in box `web` can reach box `api` as `boxa-api:<port>` with no setup.
+The catch is **Docker-in-Docker**: the inner compose containers you actually run
+(see [Docker-in-Docker](docker-in-docker.md)) sit on their own nested network and
+are *not* on `devproxy`, so they cannot resolve `boxa-api`. `boxa connect`
+bridges that gap.
+
+```bash
+boxa connect                   # Interactive: pick source box, target box(es), services
+boxa connect api 5432          # Forward this box -> boxa-api:5432 (auto local port)
+boxa connect api 5432 15432    # Pin an explicit local forward port
+boxa connect api 5432 --from web   # Run from outside web's directory
+boxa connections               # List all cross-boxa forwards + live status
+```
+
+### How it works
+
+`boxa connect <target> <port>` runs a `socat` listener **inside the source box**
+that forwards `127.0.0.1:<local-port>` → `boxa-<target>:<port>` over `devproxy`.
+The local port is auto-allocated from the **15000–15999** range (deterministic
+per `source:target:port`, so re-running is idempotent), or you can pin one.
+
+Consume the forward by address depending on *where* the client runs:
+
+| Client location | Address to use |
+|-----------------|----------------|
+| **Inner DinD container** (your compose service) | `10.0.2.2:<local-port>` |
+| A process in the source box's main shell | `localhost:<local-port>` |
+
+`10.0.2.2` is the rootless-dockerd gateway: from an inner container it routes to
+the box's own loopback, where `socat` is listening.
+
+### Requirements & lifecycle
+
+- **The target service must publish a TCP port** (a compose `ports:` mapping).
+  The interactive picker discovers exactly those; services reachable only on the
+  target's internal compose network are not connectable.
+- Forwards are **persisted** per source box in
+  `~/.config/boxa/connect/<source>.tsv` and **auto-restart** when the box
+  starts, so connections survive `boxa stop` / restart.
+- `boxa connections` shows each forward's `STATUS`: `up` (listener live),
+  `down` (source running but no listener — dead forward), or `stopped` (source
+  box not running).
+
+See [ADR 0019](adr/0019-cross-boxa-connect-via-socat-forward.md) for the design
+rationale (why a per-source socat forward rather than direct `devproxy`
+addressing, and why `10.0.2.2`).
+
 ## One-time host resolver setup for `.test`
 
 `.test` is an [RFC 2606](https://www.rfc-editor.org/rfc/rfc2606) reserved TLD;

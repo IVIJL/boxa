@@ -109,7 +109,7 @@ Per-feature guides:
 - [Firewall](docs/firewall.md) — default-deny allowlist, `allow`/`deny`/`blocked`, allow-for harvest window.
 - [Agent-browser](docs/agent-browser.md) — sessions, network windows, allowlist, artefacts, per-OS prerequisites.
 - [MCP servers](docs/mcp.md) — profile model, import/add/render/install/doctor, credential isolation.
-- [Networking & port routing](docs/networking.md) — local `.test` DNS, sslip.io fallback, HTTPS via mkcert.
+- [Networking & port routing](docs/networking.md) — local `.test` DNS, sslip.io fallback, HTTPS via mkcert, cross-boxa `connect`.
 - [SSH](docs/ssh.md) — agent forwarding, boxa SSH config, WSL2 keychain.
 - [Docker-in-Docker](docs/docker-in-docker.md) — rootless DinD, persistence, graceful shutdown.
 - [Editors](docs/editors.md) — VS Code / Cursor attach; Zed (planned).
