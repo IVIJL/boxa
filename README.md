@@ -113,6 +113,7 @@ Per-feature guides:
 - [SSH](docs/ssh.md) — agent forwarding, boxa SSH config, WSL2 keychain.
 - [Docker-in-Docker](docs/docker-in-docker.md) — rootless DinD, persistence, graceful shutdown.
 - [Editors](docs/editors.md) — VS Code / Cursor attach; Zed (planned).
+- [Clipboard images](docs/clipboard-images.md) — `boxa clip` to paste screenshots into an agent; WezTerm / Ghostty keybindings.
 
 Design rationale lives in the [Architecture Decision Records](docs/adr/).
 Project conventions and the domain glossary are in [CONTEXT.md](CONTEXT.md).

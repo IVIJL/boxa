@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # Grab clipboard image and save to ~/.clipboard-images/
-# Works on WSL2, Linux X11, and Linux Wayland.
+# Works on WSL2, Linux X11, Linux Wayland, and macOS.
 # =============================================================================
 
 CLIP_DIR="${HOME}/.clipboard-images"
@@ -52,6 +52,26 @@ elif [ "${XDG_SESSION_TYPE:-}" = "wayland" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; t
     fi
   # Fallback to raw pixels (Browser, Screenshot)
   elif ! wl-paste --type image/png >"$HOST_PATH" 2>/dev/null; then
+    rm -f "$HOST_PATH"
+    echo "ERROR: No image found in clipboard" >&2
+    exit 1
+  fi
+
+elif [ "$(uname)" = "Darwin" ]; then
+  # macOS: pngpaste if installed (handles more formats), else native osascript
+  # (no dependency). Reading the clipboard as «class PNGf» fails when there's
+  # no image, which doubles as the detection.
+  if command -v pngpaste >/dev/null 2>&1; then
+    if ! pngpaste "$HOST_PATH" >/dev/null 2>&1; then
+      rm -f "$HOST_PATH"
+      echo "ERROR: No image found in clipboard" >&2
+      exit 1
+    fi
+  elif ! osascript \
+        -e 'set theImage to (the clipboard as «class PNGf»)' \
+        -e "set theFile to (open for access POSIX file \"$HOST_PATH\" with write permission)" \
+        -e 'write theImage to theFile' \
+        -e 'close access theFile' >/dev/null 2>&1; then
     rm -f "$HOST_PATH"
     echo "ERROR: No image found in clipboard" >&2
     exit 1

@@ -846,6 +846,138 @@ setup_completions() {
     fi
 }
 
+# --- Clipboard image keybinding ---------------------------------------------
+# `boxa clip` (scripts/clip-image.sh) grabs a clipboard image and prints a path
+# an agent can read. The key that triggers it lives in the user's terminal /
+# compositor config, which install.sh does not own — so we detect what they run
+# and print the exact snippet to paste (with the absolute inject-script path
+# filled in). Full guide: docs/clipboard-images.md.
+
+setup_clipboard_keybind() {
+    info "Clipboard image keybinding..."
+
+    local inject="$BOXA_DIR/scripts/clip-image-inject.sh"
+
+    # macOS: clip-image.sh grabs natively (pngpaste/osascript). The most automatic
+    # keybind is iTerm2's "Run Coprocess" (injects output, no extra tools) or the
+    # cross-platform WezTerm callback. iTerm2 bindings live in a binary plist, so
+    # we print the steps rather than edit it.
+    if [ "$OS" = "macos" ]; then
+        local clip="$BOXA_DIR/scripts/clip-image.sh"
+        msg "macOS: 'boxa clip' grabs the clipboard image natively (pngpaste or osascript)."
+        msg "Bind Ctrl+Shift+S to it; full guide: docs/clipboard-images.md"
+
+        if [ -f "$HOME/.wezterm.lua" ] || [ -f "$HOME/.config/wezterm/wezterm.lua" ]; then
+            echo ""
+            msg "wezterm detected — the Lua keybinding in docs/clipboard-images.md works as-is."
+        fi
+        if [ -d "/Applications/iTerm.app" ] || [ -d "$HOME/Library/Application Support/iTerm2" ]; then
+            echo ""
+            msg "iTerm2 detected — Settings → Keys → Key Bindings → +:"
+            msg "  Shortcut: Ctrl+Shift+S    Action: Run Coprocess…    Command:"
+            printf '    %s | tr -d "\\n"\n' "$clip"
+        fi
+        if [ -e "$HOME/.hammerspoon/init.lua" ]; then
+            echo ""
+            msg "Hammerspoon detected — see docs/clipboard-images.md for a global-hotkey snippet."
+        fi
+        CONFIGURED+=("clipboard keybind (macOS guidance printed)")
+        return
+    fi
+
+    # WSL2: the keybind lives in WezTerm on the Windows side; clip-image.sh runs
+    # in WSL via PowerShell and WezTerm captures+injects, so no inject tool needed.
+    if is_wsl2; then
+        msg "WSL2: add the WezTerm keybinding (Windows ~/.wezterm.lua) — see docs/clipboard-images.md."
+        SKIPPED+=("clipboard keybind (WSL2 — WezTerm config is manual)")
+        return
+    fi
+
+    # Native Linux: pick the inject backend for terminals that can't capture
+    # output themselves (everything except WezTerm).
+    local session inject_tool
+    if [ -n "${WAYLAND_DISPLAY:-}" ] || [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
+        session="Wayland"; inject_tool="wtype"
+    else
+        session="X11"; inject_tool="xdotool"
+    fi
+
+    # Detect terminal / compositor configs by presence.
+    local wez_cfg=""
+    if [ -f "$HOME/.wezterm.lua" ]; then
+        wez_cfg="$HOME/.wezterm.lua"
+    elif [ -f "$HOME/.config/wezterm/wezterm.lua" ]; then
+        wez_cfg="$HOME/.config/wezterm/wezterm.lua"
+    fi
+
+    local -a found=()
+    [ -n "$wez_cfg" ] && found+=("wezterm")
+    [ -f "$HOME/.config/alacritty/alacritty.toml" ] && found+=("alacritty")
+    [ -f "$HOME/.config/kitty/kitty.conf" ] && found+=("kitty")
+    [ -f "$HOME/.config/ghostty/config" ] && found+=("ghostty")
+    [ -f "$HOME/.config/hypr/hyprland.conf" ] && found+=("hyprland")
+    [ -f "$HOME/.config/sway/config" ] && found+=("sway")
+
+    if [ ${#found[@]} -eq 0 ]; then
+        msg "No known terminal/compositor config detected."
+        msg "See docs/clipboard-images.md to wire up a clip keybinding for yours."
+        SKIPPED+=("clipboard keybind (no known terminal config found)")
+        return
+    fi
+
+    msg "Detected: ${found[*]}"
+
+    # Offer the inject tool if any detected target needs it (i.e. not pure WezTerm).
+    local t needs_inject=false
+    for t in "${found[@]}"; do
+        [ "$t" != "wezterm" ] && needs_inject=true
+    done
+    if $needs_inject && ! has "$inject_tool"; then
+        msg "$inject_tool not found (needed to type the path on $session)."
+        if confirm "Install $inject_tool?"; then
+            pkg_install "$inject_tool"
+            INSTALLED+=("$inject_tool")
+        else
+            warn "Skipping $inject_tool; the inject keybind won't work until it's installed."
+            SKIPPED+=("$inject_tool (clipboard inject tool)")
+        fi
+    fi
+
+    # Print the matching snippet for each detected target (Ctrl+Shift+S).
+    msg "Paste the matching keybinding (Ctrl+Shift+S); full guide: docs/clipboard-images.md"
+    for t in "${found[@]}"; do
+        echo ""
+        case "$t" in
+            wezterm)
+                msg "wezterm → $wez_cfg: see docs/clipboard-images.md (Lua callback, goes inside your keys table)."
+                ;;
+            alacritty)
+                msg "alacritty → ~/.config/alacritty/alacritty.toml:"
+                printf '    [[keyboard.bindings]]\n    key = "S"\n    mods = "Control|Shift"\n    command = { program = "%s" }\n' "$inject"
+                ;;
+            kitty)
+                msg "kitty → ~/.config/kitty/kitty.conf:"
+                printf '    map ctrl+shift+s launch --type=background %s\n' "$inject"
+                ;;
+            hyprland)
+                msg "hyprland → ~/.config/hypr/hyprland.conf:"
+                printf '    bind = CTRL SHIFT, S, exec, %s\n' "$inject"
+                ;;
+            sway)
+                msg "sway → ~/.config/sway/config:"
+                printf '    bindsym Ctrl+Shift+s exec %s\n' "$inject"
+                ;;
+            ghostty)
+                msg "ghostty can't spawn a command from a keybind — bind it in your compositor"
+                msg "(Hyprland/Sway snippet above), pointing at:"
+                printf '    %s\n' "$inject"
+                ;;
+        esac
+    done
+
+    CONFIGURED+=("clipboard keybind (printed snippet for: ${found[*]})")
+}
+
 # --- Clone / update boxa repo ---------------------------------------------
 
 setup_boxa_repo() {
@@ -1124,8 +1256,9 @@ main() {
         msg " 11. Install 'boxa' agent skill to \$HOME/.agents/skills/boxa (+ Claude/Codex symlinks)"
         msg " 12. Offer MCP onboarding (scan existing Claude Code / Codex MCP servers for boxa import)"
         msg " 13. Install 'boxa' command to $SYMLINK_PATH"
-        msg " 14. Optionally generate Claude Code token for containers"
-        msg " 15. Check Docker availability"
+        msg " 14. Detect your terminal and print the clipboard-image keybinding snippet"
+        msg " 15. Optionally generate Claude Code token for containers"
+        msg " 16. Check Docker availability"
         echo ""
         if ! confirm "Continue?"; then
             msg "Aborted."
@@ -1178,6 +1311,9 @@ main() {
 
     echo ""
     setup_completions
+
+    echo ""
+    setup_clipboard_keybind
 
     echo ""
     setup_claude_token
