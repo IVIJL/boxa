@@ -1000,28 +1000,39 @@ HS_BLOCK
     killall Hammerspoon 2>/dev/null || true
     sleep 1
     open -a Hammerspoon 2>/dev/null || true
-    local hs_prompted=false
+    local hs_ipc_ready=false
     if has hs; then
         for _ in $(seq 1 20); do
-            hs -c "return 1" >/dev/null 2>&1 && { hs_prompted=true; break; }
+            hs -c "return 1" >/dev/null 2>&1 && { hs_ipc_ready=true; break; }
             sleep 0.5
         done
-        # Only the dialog-raising call is gated on IPC actually being up; if
-        # accessibilityState itself errors we still fall back below.
-        if $hs_prompted && ! hs -c "hs.accessibilityState(true)" >/dev/null 2>&1; then
-            hs_prompted=false
-        fi
     fi
-    # Fallback when the hs CLI is absent, IPC never came up (stale/failed
-    # config), or the prompt call errored — open the generic pane so the user
-    # still lands somewhere instead of being told to use a dialog that never
-    # appeared.
-    $hs_prompted || open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
 
-    ACTION_REQUIRED+=("Enable Hammerspoon in System Settings → Privacy & Security → Accessibility.
+    # Drive the prompt and the ACTION REQUIRED note off the ACTUAL current
+    # trust state. If Hammerspoon is already trusted, accessibilityState(true)
+    # is a no-op and raises no dialog — telling the user to "enable
+    # Hammerspoon" then would be misleading (nothing to do, nothing appeared).
+    local already_trusted=false
+    if $hs_ipc_ready && [ "$(hs -c "return hs.accessibilityState()" 2>/dev/null)" = "true" ]; then
+        already_trusted=true
+    fi
+
+    if $already_trusted; then
+        CONFIGURED+=("Hammerspoon accessibility (already granted)")
+    else
+        if $hs_ipc_ready; then
+            # Raises Hammerspoon's own dialog, which deep-links to its entry.
+            hs -c "hs.accessibilityState(true)" >/dev/null 2>&1 || true
+        else
+            # hs CLI absent or IPC never came up — open the generic pane so the
+            # user still lands somewhere instead of at a dialog that never showed.
+            open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
+        fi
+        ACTION_REQUIRED+=("Enable Hammerspoon in System Settings → Privacy & Security → Accessibility.
    Hammerspoon's dialog has an \"Open System Settings\" button that takes you straight there.
    Without it, Ctrl+Shift+S fails silently — the PNG is saved but the path is never typed.
    If Hammerspoon is already ticked but doesn't work, toggle it off/on (or remove with − and re-add with +).")
+    fi
 
     # (d) Notifications via terminal-notifier. Fire one test notification to
     #     trigger the macOS allow-notifications prompt (one grant covers all
