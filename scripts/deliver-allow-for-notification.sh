@@ -569,11 +569,32 @@ deliver_linux() {
         "$T_TITLE" "$body" 2>/dev/null
 }
 
-# --- Delivery: macOS osascript ----------------------------------------------
-# `display notification` from osascript has no click activation. We render
-# the body and include the path so the user can copy-paste it. Caller
-# guarantees the platform is Darwin and osascript is available.
+# --- Delivery: macOS terminal-notifier / osascript --------------------------
+# Two backends, preferred first:
+#
+#   terminal-notifier  → clickable parity with the Linux notify-send path:
+#                        clicking the notification body opens the harvest log
+#                        in its default app (via an absolute `file://` URL).
+#                        We deliberately do NOT pass `-actions` (custom
+#                        buttons): terminal-notifier 2.0 rides the deprecated
+#                        NSUserNotification API and those buttons don't render
+#                        on macOS Tahoe 26 — only the system "Show" appears.
+#   osascript          → fallback when terminal-notifier is absent. `display
+#                        notification` has no click activation, so the log
+#                        path goes in the body for manual copy-paste.
+#
+# Caller guarantees the platform is Darwin and osascript is available.
 deliver_macos() {
+    if command -v terminal-notifier >/dev/null 2>&1; then
+        # P_LOG_PATH is an absolute host path from the pending JSON; prefix
+        # to a `file://` URL (absolute path → triple-slash authority form).
+        terminal-notifier \
+            -title "$T_TITLE" \
+            -message "$T_BODY" \
+            -open "file://${P_LOG_PATH}" >/dev/null 2>&1
+        return
+    fi
+
     # AppleScript strings escape `"` as `\"`. Title and body come from
     # parse_pending (controlled input), but escape defensively anyway.
     local title body path

@@ -853,35 +853,160 @@ setup_completions() {
 # and print the exact snippet to paste (with the absolute inject-script path
 # filled in). Full guide: docs/clipboard-images.md.
 
+# macOS clipboard keybind automation. Split out of setup_clipboard_keybind
+# because it does real work (brew installs, init.lua edit, permission
+# prompts) rather than printing a snippet. Darwin-only — never reached on
+# Linux/WSL2. Idempotent: re-running skips present brew packages and
+# replaces (not duplicates) the managed Hammerspoon block.
+setup_clipboard_keybind_macos() {
+    # macOS forbids granting these programmatically — the user clicks once
+    # in GUI. We trigger the prompts; the rest is automatic.
+    if ! has brew; then
+        msg "Homebrew not in PATH — install it (https://brew.sh), then re-run install.sh."
+        msg "It will set up: hammerspoon (cask), terminal-notifier, pngpaste."
+        SKIPPED+=("clipboard keybind (macOS — Homebrew missing)")
+        return
+    fi
+
+    # (a) Install the tools idempotently. hammerspoon ships the global
+    #     hotkey + keystroke injection; terminal-notifier gives clickable
+    #     notifications; pngpaste lets clip-image.sh grab PNGs natively.
+    if brew list --cask hammerspoon >/dev/null 2>&1; then
+        SKIPPED+=("hammerspoon (already installed)")
+    else
+        msg "Installing hammerspoon (cask)..."
+        # `if` (not `&&`) so a failed/cancelled cask install can't abort the
+        # whole installer under `set -e` — we handle it via the check below.
+        if brew install --cask hammerspoon; then INSTALLED+=("hammerspoon"); fi
+    fi
+    # Hammerspoon is the load-bearing dependency — the hotkey, injection and
+    # config block are all pointless without it. If the cask install failed
+    # or was cancelled, bail before writing config so we don't report the
+    # keybind as configured when Ctrl+Shift+S can't possibly work.
+    if ! brew list --cask hammerspoon >/dev/null 2>&1; then
+        warn "Hammerspoon not installed — skipping clipboard keybind setup."
+        warn "Re-run install.sh once 'brew install --cask hammerspoon' succeeds."
+        SKIPPED+=("clipboard keybind (macOS — Hammerspoon install failed)")
+        return
+    fi
+    local formula
+    for formula in terminal-notifier pngpaste; do
+        if brew list --formula "$formula" >/dev/null 2>&1; then
+            SKIPPED+=("$formula (already installed)")
+        else
+            msg "Installing $formula..."
+            if brew install "$formula"; then INSTALLED+=("$formula"); fi
+        fi
+    done
+
+    # (b) Write the managed Hammerspoon block. We touch ONLY the text
+    #     between the markers — anyone's existing init.lua survives intact.
+    local init="$HOME/.hammerspoon/init.lua"
+    local mark_begin="-- >>> boxa clipboard-image (managed) >>>"
+    local mark_end="-- <<< boxa clipboard-image (managed) <<<"
+    mkdir -p "$HOME/.hammerspoon"
+
+    local block_file
+    block_file=$(mktemp)
+    cat > "$block_file" <<HS_BLOCK
+$mark_begin
+require("hs.ipc")
+local CLIP_SCRIPT = os.getenv("HOME") .. "/.local/share/boxa/scripts/clip-image.sh"
+hs.hotkey.bind({ "ctrl", "shift" }, "s", function()
+  local out = hs.execute(CLIP_SCRIPT, true)
+  out = (out or ""):gsub("%s+\$", "")
+  if out ~= "" then
+    hs.eventtap.keyStrokes(out)
+  else
+    hs.alert.show("boxa clip: žádný obrázek v clipboardu")
+  end
+end)
+$mark_end
+HS_BLOCK
+
+    local has_begin=false has_end=false
+    if [ -f "$init" ]; then
+        grep -qF "$mark_begin" "$init" && has_begin=true
+        grep -qF "$mark_end" "$init" && has_end=true
+    fi
+
+    if $has_begin && $has_end; then
+        # Replace in place: on the begin marker, emit the fresh block (which
+        # carries its own markers) and skip the old body through end marker.
+        awk -v b="$mark_begin" -v e="$mark_end" -v bf="$block_file" '
+            $0 == b { skip=1; while ((getline line < bf) > 0) print line; close(bf); next }
+            $0 == e { skip=0; next }
+            !skip
+        ' "$init" > "$init.boxa-tmp" || { rm -f "$init.boxa-tmp"; return; }
+        # Write through the existing file (not `mv`) so a symlinked init.lua
+        # — common with chezmoi/stow dotfiles — keeps its link and the
+        # target's permissions instead of being replaced by a plain file.
+        cat "$init.boxa-tmp" > "$init"
+        rm -f "$init.boxa-tmp"
+        msg "Updated managed Hammerspoon block in $init"
+    elif $has_begin || $has_end; then
+        # Exactly one marker — a half-written/hand-edited block. Appending
+        # would nest blocks and the awk replace would truncate everything
+        # after a lone begin marker, so refuse to touch the file and let the
+        # user reconcile it. Non-destructive: init.lua is left exactly as-is.
+        rm -f "$block_file"
+        warn "Malformed boxa block in $init (only one marker present) — not touching it."
+        warn "Remove the stray '-- >>> / <<< boxa clipboard-image' marker, then re-run install.sh."
+        SKIPPED+=("clipboard keybind (macOS — malformed Hammerspoon block)")
+        return
+    else
+        # Append, separated by a blank line if the file already has content.
+        [ -s "$init" ] && printf '\n' >> "$init"
+        cat "$block_file" >> "$init"
+        msg "Added managed Hammerspoon block to $init"
+    fi
+    rm -f "$block_file"
+
+    # (c) Start Hammerspoon and trigger the Accessibility prompt. A running
+    #     Hammerspoon caches AXIsProcessTrusted(), so it must be restarted
+    #     after the user toggles the permission — otherwise injection works
+    #     but accessibilityState() keeps reporting false.
+    open -a Hammerspoon 2>/dev/null || true
+    if has hs; then
+        hs -c "hs.accessibilityState(true)" >/dev/null 2>&1 || true
+    fi
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
+    killall Hammerspoon 2>/dev/null || true
+    sleep 1
+    open -a Hammerspoon 2>/dev/null || true
+
+    warn "ACTION REQUIRED — enable Hammerspoon in System Settings → Privacy & Security"
+    warn "→ Accessibility. Without it Ctrl+Shift+S fails silently (the PNG is saved,"
+    warn "but the path is never typed). If Hammerspoon is already ticked but doesn't"
+    warn "work, toggle it off/on (or remove with − and re-add with +)."
+
+    # (d) Notifications via terminal-notifier. Fire one test notification to
+    #     trigger the macOS allow-notifications prompt (one grant covers all
+    #     terminals), then open the panel and explain the Alerts switch —
+    #     report persistence can't be set programmatically (ncprefs is
+    #     protected and the flag encoding shifts between macOS releases).
+    if has terminal-notifier; then
+        terminal-notifier -title "boxa" -message "Notifikace nastaveny ✓" >/dev/null 2>&1 || true
+        open "x-apple.systempreferences:com.apple.Notifications-Settings.extension" 2>/dev/null || true
+        warn "ACTION REQUIRED — in Notifications settings, find terminal-notifier and"
+        warn "switch its style from Banners to Alerts, so harvest reports stay on"
+        warn "screen until you acknowledge them."
+    fi
+
+    CONFIGURED+=("clipboard keybind (macOS — Hammerspoon hotkey + terminal-notifier)")
+}
+
 setup_clipboard_keybind() {
     info "Clipboard image keybinding..."
 
     local inject="$BOXA_DIR/scripts/clip-image-inject.sh"
 
-    # macOS: clip-image.sh grabs natively (pngpaste/osascript). The most automatic
-    # keybind is iTerm2's "Run Coprocess" (injects output, no extra tools) or the
-    # cross-platform WezTerm callback. iTerm2 bindings live in a binary plist, so
-    # we print the steps rather than edit it.
+    # macOS: a global hotkey via Hammerspoon works in *every* terminal
+    # (incl. Terminal.app, which can't run a command from a keybind). We
+    # install the tools, drop a managed block into init.lua, and trigger
+    # the two GUI permissions macOS won't grant programmatically.
     if [ "$OS" = "macos" ]; then
-        local clip="$BOXA_DIR/scripts/clip-image.sh"
-        msg "macOS: 'boxa clip' grabs the clipboard image natively (pngpaste or osascript)."
-        msg "Bind Ctrl+Shift+S to it; full guide: docs/clipboard-images.md"
-
-        if [ -f "$HOME/.wezterm.lua" ] || [ -f "$HOME/.config/wezterm/wezterm.lua" ]; then
-            echo ""
-            msg "wezterm detected — the Lua keybinding in docs/clipboard-images.md works as-is."
-        fi
-        if [ -d "/Applications/iTerm.app" ] || [ -d "$HOME/Library/Application Support/iTerm2" ]; then
-            echo ""
-            msg "iTerm2 detected — Settings → Keys → Key Bindings → +:"
-            msg "  Shortcut: Ctrl+Shift+S    Action: Run Coprocess…    Command:"
-            printf '    %s | tr -d "\\n"\n' "$clip"
-        fi
-        if [ -e "$HOME/.hammerspoon/init.lua" ]; then
-            echo ""
-            msg "Hammerspoon detected — see docs/clipboard-images.md for a global-hotkey snippet."
-        fi
-        CONFIGURED+=("clipboard keybind (macOS guidance printed)")
+        setup_clipboard_keybind_macos
         return
     fi
 

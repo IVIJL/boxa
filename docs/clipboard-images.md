@@ -130,9 +130,15 @@ in, ready to send.
 ### macOS — iTerm2, WezTerm, or Hammerspoon
 
 `boxa clip` works on macOS out of the box (`pngpaste` if installed, otherwise the
-built-in `osascript`). For the keybinding:
+built-in `osascript`). For the keybinding, **the recommended path is a global
+hotkey via [Hammerspoon](https://www.hammerspoon.org/)** — it works in *every*
+terminal at once (including Terminal.app, which can't run a command from a
+keybind), and `install.sh` sets it up for you. See the
+[Hammerspoon section below](#hammerspoon--terminalapp-recommended-set-up-by-installsh).
+The iTerm2 / WezTerm bindings below are alternatives if you'd rather keep the
+hotkey scoped to one terminal.
 
-**iTerm2** (the most automatic, no extra tools) — iTerm2 can run a *coprocess*
+**iTerm2** — iTerm2 can run a *coprocess*
 from a key binding, and a coprocess's stdout is injected into the session as if
 typed. Settings → Keys → Key Bindings → **+**:
 
@@ -145,14 +151,50 @@ typed. Settings → Keys → Key Bindings → **+**:
 **WezTerm** — the [Lua callback above](#wezterm-single-keypress--recommended)
 works on macOS unchanged (the non-Windows branch calls the script directly).
 
-**Hammerspoon / Terminal.app** — Terminal.app can't run a command from a
-keybinding, so use a global hotkey via [Hammerspoon](https://www.hammerspoon.org/).
-`~/.hammerspoon/init.lua`:
+#### Hammerspoon / Terminal.app (recommended, set up by `install.sh`)
+
+Terminal.app can't run a command from a keybinding, so the cross-terminal
+answer is a global hotkey via [Hammerspoon](https://www.hammerspoon.org/).
+`install.sh` automates the whole thing on macOS:
+
+- `brew install --cask hammerspoon` + `brew install terminal-notifier pngpaste`
+  (idempotent — skipped if already present).
+- A **managed block** is written into `~/.hammerspoon/init.lua` between
+  `-- >>> boxa clipboard-image (managed) >>>` markers. It only touches the
+  block between the markers, so a hand-written `init.lua` survives intact;
+  re-running replaces the block rather than duplicating it. The block binds
+  Ctrl+Shift+S to run `clip-image.sh` and type its output into the focused
+  window.
+
+Two GUI steps macOS won't let any script do for you — `install.sh` opens the
+right panels and tells you what to click:
+
+1. **Accessibility** — System Settings → Privacy & Security → Accessibility →
+   enable **Hammerspoon**. Without it, Ctrl+Shift+S fails *silently*: the PNG
+   is saved but the path is never typed. Note: a running Hammerspoon caches
+   its trust state, so `install.sh` restarts it after triggering the prompt.
+   If Hammerspoon is already ticked but injection still doesn't work, toggle
+   it off/on (or remove it with **−** and re-add with **+**).
+2. **Notifications → Alerts** — for clickable harvest-log notifications
+   (`terminal-notifier`), find **terminal-notifier** in System Settings →
+   Notifications and switch its style from **Banners** to **Alerts** so
+   reports stay on screen until acknowledged. (Persistence can't be set
+   programmatically — `ncprefs` is protected and its flag encoding shifts
+   between macOS releases.)
+
+If you'd rather wire it by hand, the managed block is just:
 
 ```lua
+require("hs.ipc")
+local CLIP_SCRIPT = os.getenv("HOME") .. "/.local/share/boxa/scripts/clip-image.sh"
 hs.hotkey.bind({ "ctrl", "shift" }, "s", function()
-  local path = hs.execute("$HOME/.local/share/boxa/scripts/clip-image.sh", true):gsub("%s+$", "")
-  if path ~= "" then hs.eventtap.keyStrokes(path) end
+  local out = hs.execute(CLIP_SCRIPT, true)
+  out = (out or ""):gsub("%s+$", "")
+  if out ~= "" then
+    hs.eventtap.keyStrokes(out)
+  else
+    hs.alert.show("boxa clip: žádný obrázek v clipboardu")
+  end
 end)
 ```
 
