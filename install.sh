@@ -38,11 +38,21 @@ AUTO_YES=false
 OS=""
 PM=""
 NEED_RELOGIN=false
+# How the container fleet will authenticate to Claude, decided in
+# setup_claude_token and read by print_summary's Next steps:
+#   have-token  — token file already present (auth done)
+#   macos-token — macOS without token (only `boxa claude-token` works)
+#   auto        — non-macOS, host creds / claude present (inherited automatically)
+#   export      — nothing to inherit; user must export ANTHROPIC_API_KEY
+CLAUDE_AUTH=""
 
 # Tracking what was done
 declare -a INSTALLED=()
 declare -a SKIPPED=()
 declare -a CONFIGURED=()
+# Manual GUI steps macOS won't let us automate — surfaced as the very last,
+# most prominent block of output so they aren't lost mid-stream.
+declare -a ACTION_REQUIRED=()
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -718,7 +728,7 @@ configure_ssh_agent() {
     local marker="# Boxa: persistent SSH agent via keychain"
 
     if has keychain; then
-        if grep -qF "$marker" "$rc_file" 2>/dev/null; then
+        if grep -qF -- "$marker" "$rc_file" 2>/dev/null; then
             SKIPPED+=("keychain in $rc_file (already configured)")
         else
             msg "Adding keychain eval to $rc_file..."
@@ -779,6 +789,7 @@ setup_claude_token() {
     local token_file="$HOME/.config/boxa/claude-token"
 
     if [ -f "$token_file" ]; then
+        CLAUDE_AUTH="have-token"
         SKIPPED+=("Claude token (already configured)")
         return
     fi
@@ -788,6 +799,7 @@ setup_claude_token() {
     # on /login (anthropics/claude-code#10039), so a token is the only way to
     # authenticate the container fleet — required regardless of any host file.
     if [ "$OS" = "macos" ]; then
+        CLAUDE_AUTH="macos-token"
         warn "macOS: host Claude login is NOT shared into containers."
         msg "Run 'boxa claude-token' once to authenticate the container fleet."
         SKIPPED+=("Claude token (macOS: run 'boxa claude-token' to authenticate containers)")
@@ -795,15 +807,22 @@ setup_claude_token() {
     fi
 
     if [ -f "$HOME/.claude/.credentials.json" ]; then
+        CLAUDE_AUTH="auto"
         SKIPPED+=("Claude token (host OAuth credentials present, shared via bind mount)")
         return
     fi
 
     if ! has claude; then
+        CLAUDE_AUTH="export"
         SKIPPED+=("Claude token (claude not installed on host)")
         return
     fi
 
+    # claude is installed on host but there are no credentials yet (no token,
+    # no .credentials.json) — nothing for the container to inherit, so the user
+    # still has to authenticate. Surface the API-key step rather than claiming
+    # it's automatic.
+    CLAUDE_AUTH="export"
     msg "Run 'boxa claude-token' after install to set up a long-lived token."
     msg "This avoids daily re-login when using Claude Code in containers."
     SKIPPED+=("Claude token (run 'boxa claude-token' to set up)")
@@ -926,8 +945,11 @@ HS_BLOCK
 
     local has_begin=false has_end=false
     if [ -f "$init" ]; then
-        grep -qF "$mark_begin" "$init" && has_begin=true
-        grep -qF "$mark_end" "$init" && has_end=true
+        # `--` so the markers (which start with `--`) aren't parsed as grep
+        # options by BSD grep — without it the check always fails and the
+        # managed block gets appended on every run.
+        grep -qF -- "$mark_begin" "$init" && has_begin=true
+        grep -qF -- "$mark_end" "$init" && has_end=true
     fi
 
     if $has_begin && $has_end; then
@@ -962,23 +984,44 @@ HS_BLOCK
     fi
     rm -f "$block_file"
 
-    # (c) Start Hammerspoon and trigger the Accessibility prompt. A running
-    #     Hammerspoon caches AXIsProcessTrusted(), so it must be restarted
-    #     after the user toggles the permission — otherwise injection works
-    #     but accessibilityState() keeps reporting false.
-    open -a Hammerspoon 2>/dev/null || true
-    if has hs; then
-        hs -c "hs.accessibilityState(true)" >/dev/null 2>&1 || true
-    fi
-    open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
+    # (c) Start Hammerspoon and trigger ITS OWN Accessibility prompt, which
+    #     deep-links straight to the Hammerspoon entry. We wait for the hs IPC
+    #     to come up (it loads via require("hs.ipc") in the block above), then
+    #     accessibilityState(true) raises Hammerspoon's "would like to control
+    #     this computer" dialog with an "Open System Settings" button that
+    #     lands directly on its row — far better than the generic Privacy pane.
+    #     We restart Hammerspoon FIRST: `open -a` is a no-op when it's already
+    #     running with a stale config, so the freshly-written block (hotkey +
+    #     hs.ipc) wouldn't load and the hs CLI wait below would time out. The
+    #     restart is BEFORE the prompt, so it doesn't kill the dialog that
+    #     accessibilityState() raises afterwards. (The AXIsProcessTrusted()
+    #     cache only affects what accessibilityState() *reports* — keyStrokes
+    #     works the instant permission is granted — so no second restart.)
     killall Hammerspoon 2>/dev/null || true
     sleep 1
     open -a Hammerspoon 2>/dev/null || true
+    local hs_prompted=false
+    if has hs; then
+        for _ in $(seq 1 20); do
+            hs -c "return 1" >/dev/null 2>&1 && { hs_prompted=true; break; }
+            sleep 0.5
+        done
+        # Only the dialog-raising call is gated on IPC actually being up; if
+        # accessibilityState itself errors we still fall back below.
+        if $hs_prompted && ! hs -c "hs.accessibilityState(true)" >/dev/null 2>&1; then
+            hs_prompted=false
+        fi
+    fi
+    # Fallback when the hs CLI is absent, IPC never came up (stale/failed
+    # config), or the prompt call errored — open the generic pane so the user
+    # still lands somewhere instead of being told to use a dialog that never
+    # appeared.
+    $hs_prompted || open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
 
-    warn "ACTION REQUIRED — enable Hammerspoon in System Settings → Privacy & Security"
-    warn "→ Accessibility. Without it Ctrl+Shift+S fails silently (the PNG is saved,"
-    warn "but the path is never typed). If Hammerspoon is already ticked but doesn't"
-    warn "work, toggle it off/on (or remove with − and re-add with +)."
+    ACTION_REQUIRED+=("Enable Hammerspoon in System Settings → Privacy & Security → Accessibility.
+   Hammerspoon's dialog has an \"Open System Settings\" button that takes you straight there.
+   Without it, Ctrl+Shift+S fails silently — the PNG is saved but the path is never typed.
+   If Hammerspoon is already ticked but doesn't work, toggle it off/on (or remove with − and re-add with +).")
 
     # (d) Notifications via terminal-notifier. Fire one test notification to
     #     trigger the macOS allow-notifications prompt (one grant covers all
@@ -988,9 +1031,8 @@ HS_BLOCK
     if has terminal-notifier; then
         terminal-notifier -title "boxa" -message "Notifikace nastaveny ✓" >/dev/null 2>&1 || true
         open "x-apple.systempreferences:com.apple.Notifications-Settings.extension" 2>/dev/null || true
-        warn "ACTION REQUIRED — in Notifications settings, find terminal-notifier and"
-        warn "switch its style from Banners to Alerts, so harvest reports stay on"
-        warn "screen until you acknowledge them."
+        ACTION_REQUIRED+=("In System Settings → Notifications, find terminal-notifier and switch its style
+   from Banners to Alerts, so harvest reports stay on screen until you acknowledge them.")
     fi
 
     CONFIGURED+=("clipboard keybind (macOS — Hammerspoon hotkey + terminal-notifier)")
@@ -1350,10 +1392,35 @@ print_summary() {
     msg "  ${step}. Build the image:  boxa build"
     step=$((step + 1))
 
-    msg "  ${step}. Set your API key: export ANTHROPIC_API_KEY=sk-ant-..."
-    step=$((step + 1))
+    # Auth step only when the user actually has to do something. have-token /
+    # auto need nothing; macos-token needs `boxa claude-token` (not export);
+    # only `export` (nothing to inherit) shows the API-key line.
+    case "$CLAUDE_AUTH" in
+        have-token|auto)
+            ;;
+        macos-token)
+            msg "  ${step}. Authenticate the fleet: boxa claude-token"
+            step=$((step + 1))
+            ;;
+        export|*)
+            msg "  ${step}. Set your API key: export ANTHROPIC_API_KEY=sk-ant-..."
+            step=$((step + 1))
+            ;;
+    esac
 
     msg "  ${step}. Run boxa:       boxa"
+
+    # ACTION REQUIRED block — dead last and loudest, so the macOS GUI steps
+    # are the final thing on screen (they're easy to miss mid-install).
+    if [ ${#ACTION_REQUIRED[@]} -gt 0 ]; then
+        local total=${#ACTION_REQUIRED[@]} idx=1 item
+        for item in "${ACTION_REQUIRED[@]}"; do
+            echo ""
+            printf '\033[1;33m==> ACTION REQUIRED (%d/%d): %s\033[0m\n' "$idx" "$total" "$item"
+            idx=$((idx + 1))
+        done
+        echo ""
+    fi
 }
 
 # --- Main --------------------------------------------------------------------
