@@ -68,16 +68,29 @@ allowlist::add() {
 # Remove a domain (exact match) from the allowlist file.
 # Returns 0 if removed, 1 if not present.
 #
+# Rewrites the file IN PLACE (preserving its inode) rather than via a
+# temp-file `mv`. This file is bind-mounted into every running boxa container
+# (`-v allowed-domains.conf:/etc/boxa-shared/...:ro`); a Docker file bind-mount
+# pins to the source inode at container start. Replacing the file with a fresh
+# inode (what `mv` does) silently detaches every already-running container from
+# this and all future allowlist changes until it is restarted — so a `boxa
+# deny` would leave other containers reading a stale allowlist. `allowlist::add`
+# already appends with `>>` (inode-preserving) for the same reason.
+#
 # Usage: allowlist::remove <file> <domain>
 allowlist::remove() {
     local file="$1" domain="$2"
     [ -f "$file" ] || return 1
-    if ! grep -qxF "$domain" "$file" 2>/dev/null; then
+    if ! grep -qxF -- "$domain" "$file" 2>/dev/null; then
         return 1
     fi
-    local tmp="${file}.tmp.$$"
-    grep -vxF "$domain" "$file" > "$tmp" || true
-    mv "$tmp" "$file"
+    local remaining
+    remaining=$(grep -vxF -- "$domain" "$file" 2>/dev/null) || true
+    if [ -n "$remaining" ]; then
+        printf '%s\n' "$remaining" > "$file"
+    else
+        : > "$file"
+    fi
 }
 
 # Render dnsmasq runtime config from the allowlist.
