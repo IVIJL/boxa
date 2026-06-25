@@ -67,24 +67,39 @@ The agent-browser proxy log is per-session, at
 `/var/lib/boxa-agent/profiles/<session>/proxy.log` while the session
 is live, archived to
 `/var/log/boxa/agent-browser/<container>-<ISO>.proxy.log` at session
-teardown. Both `boxa blocked` (browser portion) and `boxa
-agent-browser blocked` consume the **last session** for the relevant
-container(s):
+teardown.
 
-- If a session is currently live, that session's live log is the source
-  — even if it has no denials yet.
-- If no session is live, the most recent archived log (by ISO timestamp
-  in filename) is the source.
-- There is **no time window** ("last 24h", etc.). When the agent ran
-  matters less than whether its denials are still relevant; staleness
-  is filtered out instead by removing rows whose host is already in the
-  Allowlist (the user may have added them since the session ended).
+The two surfaces consume different scopes (revised — see below):
 
-The unified `boxa blocked` keeps the existing firewall-side
-"scan all running containers" behaviour and extends it with "for each
-container, find the last agent-browser session log and surface its
-denials" — globally across containers, deduplicated by host. The
-narrow `boxa agent-browser blocked` resolves to one container.
+- **`boxa agent-browser blocked`** (narrow, per-container) consumes the
+  **last session, live or archived**: if a session is live, its live log;
+  otherwise the most recent archived log (by ISO timestamp in filename).
+  This is the retrospective "the agent ran, the session closed, let me
+  review what it hit" entry point.
+- **`boxa blocked`** (unified) consumes **live sessions only** for the
+  browser portion — see the revision below.
+
+There is **no time window** ("last 24h", etc.) on either path. Staleness
+is filtered out instead by removing rows whose host is already in the
+Allowlist (the user may have added them since the session ended).
+
+### Revision — unified view is live-only (current-state semantics)
+
+Originally the unified `boxa blocked` browser portion also read archived
+logs (live ∪ archived, last session per container). In practice that made
+the unified view accumulate denials from browser sessions that had closed
+days earlier, which is jarring next to the firewall portion: the firewall
+reads the in-container dnsmasq query log, and `boxa stop` `docker rm`s the
+container, so firewall denials reset every run. The two halves of one view
+behaved inconsistently — one reset on stop, the other lingered.
+
+So the unified `boxa blocked` browser feed (`denied-hosts-global`) is now
+scoped to **live agent-browser sessions only**, matching the firewall
+side's current-state, resets-on-stop behaviour. Archived (closed-session)
+denials remain fully reachable through the narrow `boxa agent-browser
+blocked`, which keeps the live ∪ archived resolution above. The unified
+view stays a "what's being blocked right now" surface; the narrow command
+is the retrospective one.
 
 ### Multi-select header
 

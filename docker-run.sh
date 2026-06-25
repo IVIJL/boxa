@@ -2945,10 +2945,12 @@ fi
 
 if [ "$MODE" = "blocked" ]; then
     containers=$(docker ps --filter "name=^boxa-" --format '{{.Names}}' | filter_user_containers)
-    # NOTE: even when no containers are running, agent-browser denials may
-    # still exist in the archived proxy logs (ADR 0012 § Data source —
-    # archived logs survive teardown). Only short-circuit on "no running
-    # containers" if the agent-browser side also has nothing.
+    # NOTE: the agent-browser side (denied-hosts-global) is scoped to LIVE
+    # sessions only, matching this view's current-state semantics (the
+    # firewall dnsmasq log is wiped when `boxa stop` removes the container).
+    # So browser_domains can be non-empty only when a container is running;
+    # archived (closed-session) denials are reachable via
+    # `boxa agent-browser blocked` instead.
     declare -a fw_domains=()
     if [ -n "$containers" ]; then
         # Collect queried domains from dnsmasq logs across all containers

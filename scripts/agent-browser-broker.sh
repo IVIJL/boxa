@@ -4872,21 +4872,34 @@ _denied_hosts_for_container() {
     _denied_hosts_from_log "$log_path" | _filter_allowlisted_hosts | sort -u | _collapse_www_pairs
 }
 
-# Globally denied hosts across all containers that have ever produced an
-# agent-browser session (live ∪ archived), deduplicated and allowlist-
-# filtered. Used by the unified `boxa blocked` view.
+# Denied + allowlist-filtered hosts across all containers with a LIVE
+# agent-browser session, deduplicated. Used by the unified `boxa blocked`
+# view, which is a *current-state* view: the firewall side reads the
+# in-container dnsmasq log that `boxa stop` wipes (container is `docker rm`'d),
+# so it resets per run. We scope the browser side the same way — live
+# sessions only, NOT archived — so a denial from a browser session that
+# closed days ago no longer lingers here. Retrospective review of archived
+# sessions stays available via `boxa agent-browser blocked` (cmd_agent_blocked,
+# which offers a live ∪ archived picker).
 #
-# Silent fallback property (ADR 0012 acceptance #4): if no container has
-# any proxy log on disk anywhere, this function emits nothing — no headers,
-# no warnings — letting the caller render output indistinguishable from
-# today's firewall-only behaviour.
+# Silent fallback property (ADR 0012 acceptance #4): with no live session,
+# this emits nothing — no headers, no warnings — letting the caller render
+# output indistinguishable from the firewall-only behaviour.
 _denied_hosts_global() {
-    local container
-    { _live_session_containers; _archived_containers; } \
+    local container log_path
+    _live_session_containers \
         | awk 'NF && !seen[$0]++' \
         | while IFS= read -r container; do
             [ -n "$container" ] || continue
-            _denied_hosts_for_container "$container"
+            # Resolve the LIVE proxy log directly and skip on empty — do NOT
+            # go through _denied_hosts_for_container, whose _resolve_last_session_log
+            # falls back to the latest *archived* log when a live session has
+            # no usable proxy log yet (e.g. the "starting" claim window). That
+            # fallback would resurface stale closed-session denials and defeat
+            # the live-only scope.
+            log_path="$(_live_proxy_log_for "$container")"
+            [ -n "$log_path" ] || continue
+            _denied_hosts_from_log "$log_path" | _filter_allowlisted_hosts
         done \
         | awk 'NF && !seen[$0]++' \
         | sort \
