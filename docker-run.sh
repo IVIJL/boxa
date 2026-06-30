@@ -1410,10 +1410,17 @@ attach_to_container() {
 # firewall) and reads that VM's resolv.conf, not this host's, so the
 # inherited-resolv.conf path is skipped there.
 
-ipv4_non_loopback() {
-    # stdin → space-separated unique non-loopback dotted-quads (or nothing).
+ipv4_private_upstream() {
+    # stdin → space-separated unique RFC1918-private dotted-quads (or nothing).
+    # Only a private upstream (Docker bridge gateway, corporate stub) ever earns
+    # a port-53 hole in the container firewall. Public resolvers (1.1.1.1,
+    # 8.8.8.8, …) are dropped here AND refused container-side: ADR 0009 requires
+    # external DNS to be unreachable from inside, and a public upstream is never
+    # needed anyway — the embedded resolver forwards host-side, so dnsmasq still
+    # resolves via 127.0.0.11 with no hole. Loopback (127.x) is excluded for
+    # free: it is proxied host-side and is not in the private ranges below.
     grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' \
-        | grep -v '^127\.' \
+        | grep -E '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' \
         | awk '!seen[$0]++' \
         | tr '\n' ' ' \
         | sed 's/ *$//' \
@@ -1444,7 +1451,7 @@ detect_docker_dns_upstream() {
         content=$(tr -d '\r\n' < "$conf" \
             | sed -n 's/.*"dns"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p')
         if [ -n "${content//[[:space:]]/}" ]; then
-            printf '%s\n' "$content" | ipv4_non_loopback
+            printf '%s\n' "$content" | ipv4_private_upstream
             return 0
         fi
     elif [ -e "$conf" ]; then
@@ -1459,16 +1466,19 @@ detect_docker_dns_upstream() {
 
     # 2. No explicit dns: a NATIVE-Linux daemon inherits the host's
     #    /etc/resolv.conf and forwards its non-loopback nameservers from the
-    #    container netns (same mechanism, same breakage). All-loopback
-    #    resolv.conf (systemd-resolved) yields nothing — proxied host-side.
-    #    Take only the address field ($2) so an inline comment or trailing
-    #    metadata carrying another IP is never treated as an upstream.
+    #    container netns (same mechanism, same breakage). Only a PRIVATE
+    #    nameserver is emitted: a host that lists public resolvers (1.1.1.1,
+    #    8.8.8.8) directly forwards them host-side in practice, so no hole is
+    #    needed, and ADR 0009 forbids exposing them inside regardless. All-
+    #    loopback resolv.conf (systemd-resolved) yields nothing — proxied
+    #    host-side. Take only the address field ($2) so an inline comment or
+    #    trailing metadata carrying another IP is never treated as an upstream.
     os=$(docker info --format '{{.OperatingSystem}}' 2>/dev/null || true)
     case "$os" in
         *"Docker Desktop"*) return 0 ;;
     esac
     [ -r /etc/resolv.conf ] || return 0
-    awk '$1=="nameserver"{print $2}' /etc/resolv.conf | ipv4_non_loopback
+    awk '$1=="nameserver"{print $2}' /etc/resolv.conf | ipv4_private_upstream
 }
 
 # Detect the Docker DNS upstream(s) and write them to the host file that is
@@ -1493,8 +1503,10 @@ warn_if_dns_broken() {
     if ! docker exec -u node "$name" \
             sh -c 'dig +short +time=3 +tries=1 github.com 2>/dev/null | grep -q .'; then
         echo "WARNING: DNS resolution is failing inside the container."
-        echo "         If this host sets a non-loopback Docker daemon DNS (daemon.json \"dns\")"
-        echo "         that docker-run.sh could not detect, see docs/adr/0015 (BOXA_DNS_UPSTREAM)."
+        echo "         Either this host sets a non-loopback Docker daemon DNS that docker-run.sh could not"
+        echo "         detect, or it points at a PUBLIC resolver (daemon.json \"dns\" or /etc/resolv.conf) that"
+        echo "         boxa refuses to expose inside (ADR 0009). Point the Docker daemon DNS at a private stub"
+        echo "         or loopback resolver (e.g. systemd-resolved 127.0.0.53). See docs/adr/0015 (BOXA_DNS_UPSTREAM)."
     fi
 }
 

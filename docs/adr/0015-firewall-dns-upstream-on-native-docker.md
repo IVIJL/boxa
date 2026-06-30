@@ -1,9 +1,35 @@
 # ADR 0015 — Firewall DNS pin breaks the embedded resolver's upstream forward on native Docker
 
-- **Status:** accepted
+- **Status:** accepted (amended 2026-06-30 — see Amendment)
 - **Date:** 2026-06-08
 - **Builds on:** ADR 0001 (dnsmasq dynamic allowlist), ADR 0009 (allow-for
   harvest window — the reason DNS is pinned to the in-container resolver)
+
+## Amendment (2026-06-30) — restrict the hole to private upstreams
+
+The original decision opened the port-53 hole for **any** non-loopback upstream.
+That regressed ADR 0009's core guarantee on a host whose `/etc/resolv.conf`
+lists **public** resolvers directly (e.g. `nameserver 1.1.1.1` / `8.8.8.8`,
+no local stub): `detect_docker_dns_upstream` tier 2 read them and
+`init-firewall.sh` opened `1.1.1.1:53` / `8.8.8.8:53`, so a container process
+could resolve directly against public DNS again — and `dig @8.8.8.8` succeeding
+also tripped the DNS-pin regression check, failing the boot outright.
+
+Empirically (a migrated user's host): with the hole **closed**, `dig github.com`
+through dnsmasq still resolved — the embedded resolver forwarded host-side, so
+the hole was never needed there; it only punched through the guarantee.
+
+**Amended decision:** the hole is opened **only for an RFC1918-private**
+upstream (`10/8`, `172.16/12`, `192.168/16`) — the Docker bridge gateway or a
+corporate stub, the cases that genuinely forward from the container netns
+(Omarchy's `172.17.0.1` still works). A **public** upstream is dropped
+host-side (`ipv4_private_upstream`) **and** refused container-side
+(`init-firewall.sh` `_is_private_ipv4`), because (a) it is never needed — a
+host listing public resolvers forwards them host-side, so dnsmasq still resolves
+via `127.0.0.11` with no hole — and (b) a dst-IP allow cannot distinguish the
+embedded resolver's legitimate forward from a process's direct query, so opening
+it would expose external DNS inside, violating ADR 0009. The container is the
+trust boundary and enforces this regardless of what `docker-run.sh` wrote.
 
 ## Context
 

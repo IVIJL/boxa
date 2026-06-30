@@ -61,25 +61,46 @@ iptables -A OUTPUT -p tcp --dport 53 -d 127.0.0.1 -j ACCEPT
 # upstream(s). They arrive via a bind-mounted file (not an env var) so a
 # `docker start` restart re-reads the current value; the list is space-
 # separated because daemon.json may declare several DNS servers and Docker
-# falls back to later ones, so each must be allowed. Narrow dst-IP allow: the
-# allowlist's connection-layer ipset enforcement (below) is untouched, so a
-# direct query here still cannot connect anywhere new. See docs/adr/0015.
+# falls back to later ones, so each must be allowed.
+#
+# SECURITY: open the hole ONLY for an RFC1918-private upstream (Docker bridge
+# gateway, corporate stub). A PUBLIC resolver (1.1.1.1, 8.8.8.8, …) is refused
+# even if the host-side file lists it: ADR 0009 requires external DNS to be
+# unreachable from inside the container, and the dst-IP allow cannot tell the
+# embedded resolver's legitimate forward apart from a process's direct query —
+# opening 8.8.8.8:53 for the former also exposes it to the latter. A public
+# upstream is also never needed in practice: when the daemon forwards host-side
+# (the common case) dnsmasq still resolves via 127.0.0.11 with no hole at all.
+# The container is the trust boundary, so it enforces this regardless of what
+# docker-run.sh wrote. See docs/adr/0015.
+_is_private_ipv4() {
+    case "$1" in
+        10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 BOXA_DNS_UPSTREAM=""
 if [ -f "$DNS_UPSTREAM_CONTAINER_FILE" ]; then
     BOXA_DNS_UPSTREAM=$(cat "$DNS_UPSTREAM_CONTAINER_FILE")
 fi
+# Set when a candidate upstream was refused for being public, so the
+# post-lockdown DNS probe can name the real cause instead of "not detected".
+REFUSED_PUBLIC_UPSTREAM=""
 if [ -n "${BOXA_DNS_UPSTREAM:-}" ]; then
     # Split on spaces explicitly: the script-wide IFS=$'\n\t' (line 3) does NOT
     # include a space, so a bare `for upstream in $BOXA_DNS_UPSTREAM` would
     # treat the whole list as one token and fail the IPv4 check below.
     IFS=' ' read -ra _dns_upstreams <<< "$BOXA_DNS_UPSTREAM"
     for upstream in "${_dns_upstreams[@]}"; do
-        if [[ "$upstream" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        if [[ ! "$upstream" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo "WARNING: ignoring malformed BOXA_DNS_UPSTREAM entry '${upstream}' (expected IPv4)"
+        elif ! _is_private_ipv4 "$upstream"; then
+            echo "WARNING: refusing DNS hole to non-private upstream '${upstream}' — external resolvers must stay unreachable inside the container (ADR 0009)."
+            REFUSED_PUBLIC_UPSTREAM="${REFUSED_PUBLIC_UPSTREAM:+$REFUSED_PUBLIC_UPSTREAM }${upstream}"
+        else
             echo "Allowing Docker DNS upstream forward to ${upstream}"
             iptables -A OUTPUT -p udp --dport 53 -d "$upstream" -j ACCEPT
             iptables -A OUTPUT -p tcp --dport 53 -d "$upstream" -j ACCEPT
-        else
-            echo "WARNING: ignoring malformed BOXA_DNS_UPSTREAM entry '${upstream}' (expected IPv4)"
         fi
     done
 fi
@@ -239,9 +260,16 @@ iptables -I OUTPUT 1 -d 127.0.0.11 -m owner --uid-owner dnsmasq -j ACCEPT
 # loud. See docs/adr/0015.
 if [ -z "$(dig +short +time=3 +tries=1 @127.0.0.1 github.com 2>/dev/null)" ]; then
     echo "WARNING: upstream DNS is not answering — name resolution will fail inside this container."
-    if [ -z "${BOXA_DNS_UPSTREAM:-}" ]; then
-        echo "         If this host sets a non-loopback Docker daemon DNS (daemon.json \"dns\"),"
-        echo "         docker-run.sh did not detect it (BOXA_DNS_UPSTREAM is empty). See docs/adr/0015."
+    if [ -n "$REFUSED_PUBLIC_UPSTREAM" ]; then
+        echo "         A public DNS upstream (${REFUSED_PUBLIC_UPSTREAM}) was refused: external resolvers must stay"
+        echo "         unreachable inside the container (ADR 0009). Point the Docker daemon DNS at a private"
+        echo "         stub or a loopback resolver (e.g. systemd-resolved 127.0.0.53). See docs/adr/0015."
+    elif [ -z "${BOXA_DNS_UPSTREAM:-}" ]; then
+        echo "         Either this host sets a non-loopback Docker daemon DNS that docker-run.sh could not"
+        echo "         detect, or it detected a PUBLIC resolver (e.g. daemon.json \"dns\": [\"8.8.8.8\"], or a"
+        echo "         public nameserver in /etc/resolv.conf) and dropped it — boxa never exposes external DNS"
+        echo "         inside (ADR 0009). Point the Docker daemon DNS at a private stub or loopback resolver"
+        echo "         (e.g. systemd-resolved 127.0.0.53). See docs/adr/0015."
     else
         echo "         The detected upstream ${BOXA_DNS_UPSTREAM} did not resolve. See docs/adr/0015."
     fi
