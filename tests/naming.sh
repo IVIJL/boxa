@@ -94,6 +94,23 @@ seed_dns_conf \
 assert_eq "dns.conf whitespace tolerant active_domain"   "127.0.0.1.sslip.io"  "$(boxa::route_domain)"
 assert_eq "dns.conf whitespace tolerant external"        "nip.io"              "$(boxa::external_provider)"
 
+# --- boxa::dns_preferred (intent, may diverge from active_domain) ----------
+
+clear_dns_conf
+assert_eq "dns_preferred default empty"     ""          "$(boxa::dns_preferred)"
+
+seed_dns_conf "preferred=external" "active_domain=127.0.0.1.sslip.io" "external_provider=sslip.io"
+assert_eq "dns_preferred external"          "external"  "$(boxa::dns_preferred)"
+
+seed_dns_conf "preferred=local" "active_domain=test" "external_provider=sslip.io"
+assert_eq "dns_preferred local"             "local"     "$(boxa::dns_preferred)"
+
+# Degraded state: intent stays local while URLs advertise the working sslip.io
+# fallback. dns_preferred reflects intent; route_domain reflects what resolves.
+seed_dns_conf "preferred=local" "active_domain=127.0.0.1.sslip.io" "external_provider=sslip.io"
+assert_eq "dns_preferred degraded intent"   "local"               "$(boxa::dns_preferred)"
+assert_eq "route_domain degraded advertises sslip" "127.0.0.1.sslip.io" "$(boxa::route_domain)"
+
 # --- boxa::route_hosts (always dual-emits local + external) ----------------
 
 seed_dns_conf "active_domain=test" "external_provider=sslip.io"

@@ -334,10 +334,54 @@ _dns::write_mode() {
 
 # --- Install orchestration ---------------------------------------------------
 
+# Loud, actionable end-banner for the degraded state: the user asked for (or
+# defaulted to) local `.test` but the host resolver setup failed for a
+# *fixable* reason (declined sudo / Touch ID, write error). We deliberately do
+# NOT print a green "External mode active" here — a silent green fallback is
+# exactly what leaves users staring at `.test` URLs that never resolve, with
+# the real reason buried in the trailing WARN summary. Pairs with the degraded
+# dns.conf write (preferred=local + active_domain=sslip) so URLs advertise the
+# *working* sslip.io fallback meanwhile and self-heal retries the resolver on
+# the next `boxa update`.
+_dns::degraded_banner() {
+    echo >&2
+    printf "${RED}%s${NC}\n" "==> .test host resolver was NOT set up." >&2
+    printf "${YELLOW}%s${NC}\n" \
+        "    Boxa URLs use the sslip.io fallback for now: <port>.<project>.${DEFAULT_EXTERNAL_DOMAIN}" \
+        "    To get the shorter .test URLs working, re-run:  boxa dns-install --local" \
+        "    (boxa update retries this automatically once the resolver drop-in is missing)." >&2
+}
+
+# Prime a single sudo session before the resolver write and the CA install
+# that follows it. Without this, macOS users face two independent auth
+# moments — a terminal sudo for /etc/resolver/test, then a separate Touch ID
+# for `mkcert -install`. Missing the first while approving the second silently
+# strands .test on the sslip.io fallback while the CA looks fine — the exact
+# failure this whole change is fixing. No-op when sudo is unavailable, already
+# cached, or there is no TTY to prompt on (non-interactive installs).
+_dns::prime_sudo() {
+    _dns::sudo_available || return 0
+    [ -t 0 ] || return 0
+    case "$(_dns::detect_platform)" in
+        macos|linux-resolved|linux-nm|wsl2) ;;
+        *) return 0 ;;
+    esac
+    sudo -n true 2>/dev/null && return 0
+    _info "Host DNS + CA setup needs elevated access — you may be prompted once."
+    sudo -v 2>/dev/null || true
+}
+
 # Mode preferences: auto | local | external
 #  - external          → no resolver setup, persist external mode.
 #  - local             → setup required; fail loud on any error.
-#  - auto (default)    → try local; fall to external on conflict or write fail.
+#  - auto (default)    → try local. A genuine, durable conflict (port 53 busy,
+#                         unsupported platform) settles calmly into external
+#                         mode. A *fixable* resolver-setup failure (declined
+#                         sudo / write error) instead degrades LOUDLY and
+#                         returns non-zero: dns.conf keeps preferred=local (so
+#                         self-heal retries) while advertising sslip.io URLs,
+#                         and the caller (install.sh) surfaces it as an action
+#                         item rather than a silent success.
 #                         A post-write verify failure stays in local mode and
 #                         only warns — bootstrap_dns has not started dnsmasq
 #                         yet on first install, so probing now would fall back
@@ -355,6 +399,22 @@ _dns::install() {
         return 0
     fi
 
+    # Unsupported platform is a DURABLE reason to live on sslip.io — there is
+    # no host resolver we know how to wire up, so retrying buys nothing.
+    # Settle into external mode calmly (no degraded retry marker).
+    if [ "$platform" = "unsupported" ]; then
+        _warn "Unsupported platform — cannot configure host resolver."
+        if [ "$mode_pref" = "local" ]; then
+            _fail "--local requested but this platform has no supported resolver setup."
+            return 1
+        fi
+        _dns::write_mode external "$DEFAULT_EXTERNAL_DOMAIN" "$DEFAULT_EXTERNAL_PROVIDER"
+        _ok "External mode active. URLs: <port>.<project>.${DEFAULT_EXTERNAL_DOMAIN}"
+        return 0
+    fi
+
+    # Port 53 conflict is likewise DURABLE (another resolver owns the port);
+    # external is the correct steady state, not a degraded one.
     if _dns::port_53_held_by_other; then
         _warn "Port 53 is in use by another process — local mode would conflict."
         if [ "$mode_pref" = "local" ]; then
@@ -373,10 +433,6 @@ _dns::install() {
         linux-resolved) _dns::install_linux_resolved || setup_rc=$? ;;
         linux-nm)       _dns::install_linux_nm       || setup_rc=$? ;;
         wsl2)           _dns::install_wsl2           || setup_rc=$? ;;
-        unsupported)
-            _warn "Unsupported platform — cannot configure host resolver."
-            setup_rc=1
-            ;;
     esac
 
     if [ "$setup_rc" -ne 0 ]; then
@@ -384,10 +440,14 @@ _dns::install() {
             _fail "--local requested but resolver setup failed."
             return 1
         fi
-        _info "Resolver setup failed — falling back to external mode."
-        _dns::write_mode external "$DEFAULT_EXTERNAL_DOMAIN" "$DEFAULT_EXTERNAL_PROVIDER"
-        _ok "External mode active. URLs: <port>.<project>.${DEFAULT_EXTERNAL_DOMAIN}"
-        return 0
+        # FIXABLE failure under auto mode → degraded state. Persist
+        # preferred=local (intent) + active_domain=sslip (what works now), so
+        # `boxa ports` advertises the resolvable sslip.io URLs instead of dead
+        # `.test` ones, while self-heal still knows local was wanted. Loud +
+        # non-zero so the user (and install.sh's action list) can't miss it.
+        _dns::write_mode local "$DEFAULT_EXTERNAL_DOMAIN" "$DEFAULT_EXTERNAL_PROVIDER"
+        _dns::degraded_banner
+        return 1
     fi
 
     _dns::write_mode local "$BOXA_LOCAL_TLD" "$DEFAULT_EXTERNAL_PROVIDER"
@@ -1169,6 +1229,9 @@ main() {
     local rc=0
     case "$action" in
         install)
+            # Prime one sudo session up front so the resolver write and the
+            # CA install below share a single auth moment (see _dns::prime_sudo).
+            _dns::prime_sudo
             _dns::install "$mode_pref" || rc=$?
             # CA install is intentionally best-effort for `dns-install` —
             # DNS resolver setup can succeed on a host where mkcert is missing
@@ -1209,4 +1272,8 @@ main() {
     return "$rc"
 }
 
-main "$@"
+# Auto-run only when executed directly. Sourcing the script (tests) exposes the
+# `_dns::*` functions without firing main and its side effects.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    main "$@"
+fi

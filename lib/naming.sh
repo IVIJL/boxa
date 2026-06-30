@@ -34,17 +34,19 @@ BOXA_LOCAL_TLD="test"
 
 # --- DNS config (lazy-loaded from dns.conf) ----------------------------------
 
-# Internal cache. Read via boxa::route_domain / boxa::external_provider;
-# reset via boxa::reset_dns_cache (used by tests and by dns-install after
-# rewriting dns.conf within the same process).
+# Internal cache. Read via boxa::route_domain / boxa::external_provider /
+# boxa::dns_preferred; reset via boxa::reset_dns_cache (used by tests and by
+# dns-install after rewriting dns.conf within the same process).
 _BOXA_DNS_CONF_LOADED=
 _BOXA_ACTIVE_DOMAIN=
 _BOXA_EXTERNAL_PROVIDER=
+_BOXA_DNS_PREFERRED=
 
 boxa::reset_dns_cache() {
     _BOXA_DNS_CONF_LOADED=
     _BOXA_ACTIVE_DOMAIN=
     _BOXA_EXTERNAL_PROVIDER=
+    _BOXA_DNS_PREFERRED=
 }
 
 # Parse ~/.config/boxa/dns.conf (or $BOXA_DNS_CONF) into the cache. The
@@ -56,6 +58,11 @@ _boxa::load_dns_conf() {
     _BOXA_DNS_CONF_LOADED=1
     _BOXA_ACTIVE_DOMAIN="$BOXA_LOCAL_TLD"
     _BOXA_EXTERNAL_PROVIDER="sslip.io"
+    # `preferred` defaults to empty (not `local`): an absent dns.conf means
+    # the user has not run dns-install yet, which is NOT the same as a
+    # degraded local install awaiting retry. Self-heal keys off the explicit
+    # `preferred=local` a real install writes.
+    _BOXA_DNS_PREFERRED=""
     local conf="${BOXA_DNS_CONF:-$HOME/.config/boxa/dns.conf}"
     [ -f "$conf" ] || return 0
     local line key value
@@ -72,6 +79,7 @@ _boxa::load_dns_conf() {
         case "$key" in
             active_domain)     [ -n "$value" ] && _BOXA_ACTIVE_DOMAIN="$value" ;;
             external_provider) [ -n "$value" ] && _BOXA_EXTERNAL_PROVIDER="$value" ;;
+            preferred)         [ -n "$value" ] && _BOXA_DNS_PREFERRED="$value" ;;
         esac
     done < "$conf"
 }
@@ -113,6 +121,18 @@ boxa::route_domain() {
 boxa::external_provider() {
     _boxa::load_dns_conf
     printf '%s' "$_BOXA_EXTERNAL_PROVIDER"
+}
+
+# Return the persisted mode *preference* (`local` | `external` | `auto` | "").
+# This is the user's intent, which can diverge from `active_domain` (what URLs
+# advertise) in the degraded state: `preferred=local` + an external
+# `active_domain` means "local was wanted but the host resolver setup failed —
+# advertise the working sslip.io URLs for now and retry the resolver later".
+# Self-heal (`_boxa::resolver_drop_in_missing`) reads this to know whether to
+# re-attempt the resolver drop-in. Empty when dns.conf is absent.
+boxa::dns_preferred() {
+    _boxa::load_dns_conf
+    printf '%s' "$_BOXA_DNS_PREFERRED"
 }
 
 # Yield every Traefik route hostname for a project, one per line. Always

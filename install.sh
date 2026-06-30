@@ -93,7 +93,7 @@ What this script does:
   2. Configures SSH agent via keychain (no key scanning)
   3. Adds AddKeysToAgent to ~/.ssh/config
   4. Clones boxa to ~/.local/share/boxa
-  5. Installs mkcert (for HTTPS dev certs; CA install runs later via dns-install)
+  5. Installs mkcert and sets up the .test host resolver + mkcert CA (sudo / Touch ID)
   6. Checks Docker availability (never installs automatically)
   7. Installs 'boxa' command to /usr/local/bin
 
@@ -478,6 +478,61 @@ install_mkcert() {
         INSTALLED+=("mkcert (${resolved:-already present})")
     else
         SKIPPED+=("mkcert (install failed; see warnings above)")
+    fi
+}
+
+# --- Host DNS resolver + mkcert CA (ADR 0007 / 0008) -------------------------
+# Wire up the per-OS `.test` host resolver (and the mkcert root CA) during the
+# initial install, fulfilling ADR 0007's promise that this is "Auto-triggered
+# by install.sh (first-time install)". install.sh is the right home: it is the
+# one interactive moment where a sudo / Touch ID prompt is expected, and
+# dns-install shares that single auth session for both the resolver write and
+# the CA install — so the user can't approve one and silently miss the other
+# (the split that used to strand `.test` on the sslip.io fallback).
+#
+# Needs neither Docker nor the boxa image: the boxa_dns container starts later
+# via bootstrap_dns, and dns-install defers resolver verification until it is
+# up. Safe to run before `boxa build`.
+#
+# Non-fatal. dns-install returns non-zero only for a FIXABLE resolver failure
+# (declined prompt / write error) — `.test` is then missing but recoverable, so
+# we surface it in the ACTION REQUIRED block. A durable external fallback
+# (port 53 busy, unsupported platform) returns 0 and is reported as a normal
+# install outcome.
+setup_dns() {
+    info "Setting up host DNS resolver for .test..."
+
+    local script="$BOXA_DIR/scripts/dns-install.sh"
+    if [ ! -x "$script" ]; then
+        warn "scripts/dns-install.sh missing or non-executable; skipping .test resolver setup."
+        SKIPPED+=(".test DNS resolver (script missing) — run 'boxa dns-install' later")
+        return
+    fi
+
+    # Honour an existing explicit external-mode choice. install.sh is re-runnable
+    # on an existing checkout (setup_boxa_repo just pulls), so a plain `install`
+    # here would re-attempt local and rewrite a user's deliberate
+    # `boxa dns-install --external` back to local. Re-affirm external instead —
+    # still idempotent and still installs the CA. A fresh install (no dns.conf)
+    # or a local/degraded one falls through to auto, which re-heals local.
+    local dns_conf="${BOXA_DNS_CONF:-$HOME/.config/boxa/dns.conf}"
+    local ok=false
+    if [ -f "$dns_conf" ] \
+        && grep -qE '^[[:space:]]*preferred[[:space:]]*=[[:space:]]*external[[:space:]]*$' "$dns_conf"; then
+        info "Existing dns.conf prefers external mode — keeping it (sslip.io URLs)."
+        "$script" install --external && ok=true
+    else
+        "$script" install && ok=true
+    fi
+
+    if $ok; then
+        INSTALLED+=(".test host DNS resolver + mkcert CA")
+    else
+        # dns-install already printed its own loud, actionable banner. Mirror
+        # the one-line recovery into ACTION REQUIRED so it survives the scroll
+        # to the end of a long install.
+        ACTION_REQUIRED+=(".test host resolver was not set up — re-run 'boxa dns-install --local' to retry.
+Boxa URLs use the sslip.io fallback meanwhile and still work.")
     fi
 }
 
@@ -1450,7 +1505,7 @@ main() {
         msg "  2. Configure SSH agent via keychain"
         msg "  3. Clone boxa to $BOXA_DIR"
         msg "  4. Choose your dotfiles strategy (boxa bundled starter / your chezmoi repo / none)"
-        msg "  5. Install mkcert v$MKCERT_VERSION (HTTPS dev certs; CA install deferred to dns-install)"
+        msg "  5. Install mkcert v$MKCERT_VERSION + set up the .test host resolver & mkcert CA (sudo / Touch ID prompt)"
         msg "  6. Set up /var/log/boxa/allow-for (root-owned harvest log dir; sudo prompt)"
         msg "  7. Create boxa-agent OS user + add $USER to that group (agent-browser feature; sudo prompt)"
         msg "  8. Stage agent-browser Python helpers to /usr/local/lib/boxa (sudo prompt)"
@@ -1487,6 +1542,9 @@ main() {
 
     echo ""
     install_mkcert
+
+    echo ""
+    setup_dns
 
     echo ""
     setup_allow_for_state

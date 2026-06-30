@@ -544,6 +544,12 @@ EOF
 # repair it without prompting for sudo mid-`boxa <project>`. The fix lives
 # in the `boxa update` flow, which is already interactive.
 #
+# Also fires for the degraded state a failed `dns-install --auto` leaves
+# behind (preferred=local + external active_domain): there the install never
+# completed, so the retry is short-circuited in before the platform probes —
+# crucially so WSL2 NRPT-only degraded installs aren't missed by the Linux
+# drop-in checks below.
+#
 # Returns 0 when self-heal is needed, 1 otherwise. The predicate keys off
 # *the live runtime* rather than `_dns::detect_platform`: we check for the
 # drop-in path that the *currently running* host resolver would consume.
@@ -557,10 +563,32 @@ EOF
 # we leave that verification to `boxa dns-status`.
 _boxa::resolver_drop_in_missing() {
     [ -f "$HOME/.config/boxa/dns.conf" ] || return 1
-    # External-mode users intentionally have no host drop-in (sslip.io URLs
-    # resolve without one). Skip them, or we'd force-flip them to local
-    # below: `dns-install --auto` defaults to local-first.
-    [ "$(boxa::route_domain)" = "$BOXA_LOCAL_TLD" ] || return 1
+
+    local domain preferred
+    domain="$(boxa::route_domain)"
+    preferred="$(boxa::dns_preferred)"
+
+    # Pure external-mode users (preferred=external) deliberately have no host
+    # drop-in and must be skipped, or we'd force-flip them to local:
+    # `dns-install --auto` defaults to local-first.
+    if [ "$domain" != "$BOXA_LOCAL_TLD" ] && [ "$preferred" != "local" ]; then
+        return 1
+    fi
+
+    # Degraded state: preferred=local but advertising the external fallback
+    # because a prior resolver setup FAILED. Nothing landed on disk on ANY
+    # platform — and on a WSL2 NRPT-only setup the Linux drop-in checks below
+    # would wrongly report "nothing missing" and skip the retry the degraded
+    # banner promised. Flag it for self-heal here, before any platform probe.
+    if [ "$domain" != "$BOXA_LOCAL_TLD" ]; then
+        return 0
+    fi
+
+    # Normal local mode (active_domain=test): verify the platform-specific
+    # drop-in the *currently running* host resolver consumes is actually
+    # present. (NRPT-only WSL2 has no Linux drop-in by design — see the header
+    # note — so it falls through to `return 1`; that path is a successful
+    # install, not a degraded one, and is left to `boxa dns-status` to verify.)
     local uname_s
     uname_s="$(uname -s 2>/dev/null || echo Unknown)"
     case "$uname_s" in

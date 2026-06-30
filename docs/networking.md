@@ -92,7 +92,10 @@ addressing, and why `10.0.2.2`).
 
 `.test` is an [RFC 2606](https://www.rfc-editor.org/rfc/rfc2606) reserved TLD;
 the host OS needs to be told to route `*.test` to `127.0.0.1`.
-`boxa dns-install` handles that for you per OS:
+**`install.sh` runs `boxa dns-install` for you on first install** (it shares
+the same sudo / Touch ID moment as the mkcert CA install), so `.test` works
+out of the box. You only need the commands below to change mode, recover from a
+declined prompt, or inspect state:
 
 ```bash
 boxa dns-install               # auto: try local, fall back to external on conflict
@@ -101,6 +104,16 @@ boxa dns-install --external    # skip resolver setup, use sslip.io URLs only
 boxa dns-status                # show current mode + resolver state + verify
 boxa dns-uninstall             # remove resolver config + dns.conf
 ```
+
+If the resolver setup fails for a *fixable* reason (you dismissed the sudo /
+Touch ID prompt, or the write errored), `--auto` does **not** silently pretend
+success: it prints a loud banner, advertises the working `sslip.io` URLs in the
+meantime (so `boxa ports` never offers dead `.test` links), and persists a
+degraded state (`preferred=local` + an external `active_domain`). The next
+`boxa update` retries the resolver automatically, or re-run
+`boxa dns-install --local` yourself. A *durable* fallback instead — port 53
+already owned by another resolver, or an unsupported platform — settles calmly
+into `external` mode with no retry, since `.test` could never work there.
 
 What `--auto` does per platform (all are idempotent; sudo / UAC prompts as
 needed):
