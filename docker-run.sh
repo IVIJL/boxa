@@ -1510,6 +1510,44 @@ warn_if_dns_broken() {
     fi
 }
 
+# Block until a freshly (re)started container either reaches its node phase or
+# exits. The container runs detached (docker run -d / docker start), so when the
+# root entrypoint aborts — most commonly init-firewall.sh's `exit 1` on a failed
+# verification — the explanatory ERROR lands only in `docker logs` and the start
+# looks silently broken: the caller would barrel on to `docker exec`, which then
+# fails with a cryptic "container is not running". Detect the outcome and, on
+# failure, surface the container's own log on the user's terminal with a reason.
+#
+# Readiness signal: PID 1's owner flips root -> node when the entrypoint drops
+# privileges via setpriv, which happens ONLY after init-firewall and all other
+# root setup passed. This is race-free and needs no in-container sentinel — a
+# file marker under /run would read stale across restarts (/run is overlayfs,
+# not tmpfs, so it persists). Returns 0 when ready, 1 (after printing the log)
+# when the container died during init.
+wait_for_boxa_ready() {
+    local name="$1" owner waited=0
+    while [ "$waited" -lt 120 ]; do
+        if [ "$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)" != "running" ]; then
+            echo "" >&2
+            echo "ERROR: boxa failed to start — container '$name' exited during initialization." >&2
+            echo "       Root setup did not pass (most often the firewall verification). Last log lines:" >&2
+            echo "" >&2
+            docker logs --tail 25 "$name" 2>&1 | sed 's/^/    /' >&2 || true
+            echo "" >&2
+            echo "       Full log:  docker logs $name" >&2
+            return 1
+        fi
+        owner=$(docker exec "$name" stat -c '%U' /proc/1 2>/dev/null || true)
+        [ "$owner" = "node" ] && return 0
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    # Still in the root phase after the cap (a pathologically slow but not-yet-
+    # failed start) — don't block the user further; downstream exec still works
+    # if it eventually came up, and re-fails loudly if it did not.
+    return 0
+}
+
 # Restart an exited boxa container and re-run init scripts
 # Returns 1 if restart fails (stale mounts after reboot) — caller should recreate
 restart_exited_container() {
@@ -1535,6 +1573,13 @@ restart_exited_container() {
         echo "Restart failed (stale mounts?), removing dead container..."
         docker rm "$name" > /dev/null
         return 1
+    fi
+    # The entrypoint re-runs the root setup (firewall verification included) on
+    # every start; if it aborts, the container exits detached. Surface the cause
+    # instead of failing cryptically on the node-mode exec below. A firewall
+    # failure is fatal and recreating would not fix it, so stop outright.
+    if ! wait_for_boxa_ready "$name"; then
+        exit 1
     fi
     # Root-context setup (firewall, gitconfig, host-home symlink) is handled by
     # the entrypoint on every container start. Here we only run the user-mode
@@ -3901,6 +3946,15 @@ echo "Starting boxa..."
 
 # Start container in background
 docker run -d --name "$CONTAINER_NAME" --stop-timeout 45 "${DOCKER_ARGS[@]}" "$IMAGE" boxa-entrypoint.sh
+
+# Confirm the container actually came up before reporting success. The root
+# entrypoint (firewall verification included) runs detached; if it aborts the
+# container exits and the ERROR is buried in `docker logs`. Surface it here and
+# stop, instead of printing routes as if all is well and then hitting a cryptic
+# "container is not running" on the exec below.
+if ! wait_for_boxa_ready "$CONTAINER_NAME"; then
+    exit 1
+fi
 
 # Apply default port routes
 apply_port_routes "$CONTAINER_NAME"
