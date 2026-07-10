@@ -119,6 +119,14 @@ The reference platform. Chrome runs as a Linux binary inside the WSL2 distro —
 *not* the Windows Chrome on the host. WSLg renders the window onto the Windows
 desktop, so the visual-audit story is identical to native Linux.
 
+Security note: WSL2's default drvfs permissions can make `/mnt/c` and other
+Windows-drive mounts readable by every Linux user, which defeats the
+`boxa-agent` OS-user isolation. Boxa hardens `/etc/wsl.conf` with automount
+`umask=077` during install and `boxa update`; run `wsl --shutdown` from Windows
+and reopen the distro before the live mounts pick it up. WSL interop is still
+not a hard multi-user boundary: a process running as any Linux user that
+executes a Windows `.exe` runs as the Windows user.
+
 Setup checklist:
 
 1. Install Chrome (or Chromium) inside the WSL2 distro:

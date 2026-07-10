@@ -36,13 +36,13 @@ exit 0
 EOF
 chmod +x "$tmp/scripts/ensure-allow-for-host-state.sh"
 for s in mkcert agent-browser-helpers agent-browser-host-state \
-         upstream-agent-browser-skill agent-allowlist-example boxa-skill \
-         completions; do
+         wsl-mount-guard upstream-agent-browser-skill \
+         agent-allowlist-example boxa-skill completions; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/scripts/ensure-$s.sh"
     chmod +x "$tmp/scripts/ensure-$s.sh"
 done
 
-# shellcheck source=../lib/provisioning.sh
+# shellcheck source=../lib/provisioning.sh disable=SC1091
 source "$REPO_DIR/lib/provisioning.sh"
 
 # --- Field accessor ----------------------------------------------------------
@@ -51,19 +51,19 @@ check "field id"       "allow-for-host-state" "$(boxa::provisioning_field "$entr
 check "field script"   "scripts/ensure-allow-for-host-state.sh" "$(boxa::provisioning_field "$entry" script)"
 check "field category" "A" "$(boxa::provisioning_field "$entry" category)"
 
-# --- Registry: 8 category-A + 3 category-B + 4 category-C steps ---------------
-check "registry size" "15" "${#BOXA_PROVISIONING_STEPS[@]}"
+# --- Registry: 9 category-A + 3 category-B + 4 category-C steps ---------------
+check "registry size" "16" "${#BOXA_PROVISIONING_STEPS[@]}"
 
 # --- First run repairs the one stub that has work, rest already OK ------------
 boxa::run_provisioning repair-a >/dev/null
 check "run1 repaired" "allow-for-host-state" "${BOXA_PROVISIONING_REPAIRED[*]}"
-check "run1 ok count" "7" "${#BOXA_PROVISIONING_OK[@]}"
+check "run1 ok count" "8" "${#BOXA_PROVISIONING_OK[@]}"
 check "run1 failed"   ""  "${BOXA_PROVISIONING_FAILED[*]}"
 
 # --- Second run is idempotent: everything already provisioned ----------------
 boxa::run_provisioning repair-a >/dev/null
 check "run2 repaired (none)" "" "${BOXA_PROVISIONING_REPAIRED[*]}"
-check "run2 ok count"        "8" "${#BOXA_PROVISIONING_OK[@]}"
+check "run2 ok count"        "9" "${#BOXA_PROVISIONING_OK[@]}"
 
 # --- Id filter restricts the run to named steps ------------------------------
 boxa::run_provisioning repair-a boxa-skill >/dev/null

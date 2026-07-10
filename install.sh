@@ -622,6 +622,30 @@ setup_agent_user() {
     fi
 }
 
+# --- WSL2 drvfs mount guard (agent-browser isolation) ------------------------
+# WSL2's default drvfs permissions make /mnt/c world-readable to every Linux
+# OS user, including boxa-agent. Delegate the section-aware /etc/wsl.conf
+# hardening to the category-A provisioner so install, update, and doctor share
+# one implementation.
+
+setup_wsl_mount_guard() {
+    info "Configuring WSL /mnt umask guard..."
+
+    local provisioner="$BOXA_DIR/scripts/ensure-wsl-mount-guard.sh"
+    if [ ! -x "$provisioner" ]; then
+        warn "scripts/ensure-wsl-mount-guard.sh missing or non-executable; skipping."
+        SKIPPED+=("WSL /mnt umask guard (provisioner script missing)")
+        return
+    fi
+
+    if "$provisioner"; then
+        CONFIGURED+=("WSL /mnt umask guard")
+    else
+        warn "Failed to configure WSL /mnt umask guard — see warnings above."
+        SKIPPED+=("WSL /mnt umask guard (setup failed; see warnings above)")
+    fi
+}
+
 # --- Agent-browser Python helpers (ADR 0010) ---------------------------------
 # Delegates to scripts/ensure-agent-browser-helpers.sh — the same script
 # `boxa update` self-heals existing installs through, so install-time
@@ -1508,15 +1532,16 @@ main() {
         msg "  5. Install mkcert v$MKCERT_VERSION + set up the .test host resolver & mkcert CA (sudo / Touch ID prompt)"
         msg "  6. Set up /var/log/boxa/allow-for (root-owned harvest log dir; sudo prompt)"
         msg "  7. Create boxa-agent OS user + add $USER to that group (agent-browser feature; sudo prompt)"
-        msg "  8. Stage agent-browser Python helpers to /usr/local/lib/boxa (sudo prompt)"
-        msg "  9. Install upstream vercel-labs/agent-browser skill via 'npx skills add' (network)"
-        msg " 10. Install agent-browser allowlist example to \$HOME/.config/boxa"
-        msg " 11. Install 'boxa' agent skill to \$HOME/.agents/skills/boxa (+ Claude/Codex symlinks)"
-        msg " 12. Offer MCP onboarding (scan existing Claude Code / Codex MCP servers for boxa import)"
-        msg " 13. Install 'boxa' command to $SYMLINK_PATH"
-        msg " 14. Detect your terminal and print the clipboard-image keybinding snippet"
-        msg " 15. Optionally generate Claude Code token for containers"
-        msg " 16. Check Docker availability"
+        msg "  8. Harden WSL2 drvfs automount permissions for agent-browser isolation"
+        msg "  9. Stage agent-browser Python helpers to /usr/local/lib/boxa (sudo prompt)"
+        msg " 10. Install upstream vercel-labs/agent-browser skill via 'npx skills add' (network)"
+        msg " 11. Install agent-browser allowlist example to \$HOME/.config/boxa"
+        msg " 12. Install 'boxa' agent skill to \$HOME/.agents/skills/boxa (+ Claude/Codex symlinks)"
+        msg " 13. Offer MCP onboarding (scan existing Claude Code / Codex MCP servers for boxa import)"
+        msg " 14. Install 'boxa' command to $SYMLINK_PATH"
+        msg " 15. Detect your terminal and print the clipboard-image keybinding snippet"
+        msg " 16. Optionally generate Claude Code token for containers"
+        msg " 17. Check Docker availability"
         echo ""
         if ! confirm "Continue?"; then
             msg "Aborted."
@@ -1551,6 +1576,9 @@ main() {
 
     echo ""
     setup_agent_user
+
+    echo ""
+    setup_wsl_mount_guard
 
     echo ""
     stage_agent_browser_helpers

@@ -53,6 +53,7 @@ BOXA_PROVISIONING_STEPS=(
     "allow-for-host-state|scripts/ensure-allow-for-host-state.sh|A"
     "agent-browser-helpers|scripts/ensure-agent-browser-helpers.sh|A"
     "agent-browser-host-state|scripts/ensure-agent-browser-host-state.sh|A"
+    "wsl-mount-guard|scripts/ensure-wsl-mount-guard.sh|A"
     "upstream-agent-browser-skill|scripts/ensure-upstream-agent-browser-skill.sh|A"
     "agent-allowlist-example|scripts/ensure-agent-allowlist-example.sh|A"
     "boxa-skill|scripts/ensure-boxa-skill.sh|A"
@@ -95,7 +96,7 @@ boxa::provisioning_probe() {
         https)
             # Shared source of truth: https.conf (read via lib/https.sh).
             # active -> ok; opted out -> declined; neither decided -> missing.
-            # shellcheck source=lib/https.sh
+            # shellcheck source=lib/https.sh disable=SC1091
             source "$BOXA_DIR/lib/https.sh"
             if boxa::https_active; then
                 printf 'ok'
