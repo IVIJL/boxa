@@ -229,6 +229,40 @@ Consumed by agent-side hooks and the `boxa` skill for host/container
 branching. See ADR 0011.
 _Avoid_: identity sentinel, container marker, boxa marker file
 
+### Memory
+
+**Memory limit**:
+The hard ceiling on a **Project**'s RAM use, enforced on its outer
+**Container** so that every process inside — agent subprocesses and
+nested DinD containers alike — counts against it. When it is reached,
+the kernel kills the largest process inside the Container; the
+Container itself keeps running. Unless configured, a default is
+derived from the host's total RAM when the Container starts, and the
+effective value is printed at startup.
+_Avoid_: memory quota, RAM cap
+
+**Memory+swap limit**:
+The total RAM-plus-swap a **Container** may consume. Equal to the
+**Memory limit** by default, so a runaway process is OOM-killed
+immediately instead of dragging the host into swap thrashing. Raising
+it above the **Memory limit** grants exactly the difference as swap.
+_Avoid_: swap limit (the value is a total, not an amount of swap)
+
+**OOM archive**:
+The durable per-event record of an OOM kill in a **Project**, captured
+from the kernel log at first sighting so it outlives both the
+Container and a host VM restart. Carries the project name, timestamp,
+the victim process and its RSS, and the **Memory limit** in force.
+The kernel log is the source; the archive is the record.
+_Avoid_: oom log, kill log
+
+**Memory warning**:
+The banded notice raised when a **Project** crosses 80 % or 90 % of
+its **Memory limit**. Fires only on entering a band and re-arms only
+after usage falls back below it, so a Project hovering at a threshold
+warns once, not continuously.
+_Avoid_: memory pressure (PSI is a different kernel concept)
+
 ### Host provisioning
 
 **Provisioning step**:
@@ -317,6 +351,15 @@ _Avoid_: boxa check, boxa repair, boxa heal
   everything else stays private to each account. None of this sharing touches the
   host — the bridge group lives only in the **Container** and the idmapped mount
   leaves host file ownership/permissions unchanged (ADR 0014).
+- A **Memory limit** binds the **Container** as one aggregate: nested
+  DinD workloads count against it but cannot be attributed
+  individually, so per-process and per-nested-container numbers are
+  always reported as project totals.
+- A **Memory limit** change applies to a running **Container** in
+  place; it never requires recreating the Container and never touches
+  volumes.
+- An OOM kill inside one **Project**'s Container never affects another
+  Project's Container or the host's Docker daemon.
 - Every **Provisioning step** is reachable from all three entry points
   (`install.sh`, `boxa update`, `boxa doctor`); none of the three owns
   steps the others cannot run. This is what keeps a fresh install and an
