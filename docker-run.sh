@@ -177,6 +177,10 @@ source "$BOXA_DIR/lib/allowlist.sh"
 # shellcheck source=lib/naming.sh
 source "$BOXA_DIR/lib/naming.sh"
 
+# Per-project Memory and Memory+swap limit resolution (ADR 0020).
+# shellcheck source=lib/resources.sh
+source "$BOXA_DIR/lib/resources.sh"
+
 # Picker module — single + multi interactive selection with consistent UX
 # across fzf and the no-fzf fallback. See lib/picker.sh and
 # docs/adr/0006-interactive-picker-conventions.md.
@@ -3701,9 +3705,29 @@ write_dns_upstream_file
 
 # --- Build docker arguments -------------------------------------------------
 
+_boxa::resolve_resources "$PROJECT_PATH"
+
+memory_display="$(_boxa::format_size "$_BOXA_MEMORY_BYTES")"
+host_memory_display="$(_boxa::format_size "$_BOXA_HOST_MEMTOTAL_BYTES")"
+if [ "$_BOXA_MEMORY_SOURCE" = "derived" ]; then
+    memory_source="derived from $host_memory_display host RAM"
+else
+    memory_source="$_BOXA_MEMORY_SOURCE"
+fi
+echo "Memory limit: $memory_display ($memory_source; override in ~/.config/boxa/resources.conf)"
+
+if [ "$_BOXA_MEMORY_BYTES" -gt "$_BOXA_HOST_MEMTOTAL_BYTES" ]; then
+    echo "WARNING: Memory limit exceeds host RAM; protection is void."
+fi
+if _boxa::would_jointly_exhaust_host "$_BOXA_MEMORY_BYTES" "$_BOXA_HOST_MEMTOTAL_BYTES"; then
+    echo "WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop."
+fi
+
 DOCKER_ARGS=(
     --hostname "$BOXA_HOSTNAME"
     --network devproxy
+    --memory "$_BOXA_MEMORY_BYTES"
+    --memory-swap "$_BOXA_MEMORY_SWAP_BYTES"
     # `host.docker.internal` resolution for the in-container Agent-browser
     # bridge socat (ADR 0010). No-op on Docker Desktop (the hostname is
     # built-in), required on native Linux (no built-in mapping). Uniform
