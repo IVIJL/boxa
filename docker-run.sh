@@ -278,9 +278,9 @@ EOF
         connections)    printf 'boxa connections               List cross-boxa TCP forwards\n' ;;
         deny)           printf 'boxa deny [domain]             Remove allowed domain (interactive)\n' ;;
         blocked)        printf 'boxa blocked                   Show blocked DNS queries, allow interactively\n' ;;
-        dns-install)    printf 'boxa dns-install [--local|--external]\n                                   Configure host resolver for *.test (per-OS)\n' ;;
-        dns-status)     printf 'boxa dns-status                Show DNS mode + resolver state + verification\n' ;;
-        dns-uninstall)  printf 'boxa dns-uninstall             Remove host resolver config + dns.conf\n' ;;
+        dns-install|dns-status|dns-uninstall)
+            "$BOXA_DIR/scripts/dns-install.sh" --help
+            ;;
         update)         printf 'boxa update                    Update boxa (pull repo + rebuild image)\n' ;;
         prune)          printf 'boxa prune [--all]             Remove old build cache (--all = everything)\n' ;;
         claude-token)   printf 'boxa claude-token              Generate/regenerate Claude Code token\n' ;;
@@ -299,7 +299,7 @@ EOF
     esac
 
     case "$command" in
-        agent-browser|mcp|allow-for|allow|mem|doctor|build|uninstall|ports|connect) ;;
+        agent-browser|mcp|allow-for|allow|mem|doctor|build|uninstall|ports|connect|dns-install|dns-status|dns-uninstall) ;;
         *) printf "\nRun 'boxa <command> --help' for details.\n" ;;
     esac
     exit 0
@@ -2563,6 +2563,9 @@ if [ "$MODE" = "mem-unset" ]; then
         exit 0
     fi
 
+    mem_unset_host_total="$(_boxa::host_memtotal_bytes 2>/dev/null || true)"
+    _boxa::effective_scope_joint_exhaustion_warning \
+        "$mem_unset_scope" "$mem_unset_path" "$mem_unset_host_total" || true
     _boxa::sweep_running_resource_limits || true
     if [ "$mem_unset_scope" = global ]; then
         echo "Global Memory limits removed."

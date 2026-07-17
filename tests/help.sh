@@ -60,6 +60,18 @@ assert_contains "mcp lists reload" "reload      Re-stage changed MCP secrets" "$
 assert_contains "mcp keeps ADR pointer" "ADR 0013" "$mcp_help"
 assert_eq "mcp -h uses unified text" "$mcp_help" "$(run_boxa mcp -h)"
 
+dns_install_help="$(run_boxa dns-install --help)"
+assert_contains "dns-install delegates detailed mode options" \
+    "--local | --external | --auto" "$dns_install_help"
+assert_contains "dns-install delegates detailed HTTPS options" \
+    "--enable-https" "$dns_install_help"
+assert_eq "dns-install help forms match" \
+    "$(run_boxa help dns-install)" "$dns_install_help"
+for command in dns-status dns-uninstall; do
+    assert_contains "$command delegates shared DNS usage" \
+        "--disable-https" "$(run_boxa "$command" --help)"
+done
+
 fallback_help="$(run_boxa help ls)"
 assert_contains "fallback prints overview line" \
     "boxa ls                        List running containers" "$fallback_help"

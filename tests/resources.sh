@@ -481,6 +481,36 @@ assert_eq "running target limit uses replacement semantics without double count"
     "$(_boxa::project_joint_exhaustion_warning 5368709120 /work/target 10737418240)"
 
 seed_conf \
+    'memory = 8g' \
+    '[/work/target]' \
+    'memory = 2g' \
+    '[/work/other]' \
+    'memory = 2g'
+printf '%s\t%s\n' \
+    2147483648 /work/target \
+    2147483648 /work/other \
+    > "$BOXA_RUNNING_MEMORY_LIMITS_FILE"
+_boxa::write_resources_conf project /work/target ''
+assert_eq "project unset to larger fallback warns for running target" \
+    "WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop." \
+    "$(_boxa::effective_scope_joint_exhaustion_warning project /work/target 9663676416)"
+
+printf '%s\t%s\n' 2147483648 /work/other > "$BOXA_RUNNING_MEMORY_LIMITS_FILE"
+assert_eq "project unset to larger fallback warns for stopped target" \
+    "WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop." \
+    "$(_boxa::effective_scope_joint_exhaustion_warning project /work/target 9663676416)"
+
+seed_conf 'memory = 2g'
+printf '%s\t%s\n' \
+    2147483648 /work/first \
+    2147483648 /work/second \
+    > "$BOXA_RUNNING_MEMORY_LIMITS_FILE"
+_boxa::write_resources_conf global '' ''
+assert_eq "global unset to larger derived fallback warns" \
+    "WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop." \
+    "$(_boxa::effective_scope_joint_exhaustion_warning global '' 10737418240)"
+
+seed_conf \
     'memory = 4g' \
     '[/work/special]' \
     'memory = 2g'

@@ -34,6 +34,17 @@ assert_eq() {
     fi
 }
 
+assert_not_contains() {
+    local label="$1" needle="$2" haystack="$3"
+    if [[ "$haystack" != *"$needle"* ]]; then
+        printf 'PASS  %s\n' "$label"
+    else
+        printf 'FAIL  %s\n      unexpected: %q\n      actual:     %q\n' \
+            "$label" "$needle" "$haystack"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
 assert_ok() {
     local label="$1"
     shift
@@ -91,6 +102,30 @@ effective_output=$(_boxa::mem_render_effective_limits "$TEST_TMP/My Project")
 assert_eq "effective limits show independent sources and durable hint" \
     $'Effective Memory limit: 5g\nMemory limit source: project config\nEffective Memory+swap limit: 9g\nMemory+swap limit source: global config\nHint: use `boxa mem set` to change these limits durably.' \
     "$effective_output"
+
+missing_path_output=$(_boxa::mem_render_effective_limits "")
+assert_ok "missing absolute path keeps unavailable diagnosis" \
+    grep -Fq "absolute project path unavailable" <<< "$missing_path_output"
+
+printf '%s\n' "[$TEST_TMP/My Project]" 'memory = invalid' > "$BOXA_RESOURCES_CONF"
+_boxa::reset_resources_cache
+resolution_failure_output=$(_boxa::mem_render_effective_limits "$TEST_TMP/My Project" 2>&1)
+assert_ok "effective limits surface invalid configured size" \
+    grep -Fq "Invalid memory size 'invalid'" <<< "$resolution_failure_output"
+assert_not_contains "resolution failure is not reported as an unavailable path" \
+    "absolute project path unavailable" "$resolution_failure_output"
+
+: > "$BOXA_RESOURCES_CONF"
+rm -f "$BOXA_MEMINFO_FILE"
+export BOXA_DOCKER_INFO_CMD=/bin/false
+export BOXA_SYSCTL_CMD=/bin/false
+_boxa::reset_resources_cache
+resolution_failure_output=$(_boxa::mem_render_effective_limits "$TEST_TMP/My Project" 2>&1)
+assert_ok "effective limits surface unavailable host RAM" \
+    grep -Fq "Unable to determine host RAM" <<< "$resolution_failure_output"
+assert_not_contains "host RAM failure is not reported as an unavailable path" \
+    "absolute project path unavailable" "$resolution_failure_output"
+printf 'MemTotal:       10485760 kB\n' > "$BOXA_MEMINFO_FILE"
 
 events_output=$(_boxa::mem_render_events $'low 1\nhigh 2\nmax 3\noom 4\noom_kill 5')
 assert_eq "render full memory.events" $'  low:      1\n  high:     2\n  max:      3\n  oom:      4\n  oom_kill: 5' "$events_output"

@@ -174,16 +174,21 @@ _boxa::mem_recommended_size() {
 
 _boxa::mem_render_effective_limits() {
     local project_path="${1:-}"
-    if [[ "$project_path" == /* ]] && _boxa::resolve_resources "$project_path"; then
+    if [[ "$project_path" != /* ]]; then
+        printf 'Effective Memory limit: unknown\n'
+        printf 'Memory limit source: unknown (absolute project path unavailable)\n'
+        printf 'Effective Memory+swap limit: unknown\n'
+        printf 'Memory+swap limit source: unknown (absolute project path unavailable)\n'
+    elif _boxa::resolve_resources "$project_path"; then
         printf 'Effective Memory limit: %s\n' "$(_boxa::format_size "$_BOXA_MEMORY_BYTES")"
         printf 'Memory limit source: %s\n' "$_BOXA_MEMORY_SOURCE"
         printf 'Effective Memory+swap limit: %s\n' "$(_boxa::format_size "$_BOXA_MEMORY_SWAP_BYTES")"
         printf 'Memory+swap limit source: %s\n' "$_BOXA_MEMORY_SWAP_SOURCE"
     else
         printf 'Effective Memory limit: unknown\n'
-        printf 'Memory limit source: unknown (absolute project path unavailable)\n'
+        printf 'Memory limit source: unknown (resource resolution failed)\n'
         printf 'Effective Memory+swap limit: unknown\n'
-        printf 'Memory+swap limit source: unknown (absolute project path unavailable)\n'
+        printf 'Memory+swap limit source: unknown (resource resolution failed)\n'
     fi
     printf '%s\n' "Hint: use \`boxa mem set\` to change these limits durably."
 }

@@ -887,3 +887,18 @@ _boxa::project_joint_exhaustion_warning() {
     fi
     _boxa::joint_exhaustion_warning "$proposed" "$host_total" effective
 }
+
+# Warn from the effective limits after a scope change. Global changes are
+# already represented by every running Container in effective mode; a stopped
+# Project target must still be added separately.
+_boxa::effective_scope_joint_exhaustion_warning() {
+    local scope="$1" project_path="${2:-}" host_total="${3:-}"
+    if [ "$scope" = global ]; then
+        _boxa::joint_exhaustion_warning 0 "$host_total" effective
+        return
+    fi
+
+    _boxa::resolve_resources "$project_path" || return 1
+    _boxa::project_joint_exhaustion_warning \
+        "$_BOXA_MEMORY_BYTES" "$project_path" "$host_total"
+}
