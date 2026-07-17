@@ -235,8 +235,8 @@ _Avoid_: identity sentinel, container marker, boxa marker file
 The hard ceiling on a **Project**'s RAM use, enforced on its outer
 **Container** so that every process inside — agent subprocesses and
 nested DinD containers alike — counts against it. When it is reached,
-the kernel kills the largest process inside the Container; the
-Container itself keeps running. Unless configured, a default is
+the kernel kills a victim process it selects inside the Container
+(observed: the largest one); the Container itself keeps running. Unless configured, a default is
 derived from the host's total RAM when the Container starts, and the
 effective value is printed at startup.
 _Avoid_: memory quota, RAM cap
