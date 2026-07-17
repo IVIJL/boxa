@@ -112,6 +112,7 @@ Per-feature guides:
 - [Networking & port routing](docs/networking.md) — local `.test` DNS, sslip.io fallback, HTTPS via mkcert, cross-boxa `connect`.
 - [SSH](docs/ssh.md) — agent forwarding, boxa SSH config, WSL2 keychain.
 - [Docker-in-Docker](docs/docker-in-docker.md) — rootless DinD, persistence, graceful shutdown.
+- [Memory limits](docs/memory.md) — per-project Memory limit and swap semantics, `resources.conf`, OOM archive, `boxa mem`, troubleshooting.
 - [Editors](docs/editors.md) — VS Code / Cursor attach; Zed (planned).
 - [Clipboard images](docs/clipboard-images.md) — `boxa clip` to paste screenshots into an agent; WezTerm / Ghostty keybindings.
 
