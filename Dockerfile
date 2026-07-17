@@ -436,6 +436,14 @@ COPY managed-settings/claude-code/50-boxa-identity.json \
 COPY managed-settings/codex/managed_config.toml \
      /etc/codex/managed_config.toml
 
+# Agent-facing Memory warning + OOM detection hook (ADR 0020). PostToolUse
+# for both Claude Code and Codex; polls this Container's cgroup memory
+# files and speaks up only on an oom_kill counter delta or a Memory
+# warning band entry. Same identity-file guard as the identity hook.
+COPY scripts/hooks/boxa-memory-context.sh /usr/local/bin/
+COPY managed-settings/claude-code/51-boxa-memory.json \
+     /etc/claude-code/managed-settings.d/51-boxa-memory.json
+
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
     /usr/local/bin/boxa-entrypoint.sh /usr/local/bin/boxa-firewall-reload \
@@ -451,7 +459,8 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/boxa-mcp-broker \
     /usr/local/bin/mcp-broker-namespace \
     /usr/local/bin/stage-mcp-secrets \
-    /usr/local/bin/boxa-identity-context.sh
+    /usr/local/bin/boxa-identity-context.sh \
+    /usr/local/bin/boxa-memory-context.sh
 
 # The MCP runtime (Python package + launchers) must be readable+executable by
 # BOTH node (relay) and boxa-mcp (broker). It is copied root-owned with
