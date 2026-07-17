@@ -235,6 +235,51 @@ _boxa::format_size() {
         'BEGIN { value = bytes / divisor; if (value == int(value)) printf "%d%s", value, suffix; else printf "%.1f%s", value, suffix }'
 }
 
+# Render the `boxa ls` MEM cell from a raw in-container cgroup probe: three
+# whitespace-separated fields — memory.current in bytes, memory.max in bytes
+# or the literal "max" (no limit), and the memory.events oom_kill count. Any
+# missing or malformed field degrades to "-" (the Container may have died
+# mid-probe); the cell must never break the table. A non-zero oom_kill count
+# appends a marker: OOM kills happened during the Container's lifetime — the
+# Container itself keeps running (ADR 0020).
+_boxa::mem_cell() {
+    local probe="${1:-}"
+    local -a fields=()
+    read -r -d '' -a fields <<< "$probe" || true
+    local current="${fields[0]:-}" max="${fields[1]:-}" oom_kill="${fields[2]:-}"
+    local cell percent
+
+    if [[ ! "$current" =~ ^[0-9]+$ ]] || [[ ! "$oom_kill" =~ ^[0-9]+$ ]]; then
+        printf -- '-'
+        return 0
+    fi
+    if [ "$max" = "max" ]; then
+        cell="no limit"
+    elif [[ "$max" =~ ^[0-9]+$ ]] && [ "$max" -gt 0 ]; then
+        percent=$(((current * 100 + max / 2) / max))
+        cell="$(_boxa::format_size "$current")/$(_boxa::format_size "$max") ${percent}%"
+    else
+        printf -- '-'
+        return 0
+    fi
+    if [ "$oom_kill" -gt 0 ]; then
+        cell="$cell !oom×${oom_kill}"
+    fi
+    printf '%s' "$cell"
+}
+
+# Marker for an exited Container whose `docker inspect .State.OOMKilled` is
+# true. That flag is a lifetime flag: "at least one OOM kill happened while
+# the container ran", NOT "the container died of OOM" — it reads true even
+# after a clean exit (ADR 0020). The wording must not claim the exit was
+# OOM-caused. Prints nothing for any other flag value.
+_boxa::exited_oom_marker() {
+    local oomkilled="${1:-}" project="${2:-}"
+    if [ "$oomkilled" = "true" ]; then
+        printf "oom seen during run — see 'boxa mem %s'" "$project"
+    fi
+}
+
 # Sum HostConfig.Memory for running user Containers. A newline-delimited file
 # of byte values in BOXA_RUNNING_MEMORY_LIMITS_FILE replaces Docker in tests.
 _boxa::running_memory_limit_sum() {

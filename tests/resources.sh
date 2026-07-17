@@ -149,6 +149,36 @@ assert_eq "sum running limits" "5368709120" "$(_boxa::running_memory_limit_sum)"
 assert_ok "joint exhaustion detected" _boxa::would_jointly_exhaust_host 6442450944 10737418240
 assert_fail "sum within host RAM" _boxa::would_jointly_exhaust_host 4294967296 10737418240
 
+# --- `boxa ls` MEM cell -------------------------------------------------------
+
+assert_eq "mem cell usage/limit percent" "2.3g/6.5g 35%" \
+    "$(_boxa::mem_cell $'2469606195\n6979321856\n0')"
+assert_eq "mem cell rounds percent to nearest" "2g/3g 67%" \
+    "$(_boxa::mem_cell $'2147483648\n3221225472\n0')"
+assert_eq "mem cell appends oom marker with count" "512m/1g 50% !oom×3" \
+    "$(_boxa::mem_cell $'536870912\n1073741824\n3')"
+assert_eq "mem cell limitless" "no limit" \
+    "$(_boxa::mem_cell $'1073741824\nmax\n0')"
+assert_eq "mem cell limitless keeps oom marker" "no limit !oom×2" \
+    "$(_boxa::mem_cell $'1073741824\nmax\n2')"
+assert_eq "mem cell empty probe degrades" "-" "$(_boxa::mem_cell '')"
+assert_eq "mem cell partial probe degrades" "-" "$(_boxa::mem_cell $'123')"
+assert_eq "mem cell garbage probe degrades" "-" \
+    "$(_boxa::mem_cell 'cat: /sys/fs/cgroup/memory.current: No such file')"
+assert_eq "mem cell zero max degrades" "-" "$(_boxa::mem_cell $'1\n0\n0')"
+assert_eq "mem cell non-numeric oom count degrades" "-" \
+    "$(_boxa::mem_cell $'1073741824\nmax\nnope')"
+
+# --- Exited-Container OOM marker ---------------------------------------------
+
+assert_eq "exited marker on lifetime flag" \
+    "oom seen during run — see 'boxa mem foo'" \
+    "$(_boxa::exited_oom_marker true foo)"
+assert_eq "exited marker silent when false" "" \
+    "$(_boxa::exited_oom_marker false foo)"
+assert_eq "exited marker silent when flag missing" "" \
+    "$(_boxa::exited_oom_marker '' foo)"
+
 if [ "$fail_count" -gt 0 ]; then
     printf '\n%d test(s) failed.\n' "$fail_count" >&2
     exit 1
