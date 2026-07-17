@@ -43,7 +43,7 @@ _boxa() {
     # `prev` reserved for future use; reference it once to satisfy shellcheck.
     : "${prev:-}"
 
-    local top_commands="help ls stop remove port ports connect connections build update uninstall prune claude-token allow deny blocked allow-for agent-browser cursor code clip ssh-config sync-skills dns-install dns-status dns-uninstall"
+    local top_commands="help ls mem stop remove port ports connect connections build update uninstall prune claude-token allow deny blocked allow-for agent-browser cursor code clip ssh-config sync-skills dns-install dns-status dns-uninstall"
 
     # Top-level subcommand
     if [ "$cword" -eq 1 ]; then
@@ -54,8 +54,8 @@ _boxa() {
 
     local sub="${words[1]}"
     case "$sub" in
-        stop|remove|cursor|code)
-            # These accept a container name as the only positional. No
+        mem|stop|remove|cursor|code)
+            # These offer a project name as their positional completion. No
             # top-level `status` exists — that lives under `agent-browser`
             # and is handled by the agent-browser branch below.
             if [ "$cword" -eq 2 ]; then
