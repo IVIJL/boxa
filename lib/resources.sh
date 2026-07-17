@@ -136,15 +136,27 @@ _boxa::parse_size() {
     printf '%s' "$bytes"
 }
 
-# Read host MemTotal in bytes. BOXA_MEMINFO_FILE is a unit-test seam.
+# Read host MemTotal in bytes. BOXA_MEMINFO_FILE and BOXA_SYSCTL_CMD are
+# unit-test seams for the Linux and macOS sources respectively.
 _boxa::host_memtotal_bytes() {
-    local meminfo="${BOXA_MEMINFO_FILE:-/proc/meminfo}" kib
-    kib="$(awk '$1 == "MemTotal:" { print $2; exit }' "$meminfo" 2>/dev/null)"
-    if [[ ! "$kib" =~ ^[0-9]+$ ]] || [ "$kib" -eq 0 ]; then
-        printf 'Unable to determine host RAM from %s.\n' "$meminfo" >&2
+    local meminfo="${BOXA_MEMINFO_FILE:-/proc/meminfo}" sysctl_cmd="${BOXA_SYSCTL_CMD:-sysctl}"
+    local kib bytes
+    if [ -f "$meminfo" ]; then
+        kib="$(awk '$1 == "MemTotal:" { print $2; exit }' "$meminfo" 2>/dev/null)"
+        if [[ ! "$kib" =~ ^[0-9]+$ ]] || [ "$kib" -eq 0 ]; then
+            printf 'Unable to determine host RAM from %s.\n' "$meminfo" >&2
+            return 1
+        fi
+        printf '%s' "$((kib * 1024))"
+        return 0
+    fi
+
+    bytes="$("$sysctl_cmd" -n hw.memsize 2>/dev/null || true)"
+    if [[ ! "$bytes" =~ ^[0-9]+$ ]] || [ "$bytes" -eq 0 ]; then
+        printf 'Unable to determine host RAM from %s or sysctl -n hw.memsize.\n' "$meminfo" >&2
         return 1
     fi
-    printf '%s' "$((kib * 1024))"
+    printf '%s' "$bytes"
 }
 
 # Resolve limits for an absolute host project path. Optional arguments are the
@@ -160,9 +172,7 @@ _boxa::resolve_resources() {
     fi
 
     _boxa::load_resources_conf
-    if ! _BOXA_HOST_MEMTOTAL_BYTES="$(_boxa::host_memtotal_bytes)"; then
-        return 1
-    fi
+    _BOXA_HOST_MEMTOTAL_BYTES=
 
     if [ -n "$cli_memory" ]; then
         memory_value="$cli_memory"
@@ -182,7 +192,11 @@ _boxa::resolve_resources() {
         if ! _BOXA_MEMORY_BYTES="$(_boxa::parse_size "$memory_value")"; then
             return 1
         fi
+        _BOXA_HOST_MEMTOTAL_BYTES="$(_boxa::host_memtotal_bytes 2>/dev/null || true)"
     else
+        if ! _BOXA_HOST_MEMTOTAL_BYTES="$(_boxa::host_memtotal_bytes)"; then
+            return 1
+        fi
         _BOXA_MEMORY_BYTES=$((_BOXA_HOST_MEMTOTAL_BYTES * 65 / 100))
         if [ "$_BOXA_MEMORY_BYTES" -lt 6291456 ]; then
             printf 'Derived Memory limit is below Docker minimum of 6 MiB.\n' >&2

@@ -12,7 +12,16 @@ _TMPROOT="$(mktemp -d)"
 export BOXA_RESOURCES_CONF="$_TMPROOT/resources.conf"
 export BOXA_MEMINFO_FILE="$_TMPROOT/meminfo"
 export BOXA_RUNNING_MEMORY_LIMITS_FILE="$_TMPROOT/running-limits"
+export BOXA_SYSCTL_CMD="$_TMPROOT/sysctl"
 trap 'rm -rf "$_TMPROOT"' EXIT
+
+printf '%s\n' \
+    '#!/bin/sh' \
+    "[ \"\$1\" = \"-n\" ] && [ \"\$2\" = \"hw.memsize\" ] || exit 2" \
+    "[ -n \"\${BOXA_TEST_SYSCTL_MEMSIZE:-}\" ] || exit 1" \
+    "printf \"%s\\n\" \"\$BOXA_TEST_SYSCTL_MEMSIZE\"" \
+    > "$BOXA_SYSCTL_CMD"
+chmod +x "$BOXA_SYSCTL_CMD"
 
 fail_count=0
 
@@ -46,6 +55,17 @@ assert_fail() {
         fail_count=$((fail_count + 1))
     else
         printf 'PASS  %s\n' "$label"
+    fi
+}
+
+assert_contains() {
+    local label="$1" needle="$2" haystack="$3"
+    if [[ "$haystack" == *"$needle"* ]]; then
+        printf 'PASS  %s\n' "$label"
+    else
+        printf 'FAIL  %s\n      missing: %q\n      actual:  %q\n' \
+            "$label" "$needle" "$haystack"
+        fail_count=$((fail_count + 1))
     fi
 }
 
@@ -123,6 +143,39 @@ assert_eq "derived default is 65 percent" "6979321856" "$_BOXA_MEMORY_BYTES"
 assert_eq "derived source" "derived" "$_BOXA_MEMORY_SOURCE"
 assert_eq "derived swap defaults to memory" "6979321856" "$_BOXA_MEMORY_SWAP_BYTES"
 assert_eq "derived startup display" "6.5g" "$(_boxa::format_size "$_BOXA_MEMORY_BYTES")"
+
+# --- Portable host RAM detection and graceful degradation ------------------
+
+rm -f "$BOXA_MEMINFO_FILE"
+export BOXA_TEST_SYSCTL_MEMSIZE=17179869184
+assert_eq "sysctl fallback reads hw.memsize bytes" \
+    "17179869184" "$(_boxa::host_memtotal_bytes)"
+
+unset BOXA_TEST_SYSCTL_MEMSIZE
+seed_conf
+explicit_stderr="$_TMPROOT/explicit.stderr"
+if _boxa::resolve_resources /work/explicit 7g 2> "$explicit_stderr"; then
+    printf 'PASS  explicit limit works without host MemTotal\n'
+else
+    printf 'FAIL  explicit limit works without host MemTotal\n      expected success\n'
+    fail_count=$((fail_count + 1))
+fi
+assert_eq "explicit limit keeps resolved bytes without host MemTotal" \
+    "7516192768" "$_BOXA_MEMORY_BYTES"
+assert_eq "RAM-dependent warnings have no host total" "" "$_BOXA_HOST_MEMTOTAL_BYTES"
+assert_eq "missing optional host MemTotal stays silent" "" "$(< "$explicit_stderr")"
+
+derived_stderr="$_TMPROOT/derived.stderr"
+if _boxa::resolve_resources /work/default 2> "$derived_stderr"; then
+    printf 'FAIL  derived default fails without any host RAM source\n      expected failure\n'
+    fail_count=$((fail_count + 1))
+else
+    printf 'PASS  derived default fails without any host RAM source\n'
+fi
+assert_contains "derived failure explains missing host RAM" \
+    "Unable to determine host RAM" "$(< "$derived_stderr")"
+
+set_host_gib 10
 
 # --- Validation -------------------------------------------------------------
 

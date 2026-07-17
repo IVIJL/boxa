@@ -1591,7 +1591,7 @@ wait_for_boxa_ready() {
 # Restart an exited boxa container and re-run init scripts
 # Returns 1 if restart fails (stale mounts after reboot) — caller should recreate
 restart_exited_container() {
-    local name="$1"
+    local name="$1" project_path="${2:-}" cli_memory="${3:-}" cli_memory_swap="${4:-}"
     echo "Restarting exited container: $name"
     # Containers created before the DNS upstream bind mount existed (ADR 0015)
     # would have DNS_UPSTREAM_CONTAINER_FILE absent after a plain `docker start`,
@@ -1609,6 +1609,8 @@ restart_exited_container() {
     # init-firewall on every start, so a daemon-DNS change since create is
     # picked up here without recreating the container (ADR 0015).
     write_dns_upstream_file
+    _boxa::converge_container_resources "$name" "$project_path" \
+        "$cli_memory" "$cli_memory_swap" stopped || exit 1
     if ! docker start "$name" 2>/dev/null; then
         echo "Restart failed (stale mounts?), removing dead container..."
         docker rm "$name" > /dev/null
@@ -1659,6 +1661,7 @@ _boxa::container_memory_usage_bytes() {
 # touched-container callers; Docker/race failures are silent and non-fatal.
 _boxa::converge_container_resources() {
     local name="$1" project_path="${2:-}" cli_memory="${3:-}" cli_memory_swap="${4:-}"
+    local container_state="${5:-running}"
     local desired_memory desired_memory_swap live live_memory live_memory_swap extra usage="" one_shot=""
 
     if [ -z "$project_path" ]; then
@@ -1679,7 +1682,8 @@ _boxa::converge_container_resources() {
     [[ "$live_memory_swap" =~ ^-?[0-9]+$ ]] || return 0
     [ -z "$extra" ] || return 0
 
-    if { [ "$live_memory" -eq 0 ] || [ "$desired_memory" -lt "$live_memory" ]; } \
+    if [ "$container_state" != stopped ] \
+        && { [ "$live_memory" -eq 0 ] || [ "$desired_memory" -lt "$live_memory" ]; } \
         && [ "$live_memory" -ne "$desired_memory" ]; then
         usage="$(_boxa::container_memory_usage_bytes "$name" 2>/dev/null || true)"
     fi
@@ -3805,9 +3809,8 @@ if [ -d "${1:-.}" ]; then
     if docker ps -a --filter "name=^${CONTAINER_NAME}$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
         bootstrap_traefik
         bootstrap_dns
-        if restart_exited_container "$CONTAINER_NAME"; then
-            _boxa::converge_container_resources "$CONTAINER_NAME" "$PROJECT_PATH" \
-                "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
+        if restart_exited_container "$CONTAINER_NAME" "$PROJECT_PATH" \
+                "$CLI_MEMORY" "$CLI_MEMORY_SWAP"; then
             attach_to_container "$CONTAINER_NAME"
             # exec → script ends here
         fi
@@ -3827,9 +3830,8 @@ else
     elif docker ps -a --filter "name=^${CONTAINER_NAME}$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
         bootstrap_traefik
         bootstrap_dns
-        if restart_exited_container "$CONTAINER_NAME"; then
-            _boxa::converge_container_resources "$CONTAINER_NAME" "" \
-                "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
+        if restart_exited_container "$CONTAINER_NAME" "" \
+                "$CLI_MEMORY" "$CLI_MEMORY_SWAP"; then
             attach_to_container "$CONTAINER_NAME"
         else
             echo "Container $CONTAINER_NAME removed. Run again to create a new one." >&2
@@ -3902,8 +3904,8 @@ write_dns_upstream_file
 _boxa::resolve_resources "$PROJECT_PATH" "$CLI_MEMORY" "$CLI_MEMORY_SWAP"
 
 memory_display="$(_boxa::format_size "$_BOXA_MEMORY_BYTES")"
-host_memory_display="$(_boxa::format_size "$_BOXA_HOST_MEMTOTAL_BYTES")"
 if [ "$_BOXA_MEMORY_SOURCE" = "derived" ]; then
+    host_memory_display="$(_boxa::format_size "$_BOXA_HOST_MEMTOTAL_BYTES")"
     memory_source="derived from $host_memory_display host RAM"
 else
     memory_source="$_BOXA_MEMORY_SOURCE"
@@ -3914,10 +3916,12 @@ else
     echo "Memory limit: $memory_display ($memory_source; override in ~/.config/boxa/resources.conf)"
 fi
 
-if [ "$_BOXA_MEMORY_BYTES" -gt "$_BOXA_HOST_MEMTOTAL_BYTES" ]; then
+if [ -n "$_BOXA_HOST_MEMTOTAL_BYTES" ] \
+    && [ "$_BOXA_MEMORY_BYTES" -gt "$_BOXA_HOST_MEMTOTAL_BYTES" ]; then
     echo "WARNING: Memory limit exceeds host RAM; protection is void."
 fi
-if _boxa::would_jointly_exhaust_host "$_BOXA_MEMORY_BYTES" "$_BOXA_HOST_MEMTOTAL_BYTES"; then
+if [ -n "$_BOXA_HOST_MEMTOTAL_BYTES" ] \
+    && _boxa::would_jointly_exhaust_host "$_BOXA_MEMORY_BYTES" "$_BOXA_HOST_MEMTOTAL_BYTES"; then
     echo "WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop."
 fi
 

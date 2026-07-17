@@ -5,8 +5,12 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BOXA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source-path=SCRIPTDIR source=../lib/resources.sh disable=SC1091
 source "$SCRIPT_DIR/../lib/resources.sh"
+
+_TMPROOT="$(mktemp -d)"
+trap 'rm -rf "$_TMPROOT"' EXIT
 
 fail_count=0
 
@@ -53,6 +57,56 @@ _boxa::plan_resource_convergence boxa-app 0 0 1073741824 1073741824 500000000 1
 assert_eq "one-shot notice points to durable config" \
     "Memory limits updated for boxa-app: memory unlimited -> 1g; memory+swap unlimited -> 1g. One-shot override; set ~/.config/boxa/resources.conf for a durable setting." \
     "$_BOXA_RESOURCE_UPDATE_NOTICE"
+
+_boxa::plan_resource_convergence boxa-app 2147483648 2147483648 1073741824 1073741824 ""
+assert_eq "stopped Container with no usage does not warn" "" "$_BOXA_RESOURCE_UPDATE_WARNING"
+
+# docker-run.sh is not source-safe, so extract only the restart helper and
+# verify its stopped-Container convergence wiring with mocked dependencies.
+extracted="$_TMPROOT/restart_exited_container.sh"
+awk '
+    /^restart_exited_container\(\) \{$/ { capture=1 }
+    capture { print }
+    capture && /^\}$/ { exit }
+' "$BOXA_DIR/docker-run.sh" > "$extracted"
+
+if [ ! -s "$extracted" ]; then
+    printf 'FAIL  could not extract restart_exited_container from docker-run.sh\n'
+    fail_count=$((fail_count + 1))
+else
+    # shellcheck source=/dev/null
+    source "$extracted"
+    calls="$_TMPROOT/restart.calls"
+    : > "$calls"
+    DNS_UPSTREAM_CONTAINER_FILE=/etc/boxa-shared/docker-dns-upstream.conf
+
+    # shellcheck disable=SC2317
+    docker() {
+        if [ "$1" = inspect ]; then
+            printf '%s\n' "$DNS_UPSTREAM_CONTAINER_FILE"
+        else
+            printf 'docker:%s\n' "$*" >> "$calls"
+        fi
+    }
+    # shellcheck disable=SC2317
+    write_dns_upstream_file() { printf '%s\n' write-dns >> "$calls"; }
+    # shellcheck disable=SC2317
+    _boxa::converge_container_resources() { printf 'converge:%s\n' "$*" >> "$calls"; }
+    # shellcheck disable=SC2317
+    wait_for_boxa_ready() { :; }
+    # shellcheck disable=SC2317
+    warn_if_dns_broken() { :; }
+    # shellcheck disable=SC2317
+    apply_port_routes() { :; }
+    # shellcheck disable=SC2317
+    start_boxa_connections() { :; }
+
+    restart_exited_container boxa-app /work/app 2g 3g >/dev/null
+    restart_calls="$(< "$calls")"
+    assert_eq "stopped Container converges before docker start" \
+        $'write-dns\nconverge:boxa-app /work/app 2g 3g stopped\ndocker:start boxa-app\ndocker:exec -u node boxa-app bash -c /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh' \
+        "$restart_calls"
+fi
 
 if [ "$fail_count" -gt 0 ]; then
     printf '\n%d test(s) failed.\n' "$fail_count" >&2
