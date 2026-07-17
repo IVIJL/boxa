@@ -27,13 +27,27 @@ _boxa::oom_read_dmesg() {
     fi
 }
 
+# Read the boot id through the same file seam pattern as dmesg. The state
+# cutoff is only meaningful within the boot whose uptime clock produced it.
+_boxa::oom_read_boot_id() {
+    local boot_id=""
+    IFS= read -r boot_id \
+        < "${BOXA_OOM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" \
+        2>/dev/null || true
+    printf '%s\n' "$boot_id"
+}
+
 # Emit tab-separated records:
 #   EVENT <oom timestamp> <container id> <pid> <victim> <anon RSS kB>
+#   PENDING <timestamp of a trailing oom-kill line whose Killed line is not
+#            in the snapshot yet>
 #   LATEST <latest timestamp present anywhere in the ring-buffer snapshot>
 #
 # An oom-kill line identifies the memcg and the following Killed-process line
 # supplies the actual kernel-selected victim and RSS. Incomplete pairs are not
-# archived; a later sweep can retry while the evidence remains in dmesg.
+# archived; a later sweep can retry while the evidence remains in dmesg. Only
+# the trailing pair can still complete (the kernel serializes OOM reports), so
+# only that one is reported as PENDING for the sweep to resume before.
 _boxa::oom_parse_dmesg() {
     local line timestamp latest=""
     local event_timestamp="" container_id=""
@@ -77,6 +91,7 @@ _boxa::oom_parse_dmesg() {
         fi
     done
 
+    [ -z "$event_timestamp" ] || printf 'PENDING\t%s\n' "$event_timestamp"
     [ -z "$latest" ] || printf 'LATEST\t%s\n' "$latest"
 }
 
@@ -98,21 +113,40 @@ _boxa::oom_timestamp_gt() {
     [ "$left" -gt "$right" ]
 }
 
-# State is data, never shell. Accept exactly one kernel timestamp and treat a
-# missing or corrupt file as an empty state (fail open); existing archive files
-# remain the second dedup layer and prevent re-notification.
+# The greatest representable timestamp strictly below the argument, so a
+# cutoff written from it re-admits the argument's event on the next sweep.
+_boxa::oom_timestamp_before() {
+    local key
+    key=$(_boxa::oom_timestamp_key "$1")
+    [ "$key" -gt 0 ] || return 1
+    key=$((key - 1))
+    printf '%d.%09d\n' "$((key / 1000000000))" "$((key % 1000000000))"
+}
+
+# State is data, never shell: line one is the kernel timestamp cutoff, line
+# two the boot id it belongs to. A missing or corrupt file reads as an empty
+# state (fail open), and so does a boot id mismatch — uptime timestamps are
+# only comparable within one boot. A pre-boot-id state file mismatches too and
+# therefore resets, so events from before the upgrade are not skipped; the
+# archive's noclobber dedup keeps already-archived events from re-notifying,
+# so the rescan can only re-notify if the archive was wiped independently.
 _boxa::oom_read_state() {
-    local state=""
+    local state="" stored_boot_id="" current_boot_id
     [ -f "$BOXA_OOM_STATE_FILE" ] || return 0
-    IFS= read -r state < "$BOXA_OOM_STATE_FILE" || true
-    if [[ "$state" =~ ^[0-9]+\.[0-9]+$ ]]; then
-        printf '%s\n' "$state"
-    fi
+    {
+        IFS= read -r state || true
+        IFS= read -r stored_boot_id || true
+    } < "$BOXA_OOM_STATE_FILE"
+    [[ "$state" =~ ^[0-9]+\.[0-9]+$ ]] || return 0
+    current_boot_id=$(_boxa::oom_read_boot_id)
+    [ "$stored_boot_id" = "$current_boot_id" ] || return 0
+    printf '%s\n' "$state"
 }
 
 _boxa::oom_write_state() {
     local timestamp="$1" tmp="${BOXA_OOM_STATE_FILE}.tmp.$$"
-    if printf '%s\n' "$timestamp" > "$tmp" 2>/dev/null; then
+    if printf '%s\n' "$timestamp" "$(_boxa::oom_read_boot_id)" \
+        > "$tmp" 2>/dev/null; then
         mv -f "$tmp" "$BOXA_OOM_STATE_FILE" 2>/dev/null || rm -f "$tmp"
     else
         rm -f "$tmp"
@@ -247,14 +281,15 @@ _boxa::oom_process_event() {
     return 1
 }
 
-# Sweep one snapshot. A backwards latest timestamp means the VM/ring buffer
-# restarted: discard the old cutoff and process everything currently visible.
-# Old events are gone; archive-file dedup prevents any surviving fixture or
-# corrupt-state rescan from notifying twice.
+# Sweep one snapshot. A reboot resets the cutoff via the state-file boot id;
+# a backwards latest timestamp stays as a second reset trigger for states
+# without a comparable boot id. Old events are gone after a reboot; archive-
+# file dedup prevents any surviving fixture or corrupt-state rescan from
+# notifying twice.
 _boxa::oom_sweep() {
     mkdir -p "$BOXA_OOM_ARCHIVE_DIR" 2>/dev/null || return 0
 
-    local previous latest="" cutoff failed=false
+    local previous latest="" pending="" cutoff advance failed=false
     local row kind timestamp container_id victim_pid victim_name victim_rss_kb
     local -a parsed=()
     previous=$(_boxa::oom_read_state)
@@ -262,7 +297,10 @@ _boxa::oom_sweep() {
 
     for row in "${parsed[@]}"; do
         IFS=$'\t' read -r kind timestamp _ <<< "$row"
-        [ "$kind" = "LATEST" ] && latest="$timestamp"
+        case "$kind" in
+            LATEST) latest="$timestamp" ;;
+            PENDING) pending="$timestamp" ;;
+        esac
     done
     [ -n "$latest" ] || return 0
 
@@ -282,6 +320,15 @@ _boxa::oom_sweep() {
             "$victim_name" "$victim_rss_kb" || failed=true
     done
 
-    $failed || _boxa::oom_write_state "$latest"
+    # Never advance the cutoff past a pending event: its Killed line is still
+    # being written, and a cutoff at LATEST would skip the completed pair on
+    # the next sweep. Cap just below it so that sweep re-reads the event.
+    advance="$latest"
+    if [ -n "$pending" ]; then
+        advance=$(_boxa::oom_timestamp_before "$pending") || advance=""
+    fi
+    if ! $failed && [ -n "$advance" ]; then
+        _boxa::oom_write_state "$advance"
+    fi
     return 0
 }

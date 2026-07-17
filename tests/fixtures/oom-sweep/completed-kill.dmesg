@@ -1,0 +1,5 @@
+[60000.099000] worker invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=0
+[60000.100000] oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=/docker/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,task=worker,pid=301,uid=1000
+[60000.100150] Memory cgroup stats for /docker/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:
+[60000.100200] Memory cgroup out of memory: Killed process 301 (worker) total-vm:4000kB, anon-rss:1048576kB, file-rss:0kB
+[60001.000000] ordinary kernel line after the event

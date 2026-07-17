@@ -1,0 +1,3 @@
+[30000.200000] oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=/docker/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,task=fresh,pid=401,uid=1000
+[30000.200100] Memory cgroup out of memory: Killed process 401 (fresh) total-vm:4000kB, anon-rss:3072kB, file-rss:0kB
+[60000.000000] ordinary kernel line long after the event

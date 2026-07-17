@@ -42,6 +42,7 @@ export BOXA_OOM_STATE_FILE="$TEST_TMP/archive/state"
 export BOXA_OOM_DOCKER_CMD="$DOCKER_STUB"
 export BOXA_OOM_NOTIFY_CMD="$NOTIFY_STUB"
 export BOXA_OOM_TEST_NOTIFICATIONS="$TEST_TMP/notifications"
+export BOXA_OOM_BOOT_ID_FILE="$TEST_TMP/boot_id"
 
 # shellcheck source-path=SCRIPTDIR source=../lib/oom-sweep.sh disable=SC1091
 source "$SCRIPT_DIR/../lib/oom-sweep.sh"
@@ -81,10 +82,15 @@ archive_count() {
         2>/dev/null | wc -l | tr -d ' '
 }
 
+set_boot_id() {
+    printf '%s\n' "$1" > "$BOXA_OOM_BOOT_ID_FILE"
+}
+
 reset_case() {
     rm -rf "$BOXA_OOM_ARCHIVE_DIR"
     rm -f "$BOXA_OOM_TEST_NOTIFICATIONS"
     mkdir -p "$BOXA_OOM_ARCHIVE_DIR"
+    set_boot_id boot-a
 }
 
 run_fixture() {
@@ -148,6 +154,43 @@ assert_eq "post-reset repeat stays deduplicated" "2" "$(line_count "$BOXA_OOM_TE
 printf 'not shell and not a timestamp\n' > "$BOXA_OOM_STATE_FILE"
 run_fixture post-reset.dmesg
 assert_eq "corrupt state does not re-notify archived event" "2" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+
+# A sweep that races the kernel mid-report must not advance the cutoff past
+# the unmatched oom-kill line; the completed pair is archived next sweep.
+reset_case
+run_fixture truncated-kill.dmesg
+assert_eq "truncated event is not archived yet" "0" "$(archive_count)"
+assert_eq "truncated event is not notified yet" "0" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+IFS= read -r state_line < "$BOXA_OOM_STATE_FILE"
+assert_eq "cutoff capped just below the pending event" "60000.099999999" "$state_line"
+run_fixture completed-kill.dmesg
+assert_eq "completed pair archived by the next sweep" "1" "$(archive_count)"
+assert_eq "completed pair notified by the next sweep" "1" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+run_fixture completed-kill.dmesg
+assert_eq "completed pair is not archived twice" "1" "$(archive_count)"
+assert_eq "completed pair is not re-notified" "1" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+
+# A boot id change resets the cutoff even when the new boot's timestamps are
+# already past the old cutoff, so no backwards jump exists to detect.
+reset_case
+run_fixture pre-reset.dmesg
+run_fixture late-boot.dmesg
+assert_eq "same boot id keeps the cutoff" "1" "$(archive_count)"
+set_boot_id boot-b
+run_fixture late-boot.dmesg
+assert_eq "boot id change admits the pre-cutoff event" "2" "$(archive_count)"
+assert_eq "boot id change notifies the admitted event" "2" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+run_fixture late-boot.dmesg
+assert_eq "new boot's cutoff dedups the repeat" "2" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+
+# A pre-boot-id state file (timestamp only) resets instead of skipping events.
+reset_case
+printf '12345.700000\n' > "$BOXA_OOM_STATE_FILE"
+run_fixture boxa.dmesg
+assert_eq "old-format state resets and archives the event" "1" "$(archive_count)"
+assert_eq "old-format state resets and notifies the event" "1" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+mapfile -t state_lines < "$BOXA_OOM_STATE_FILE"
+assert_eq "state rewritten with the current boot id" "boot-a" "${state_lines[1]:-}"
 
 # Empty/no-OOM logs have no side effects beyond advancing scan state.
 reset_case
