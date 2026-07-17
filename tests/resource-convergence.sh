@@ -61,6 +61,17 @@ assert_eq "one-shot notice points to durable config" \
 _boxa::plan_resource_convergence boxa-app 2147483648 2147483648 1073741824 1073741824 ""
 assert_eq "stopped Container with no usage does not warn" "" "$_BOXA_RESOURCE_UPDATE_WARNING"
 
+_boxa::plan_resource_convergence boxa-app 1073741824 1073741824 17179869184 17179869184 "" "" 8589934592
+assert_eq "limit above host RAM warns that protection is void" \
+    "WARNING: Memory limit exceeds host RAM; protection is void." \
+    "$_BOXA_RESOURCE_UPDATE_WARNING"
+
+_boxa::plan_resource_convergence boxa-app 1073741824 1073741824 4294967296 4294967296 "" "" 8589934592
+assert_eq "limit below host RAM does not warn" "" "$_BOXA_RESOURCE_UPDATE_WARNING"
+
+_boxa::plan_resource_convergence boxa-app 1073741824 1073741824 17179869184 17179869184 "" "" ""
+assert_eq "unavailable host RAM skips unsafe-limit warning" "" "$_BOXA_RESOURCE_UPDATE_WARNING"
+
 # docker-run.sh is not source-safe, so extract only the restart helper and
 # verify its stopped-Container convergence wiring with mocked dependencies.
 extracted="$_TMPROOT/restart_exited_container.sh"

@@ -1701,7 +1701,8 @@ _boxa::converge_container_resources() {
     fi
     [ -z "$cli_memory$cli_memory_swap" ] || one_shot=1
     _boxa::plan_resource_convergence "$name" "$live_memory" "$live_memory_swap" \
-        "$desired_memory" "$desired_memory_swap" "$usage" "$one_shot"
+        "$desired_memory" "$desired_memory_swap" "$usage" "$one_shot" \
+        "$_BOXA_HOST_MEMTOTAL_BYTES"
     [ -n "$_BOXA_RESOURCE_UPDATE_NEEDED" ] || return 0
 
     if docker update --memory "$desired_memory" --memory-swap "$desired_memory_swap" \
@@ -2565,6 +2566,11 @@ if [ "$MODE" = "uninstall" ]; then
     # Forward any flags (currently just --purge-ca) through to build.sh,
     # which owns the actual uninstall lifecycle (full_reset + dns-install
     # uninstall + optional CA purge + image / network / config cleanup).
+    # Ordering invariant: archive OOM evidence synchronously before build.sh
+    # stops and removes the Containers needed to correlate those events.
+    if [ -x "$BOXA_DIR/scripts/sweep-oom-events.sh" ]; then
+        "$BOXA_DIR/scripts/sweep-oom-events.sh" || true
+    fi
     exec "$BOXA_DIR/build.sh" --uninstall "$@"
 fi
 
@@ -3928,10 +3934,7 @@ else
     echo "Memory limit: $memory_display ($memory_source; override in ~/.config/boxa/resources.conf)"
 fi
 
-if [ -n "$_BOXA_HOST_MEMTOTAL_BYTES" ] \
-    && [ "$_BOXA_MEMORY_BYTES" -gt "$_BOXA_HOST_MEMTOTAL_BYTES" ]; then
-    echo "WARNING: Memory limit exceeds host RAM; protection is void."
-fi
+_boxa::memory_limit_host_warning "$_BOXA_MEMORY_BYTES" "$_BOXA_HOST_MEMTOTAL_BYTES"
 if [ -n "$_BOXA_HOST_MEMTOTAL_BYTES" ] \
     && _boxa::would_jointly_exhaust_host "$_BOXA_MEMORY_BYTES" "$_BOXA_HOST_MEMTOTAL_BYTES"; then
     echo "WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop."

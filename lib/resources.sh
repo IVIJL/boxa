@@ -272,13 +272,23 @@ _boxa::format_live_limit() {
     fi
 }
 
+# Print the unsafe-limit warning when host RAM is known and the proposed
+# Memory limit exceeds it. An unavailable host total intentionally stays silent.
+_boxa::memory_limit_host_warning() {
+    local proposed="$1" host_total="${2:-}"
+    if [ -n "$host_total" ] && [ "$proposed" -gt "$host_total" ]; then
+        printf 'WARNING: Memory limit exceeds host RAM; protection is void.\n'
+    fi
+}
+
 # Compare live and desired limits and compose the user-visible result without
 # touching Docker. Optional current usage enables the immediate-OOM warning.
 # Results are exposed in _BOXA_RESOURCE_UPDATE_* globals for docker-run.sh.
 _boxa::plan_resource_convergence() {
     local container="$1" live_memory="$2" live_memory_swap="$3"
     local desired_memory="$4" desired_memory_swap="$5" usage="${6:-}" one_shot="${7:-}"
-    local live_memory_display live_swap_display desired_memory_display desired_swap_display usage_display
+    local host_total="${8:-}"
+    local live_memory_display live_swap_display desired_memory_display desired_swap_display usage_display host_warning
 
     _BOXA_RESOURCE_UPDATE_NEEDED=
     _BOXA_RESOURCE_UPDATE_NOTICE=
@@ -299,11 +309,19 @@ _boxa::plan_resource_convergence() {
         _BOXA_RESOURCE_UPDATE_NOTICE+=" One-shot override; set ~/.config/boxa/resources.conf for a durable setting."
     fi
 
+    host_warning="$(_boxa::memory_limit_host_warning "$desired_memory" "$host_total")"
+    if [ -n "$host_warning" ]; then
+        _BOXA_RESOURCE_UPDATE_WARNING="$host_warning"
+    fi
+
     if [[ "$usage" =~ ^[0-9]+$ ]] \
         && { [ "$live_memory" -eq 0 ] || [ "$desired_memory" -lt "$live_memory" ]; } \
         && [ "$desired_memory" -lt "$usage" ]; then
         usage_display="$(_boxa::format_size "$usage")"
-        _BOXA_RESOURCE_UPDATE_WARNING="WARNING: ${container} currently uses ${usage_display}, above its new ${desired_memory_display} Memory limit; an immediate OOM kill may follow."
+        if [ -n "$_BOXA_RESOURCE_UPDATE_WARNING" ]; then
+            _BOXA_RESOURCE_UPDATE_WARNING+=$'\n'
+        fi
+        _BOXA_RESOURCE_UPDATE_WARNING+="WARNING: ${container} currently uses ${usage_display}, above its new ${desired_memory_display} Memory limit; an immediate OOM kill may follow."
     fi
 }
 
