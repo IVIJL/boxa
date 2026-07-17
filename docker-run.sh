@@ -1815,6 +1815,16 @@ if [ -d /var/log/boxa/allow-for/pending ] \
     detach_bg "$BOXA_DIR/scripts/deliver-allow-for-notification.sh" --sweep
 fi
 
+# --- OOM archive sweep -------------------------------------------------------
+# Read the shared kernel ring buffer after every boxa invocation and archive
+# newly observed boxa memcg OOM kills. The detached worker owns all parsing,
+# correlation, dedup, and notification work; this path stays one cheap guard
+# plus one fire-and-forget fork. If the VM dies before a sweep, its memory-only
+# dmesg evidence is irretrievably lost.
+if [ -x "$BOXA_DIR/scripts/sweep-oom-events.sh" ]; then
+    detach_bg "$BOXA_DIR/scripts/sweep-oom-events.sh"
+fi
+
 # --- Subcommand parsing ------------------------------------------------------
 
 CLEAN_VOLUMES=false

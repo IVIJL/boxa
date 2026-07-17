@@ -1,0 +1,3 @@
+[14000.200000] hostjob invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL)
+[14000.200050] oom-kill:constraint=CONSTRAINT_NONE,task=hostjob,pid=88,uid=0
+[14000.200100] Out of memory: Killed process 88 (hostjob) total-vm:2000kB, anon-rss:1024kB, file-rss:0kB
