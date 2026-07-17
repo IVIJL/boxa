@@ -165,7 +165,9 @@ _boxa::remove_resources_conf_keys() {
         fi
 
         key="${parsed%%=*}"
-        if [ "$key" != "$parsed" ]; then
+        if [ "$key" = "$parsed" ]; then
+            key=
+        else
             key="${key%"${key##*[![:space:]]}"}"
         fi
         if { [ "$scope" = global ] && [ -z "$section" ]; } \
@@ -441,7 +443,9 @@ _boxa::write_resources_conf() {
             body="${line%%#*}"
             comment="${line:${#body}}"
             key="${parsed%%=*}"
-            if [ "$key" != "$parsed" ]; then
+            if [ "$key" = "$parsed" ]; then
+                key=
+            else
                 key="${key%"${key##*[![:space:]]}"}"
             fi
             if { [ "$scope" = global ] && [ -z "$section" ]; } \

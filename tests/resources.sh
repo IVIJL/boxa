@@ -251,6 +251,13 @@ _boxa::write_resources_conf project /work/target 9g 10g
 assert_file_eq "project rewrite preserves comments, formatting, unknown lines, and other scopes" \
     "$expected_conf" "$BOXA_RESOURCES_CONF"
 
+printf '%s\n' '[/work/target]' 'memory' 'memory # note' > "$BOXA_RESOURCES_CONF"
+printf '%s\n' '[/work/target]' 'memory' 'memory # note' \
+    'memory = 8g' > "$expected_conf"
+_boxa::write_resources_conf project /work/target 8g
+assert_file_eq "project set preserves bare resource-like lines and appends the assignment" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
 printf '%s\n' 'memory = 7g' '[/work/other]' 'memory = 6g' > "$BOXA_RESOURCES_CONF"
 printf '%s\n' 'memory = 7g' '[/work/other]' 'memory = 6g' '' \
     '[/work/new project]' 'memory = 8g' 'memory_swap = 9g' > "$expected_conf"
@@ -390,6 +397,13 @@ assert_eq "project unset reports a change" "1" "$_BOXA_RESOURCES_CONF_CHANGED"
 resolve_ok /work/app
 assert_eq "project unset exposes global Memory fallback" "8589934592" "$_BOXA_MEMORY_BYTES"
 assert_eq "project unset exposes global source" "global config" "$_BOXA_MEMORY_SOURCE"
+
+printf '%s\n' '[/work/app]' 'memory = 6g' 'memory_swap = 7g' \
+    'memory' 'memory # note' > "$BOXA_RESOURCES_CONF"
+printf '%s\n' '[/work/app]' 'memory' 'memory # note' > "$expected_conf"
+_boxa::write_resources_conf project /work/app ''
+assert_file_eq "project unset preserves bare resource-like lines and their section" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
 
 printf '%s\n' 'memory = 8g' 'memory_swap = 7g' \
     '[/work/masked]' 'memory = 5g' > "$BOXA_RESOURCES_CONF"
