@@ -263,6 +263,12 @@ _boxa::write_resources_conf global '' 8g 9g
 assert_file_eq "missing global keys are inserted before project sections" \
     "$expected_conf" "$BOXA_RESOURCES_CONF"
 
+printf '%s\n' 'memory = 7g' '[/work/app]' 'memory = 6g' > "$BOXA_RESOURCES_CONF"
+printf '%s\n' 'memory = 8g' 'memory_swap = 9g' '[/work/app]' 'memory = 6g' > "$expected_conf"
+_boxa::write_resources_conf global '' 8g 9g
+assert_file_eq "missing global memory_swap is appended independently" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
 printf '%s' $'# global\nmemory=7g # keep\nmemory_swap = 8g\n[/work/app]\nmemory=6g' \
     > "$BOXA_RESOURCES_CONF"
 printf '%s' $'# global\nmemory=9g # keep\nmemory_swap = 10g\n[/work/app]\nmemory=6g' \
@@ -286,6 +292,21 @@ assert_file_eq "invalid size leaves config untouched" "$expected_conf" "$BOXA_RE
 assert_fail "writer rejects inherited memory_swap below new memory" \
     _boxa::write_resources_conf global '' 9g
 assert_file_eq "invalid resulting pair leaves config untouched" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+printf '%s\n' 'memory = 4g' 'memory_swap = 8g' \
+    '[/work/swap-only]' 'memory_swap = 6g' > "$BOXA_RESOURCES_CONF"
+cp "$BOXA_RESOURCES_CONF" "$expected_conf"
+writer_stderr="$_TMPROOT/writer.stderr"
+if _boxa::write_resources_conf global '' 7g 8g 2> "$writer_stderr"; then
+    printf 'FAIL  global writer rejects invalid effective project pair\n      expected failure\n'
+    fail_count=$((fail_count + 1))
+else
+    printf 'PASS  global writer rejects invalid effective project pair\n'
+fi
+assert_contains "global writer error names the offending project section" \
+    "[/work/swap-only]" "$(< "$writer_stderr")"
+assert_file_eq "invalid effective project pair leaves config untouched" \
     "$expected_conf" "$BOXA_RESOURCES_CONF"
 
 printf '%s\n' 'memory = 7g' '[/work/app]' 'memory = 6g' > "$BOXA_RESOURCES_CONF"
@@ -343,6 +364,20 @@ printf '%s' $'# global\nmemory = 8g # remove\nmemory_swap=9g\nunknown = preserve
 printf '%s' $'# global\nunknown = preserve\n[/work/app]\nmemory = 6g' > "$expected_conf"
 _boxa::write_resources_conf global '' ''
 assert_file_eq "global unset preserves unrelated bytes and final-newline state" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+printf '%s\n' 'memory = 4g' '[/work/swap-only]' 'memory_swap = 6g' \
+    > "$BOXA_RESOURCES_CONF"
+cp "$BOXA_RESOURCES_CONF" "$expected_conf"
+if _boxa::write_resources_conf global '' '' 2> "$writer_stderr"; then
+    printf 'FAIL  global unset rejects invalid derived effective project pair\n      expected failure\n'
+    fail_count=$((fail_count + 1))
+else
+    printf 'PASS  global unset rejects invalid derived effective project pair\n'
+fi
+assert_contains "global unset error names the offending project section" \
+    "[/work/swap-only]" "$(< "$writer_stderr")"
+assert_file_eq "invalid effective pair after global unset leaves config untouched" \
     "$expected_conf" "$BOXA_RESOURCES_CONF"
 
 cp "$BOXA_RESOURCES_CONF" "$expected_conf"

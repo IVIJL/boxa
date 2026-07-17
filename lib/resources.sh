@@ -190,6 +190,71 @@ _boxa::remove_resources_conf_keys() {
     unset -f _boxa::emit_resources_line _boxa::flush_resources_target
 }
 
+# Reject a global change if any project that inherits a changed key would
+# resolve to an invalid Memory and Memory+swap pair.
+_boxa::validate_global_project_pairs() {
+    local memory_value="$1" memory_swap_value="$2"
+    local old_memory="$_BOXA_RESOURCES_GLOBAL_MEMORY"
+    local old_swap="$_BOXA_RESOURCES_GLOBAL_MEMORY_SWAP"
+    local old_memory_set="$_BOXA_RESOURCES_GLOBAL_MEMORY_SET"
+    local old_swap_set="$_BOXA_RESOURCES_GLOBAL_MEMORY_SWAP_SET"
+    local memory_changed='' swap_changed='' section affected validation_error
+    local -A project_sections=()
+
+    if [ -n "$memory_value" ]; then
+        _BOXA_RESOURCES_GLOBAL_MEMORY="$memory_value"
+        _BOXA_RESOURCES_GLOBAL_MEMORY_SET=1
+        memory_changed=1
+        if [ -n "$memory_swap_value" ]; then
+            _BOXA_RESOURCES_GLOBAL_MEMORY_SWAP="$memory_swap_value"
+            _BOXA_RESOURCES_GLOBAL_MEMORY_SWAP_SET=1
+            swap_changed=1
+        fi
+    else
+        memory_changed="$_BOXA_RESOURCES_GLOBAL_MEMORY_SET"
+        swap_changed="$_BOXA_RESOURCES_GLOBAL_MEMORY_SWAP_SET"
+        _BOXA_RESOURCES_GLOBAL_MEMORY=
+        _BOXA_RESOURCES_GLOBAL_MEMORY_SWAP=
+        _BOXA_RESOURCES_GLOBAL_MEMORY_SET=
+        _BOXA_RESOURCES_GLOBAL_MEMORY_SWAP_SET=
+    fi
+
+    for section in "${!_BOXA_RESOURCES_PROJECT_MEMORY[@]}"; do
+        project_sections["$section"]=1
+    done
+    for section in "${!_BOXA_RESOURCES_PROJECT_MEMORY_SWAP[@]}"; do
+        project_sections["$section"]=1
+    done
+
+    for section in "${!project_sections[@]}"; do
+        affected=
+        if [ -z "${_BOXA_RESOURCES_PROJECT_MEMORY[$section]+set}" ] \
+            && [ -n "$memory_changed" ]; then
+            affected=1
+        fi
+        if [ -z "${_BOXA_RESOURCES_PROJECT_MEMORY_SWAP[$section]+set}" ] \
+            && [ -n "$swap_changed" ]; then
+            affected=1
+        fi
+        [ -n "$affected" ] || continue
+
+        if ! validation_error="$(_boxa::resolve_resources "$section" 2>&1)"; then
+            _BOXA_RESOURCES_GLOBAL_MEMORY="$old_memory"
+            _BOXA_RESOURCES_GLOBAL_MEMORY_SWAP="$old_swap"
+            _BOXA_RESOURCES_GLOBAL_MEMORY_SET="$old_memory_set"
+            _BOXA_RESOURCES_GLOBAL_MEMORY_SWAP_SET="$old_swap_set"
+            printf 'Invalid resulting resource limits for project section [%s]: %s\n' \
+                "$section" "$validation_error" >&2
+            return 1
+        fi
+    done
+
+    _BOXA_RESOURCES_GLOBAL_MEMORY="$old_memory"
+    _BOXA_RESOURCES_GLOBAL_MEMORY_SWAP="$old_swap"
+    _BOXA_RESOURCES_GLOBAL_MEMORY_SET="$old_memory_set"
+    _BOXA_RESOURCES_GLOBAL_MEMORY_SWAP_SET="$old_swap_set"
+}
+
 # Replace or remove the targeted Memory keys without sourcing or normalising the config.
 # Existing lines retain their formatting and comments; unrelated bytes pass
 # through unchanged. Validation completes before the config directory or file
@@ -234,6 +299,10 @@ _boxa::write_resources_conf() {
             return 0
         fi
 
+        if [ "$scope" = global ]; then
+            _boxa::validate_global_project_pairs '' '' || return 1
+        fi
+
         temp="$(mktemp "${conf}.tmp.XXXXXX")" || return 1
         if [ -s "$conf" ] \
             && [ "$(tail -c 1 "$conf" | wc -l | tr -d ' ')" -gt 0 ]; then
@@ -275,6 +344,9 @@ _boxa::write_resources_conf() {
             "$memory_swap_bytes" "$memory_bytes" >&2
         return 1
     fi
+    if [ "$scope" = global ]; then
+        _boxa::validate_global_project_pairs "$memory_value" "$memory_swap_value" || return 1
+    fi
 
     conf_dir="${conf%/*}"
     [ "$conf_dir" != "$conf" ] || conf_dir=.
@@ -293,12 +365,14 @@ _boxa::write_resources_conf() {
             parsed="${parsed%"${parsed##*[![:space:]]}"}"
 
             if [[ "$parsed" == \[*\] ]]; then
-                if [ "$scope" = global ] && [ -z "$target_seen" ]; then
-                    [ -n "$output_started" ] && printf '\n' >> "$temp"
-                    printf 'memory = %s' "$memory_value" >> "$temp"
-                    output_started=1
-                    memory_seen=1
-                    if [ -n "$memory_swap_value" ]; then
+                if [ "$scope" = global ]; then
+                    if [ -z "$memory_seen" ]; then
+                        [ -n "$output_started" ] && printf '\n' >> "$temp"
+                        printf 'memory = %s' "$memory_value" >> "$temp"
+                        output_started=1
+                        memory_seen=1
+                    fi
+                    if [ -n "$memory_swap_value" ] && [ -z "$swap_seen" ]; then
                         printf '\nmemory_swap = %s' "$memory_swap_value" >> "$temp"
                         swap_seen=1
                     fi
@@ -372,12 +446,16 @@ _boxa::write_resources_conf() {
         done < "$conf"
     fi
 
-    if [ "$scope" = global ] && [ -z "$target_seen" ]; then
-        [ -z "$output_started" ] || printf '\n' >> "$temp"
-        printf 'memory = %s' "$memory_value" >> "$temp"
-        output_started=1
-        if [ -n "$memory_swap_value" ]; then
-            printf '\nmemory_swap = %s' "$memory_swap_value" >> "$temp"
+    if [ "$scope" = global ]; then
+        if [ -z "$memory_seen" ]; then
+            [ -z "$output_started" ] || printf '\n' >> "$temp"
+            printf 'memory = %s' "$memory_value" >> "$temp"
+            output_started=1
+        fi
+        if [ -n "$memory_swap_value" ] && [ -z "$swap_seen" ]; then
+            [ -z "$output_started" ] || printf '\n' >> "$temp"
+            printf 'memory_swap = %s' "$memory_swap_value" >> "$temp"
+            output_started=1
         fi
     elif [ "$scope" = project ]; then
         if [ -z "$target_seen" ]; then
