@@ -88,53 +88,204 @@ Examples:
   boxa port 3000                 Route 3000.<project>.test (and external fallback URL)
   boxa allow pypi.org            Allow pypi.org (and *.pypi.org) through firewall
   boxa cursor                    Open Cursor for CWD project
+
+Run 'boxa <command> --help' for details.
 EOF
     exit 0
 }
 
-# Pending per-command help for issue 02. This prose was intentionally moved
-# out of the overview so its behavioral details remain available to that slice.
-: <<'BOXA_COMMAND_HELP_DETAILS'
-boxa ports defaults to running containers and only listening ports.
-Inner Docker connects to a forwarded port at 10.0.2.2:<local-port>.
+show_command_help() {
+    local command="${1:-}"
 
-boxa doctor repairs host provisioning regardless of repo state: it silently
-fixes unconditional steps and reports skipped or declined elective steps.
-With --fix [step…], it repairs all elective steps or only the named step ids;
-plain boxa doctor lists those ids.
+    case "$command" in
+        agent-browser)
+            cat <<'EOF'
+Usage: boxa agent-browser <command> [args]
 
-boxa uninstall --purge-ca also strips the mkcert root CA from system trust
-stores (UAC on WSL2).
+Manage the Agent-browser session for a boxa Container. The session launches
+Host agent Chrome on the host and an in-Container CDP bridge. See ADR 0010.
 
-boxa allow entries match the domain and all subdomains.
-boxa allow-for opens a window for N minutes (default 15) in one container;
-non-allowlist domains are passively allowed and recorded. With no arguments it
-shows the CWD container's status, or starts a 15-minute window if none is active.
-See ADR 0009.
+Commands:
+  start [--no-open] [project]             Start a session
+  stop [project]                          Stop a session
+  status [project]                        Show session status
+  open [--project|-p NAME] <url> [...]    Open one or more URLs
+  allow-for <N> [project]                 Open a network window for N minutes
+  allow-for --stop [project]              Close the window immediately
+  allow [domain]                          List or add an allowlist entry
+  deny <domain>                           Remove an allowlist entry
+  blocked [--project|-p NAME]             Pick denied hosts and allow them
 
-boxa agent-browser commands are start, stop, status, open, allow-for, allow,
-deny, and blocked. The command launches Host agent Chrome on the host and the
-in-container CDP bridge. See ADR 0010.
-boxa agent-browser allow-for opens a network window for N minutes (proxy in
-harvest mode plus JSONL log); --stop closes it immediately.
-boxa agent-browser allow matches only the literal host, unlike boxa allow.
-Quote a glob for subdomains (for example, '*.example.com'). It automatically
-pairs apex and www hosts (qr.cz also adds www.qr.cz) and SIGHUPs every live
-proxy.
-boxa agent-browser deny removes an entry and its apex/www counterpart, then
-SIGHUPs every live proxy.
-boxa agent-browser blocked picks from the last session's denied hosts in a live
-or archived proxy log and allows them. It resolves -p, then the CWD basename,
-then offers a picker over live sessions and containers with archived logs.
+The allow-for window puts the proxy in harvest mode and records a JSONL log.
+Agent-browser allowlist entries match only the literal host, unlike boxa allow.
+Quote a glob for subdomains (for example, '*.example.com'). Allow automatically
+pairs apex and www hosts (qr.cz also adds www.qr.cz); deny removes both. Both
+commands SIGHUP every live proxy.
 
-boxa mcp commands are import, list, render, doctor, add, install, enable,
-disable, and remove. Read-only commands are currently mcp import (dry-run
-discovery) and mcp list --inherited. See ADR 0013.
+blocked reads the last session's live or archived proxy log. It resolves an
+explicit project, then the CWD basename, then offers a picker over live sessions
+and Containers with archived logs.
 
-boxa build uses cache by default. --no-cache performs a full rebuild;
---clean wipes build cache and dangling images before rebuilding; and
---progress=plain shows the full build log.
-BOXA_COMMAND_HELP_DETAILS
+Examples:
+  boxa agent-browser start my-app
+  boxa agent-browser open https://example.com
+  boxa agent-browser allow '*.example.com'
+  boxa agent-browser blocked -p my-app
+EOF
+            ;;
+        mcp)
+            "$BOXA_DIR/scripts/mcp-cli.sh" --help
+            ;;
+        allow-for)
+            cat <<'EOF'
+Usage:
+  boxa allow-for [N] [project]
+  boxa allow-for --stop [project]
+
+Open an Allow-for window for N minutes (default 15) in one Container. Domains
+outside the Allowlist are passively allowed and recorded. With no arguments,
+show the CWD Container's status when a window is active; otherwise start a
+15-minute window. Starting again resets the clock. See ADR 0009.
+
+Examples:
+  boxa allow-for 30
+  boxa allow-for 30 my-app
+  boxa allow-for --stop
+EOF
+            ;;
+        allow)
+            cat <<'EOF'
+Usage: boxa allow [domain]
+
+With no domain, list the firewall Allowlist. Otherwise add the domain; an entry
+matches that domain and all of its subdomains.
+
+Example:
+  boxa allow pypi.org
+EOF
+            ;;
+        mem)
+            cat <<'EOF'
+Usage: boxa mem [project|path]
+
+Show one Project's configured Memory and Memory+swap limits, current Container
+usage, remaining headroom, and recent OOM evidence. The target defaults to the
+Project for the current directory. Process detail is best-effort where the
+platform does not expose per-process cgroup attribution. See ADR 0020.
+
+Examples:
+  boxa mem
+  boxa mem my-app
+  boxa mem ~/projects/app
+EOF
+            ;;
+        doctor)
+            cat <<'EOF'
+Usage: boxa doctor [--fix [step…]]
+
+Check host provisioning regardless of repository state. The default run
+silently repairs unconditional steps and reports skipped or declined elective
+steps. --fix repairs every elective step, or only the named step ids. Run plain
+boxa doctor to list the available ids. See ADR 0017.
+
+Examples:
+  boxa doctor
+  boxa doctor --fix
+  boxa doctor --fix mcp-onboarding
+EOF
+            ;;
+        build)
+            cat <<'EOF'
+Usage: boxa build [--no-cache|--clean|--progress=plain]
+
+Build or rebuild the boxa image. Builds use the cache by default.
+
+Options:
+  --no-cache        Perform a full rebuild without cache
+  --clean           Wipe build cache and dangling images before rebuilding
+  --progress=plain  Show the full build log
+
+Examples:
+  boxa build
+  boxa build --no-cache
+EOF
+            ;;
+        uninstall)
+            cat <<'EOF'
+Usage: boxa uninstall [--purge-ca]
+
+Remove all boxa Containers, volumes, and the image. --purge-ca also removes the
+mkcert root CA from system trust stores; on WSL2 this requires UAC approval.
+EOF
+            ;;
+        ports)
+            cat <<'EOF'
+Usage: boxa ports [--all] [--external] [-m|--machine-readable]
+
+List active port routes. By default, include only running Containers and ports
+that are currently listening.
+
+Options:
+  --all       Include stopped Containers and skip the listening filter
+  --external  Show the external sslip.io URL alongside the active URL
+  -m, --machine-readable
+              Emit tab-separated rows
+              (container<TAB>port<TAB>url[<TAB>external]) without headers,
+              separators, or column alignment
+
+Example:
+  boxa ports --all
+EOF
+            ;;
+        connect)
+            cat <<'EOF'
+Usage:
+  boxa connect
+  boxa connect <target> <port> [local-port] [--from source]
+
+With no arguments, pick a source, target boxaes, and published TCP services.
+The explicit form forwards one TCP port from the source boxa to a target.
+Inner Docker connects to the forward at 10.0.2.2:<local-port>.
+
+Examples:
+  boxa connect api 5432
+  boxa connect db 5432 15432
+  boxa connect api 5432 --from web
+EOF
+            ;;
+        ls)             printf 'boxa ls                        List running containers\n' ;;
+        stop)           printf 'boxa stop [name] [--clean]     Stop container (--clean removes volumes)\n' ;;
+        remove)         printf 'boxa remove [name]             Remove project data (volumes)\n' ;;
+        port)           printf 'boxa port <port>               Expose port via Traefik\n' ;;
+        connections)    printf 'boxa connections               List cross-boxa TCP forwards\n' ;;
+        deny)           printf 'boxa deny [domain]             Remove allowed domain (interactive)\n' ;;
+        blocked)        printf 'boxa blocked                   Show blocked DNS queries, allow interactively\n' ;;
+        dns-install)    printf 'boxa dns-install [--local|--external]\n                                   Configure host resolver for *.test (per-OS)\n' ;;
+        dns-status)     printf 'boxa dns-status                Show DNS mode + resolver state + verification\n' ;;
+        dns-uninstall)  printf 'boxa dns-uninstall             Remove host resolver config + dns.conf\n' ;;
+        update)         printf 'boxa update                    Update boxa (pull repo + rebuild image)\n' ;;
+        prune)          printf 'boxa prune [--all]             Remove old build cache (--all = everything)\n' ;;
+        claude-token)   printf 'boxa claude-token              Generate/regenerate Claude Code token\n' ;;
+        sync-skills)    printf 'boxa sync-skills               Sync host skills to all running containers\n' ;;
+        cursor)         printf 'boxa cursor [name]             Open Cursor attached to running boxa\n' ;;
+        code)           printf 'boxa code [name]               Open VS Code attached to running boxa\n' ;;
+        clip)           printf 'boxa clip                      Grab clipboard image for container use\n' ;;
+        ssh-config)     printf 'boxa ssh-config [add|edit]     Manage boxa SSH config\n' ;;
+        '')
+            show_help
+            ;;
+        *)
+            printf "Unknown boxa command: %s\nRun 'boxa help' for the command overview.\n" "$command" >&2
+            exit 2
+            ;;
+    esac
+
+    case "$command" in
+        agent-browser|mcp|allow-for|allow|mem|doctor|build|uninstall|ports|connect) ;;
+        *) printf "\nRun 'boxa <command> --help' for details.\n" ;;
+    esac
+    exit 0
+}
 
 SSH_WARNING=""
 BOXA_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -1998,8 +2149,13 @@ SSH_CONFIG_MOUNT=false
 CLI_MEMORY=
 CLI_MEMORY_SWAP=
 
+case "${2:-}" in
+    -h|--help|help) show_command_help "${1:-}" ;;
+esac
+
 case "${1:-}" in
-    -h|--help|help) show_help ;;
+    -h|--help) show_help ;;
+    help)     shift; show_command_help "${1:-}" ;;
     ls)      MODE="ls";      shift ;;
     mem)     MODE="mem";     shift; MEM_TARGET="${1:-}" ;;
     stop)    MODE="stop";    shift; PROJECT_FILTER=""
@@ -2695,15 +2851,7 @@ if [ "$MODE" = "ports" ]; then
             --all)      PORTS_SHOW_ALL=true ;;
             --external) PORTS_SHOW_EXTERNAL=true ;;
             -m|--machine-readable) PORTS_MACHINE=true ;;
-            -h|--help)
-                echo "Usage: boxa ports [--all] [--external] [-m|--machine-readable]"
-                echo "  --all       Include stopped containers and skip the listening filter."
-                echo "  --external  Show the external sslip.io URL alongside the active URL."
-                echo "  -m, --machine-readable"
-                echo "              Emit tab-separated rows (container<TAB>port<TAB>url[<TAB>external])"
-                echo "              with no headers, no separators, no column alignment."
-                exit 0
-                ;;
+            -h|--help) show_command_help ports ;;
             *) echo "Unknown flag: $arg" >&2; exit 2 ;;
         esac
     done
@@ -2917,13 +3065,7 @@ if [ "$MODE" = "connect" ]; then
             --from=*)
                 SOURCE_TOKEN="${1#--from=}"
                 ;;
-            -h|--help)
-                echo "Usage: boxa connect"
-                echo "       boxa connect <target> <port> [local-port] [--from source]"
-                echo "Example: boxa connect api 5432"
-                echo "Inner Docker containers connect to 10.0.2.2:<local-port>."
-                exit 0
-                ;;
+            -h|--help) show_command_help connect ;;
             *)
                 POSITIONAL+=("$1")
                 ;;
@@ -3545,10 +3687,10 @@ if [ "$MODE" = "agent-browser" ]; then
             ;;
     esac
 
-    # help passes through without container resolution.
+    # Help stays in this dispatcher so both public forms use one text.
     case "$AGENT_BROWSER_SUB" in
         -h|--help|help)
-            exec "$BOXA_DIR/scripts/agent-browser-broker.sh" "$AGENT_BROWSER_SUB"
+            show_command_help agent-browser
             ;;
     esac
 
