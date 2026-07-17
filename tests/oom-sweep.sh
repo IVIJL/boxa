@@ -117,6 +117,22 @@ run_fixture boxa.dmesg
 assert_eq "repeat does not duplicate archive" "1" "$(archive_count)"
 assert_eq "repeat does not re-notify" "1" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
 
+# The systemd cgroup driver reports Docker IDs in docker-<id>.scope paths.
+systemd_parsed=$(_boxa::oom_parse_dmesg < "$FIXTURE_DIR/systemd.dmesg")
+assert_contains "systemd cgroup path parses the container ID" \
+    $'EVENT\t22345.678950\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t2345\tsystemd-worker\t3984588' \
+    <(printf '%s\n' "$systemd_parsed")
+reset_case
+run_fixture systemd.dmesg
+systemd_record="$BOXA_OOM_ARCHIVE_DIR/boxa-media-22345.678950.log"
+assert_eq "systemd cgroup event archived once" "1" "$(archive_count)"
+assert_contains "systemd archive keeps kernel-selected victim" \
+    "Kernel-selected victim: systemd-worker (PID 2345)" "$systemd_record"
+run_fixture systemd.dmesg
+assert_eq "systemd cgroup repeat does not duplicate archive" "1" "$(archive_count)"
+assert_eq "systemd cgroup repeat does not re-notify" "1" \
+    "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+
 # Default dmesg pads short uptimes after `[`. A boot-time OOM must still be
 # parsed, archived, and deduplicated on a repeated snapshot.
 reset_case
@@ -213,6 +229,25 @@ reset_case
 run_fixture empty.dmesg
 assert_eq "empty log creates no archive" "0" "$(archive_count)"
 assert_eq "empty log sends no notification" "0" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+
+# An unreadable kernel log must leave the old cutoff and all outputs untouched.
+reset_case
+printf '%s\n' '12000.000000' 'boot-a' > "$BOXA_OOM_STATE_FILE"
+cat > "$TEST_TMP/dmesg" <<'STUB'
+#!/bin/bash
+printf '%s\n' '[12345.678950] oom-kill: oom_memcg=/docker/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+printf '%s\n' 'dmesg: read kernel buffer failed: Operation not permitted' >&2
+exit 1
+STUB
+chmod +x "$TEST_TMP/dmesg"
+unset BOXA_OOM_DMESG_FILE
+dmesg_failure_output=$(PATH="$TEST_TMP:$PATH" _boxa::oom_sweep)
+assert_eq "failed dmesg sweep stays silent" "" "$dmesg_failure_output"
+assert_eq "failed dmesg sweep preserves state" \
+    $'12000.000000\nboot-a' "$(< "$BOXA_OOM_STATE_FILE")"
+assert_eq "failed dmesg sweep creates no archive" "0" "$(archive_count)"
+assert_eq "failed dmesg sweep sends no notification" "0" \
+    "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
 
 # docker-run.sh is not source-safe, so extract the destructive-removal helper
 # and assert its decision-layer ordering with canned sweep and Docker seams.

@@ -1,0 +1,4 @@
+[22345.678901] systemd-worker invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=0
+[22345.678950] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=...,mems_allowed=0,oom_memcg=/system.slice/docker-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.scope,task_memcg=/system.slice/docker-aaaaaaaaaaaa.scope,task=systemd-worker,pid=2345,uid=1000
+[22345.679001] Memory cgroup out of memory: Killed process 2345 (systemd-worker) total-vm:5000000kB, anon-rss:3984588kB, file-rss:1024kB, shmem-rss:0kB, UID:1000 pgtables:9000kB oom_score_adj:0
+[22346.000000] ordinary kernel line after the event

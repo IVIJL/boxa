@@ -197,6 +197,22 @@ Two honest caveats:
 
 ## Troubleshooting
 
+### No OOM archive entries appear
+
+The best-effort/eventual archive and desktop notification require the host
+`dmesg` command to read the kernel log. Run `dmesg` as the same unprivileged
+host user that runs boxa. If it fails with `Operation not permitted`, check
+`kernel.dmesg_restrict`; a value of `1` blocks the sweep on native Linux.
+Boxa deliberately leaves its cutoff untouched when `dmesg` fails so a later
+sweep with readable access can still archive the old kernel-selected victim.
+
+This path is verified on WSL2/Docker Desktop, where host `dmesg` exposes the
+shared Linux VM ring buffer. macOS Docker Desktop does not expose its Linux
+VM kernel log through host `dmesg`, so it gets no OOM archive entries or
+desktop OOM notifications. The live surfaces remain available on either
+kind of host: `boxa ls`, `boxa mem`, and the agent hook read cgroup files and
+`docker inspect` rather than the kernel log.
+
 ### A single process with runaway RSS
 
 The ugrep-style incident: one process grows without bound until it hits the

@@ -143,6 +143,14 @@ no daemon anywhere.
 - **If the VM dies before any `boxa` invocation sweeps, the OOM event is
   lost** — the no-daemon diagnostics layer is best-effort/eventual, and the
   ring buffer does not survive a restart. Enforcement is unaffected.
+- **The kernel-log source requires readable host `dmesg`.** Unprivileged
+  access to the shared VM ring buffer is verified on the target WSL2/Docker
+  Desktop host. macOS Docker Desktop exposes no Linux VM kernel log through
+  host `dmesg`, while native Linux hosts with `kernel.dmesg_restrict=1` deny
+  an unprivileged sweep; those hosts get no OOM archive or desktop
+  notification. Live `boxa ls`, `boxa mem`, and agent-hook surfaces are
+  unaffected because they read cgroup files and `docker inspect`, not the
+  kernel log.
 - **No per-nested-container attribution, ever.** The inner dockerd runs
   without cgroups, so `boxa mem` can only show a project aggregate and top
   processes by RSS.

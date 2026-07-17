@@ -53,6 +53,7 @@ _boxa::oom_parse_dmesg() {
     local event_timestamp="" container_id=""
     local victim_pid="" victim_name="" victim_rss_kb=""
     local killed_re='Killed[[:space:]]process[[:space:]]([0-9]+)[[:space:]]\(([^)]*)\).*anon-rss:([0-9]+)kB'
+    local docker_memcg_re='oom_memcg=(/docker/([[:xdigit:]]{64})|/system[.]slice/docker-([[:xdigit:]]{64})[.]scope)(,|[[:space:]])'
 
     while IFS= read -r line || [ -n "$line" ]; do
         if [[ "$line" =~ ^\[[[:space:]]*([0-9]+\.[0-9]+)\] ]]; then
@@ -63,9 +64,9 @@ _boxa::oom_parse_dmesg() {
         fi
 
         if [[ "$line" == *"oom-kill:"* ]]; then
-            if [[ "$line" =~ oom_memcg=/docker/([[:xdigit:]]{64})(,|[[:space:]]) ]]; then
+            if [[ "$line" =~ $docker_memcg_re ]]; then
                 event_timestamp="$timestamp"
-                container_id="${BASH_REMATCH[1]}"
+                container_id="${BASH_REMATCH[2]:-${BASH_REMATCH[3]}}"
                 victim_pid=""
                 victim_name=""
                 victim_rss_kb=""
@@ -287,13 +288,18 @@ _boxa::oom_process_event() {
 # file dedup prevents any surviving fixture or corrupt-state rescan from
 # notifying twice.
 _boxa::oom_sweep() {
-    mkdir -p "$BOXA_OOM_ARCHIVE_DIR" 2>/dev/null || return 0
-
+    local dmesg_snapshot
     local previous latest="" pending="" cutoff advance failed=false
     local row kind timestamp container_id victim_pid victim_name victim_rss_kb
     local -a parsed=()
+
+    # A failed read is not an empty snapshot: retain all state so a later
+    # sweep with permission to read the kernel log can still see old events.
+    dmesg_snapshot=$(_boxa::oom_read_dmesg) || return 0
+    mkdir -p "$BOXA_OOM_ARCHIVE_DIR" 2>/dev/null || return 0
+
     previous=$(_boxa::oom_read_state)
-    mapfile -t parsed < <(_boxa::oom_read_dmesg | _boxa::oom_parse_dmesg)
+    mapfile -t parsed < <(printf '%s' "$dmesg_snapshot" | _boxa::oom_parse_dmesg)
 
     for row in "${parsed[@]}"; do
         IFS=$'\t' read -r kind timestamp _ <<< "$row"
