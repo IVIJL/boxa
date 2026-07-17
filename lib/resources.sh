@@ -21,6 +21,10 @@ _BOXA_MEMORY_SOURCE=
 _BOXA_MEMORY_SWAP_SOURCE=
 _BOXA_HOST_MEMTOTAL_BYTES=
 
+_BOXA_RESOURCE_UPDATE_NEEDED=
+_BOXA_RESOURCE_UPDATE_NOTICE=
+_BOXA_RESOURCE_UPDATE_WARNING=
+
 _boxa::reset_resources_cache() {
     _BOXA_RESOURCES_CONF_LOADED=
     _BOXA_RESOURCES_GLOBAL_MEMORY=
@@ -233,6 +237,52 @@ _boxa::format_size() {
     fi
     awk -v bytes="$bytes" -v divisor="$divisor" -v suffix="$suffix" \
         'BEGIN { value = bytes / divisor; if (value == int(value)) printf "%d%s", value, suffix; else printf "%.1f%s", value, suffix }'
+}
+
+# Render a live Docker limit for convergence notices. Docker reports zero
+# Memory and zero/-1 MemorySwap for unconstrained legacy Containers.
+_boxa::format_live_limit() {
+    local bytes="$1"
+    if [ "$bytes" -le 0 ]; then
+        printf 'unlimited'
+    else
+        _boxa::format_size "$bytes"
+    fi
+}
+
+# Compare live and desired limits and compose the user-visible result without
+# touching Docker. Optional current usage enables the immediate-OOM warning.
+# Results are exposed in _BOXA_RESOURCE_UPDATE_* globals for docker-run.sh.
+_boxa::plan_resource_convergence() {
+    local container="$1" live_memory="$2" live_memory_swap="$3"
+    local desired_memory="$4" desired_memory_swap="$5" usage="${6:-}" one_shot="${7:-}"
+    local live_memory_display live_swap_display desired_memory_display desired_swap_display usage_display
+
+    _BOXA_RESOURCE_UPDATE_NEEDED=
+    _BOXA_RESOURCE_UPDATE_NOTICE=
+    _BOXA_RESOURCE_UPDATE_WARNING=
+
+    if [ "$live_memory" -eq "$desired_memory" ] \
+        && [ "$live_memory_swap" -eq "$desired_memory_swap" ]; then
+        return 0
+    fi
+
+    _BOXA_RESOURCE_UPDATE_NEEDED=1
+    live_memory_display="$(_boxa::format_live_limit "$live_memory")"
+    live_swap_display="$(_boxa::format_live_limit "$live_memory_swap")"
+    desired_memory_display="$(_boxa::format_size "$desired_memory")"
+    desired_swap_display="$(_boxa::format_size "$desired_memory_swap")"
+    _BOXA_RESOURCE_UPDATE_NOTICE="Memory limits updated for ${container}: memory ${live_memory_display} -> ${desired_memory_display}; memory+swap ${live_swap_display} -> ${desired_swap_display}."
+    if [ -n "$one_shot" ]; then
+        _BOXA_RESOURCE_UPDATE_NOTICE+=" One-shot override; set ~/.config/boxa/resources.conf for a durable setting."
+    fi
+
+    if [[ "$usage" =~ ^[0-9]+$ ]] \
+        && { [ "$live_memory" -eq 0 ] || [ "$desired_memory" -lt "$live_memory" ]; } \
+        && [ "$desired_memory" -lt "$usage" ]; then
+        usage_display="$(_boxa::format_size "$usage")"
+        _BOXA_RESOURCE_UPDATE_WARNING="WARNING: ${container} currently uses ${usage_display}, above its new ${desired_memory_display} Memory limit; an immediate OOM kill may follow."
+    fi
 }
 
 # Sum HostConfig.Memory for running user Containers. A newline-delimited file

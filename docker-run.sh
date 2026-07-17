@@ -26,7 +26,8 @@ show_help() {
 Boxa — portable dev container with default-deny firewall
 
 Usage:
-  boxa [--ssh-config] [path]     Start/attach container for project
+  boxa [--ssh-config] [--memory SIZE] [--memory-swap SIZE] [path]
+                                   Start/attach container for project
   boxa <name>                    Attach to running boxa-<name>
   boxa ls                        List running containers
   boxa stop [name] [--clean]     Stop container (--clean removes volumes)
@@ -116,6 +117,7 @@ Examples:
   boxa                           Mount CWD at host project path inside container
   boxa ~/projects/app            Mount specific project
   boxa --ssh-config ~/app        Mount with full host SSH config
+  boxa --memory 4g ~/app         One-shot Memory limit override
   boxa ssh-config add            Add SSH host to boxa config
   boxa cursor                     Open Cursor for CWD project
   boxa cursor my-app              Open Cursor for specific boxa
@@ -1624,6 +1626,109 @@ restart_exited_container() {
     start_boxa_connections "$name"
 }
 
+# Read the absolute host Project path recorded in a Container's environment.
+# Inspecting Config.Env avoids an exec and works during early startup too.
+_boxa::container_project_path() {
+    local name="$1"
+    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$name" 2>/dev/null \
+        | awk 'index($0, "BOXA_PROJECT_HOST_PATH=") == 1 && !found {
+            sub(/^BOXA_PROJECT_HOST_PATH=/, "")
+            print
+            found=1
+        }'
+}
+
+# Read current cgroup usage. BOXA_MEMORY_USAGE_FILE is the no-Docker unit-test
+# seam; production reads the unified-cgroup value from inside the Container.
+_boxa::container_memory_usage_bytes() {
+    local name="$1"
+    if [ -n "${BOXA_MEMORY_USAGE_FILE:-}" ]; then
+        cat "$BOXA_MEMORY_USAGE_FILE"
+    else
+        docker exec "$name" cat /sys/fs/cgroup/memory.current 2>/dev/null
+    fi
+}
+
+# Converge one existing Container. Config/CLI validation errors are returned to
+# touched-container callers; Docker/race failures are silent and non-fatal.
+_boxa::converge_container_resources() {
+    local name="$1" project_path="${2:-}" cli_memory="${3:-}" cli_memory_swap="${4:-}"
+    local desired_memory desired_memory_swap live live_memory live_memory_swap extra usage="" one_shot=""
+
+    if [ -z "$project_path" ]; then
+        project_path="$(_boxa::container_project_path "$name" 2>/dev/null || true)"
+    fi
+    [ -n "$project_path" ] || return 0
+
+    if ! _boxa::resolve_resources "$project_path" "$cli_memory" "$cli_memory_swap"; then
+        return 1
+    fi
+    desired_memory="$_BOXA_MEMORY_BYTES"
+    desired_memory_swap="$_BOXA_MEMORY_SWAP_BYTES"
+
+    live="$(docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}' "$name" 2>/dev/null)" \
+        || return 0
+    read -r live_memory live_memory_swap extra <<< "$live"
+    [[ "$live_memory" =~ ^[0-9]+$ ]] || return 0
+    [[ "$live_memory_swap" =~ ^-?[0-9]+$ ]] || return 0
+    [ -z "$extra" ] || return 0
+
+    if { [ "$live_memory" -eq 0 ] || [ "$desired_memory" -lt "$live_memory" ]; } \
+        && [ "$live_memory" -ne "$desired_memory" ]; then
+        usage="$(_boxa::container_memory_usage_bytes "$name" 2>/dev/null || true)"
+    fi
+    [ -z "$cli_memory$cli_memory_swap" ] || one_shot=1
+    _boxa::plan_resource_convergence "$name" "$live_memory" "$live_memory_swap" \
+        "$desired_memory" "$desired_memory_swap" "$usage" "$one_shot"
+    [ -n "$_BOXA_RESOURCE_UPDATE_NEEDED" ] || return 0
+
+    if docker update --memory "$desired_memory" --memory-swap "$desired_memory_swap" \
+            "$name" >/dev/null 2>&1; then
+        printf '%s\n' "$_BOXA_RESOURCE_UPDATE_NOTICE"
+        [ -z "$_BOXA_RESOURCE_UPDATE_WARNING" ] || printf '%s\n' "$_BOXA_RESOURCE_UPDATE_WARNING"
+    fi
+}
+
+# Converge every running user Container except an optional one being handled
+# later with a one-shot override. Per-Container failures never block the CLI.
+_boxa::sweep_running_resource_limits() {
+    local exclude="${1:-}" containers name project_path
+    containers="$(docker ps --filter 'name=^boxa-' --format '{{.Names}}' 2>/dev/null \
+        | filter_user_containers)" || return 0
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        [ "$name" != "$exclude" ] || continue
+        project_path="$(_boxa::container_project_path "$name" 2>/dev/null || true)"
+        [ -n "$project_path" ] || continue
+        _boxa::converge_container_resources "$name" "$project_path" 2>/dev/null || true
+    done <<< "$containers"
+}
+
+# Identify the auto-mode Container only when raw arguments contain a one-shot
+# override. The real parser below still owns validation and consumes argv.
+_boxa::cli_override_container() {
+    local has_override=false target
+    while [[ "${1:-}" == --* ]]; do
+        case "$1" in
+            --memory|--memory-swap)
+                has_override=true
+                [ "$#" -ge 2 ] || return 1
+                shift 2
+                ;;
+            --ssh-config) shift ;;
+            *) return 1 ;;
+        esac
+    done
+    [ "$has_override" = true ] || return 1
+    target="${1:-.}"
+    if [ -d "$target" ]; then
+        boxa::names_from_path "$(realpath "$target")"
+    else
+        boxa::names_from_token "$target"
+    fi
+    printf '%s' "$BOXA_CONTAINER_NAME"
+}
+
 list_running_containers() {
     local containers
     containers=$(docker ps --filter "name=^boxa-" --format '{{.Names}}\t{{.Status}}\t{{.RunningFor}}' | filter_user_containers)
@@ -1829,10 +1934,20 @@ if [ -x "$BOXA_DIR/scripts/sweep-oom-events.sh" ]; then
     detach_bg "$BOXA_DIR/scripts/sweep-oom-events.sh"
 fi
 
+# --- Memory-limit convergence sweep -----------------------------------------
+# Synchronous because changed Containers must be visible to the user. The
+# touched Container is skipped only for a one-shot override and converged on
+# its attach/restart path; every other running user Container is checked here.
+convergence_sweep_exclude="$(_boxa::cli_override_container "$@" 2>/dev/null || true)"
+_boxa::sweep_running_resource_limits "$convergence_sweep_exclude" || true
+unset convergence_sweep_exclude
+
 # --- Subcommand parsing ------------------------------------------------------
 
 CLEAN_VOLUMES=false
 SSH_CONFIG_MOUNT=false
+CLI_MEMORY=
+CLI_MEMORY_SWAP=
 
 case "${1:-}" in
     -h|--help|help) show_help ;;
@@ -3597,9 +3712,24 @@ fi
 while [[ "${1:-}" == --* ]]; do
     case "$1" in
         --ssh-config) SSH_CONFIG_MOUNT=true; shift ;;
+        --memory|--memory-swap)
+            flag="$1"
+            if [ "$#" -lt 2 ] || [[ "$2" == --* ]]; then
+                echo "$flag requires a size value." >&2
+                exit 1
+            fi
+            _boxa::parse_size "$2" >/dev/null || exit 1
+            if [ "$flag" = "--memory" ]; then
+                CLI_MEMORY="$2"
+            else
+                CLI_MEMORY_SWAP="$2"
+            fi
+            shift 2
+            ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done
+unset flag
 
 if [ -d "${1:-.}" ]; then
     # Argument is a directory (or none → CWD) → create/attach mode
@@ -3620,6 +3750,8 @@ if [ -d "${1:-.}" ]; then
         # here is idempotent: start_container_connection exits early when the
         # listener is already present, so live forwards are untouched and only
         # the dead ones are re-established.
+        _boxa::converge_container_resources "$CONTAINER_NAME" "$PROJECT_PATH" \
+            "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
         start_boxa_connections "$CONTAINER_NAME"
         attach_to_container "$CONTAINER_NAME"
         # exec → script ends here
@@ -3630,6 +3762,8 @@ if [ -d "${1:-.}" ]; then
         bootstrap_traefik
         bootstrap_dns
         if restart_exited_container "$CONTAINER_NAME"; then
+            _boxa::converge_container_resources "$CONTAINER_NAME" "$PROJECT_PATH" \
+                "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
             attach_to_container "$CONTAINER_NAME"
             # exec → script ends here
         fi
@@ -3642,12 +3776,16 @@ else
     boxa::names_from_token "$1"
     CONTAINER_NAME="$BOXA_CONTAINER_NAME"
     if docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.ID}}' | grep -q .; then
+        _boxa::converge_container_resources "$CONTAINER_NAME" "" \
+            "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
         start_boxa_connections "$CONTAINER_NAME"   # self-heal forwards (idempotent)
         attach_to_container "$CONTAINER_NAME"
     elif docker ps -a --filter "name=^${CONTAINER_NAME}$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
         bootstrap_traefik
         bootstrap_dns
         if restart_exited_container "$CONTAINER_NAME"; then
+            _boxa::converge_container_resources "$CONTAINER_NAME" "" \
+                "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
             attach_to_container "$CONTAINER_NAME"
         else
             echo "Container $CONTAINER_NAME removed. Run again to create a new one." >&2
@@ -3661,6 +3799,8 @@ else
         # otherwise start_boxa_connections would print a misleading
         # "Failed to start connection" for a container that simply isn't up.
         if docker ps --filter "name=^${selected}$" --format '{{.ID}}' | grep -q .; then
+            _boxa::converge_container_resources "$selected" "" \
+                "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
             start_boxa_connections "$selected"   # self-heal forwards (idempotent)
         fi
         attach_to_container "$selected"
@@ -3715,7 +3855,7 @@ write_dns_upstream_file
 
 # --- Build docker arguments -------------------------------------------------
 
-_boxa::resolve_resources "$PROJECT_PATH"
+_boxa::resolve_resources "$PROJECT_PATH" "$CLI_MEMORY" "$CLI_MEMORY_SWAP"
 
 memory_display="$(_boxa::format_size "$_BOXA_MEMORY_BYTES")"
 host_memory_display="$(_boxa::format_size "$_BOXA_HOST_MEMTOTAL_BYTES")"
@@ -3724,7 +3864,11 @@ if [ "$_BOXA_MEMORY_SOURCE" = "derived" ]; then
 else
     memory_source="$_BOXA_MEMORY_SOURCE"
 fi
-echo "Memory limit: $memory_display ($memory_source; override in ~/.config/boxa/resources.conf)"
+if [ -n "$CLI_MEMORY" ] || [ -n "$CLI_MEMORY_SWAP" ]; then
+    echo "Memory limit: $memory_display ($memory_source; one-shot only; set ~/.config/boxa/resources.conf for a durable setting)"
+else
+    echo "Memory limit: $memory_display ($memory_source; override in ~/.config/boxa/resources.conf)"
+fi
 
 if [ "$_BOXA_MEMORY_BYTES" -gt "$_BOXA_HOST_MEMTOTAL_BYTES" ]; then
     echo "WARNING: Memory limit exceeds host RAM; protection is void."
