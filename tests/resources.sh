@@ -470,6 +470,15 @@ assert_eq "projected sum replaces target Container old limit" "7516192768" \
     "$(_boxa::running_memory_limit_sum effective)"
 assert_fail "project update projected sum stays within host RAM" \
     _boxa::would_jointly_exhaust_host 0 10737418240 effective
+assert_ok "running-limit seam finds the target Project" \
+    _boxa::project_is_in_running_memory_limits /work/target
+assert_fail "running-limit seam excludes a stopped target Project" \
+    _boxa::project_is_in_running_memory_limits /work/stopped
+assert_eq "stopped target limit counts toward joint-exhaustion warning" \
+    "WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop." \
+    "$(_boxa::project_joint_exhaustion_warning 5368709120 /work/stopped 10737418240)"
+assert_eq "running target limit uses replacement semantics without double count" "" \
+    "$(_boxa::project_joint_exhaustion_warning 5368709120 /work/target 10737418240)"
 
 seed_conf \
     'memory = 4g' \

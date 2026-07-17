@@ -836,6 +836,28 @@ _boxa::running_memory_limit_sum() {
     printf '%s' "$sum"
 }
 
+# True when the absolute Project path belongs to a running Container.
+# BOXA_RUNNING_MEMORY_LIMITS_FILE uses the same effective-mode path records as
+# _boxa::running_memory_limit_sum so tests need no Docker daemon.
+_boxa::project_is_in_running_memory_limits() {
+    local target_path="$1" limits project_path name
+    if [ -n "${BOXA_RUNNING_MEMORY_LIMITS_FILE:-}" ]; then
+        limits="$(cat "$BOXA_RUNNING_MEMORY_LIMITS_FILE")"
+        while IFS=$'\t' read -r _ project_path; do
+            [ "$project_path" = "$target_path" ] && return 0
+        done <<< "$limits"
+        return 1
+    fi
+
+    local -a containers=()
+    mapfile -t containers < <(docker ps --filter 'name=^boxa-' --format '{{.Names}}')
+    for name in "${containers[@]}"; do
+        project_path="$(_boxa::container_project_path "$name" 2>/dev/null || true)"
+        [ "$project_path" = "$target_path" ] && return 0
+    done
+    return 1
+}
+
 # True when running limits plus a proposed Container limit exceed host RAM.
 _boxa::would_jointly_exhaust_host() {
     local proposed="$1" host_total="${2:-}" sum_mode="${3:-live}" running_total
@@ -854,4 +876,14 @@ _boxa::joint_exhaustion_warning() {
         && _boxa::would_jointly_exhaust_host "$proposed" "$host_total" "$sum_mode"; then
         printf 'WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop.\n'
     fi
+}
+
+# A running target is already represented by its newly effective limit in the
+# projected sum. A stopped or not-yet-created target must be added separately.
+_boxa::project_joint_exhaustion_warning() {
+    local proposed="$1" project_path="$2" host_total="${3:-}"
+    if _boxa::project_is_in_running_memory_limits "$project_path"; then
+        proposed=0
+    fi
+    _boxa::joint_exhaustion_warning "$proposed" "$host_total" effective
 }

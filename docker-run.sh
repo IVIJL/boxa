@@ -2518,7 +2518,12 @@ if [ "$MODE" = "mem-set" ]; then
     mem_set_bytes="$(_boxa::parse_size "$MEM_SET_SIZE")"
     mem_set_host_total="$(_boxa::host_memtotal_bytes 2>/dev/null || true)"
     _boxa::memory_limit_host_warning "$mem_set_bytes" "$mem_set_host_total"
-    _boxa::joint_exhaustion_warning 0 "$mem_set_host_total" effective
+    if [ "$mem_set_scope" = global ]; then
+        _boxa::joint_exhaustion_warning 0 "$mem_set_host_total" effective
+    else
+        _boxa::project_joint_exhaustion_warning \
+            "$mem_set_bytes" "$mem_set_path" "$mem_set_host_total"
+    fi
     _boxa::sweep_running_resource_limits || true
     if [ "$mem_set_scope" = global ]; then
         echo "Memory limit saved in the global resources.conf scope."
