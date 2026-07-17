@@ -21,6 +21,9 @@ set -euo pipefail
 #                              pending arrives for this container, or
 #                              <expires_iso> + grace passes (safety net for
 #                              dead daemons).
+#   --notification <title> <body> <log-path>
+#                              Internal reusable-backend entry point for
+#                              durable host events such as the OOM archive.
 #
 # Cascade per platform:
 #   WSL2 + powershell.exe   → COM toast with protocol activation → click
@@ -440,6 +443,21 @@ backend_available_linux() {
         && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]
 }
 
+# Select and invoke the existing per-platform backend for the notification
+# currently held in T_TITLE, T_BODY, and P_LOG_PATH. DELIVERY_OUTCOME is one
+# of delivered, failed, or silent; callers decide whether their durable event
+# signal should be removed, restored, or simply left on disk.
+dispatch_notification() {
+    DELIVERY_OUTCOME="silent"
+    if backend_available_windows; then
+        if deliver_windows; then DELIVERY_OUTCOME="delivered"; else DELIVERY_OUTCOME="failed"; fi
+    elif backend_available_macos; then
+        if deliver_macos;   then DELIVERY_OUTCOME="delivered"; else DELIVERY_OUTCOME="failed"; fi
+    elif backend_available_linux; then
+        if deliver_linux;   then DELIVERY_OUTCOME="delivered"; else DELIVERY_OUTCOME="failed"; fi
+    fi
+}
+
 # --- Delivery: Windows COM toast --------------------------------------------
 # Inline COM toast under the HKCU AppId provisioned in
 # ensure-allow-for-host-state.sh. Click activation goes through protocol
@@ -734,16 +752,9 @@ deliver_one() {
     # Pick a backend by applicability, then run delivery. Outcome
     # depends on both — only "applicable but failed" preserves the
     # pending file for retry.
-    local outcome="silent"
-    if backend_available_windows; then
-        if deliver_windows; then outcome="delivered"; else outcome="failed"; fi
-    elif backend_available_macos; then
-        if deliver_macos;   then outcome="delivered"; else outcome="failed"; fi
-    elif backend_available_linux; then
-        if deliver_linux;   then outcome="delivered"; else outcome="failed"; fi
-    fi
+    dispatch_notification
 
-    case "$outcome" in
+    case "$DELIVERY_OUTCOME" in
         delivered)
             rm -f "$claim"
             ;;
@@ -763,6 +774,16 @@ deliver_one() {
             return 1
             ;;
     esac
+}
+
+# Reuse the same backend cascade for an already-durable event that does not
+# need the pending-file claim protocol. The path remains the click/open target.
+deliver_notification() {
+    T_TITLE="$1"
+    T_BODY="$2"
+    P_LOG_PATH="$3"
+    dispatch_notification
+    [ "$DELIVERY_OUTCOME" != "failed" ]
 }
 
 # --- Stale pruning -----------------------------------------------------------
@@ -853,6 +874,11 @@ case "${1:-}" in
     --watch)
         shift
         watch_window "${1:-}" "${2:-}"
+        ;;
+    --notification)
+        shift
+        [ "$#" -eq 3 ] || { _warn "notification: expected title, body, and log path"; exit 2; }
+        deliver_notification "$1" "$2" "$3"
         ;;
     --help|-h|"")
         sed -n '4,32p' "$0"

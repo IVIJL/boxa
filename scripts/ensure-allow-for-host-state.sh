@@ -2,7 +2,7 @@
 set -euo pipefail
 # Idempotent host-side state for `boxa allow-for` (ADR 0009).
 #
-# Provisions four pieces of state that live outside Docker and therefore
+# Provisions five pieces of state that live outside Docker and therefore
 # survive container teardown:
 #   1. /var/log/boxa/allow-for/ as root:root 0755 — the harvest log
 #      directory. Mounted read-write into every container so the in-container
@@ -24,7 +24,10 @@ set -euo pipefail
 #      mode 0700 + root parent denies the in-container node user any
 #      visibility — closing the TOCTOU race a user-writable tempdir
 #      would otherwise allow.
-#   4. (WSL2 only) HKCU\Software\Classes\AppUserModelId\Boxa.AllowFor —
+#   4. /var/log/boxa/oom/ as <host-uid>:<host-gid> 0755 — durable OOM
+#      archive + last-seen kernel timestamp. The host-side detached sweep
+#      writes here without sudo on ordinary boxa invocations.
+#   5. (WSL2 only) HKCU\Software\Classes\AppUserModelId\Boxa.AllowFor —
 #      the toast notification AppId so the inline-COM PowerShell toast at
 #      window close can launch File Explorer at the harvest log via WSL
 #      UNC path. Missing AppId would degrade to a generic toast without
@@ -36,8 +39,8 @@ set -euo pipefail
 # distro under WSL2 (rare but possible) degrades to a warning, not an
 # overall failure — the log file remains the canonical record.
 #
-# Exits 0 when both steps end in their desired state ("created" or "already
-# present"). Exits non-zero only when the directory step actually failed,
+# Exits 0 when all required directories end in their desired state ("created" or "already
+# present"). Exits non-zero only when a directory step actually failed,
 # since that breaks the feature; HKCU failure is informational.
 
 ALLOW_FOR_LOG_DIR="/var/log/boxa/allow-for"
@@ -52,6 +55,7 @@ ALLOW_FOR_PENDING_DIR="$ALLOW_FOR_LOG_DIR/pending"
 # node user can't relocate or peek into it). See lib/allow-for.sh for
 # the full threat-model reasoning.
 ALLOW_FOR_TMP_DIR="$ALLOW_FOR_LOG_DIR/.tmp"
+OOM_ARCHIVE_DIR="/var/log/boxa/oom"
 HOST_UID=$(id -u)
 HOST_GID=$(id -g)
 WSL_APP_ID="Boxa.AllowFor"
@@ -73,6 +77,7 @@ Idempotently provision the host-side state `boxa allow-for` needs:
   - /var/log/boxa/allow-for/         owned root:root 0755
   - /var/log/boxa/allow-for/pending/ owned <host-uid>:<host-gid> 0755
   - /var/log/boxa/allow-for/.tmp/    owned root:root 0700
+  - /var/log/boxa/oom/               owned <host-uid>:<host-gid> 0755
   - (WSL2 only) HKCU\...\AppUserModelId\Boxa.AllowFor toast AppId
 
 Options:
@@ -196,6 +201,29 @@ ensure_tmp_dir() {
     _ok "$ALLOW_FOR_TMP_DIR ready."
 }
 
+# --- Step 1d: host-user-owned OOM archive -----------------------------------
+# The OOM sweep is launched detached on ordinary, non-sudo boxa invocations.
+# Delegate only this archive directory; /var/log/boxa and the allow-for
+# forensics remain under their existing ownership boundaries.
+ensure_oom_archive_dir() {
+    local want="${HOST_UID}:${HOST_GID}:755"
+    if [ -d "$OOM_ARCHIVE_DIR" ]; then
+        local stat_out
+        stat_out="$(_stat_owner_mode "$OOM_ARCHIVE_DIR" || true)"
+        if [ "$stat_out" = "$want" ]; then
+            _noop_msg "$OOM_ARCHIVE_DIR already ${HOST_UID}:${HOST_GID} 0755 — skipping."
+            return 0
+        fi
+    fi
+
+    _info "Creating $OOM_ARCHIVE_DIR (${HOST_UID}:${HOST_GID} 0755) — sudo may prompt."
+    if ! sudo install -d -o "$HOST_UID" -g "$HOST_GID" -m 0755 "$OOM_ARCHIVE_DIR"; then
+        _warn "Failed to create $OOM_ARCHIVE_DIR — boxa OOM events cannot be archived until this is fixed."
+        return 1
+    fi
+    _ok "$OOM_ARCHIVE_DIR ready."
+}
+
 # --- Step 2: WSL2 HKCU toast AppId ------------------------------------------
 # HKCU writes never elevate, so this is a plain powershell.exe call (no
 # Start-Process -Verb RunAs). The script is doubly idempotent: outer
@@ -234,4 +262,5 @@ ensure_wsl_app_id() {
 ensure_log_dir
 ensure_pending_dir
 ensure_tmp_dir
+ensure_oom_archive_dir
 ensure_wsl_app_id

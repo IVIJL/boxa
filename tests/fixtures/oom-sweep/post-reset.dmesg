@@ -1,0 +1,2 @@
+[10.250000] oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=/docker/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,task=new,pid=202,uid=1000
+[10.250100] Memory cgroup out of memory: Killed process 202 (new) total-vm:4000kB, anon-rss:2048kB, file-rss:0kB

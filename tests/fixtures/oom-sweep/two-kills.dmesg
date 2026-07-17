@@ -1,0 +1,4 @@
+[20000.100000] oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=/docker/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,task=first,pid=101,uid=1000
+[20000.100100] Memory cgroup out of memory: Killed process 101 (first) total-vm:2000kB, anon-rss:1048576kB, file-rss:0kB
+[20000.900000] oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=/docker/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,task=second,pid=102,uid=1000
+[20000.900100] Memory cgroup out of memory: Killed process 102 (second) total-vm:4000kB, anon-rss:2097152kB, file-rss:0kB

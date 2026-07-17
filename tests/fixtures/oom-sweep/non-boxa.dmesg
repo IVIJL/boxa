@@ -1,0 +1,3 @@
+[13000.100000] app invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL)
+[13000.100050] oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=/docker/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,task=app,pid=77,uid=1000
+[13000.100100] Memory cgroup out of memory: Killed process 77 (app) total-vm:1000kB, anon-rss:512kB, file-rss:0kB

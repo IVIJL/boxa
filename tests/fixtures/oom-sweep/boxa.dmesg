@@ -1,0 +1,4 @@
+[12345.678901] ugrep invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=0
+[12345.678950] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=...,mems_allowed=0,oom_memcg=/docker/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,task_memcg=/docker/aaaaaaaaaaaa,task=ugrep,pid=1234,uid=1000
+[12345.679001] Memory cgroup out of memory: Killed process 1234 (ugrep) total-vm:5000000kB, anon-rss:3984588kB, file-rss:1024kB, shmem-rss:0kB, UID:1000 pgtables:9000kB oom_score_adj:0
+[12346.000000] ordinary kernel line after the event
