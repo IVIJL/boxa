@@ -134,7 +134,8 @@ cleanup() {
     docker rm -f "$VICTIM" "$BYSTANDER" "$LOWER" >/dev/null 2>&1 || true
     if [ "$REAL_STARTED" = true ]; then
         if docker ps -a --filter "name=^${REAL_CONTAINER}$" --format '{{.ID}}' 2>/dev/null | grep -q .; then
-            timeout 120 bash "$BOXA_DIR/docker-run.sh" stop "$REAL_PROJECT" --clean \
+            BOXA_RESOURCES_CONF="${REAL_CONF:-/dev/null}" \
+                timeout 120 bash "$BOXA_DIR/docker-run.sh" stop "$REAL_PROJECT" --clean \
                 </dev/null >/dev/null 2>&1 \
                 || docker rm -f "$REAL_CONTAINER" >/dev/null 2>&1 || true
         fi
@@ -430,7 +431,10 @@ fi
 printf '\n--- Phase D: boxa ls MEM column and OOM markers ---\n'
 
 ls_rc=0
-ls_output="$(timeout 120 bash "$BOXA_DIR/docker-run.sh" ls </dev/null 2>/dev/null)" || ls_rc=$?
+# Seam the conf here too: any boxa invocation runs the convergence sweep,
+# and without the seam it would re-limit the test Container to the user's
+# real effective config before the MEM-cell assertion reads it.
+ls_output="$(BOXA_RESOURCES_CONF="$REAL_CONF" timeout 120 bash "$BOXA_DIR/docker-run.sh" ls </dev/null 2>/dev/null)" || ls_rc=$?
 assert_eq "boxa ls exits 0 with test containers present" "0" "$ls_rc"
 
 victim_row="$(grep -F "$VICTIM" <<< "$ls_output" || true)"
@@ -450,7 +454,7 @@ assert_eq "victim exited" "exited" "$(container_status "$VICTIM")"
 assert_eq ".State.OOMKilled is true after a non-OOM exit (lifetime flag)" \
     "true" "$(docker inspect --format '{{.State.OOMKilled}}' "$VICTIM")"
 
-ls_output2="$(timeout 120 bash "$BOXA_DIR/docker-run.sh" ls </dev/null 2>/dev/null)" || true
+ls_output2="$(BOXA_RESOURCES_CONF="$REAL_CONF" timeout 120 bash "$BOXA_DIR/docker-run.sh" ls </dev/null 2>/dev/null)" || true
 exited_row="$(grep -F "$VICTIM" <<< "$ls_output2" || true)"
 assert_contains "exited section carries the lifetime-flag marker" \
     "$exited_row" "oom seen during run"
