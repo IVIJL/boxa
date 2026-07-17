@@ -214,6 +214,37 @@ run_fixture empty.dmesg
 assert_eq "empty log creates no archive" "0" "$(archive_count)"
 assert_eq "empty log sends no notification" "0" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
 
+# docker-run.sh is not source-safe, so extract the destructive-removal helper
+# and assert its decision-layer ordering with canned sweep and Docker seams.
+remove_helper="$TEST_TMP/remove-container-after-oom-sweep.sh"
+awk '
+    /^_boxa::remove_container_after_oom_sweep\(\)/ { found=1 }
+    found { print }
+    found && /^}/ { exit }
+' "$SCRIPT_DIR/../docker-run.sh" > "$remove_helper"
+if [ -s "$remove_helper" ]; then
+    # shellcheck source=/dev/null
+    source "$remove_helper"
+    removal_order="$TEST_TMP/removal-order"
+    removal_boxa_dir="$TEST_TMP/removal-boxa"
+    mkdir -p "$removal_boxa_dir/scripts"
+    printf '%s\n' \
+        '#!/bin/sh' \
+        "printf \"sweep\\n\" >> \"\$BOXA_OOM_TEST_REMOVAL_ORDER\"" \
+        > "$removal_boxa_dir/scripts/sweep-oom-events.sh"
+    chmod +x "$removal_boxa_dir/scripts/sweep-oom-events.sh"
+    docker() {
+        printf 'rm %s\n' "$2" >> "$BOXA_OOM_TEST_REMOVAL_ORDER"
+    }
+    export BOXA_OOM_TEST_REMOVAL_ORDER="$removal_order"
+    BOXA_DIR="$removal_boxa_dir" _boxa::remove_container_after_oom_sweep boxa-media
+    assert_eq "OOM sweep completes before destructive container removal" \
+        $'sweep\nrm boxa-media' "$(< "$removal_order")"
+else
+    printf 'FAIL  could not extract _boxa::remove_container_after_oom_sweep from docker-run.sh\n'
+    fail_count=$((fail_count + 1))
+fi
+
 if [ "$fail_count" -gt 0 ]; then
     printf '\n%d test(s) failed.\n' "$fail_count"
     exit 1

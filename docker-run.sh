@@ -1588,6 +1588,18 @@ wait_for_boxa_ready() {
     return 0
 }
 
+# Preserve any pending OOM evidence while Docker can still correlate the
+# Container ID to its Project. This must complete before every destructive
+# removal of a user Container; the ordinary invocation-time sweep stays
+# detached so non-destructive commands keep their current latency.
+_boxa::remove_container_after_oom_sweep() {
+    local name="$1"
+    if [ -x "$BOXA_DIR/scripts/sweep-oom-events.sh" ]; then
+        "$BOXA_DIR/scripts/sweep-oom-events.sh" || true
+    fi
+    docker rm "$name" > /dev/null
+}
+
 # Restart an exited boxa container and re-run init scripts
 # Returns 1 if restart fails (stale mounts after reboot) — caller should recreate
 restart_exited_container() {
@@ -1602,7 +1614,7 @@ restart_exited_container() {
     if ! docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$name" 2>/dev/null \
             | grep -qxF "$DNS_UPSTREAM_CONTAINER_FILE"; then
         echo "Recreating container to add the DNS upstream mount (ADR 0015)..."
-        docker rm "$name" >/dev/null
+        _boxa::remove_container_after_oom_sweep "$name"
         return 1
     fi
     # Refresh the DNS upstream file before start: the entrypoint re-runs
@@ -1613,7 +1625,7 @@ restart_exited_container() {
         "$cli_memory" "$cli_memory_swap" stopped || exit 1
     if ! docker start "$name" 2>/dev/null; then
         echo "Restart failed (stale mounts?), removing dead container..."
-        docker rm "$name" > /dev/null
+        _boxa::remove_container_after_oom_sweep "$name"
         return 1
     fi
     # The entrypoint re-runs the root setup (firewall verification included) on
@@ -3059,7 +3071,7 @@ if [ "$MODE" = "stop" ]; then
         name="$BOXA_CONTAINER_NAME"
         if docker ps -a --filter "name=^${name}$" --format '{{.ID}}' | grep -q .; then
             graceful_stop_container "$name"
-            docker rm "$name" > /dev/null
+            _boxa::remove_container_after_oom_sweep "$name"
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$BOXA_PROJECT_NAME"
                 _boxa::remove_project_route_yamls "$BOXA_PROJECT_NAME"
@@ -3080,7 +3092,7 @@ if [ "$MODE" = "stop" ]; then
         docker ps -a --filter "name=^boxa-" --format '{{.Names}}' | filter_user_containers | while IFS= read -r c; do
             proj="${c#boxa-}"
             graceful_stop_container "$c"
-            docker rm "$c" > /dev/null
+            _boxa::remove_container_after_oom_sweep "$c"
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$proj"
                 _boxa::remove_project_route_yamls "$proj"
@@ -3095,7 +3107,7 @@ if [ "$MODE" = "stop" ]; then
     else
         proj="${selected#boxa-}"
         graceful_stop_container "$selected"
-        docker rm "$selected" > /dev/null
+        _boxa::remove_container_after_oom_sweep "$selected"
         if [ "$CLEAN_VOLUMES" = true ]; then
             remove_project_volumes "$proj"
             _boxa::remove_project_route_yamls "$proj"

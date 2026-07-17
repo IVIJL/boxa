@@ -13,6 +13,7 @@ export BOXA_RESOURCES_CONF="$_TMPROOT/resources.conf"
 export BOXA_MEMINFO_FILE="$_TMPROOT/meminfo"
 export BOXA_RUNNING_MEMORY_LIMITS_FILE="$_TMPROOT/running-limits"
 export BOXA_SYSCTL_CMD="$_TMPROOT/sysctl"
+export BOXA_DOCKER_INFO_CMD="$_TMPROOT/docker"
 trap 'rm -rf "$_TMPROOT"' EXIT
 
 printf '%s\n' \
@@ -22,6 +23,14 @@ printf '%s\n' \
     "printf \"%s\\n\" \"\$BOXA_TEST_SYSCTL_MEMSIZE\"" \
     > "$BOXA_SYSCTL_CMD"
 chmod +x "$BOXA_SYSCTL_CMD"
+
+printf '%s\n' \
+    '#!/bin/sh' \
+    "[ \"\$1\" = \"info\" ] && [ \"\$2\" = \"--format\" ] && [ \"\$3\" = \"{{.MemTotal}}\" ] || exit 2" \
+    "[ -n \"\${BOXA_TEST_DOCKER_MEMTOTAL:-}\" ] || exit 1" \
+    "printf \"%s\\n\" \"\$BOXA_TEST_DOCKER_MEMTOTAL\"" \
+    > "$BOXA_DOCKER_INFO_CMD"
+chmod +x "$BOXA_DOCKER_INFO_CMD"
 
 fail_count=0
 
@@ -148,6 +157,11 @@ assert_eq "derived startup display" "6.5g" "$(_boxa::format_size "$_BOXA_MEMORY_
 
 rm -f "$BOXA_MEMINFO_FILE"
 export BOXA_TEST_SYSCTL_MEMSIZE=17179869184
+export BOXA_TEST_DOCKER_MEMTOTAL=8589934592
+assert_eq "docker info wins over sysctl when meminfo is absent" \
+    "8589934592" "$(_boxa::host_memtotal_bytes)"
+
+unset BOXA_TEST_DOCKER_MEMTOTAL
 assert_eq "sysctl fallback reads hw.memsize bytes" \
     "17179869184" "$(_boxa::host_memtotal_bytes)"
 

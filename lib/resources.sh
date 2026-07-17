@@ -136,10 +136,12 @@ _boxa::parse_size() {
     printf '%s' "$bytes"
 }
 
-# Read host MemTotal in bytes. BOXA_MEMINFO_FILE and BOXA_SYSCTL_CMD are
-# unit-test seams for the Linux and macOS sources respectively.
+# Read the Docker host's MemTotal in bytes. BOXA_MEMINFO_FILE,
+# BOXA_DOCKER_INFO_CMD, and BOXA_SYSCTL_CMD are unit-test seams for the Linux,
+# Docker Desktop, and physical-macOS fallback sources respectively.
 _boxa::host_memtotal_bytes() {
-    local meminfo="${BOXA_MEMINFO_FILE:-/proc/meminfo}" sysctl_cmd="${BOXA_SYSCTL_CMD:-sysctl}"
+    local meminfo="${BOXA_MEMINFO_FILE:-/proc/meminfo}"
+    local docker_info_cmd="${BOXA_DOCKER_INFO_CMD:-docker}" sysctl_cmd="${BOXA_SYSCTL_CMD:-sysctl}"
     local kib bytes
     if [ -f "$meminfo" ]; then
         kib="$(awk '$1 == "MemTotal:" { print $2; exit }' "$meminfo" 2>/dev/null)"
@@ -151,9 +153,15 @@ _boxa::host_memtotal_bytes() {
         return 0
     fi
 
+    bytes="$("$docker_info_cmd" info --format '{{.MemTotal}}' 2>/dev/null || true)"
+    if [[ "$bytes" =~ ^[0-9]+$ ]] && [ "$bytes" -gt 0 ]; then
+        printf '%s' "$bytes"
+        return 0
+    fi
+
     bytes="$("$sysctl_cmd" -n hw.memsize 2>/dev/null || true)"
     if [[ ! "$bytes" =~ ^[0-9]+$ ]] || [ "$bytes" -eq 0 ]; then
-        printf 'Unable to determine host RAM from %s or sysctl -n hw.memsize.\n' "$meminfo" >&2
+        printf 'Unable to determine host RAM from %s, docker info, or sysctl -n hw.memsize.\n' "$meminfo" >&2
         return 1
     fi
     printf '%s' "$bytes"
