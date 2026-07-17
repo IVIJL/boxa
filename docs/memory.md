@@ -64,13 +64,37 @@ The `[/abs/path/to/media]` section pins the `media` project to a 5 GiB Memory
 limit with a 1 GiB swap allowance — remember `memory_swap` is a total, so the
 allowance is the difference.
 
+Use `boxa mem set` to make the same host-owned configuration without editing
+the file by hand:
+
+```bash
+# Current Project, or an explicit Project name/path:
+boxa mem set 5g
+boxa mem set 5g /abs/path/to/media
+
+# Set both limits in the same project scope (1 GiB swap allowance):
+boxa mem set 5g /abs/path/to/media --swap 6g
+
+# Global defaults for Projects without their own values:
+boxa mem set --global 8g
+boxa mem set --global 8g --swap 9g
+```
+
+Project sections are always keyed by the absolute host path. When given a
+Project name, `mem set` reads that path from its running or stopped Container;
+if the Container no longer exists, pass the path explicitly. The command
+preserves comments, unknown keys, and unrelated sections. It validates the
+complete resulting Memory/Memory+swap pair before touching the file, warns for
+limits above host RAM or unsafe running-Container totals, and converges running
+Containers immediately through the same `docker update` path described below.
+
 ### Precedence
 
 For each of the two values independently, highest wins:
 
 1. One-shot CLI flag: `boxa --memory 4g ~/app` (and `--memory-swap SIZE`)
-2. Project section in `resources.conf`
-3. Global key in `resources.conf`
+2. Project section in `resources.conf` (including `boxa mem set`)
+3. Global key in `resources.conf` (including `boxa mem set --global`)
 4. Derived default: **65 % of host RAM** (`MemTotal`)
 
 If nothing sets `memory_swap`, it equals the Memory limit (swap off).

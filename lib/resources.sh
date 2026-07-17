@@ -117,6 +117,195 @@ _boxa::load_resources_conf() {
     done < "$conf"
 }
 
+# Replace the targeted Memory keys without sourcing or normalising the config.
+# Existing lines retain their formatting and comments; unrelated bytes pass
+# through unchanged. Validation completes before the config directory or file
+# is touched. Usage: _boxa::write_resources_conf <global|project> <path> <memory> [memory_swap]
+_boxa::write_resources_conf() {
+    local scope="$1" project_path="$2" memory_value="$3" memory_swap_value="${4:-}"
+    local conf="${BOXA_RESOURCES_CONF:-$HOME/.config/boxa/resources.conf}"
+    local memory_bytes memory_swap_bytes effective_swap conf_dir temp
+    local line parsed key value section="" target_section="" comment body lhs rhs
+    local leading trailing output_started='' file_had_newline='' target_seen=''
+    local memory_seen='' swap_seen=''
+
+    case "$scope" in
+        global) ;;
+        project)
+            if [[ "$project_path" != /* ]]; then
+                printf 'Resource limits require an absolute host project path: %s\n' "$project_path" >&2
+                return 1
+            fi
+            target_section="$project_path"
+            ;;
+        *)
+            printf 'Unknown resources.conf scope: %s\n' "$scope" >&2
+            return 1
+            ;;
+    esac
+
+    memory_bytes="$(_boxa::parse_size "$memory_value")" || return 1
+    _boxa::reset_resources_cache
+    _boxa::load_resources_conf
+
+    if [ -n "$memory_swap_value" ]; then
+        effective_swap="$memory_swap_value"
+    elif [ "$scope" = global ] && [ -n "$_BOXA_RESOURCES_GLOBAL_MEMORY_SWAP_SET" ]; then
+        effective_swap="$_BOXA_RESOURCES_GLOBAL_MEMORY_SWAP"
+    elif [ "$scope" = project ] \
+        && [ -n "${_BOXA_RESOURCES_PROJECT_MEMORY_SWAP[$project_path]+set}" ]; then
+        effective_swap="${_BOXA_RESOURCES_PROJECT_MEMORY_SWAP[$project_path]}"
+    elif [ "$scope" = project ] && [ -n "$_BOXA_RESOURCES_GLOBAL_MEMORY_SWAP_SET" ]; then
+        effective_swap="$_BOXA_RESOURCES_GLOBAL_MEMORY_SWAP"
+    else
+        effective_swap="$memory_value"
+    fi
+    memory_swap_bytes="$(_boxa::parse_size "$effective_swap")" || return 1
+    if [ "$memory_swap_bytes" -lt "$memory_bytes" ]; then
+        printf 'Invalid resource limits: memory_swap (%s bytes) must be greater than or equal to memory (%s bytes).\n' \
+            "$memory_swap_bytes" "$memory_bytes" >&2
+        return 1
+    fi
+
+    conf_dir="${conf%/*}"
+    [ "$conf_dir" != "$conf" ] || conf_dir=.
+    mkdir -p "$conf_dir" || return 1
+    temp="$(mktemp "${conf}.tmp.XXXXXX")" || return 1
+    if [ -f "$conf" ] && [ -s "$conf" ]; then
+        [ "$(tail -c 1 "$conf" | wc -l | tr -d ' ')" -gt 0 ] && file_had_newline=1
+    fi
+
+    # Emit one logical line, inserting exactly one separator before every
+    # line after the first. The original final-newline state is restored below.
+    if [ -f "$conf" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            parsed="${line%%#*}"
+            parsed="${parsed#"${parsed%%[![:space:]]*}"}"
+            parsed="${parsed%"${parsed##*[![:space:]]}"}"
+
+            if [[ "$parsed" == \[*\] ]]; then
+                if [ "$scope" = global ] && [ -z "$target_seen" ]; then
+                    [ -n "$output_started" ] && printf '\n' >> "$temp"
+                    printf 'memory = %s' "$memory_value" >> "$temp"
+                    output_started=1
+                    memory_seen=1
+                    if [ -n "$memory_swap_value" ]; then
+                        printf '\nmemory_swap = %s' "$memory_swap_value" >> "$temp"
+                        swap_seen=1
+                    fi
+                    target_seen=1
+                elif [ "$scope" = project ] && [ "$section" = "$target_section" ]; then
+                    if [ -z "$memory_seen" ]; then
+                        [ -n "$output_started" ] && printf '\n' >> "$temp"
+                        printf 'memory = %s' "$memory_value" >> "$temp"
+                        output_started=1
+                    fi
+                    if [ -n "$memory_swap_value" ] && [ -z "$swap_seen" ]; then
+                        [ -n "$output_started" ] && printf '\n' >> "$temp"
+                        printf 'memory_swap = %s' "$memory_swap_value" >> "$temp"
+                        output_started=1
+                    fi
+                    memory_seen=1
+                    [ -z "$memory_swap_value" ] || swap_seen=1
+                fi
+
+                value="${parsed:1:${#parsed}-2}"
+                if [[ "$value" == /* ]]; then
+                    section="$value"
+                else
+                    section="INVALID"
+                fi
+                [ "$section" != "$target_section" ] || target_seen=1
+            fi
+
+            body="${line%%#*}"
+            comment="${line:${#body}}"
+            key="${parsed%%=*}"
+            if [ "$key" != "$parsed" ]; then
+                key="${key%"${key##*[![:space:]]}"}"
+            fi
+            if { [ "$scope" = global ] && [ -z "$section" ]; } \
+                || { [ "$scope" = project ] && [ "$section" = "$target_section" ]; }; then
+                case "$key" in
+                    memory)
+                        value="$memory_value"
+                        memory_seen=1
+                        target_seen=1
+                        ;;
+                    memory_swap)
+                        if [ -n "$memory_swap_value" ]; then
+                            value="$memory_swap_value"
+                            swap_seen=1
+                            target_seen=1
+                        else
+                            value=
+                        fi
+                        ;;
+                    *) value= ;;
+                esac
+                if [ -n "$value" ]; then
+                    lhs="${body%%=*}"
+                    rhs="${body#*=}"
+                    if [ -z "${rhs//[[:space:]]/}" ]; then
+                        leading="$rhs"
+                        trailing=
+                    else
+                        leading="${rhs%%[![:space:]]*}"
+                        trailing="${rhs##*[![:space:]]}"
+                    fi
+                    line="${lhs}=${leading}${value}${trailing}${comment}"
+                fi
+            fi
+
+            [ -z "$output_started" ] || printf '\n' >> "$temp"
+            printf '%s' "$line" >> "$temp"
+            output_started=1
+        done < "$conf"
+    fi
+
+    if [ "$scope" = global ] && [ -z "$target_seen" ]; then
+        [ -z "$output_started" ] || printf '\n' >> "$temp"
+        printf 'memory = %s' "$memory_value" >> "$temp"
+        output_started=1
+        if [ -n "$memory_swap_value" ]; then
+            printf '\nmemory_swap = %s' "$memory_swap_value" >> "$temp"
+        fi
+    elif [ "$scope" = project ]; then
+        if [ -z "$target_seen" ]; then
+            [ -z "$output_started" ] || printf '\n\n' >> "$temp"
+            printf '[%s]\nmemory = %s' "$target_section" "$memory_value" >> "$temp"
+            output_started=1
+            if [ -n "$memory_swap_value" ]; then
+                printf '\nmemory_swap = %s' "$memory_swap_value" >> "$temp"
+            fi
+        else
+            if [ -z "$memory_seen" ]; then
+                [ -z "$output_started" ] || printf '\n' >> "$temp"
+                printf 'memory = %s' "$memory_value" >> "$temp"
+                output_started=1
+            fi
+            if [ -n "$memory_swap_value" ] && [ -z "$swap_seen" ]; then
+                [ -z "$output_started" ] || printf '\n' >> "$temp"
+                printf 'memory_swap = %s' "$memory_swap_value" >> "$temp"
+                output_started=1
+            fi
+        fi
+    fi
+    [ -z "$file_had_newline" ] || printf '\n' >> "$temp"
+
+    if [ -f "$conf" ]; then
+        chmod "$(stat -c '%a' "$conf" 2>/dev/null || stat -f '%Lp' "$conf")" "$temp" || {
+            rm -f "$temp"
+            return 1
+        }
+    fi
+    mv "$temp" "$conf" || {
+        rm -f "$temp"
+        return 1
+    }
+    _boxa::reset_resources_cache
+}
+
 # Convert a Docker-style size to bytes. Units use binary multiples, matching
 # Docker: k/m/g with optional B or iB suffix, case-insensitive. Docker refuses
 # memory limits below 6 MiB, so every parsed resource limit enforces that floor.
@@ -410,4 +599,14 @@ _boxa::would_jointly_exhaust_host() {
     fi
     running_total="$(_boxa::running_memory_limit_sum)" || return 1
     [ "$((running_total + proposed))" -gt "$host_total" ]
+}
+
+# Print the canonical shared-capacity warning when the proposed limit plus
+# running Containers' current limits exceeds host RAM.
+_boxa::joint_exhaustion_warning() {
+    local proposed="$1" host_total="${2:-}"
+    if [ -n "$host_total" ] \
+        && _boxa::would_jointly_exhaust_host "$proposed" "$host_total"; then
+        printf 'WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop.\n'
+    fi
 }

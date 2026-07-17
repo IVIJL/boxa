@@ -78,6 +78,17 @@ assert_contains() {
     fi
 }
 
+assert_file_eq() {
+    local label="$1" expected="$2" actual="$3"
+    if cmp -s "$expected" "$actual"; then
+        printf 'PASS  %s\n' "$label"
+    else
+        printf 'FAIL  %s\n      file bytes differ\n' "$label"
+        diff -u "$expected" "$actual" || true
+        fail_count=$((fail_count + 1))
+    fi
+}
+
 seed_conf() {
     _boxa::reset_resources_cache
     : > "$BOXA_RESOURCES_CONF"
@@ -209,12 +220,91 @@ seed_conf "memory=7g" "[relative/path]" "memory=9g"
 resolve_ok /work/project
 assert_eq "relative section is ignored, not global" "7516192768" "$_BOXA_MEMORY_BYTES"
 
+# --- Structure-preserving config writer ------------------------------------
+
+expected_conf="$_TMPROOT/expected.conf"
+printf '%s\n' \
+    '# global comment' \
+    'memory = 7g' \
+    'unknown_global = keep me' \
+    '' \
+    '[/work/target]' \
+    '  memory = 9g  # target memory comment' \
+    'memory_swap=10g# target swap comment' \
+    'unknown = untouched' \
+    '' \
+    '[/work/other]' \
+    'memory = 6g' > "$expected_conf"
+printf '%s\n' \
+    '# global comment' \
+    'memory = 7g' \
+    'unknown_global = keep me' \
+    '' \
+    '[/work/target]' \
+    '  memory = 5g  # target memory comment' \
+    'memory_swap=6g# target swap comment' \
+    'unknown = untouched' \
+    '' \
+    '[/work/other]' \
+    'memory = 6g' > "$BOXA_RESOURCES_CONF"
+_boxa::write_resources_conf project /work/target 9g 10g
+assert_file_eq "project rewrite preserves comments, formatting, unknown lines, and other scopes" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+printf '%s\n' 'memory = 7g' '[/work/other]' 'memory = 6g' > "$BOXA_RESOURCES_CONF"
+printf '%s\n' 'memory = 7g' '[/work/other]' 'memory = 6g' '' \
+    '[/work/new project]' 'memory = 8g' 'memory_swap = 9g' > "$expected_conf"
+_boxa::write_resources_conf project '/work/new project' 8g 9g
+assert_file_eq "missing project section is appended" "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+printf '%s\n' '# keep' '[/work/app]' 'memory = 6g' > "$BOXA_RESOURCES_CONF"
+printf '%s\n' '# keep' 'memory = 8g' 'memory_swap = 9g' '[/work/app]' 'memory = 6g' > "$expected_conf"
+_boxa::write_resources_conf global '' 8g 9g
+assert_file_eq "missing global keys are inserted before project sections" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+printf '%s' $'# global\nmemory=7g # keep\nmemory_swap = 8g\n[/work/app]\nmemory=6g' \
+    > "$BOXA_RESOURCES_CONF"
+printf '%s' $'# global\nmemory=9g # keep\nmemory_swap = 10g\n[/work/app]\nmemory=6g' \
+    > "$expected_conf"
+_boxa::write_resources_conf global '' 9g 10g
+assert_file_eq "global rewrite preserves inline comments, project bytes, and no-final-newline state" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+rm -f "$BOXA_RESOURCES_CONF"
+printf '%s' 'memory = 8g' > "$expected_conf"
+_boxa::write_resources_conf global '' 8g
+assert_file_eq "missing config is created without adding unrelated bytes" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+printf '%s' $'# untouched\nmemory = 7g\nmemory_swap = 8g' > "$BOXA_RESOURCES_CONF"
+cp "$BOXA_RESOURCES_CONF" "$expected_conf"
+assert_fail "writer rejects invalid Memory size" \
+    _boxa::write_resources_conf global '' nonsense
+assert_file_eq "invalid size leaves config untouched" "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+assert_fail "writer rejects inherited memory_swap below new memory" \
+    _boxa::write_resources_conf global '' 9g
+assert_file_eq "invalid resulting pair leaves config untouched" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+printf '%s\n' 'memory = 7g' '[/work/app]' 'memory = 6g' > "$BOXA_RESOURCES_CONF"
+_boxa::write_resources_conf project /work/app 8g 8g
+resolve_ok /work/app
+assert_eq "writer cache reset exposes new project Memory value" \
+    "8589934592" "$_BOXA_MEMORY_BYTES"
+assert_eq "writer stores --swap in the same project scope" \
+    "8589934592" "$_BOXA_MEMORY_SWAP_BYTES"
+
 # --- Running-container sum seam --------------------------------------------
 
 printf '%s\n' 2147483648 3221225472 0 > "$BOXA_RUNNING_MEMORY_LIMITS_FILE"
 assert_eq "sum running limits" "5368709120" "$(_boxa::running_memory_limit_sum)"
 assert_ok "joint exhaustion detected" _boxa::would_jointly_exhaust_host 6442450944 10737418240
 assert_fail "sum within host RAM" _boxa::would_jointly_exhaust_host 4294967296 10737418240
+assert_eq "joint-exhaustion warning reuses canonical wording" \
+    "WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop." \
+    "$(_boxa::joint_exhaustion_warning 6442450944 10737418240)"
 
 # --- `boxa ls` MEM cell -------------------------------------------------------
 

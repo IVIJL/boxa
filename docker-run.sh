@@ -35,6 +35,9 @@ Containers:
   boxa <name>                    Attach to running boxa-<name>
   boxa ls                        List running containers
   boxa mem [project|path]        Show per-project memory diagnostics
+  boxa mem set <size> [project|path]
+                                   Set a durable per-project Memory limit
+  boxa mem set --global <size>   Set the durable global Memory limit
   boxa stop [name] [--clean]     Stop container (--clean removes volumes)
   boxa remove [name]             Remove project data (volumes)
 
@@ -166,12 +169,20 @@ EOF
             ;;
         mem)
             cat <<'EOF'
-Usage: boxa mem [project|path]
+Usage:
+  boxa mem [project|path]
+  boxa mem set <size> [project|path] [--swap <size>]
+  boxa mem set --global <size> [--swap <size>]
 
 Show one Project's configured Memory and Memory+swap limits, current Container
 usage, remaining headroom, and recent OOM evidence. The target defaults to the
 Project for the current directory. Process detail is best-effort where the
 platform does not expose per-process cgroup attribution. See ADR 0020.
+
+`mem set` durably writes the Memory and optional Memory+swap limits to
+~/.config/boxa/resources.conf. Its Project target also defaults to the current
+directory; an explicit running or stopped Project name, or existing path, is
+accepted.
 
 Examples:
   boxa mem
@@ -2157,7 +2168,58 @@ case "${1:-}" in
     -h|--help) show_help ;;
     help)     shift; show_command_help "${1:-}" ;;
     ls)      MODE="ls";      shift ;;
-    mem)     MODE="mem";     shift; MEM_TARGET="${1:-}" ;;
+    mem)     MODE="mem";     shift
+             if [ "${1:-}" = set ]; then
+                 MODE="mem-set"
+                 shift
+                 MEM_SET_GLOBAL=false
+                 MEM_SET_SIZE=
+                 MEM_SET_SWAP=
+                 MEM_SET_TARGET=
+                 while [ "$#" -gt 0 ]; do
+                     case "$1" in
+                         --global)
+                             MEM_SET_GLOBAL=true
+                             shift
+                             ;;
+                         --swap)
+                             if [ "$#" -lt 2 ] || [[ "$2" == --* ]]; then
+                                 echo "--swap requires a size value." >&2
+                                 exit 1
+                             fi
+                             MEM_SET_SWAP="$2"
+                             shift 2
+                             ;;
+                         -* )
+                             echo "Unknown flag for mem set: $1" >&2
+                             exit 1
+                             ;;
+                         *)
+                             if [ -z "$MEM_SET_SIZE" ]; then
+                                 MEM_SET_SIZE="$1"
+                             elif [ -z "$MEM_SET_TARGET" ]; then
+                                 MEM_SET_TARGET="$1"
+                             else
+                                 echo "Unexpected positional for mem set: $1" >&2
+                                 exit 1
+                             fi
+                             shift
+                             ;;
+                     esac
+                 done
+                 if [ -z "$MEM_SET_SIZE" ]; then
+                     echo "Usage: boxa mem set <size> [project|path] [--swap <size>]" >&2
+                     echo "       boxa mem set --global <size> [--swap <size>]" >&2
+                     exit 1
+                 fi
+                 if [ "$MEM_SET_GLOBAL" = true ] && [ -n "$MEM_SET_TARGET" ]; then
+                     echo "boxa mem set --global does not accept a project or path." >&2
+                     exit 1
+                 fi
+             else
+                 MEM_TARGET="${1:-}"
+             fi
+             ;;
     stop)    MODE="stop";    shift; PROJECT_FILTER=""
              # Parse --clean flag and optional project name (any order)
              for arg in "$@"; do
@@ -2394,6 +2456,41 @@ fi
 if [ "$MODE" = "mem" ]; then
     _boxa::mem_report "${MEM_TARGET:-}"
     exit $?
+fi
+
+# --- boxa mem set -----------------------------------------------------------
+
+if [ "$MODE" = "mem-set" ]; then
+    mem_set_scope=project
+    mem_set_path=
+    if [ "$MEM_SET_GLOBAL" = true ]; then
+        mem_set_scope=global
+    else
+        _boxa::mem_resolve_target "$MEM_SET_TARGET" "$PWD" || exit 1
+        mem_set_path="$_BOXA_MEM_PROJECT_PATH"
+        if [ -z "$mem_set_path" ]; then
+            mem_set_path="$(_boxa::container_project_path "$_BOXA_MEM_CONTAINER" 2>/dev/null || true)"
+        fi
+        if [[ "$mem_set_path" != /* ]]; then
+            echo "Cannot determine the absolute host path for Project $_BOXA_MEM_PROJECT." >&2
+            echo "Pass an existing project path or start the Project once before setting its limit by name." >&2
+            exit 1
+        fi
+    fi
+
+    _boxa::write_resources_conf "$mem_set_scope" "$mem_set_path" \
+        "$MEM_SET_SIZE" "$MEM_SET_SWAP" || exit 1
+    mem_set_bytes="$(_boxa::parse_size "$MEM_SET_SIZE")"
+    mem_set_host_total="$(_boxa::host_memtotal_bytes 2>/dev/null || true)"
+    _boxa::memory_limit_host_warning "$mem_set_bytes" "$mem_set_host_total"
+    _boxa::joint_exhaustion_warning "$mem_set_bytes" "$mem_set_host_total"
+    _boxa::sweep_running_resource_limits || true
+    if [ "$mem_set_scope" = global ]; then
+        echo "Memory limit saved in the global resources.conf scope."
+    else
+        echo "Memory limit saved for $mem_set_path."
+    fi
+    exit 0
 fi
 
 # --- boxa build [flags] ----------------------------------------------------
@@ -4073,10 +4170,7 @@ else
 fi
 
 _boxa::memory_limit_host_warning "$_BOXA_MEMORY_BYTES" "$_BOXA_HOST_MEMTOTAL_BYTES"
-if [ -n "$_BOXA_HOST_MEMTOTAL_BYTES" ] \
-    && _boxa::would_jointly_exhaust_host "$_BOXA_MEMORY_BYTES" "$_BOXA_HOST_MEMTOTAL_BYTES"; then
-    echo "WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop."
-fi
+_boxa::joint_exhaustion_warning "$_BOXA_MEMORY_BYTES" "$_BOXA_HOST_MEMTOTAL_BYTES"
 
 DOCKER_ARGS=(
     --hostname "$BOXA_HOSTNAME"
