@@ -69,7 +69,10 @@ _boxa() {
                 mem)
                     if (( CURRENT == 3 )); then
                         local -a mem_actions
-                        mem_actions=('set:Set a durable Memory limit')
+                        mem_actions=(
+                            'set:Set a durable Memory limit'
+                            'unset:Remove durable Memory limits'
+                        )
                         _describe 'mem actions' mem_actions
                         _boxa_containers
                     elif [[ $words[3] == set ]]; then
@@ -79,6 +82,11 @@ _boxa() {
                             '--swap:Set the Memory+swap limit in the same scope'
                         )
                         _describe 'mem set flags' flags
+                        _boxa_containers
+                    elif [[ $words[3] == unset ]]; then
+                        local -a flags
+                        flags=('--global:Remove limits from the global resources.conf scope')
+                        _describe 'mem unset flags' flags
                         _boxa_containers
                     fi
                     ;;

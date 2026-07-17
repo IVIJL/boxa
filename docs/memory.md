@@ -80,6 +80,18 @@ boxa mem set --global 8g
 boxa mem set --global 8g --swap 9g
 ```
 
+Remove both durable values from a Project scope, or from the global scope, to
+expose the next configured or derived fallback:
+
+```bash
+boxa mem unset
+boxa mem unset /abs/path/to/media
+boxa mem unset --global
+```
+
+If removing the two keys leaves a Project section empty, the section is
+removed too. Comments, unrelated keys, and other sections are preserved.
+
 Project sections are always keyed by the absolute host path. When given a
 Project name, `mem set` reads that path from its running or stopped Container;
 if the Container no longer exists, pass the path explicitly. The command
@@ -100,7 +112,9 @@ For each of the two values independently, highest wins:
 If nothing sets `memory_swap`, it equals the Memory limit (swap off).
 `memory_swap` below `memory` is rejected.
 
-Every start prints the effective value and where it came from:
+Every start prints the effective value and where it came from. `boxa mem`
+shows the sources of both effective limits and points to `boxa mem set` for a
+durable change:
 
 ```
 Memory limit: 6.5g (derived from 10g host RAM; override in ~/.config/boxa/resources.conf)

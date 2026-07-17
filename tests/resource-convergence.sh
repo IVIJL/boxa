@@ -54,8 +54,8 @@ assert_eq "swap-only convergence needs update" "1" "$_BOXA_RESOURCE_UPDATE_NEEDE
 assert_eq "swap-only lowering does not claim Memory-limit OOM risk" "" "$_BOXA_RESOURCE_UPDATE_WARNING"
 
 _boxa::plan_resource_convergence boxa-app 0 0 1073741824 1073741824 500000000 1
-assert_eq "one-shot notice points to durable config" \
-    "Memory limits updated for boxa-app: memory unlimited -> 1g; memory+swap unlimited -> 1g. One-shot override; set ~/.config/boxa/resources.conf for a durable setting." \
+assert_eq "one-shot notice points to mem set" \
+    "Memory limits updated for boxa-app: memory unlimited -> 1g; memory+swap unlimited -> 1g. One-shot override; use boxa mem set for a durable setting." \
     "$_BOXA_RESOURCE_UPDATE_NOTICE"
 
 _boxa::plan_resource_convergence boxa-app 2147483648 2147483648 1073741824 1073741824 ""

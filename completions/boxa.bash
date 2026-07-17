@@ -57,13 +57,16 @@ _boxa() {
         mem)
             if [ "$cword" -eq 2 ]; then
                 # shellcheck disable=SC2207
-                COMPREPLY=( $(compgen -W "set $(_boxa_containers_bash)" -- "$cur") )
+                COMPREPLY=( $(compgen -W "set unset $(_boxa_containers_bash)" -- "$cur") )
             elif [ "${words[2]:-}" = set ]; then
                 if [ "${words[cword-1]:-}" = --swap ]; then
                     return 0
                 fi
                 # shellcheck disable=SC2207
                 COMPREPLY=( $(compgen -W "--global --swap $(_boxa_containers_bash)" -- "$cur") )
+            elif [ "${words[2]:-}" = unset ]; then
+                # shellcheck disable=SC2207
+                COMPREPLY=( $(compgen -W "--global $(_boxa_containers_bash)" -- "$cur") )
             fi
             ;;
         stop|remove|cursor|code)

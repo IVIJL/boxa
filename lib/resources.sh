@@ -24,6 +24,7 @@ _BOXA_HOST_MEMTOTAL_BYTES=
 _BOXA_RESOURCE_UPDATE_NEEDED=
 _BOXA_RESOURCE_UPDATE_NOTICE=
 _BOXA_RESOURCE_UPDATE_WARNING=
+_BOXA_RESOURCES_CONF_CHANGED=
 _BOXA_OOM_PRE_UPDATE_SWEEP_DONE=
 
 # Run at the first convergence update only. Ordering invariant: archive events
@@ -117,10 +118,83 @@ _boxa::load_resources_conf() {
     done < "$conf"
 }
 
-# Replace the targeted Memory keys without sourcing or normalising the config.
+# Remove both Memory keys from one scope. A project section containing no
+# other content is removed with the keys; unrelated bytes pass through.
+_boxa::remove_resources_conf_keys() {
+    local scope="$1" target_section="$2" conf="$3" temp="$4"
+    local line parsed key value section="" output_started='' in_target=''
+    local target_has_content=''
+    local -a target_lines=()
+
+    _boxa::emit_resources_line() {
+        [ -z "$output_started" ] || printf '\n' >> "$temp"
+        printf '%s' "$1" >> "$temp"
+        output_started=1
+    }
+
+    _boxa::flush_resources_target() {
+        local buffered
+        if [ -n "$target_has_content" ]; then
+            for buffered in "${target_lines[@]}"; do
+                _boxa::emit_resources_line "$buffered"
+            done
+        fi
+        target_lines=()
+        target_has_content=
+        in_target=
+    }
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        parsed="${line%%#*}"
+        parsed="${parsed#"${parsed%%[![:space:]]*}"}"
+        parsed="${parsed%"${parsed##*[![:space:]]}"}"
+
+        if [[ "$parsed" == \[*\] ]]; then
+            [ -z "$in_target" ] || _boxa::flush_resources_target
+            value="${parsed:1:${#parsed}-2}"
+            if [[ "$value" == /* ]]; then
+                section="$value"
+            else
+                section="INVALID"
+            fi
+            if [ "$scope" = project ] && [ "$section" = "$target_section" ]; then
+                in_target=1
+                target_lines+=("$line")
+                continue
+            fi
+        fi
+
+        key="${parsed%%=*}"
+        if [ "$key" != "$parsed" ]; then
+            key="${key%"${key##*[![:space:]]}"}"
+        fi
+        if { [ "$scope" = global ] && [ -z "$section" ]; } \
+            || [ -n "$in_target" ]; then
+            case "$key" in
+                memory|memory_swap)
+                    _BOXA_RESOURCES_CONF_CHANGED=1
+                    continue
+                    ;;
+            esac
+        fi
+
+        if [ -n "$in_target" ]; then
+            target_lines+=("$line")
+            [ -z "${line//[[:space:]]/}" ] || target_has_content=1
+        else
+            _boxa::emit_resources_line "$line"
+        fi
+    done < "$conf"
+    [ -z "$in_target" ] || _boxa::flush_resources_target
+
+    unset -f _boxa::emit_resources_line _boxa::flush_resources_target
+}
+
+# Replace or remove the targeted Memory keys without sourcing or normalising the config.
 # Existing lines retain their formatting and comments; unrelated bytes pass
 # through unchanged. Validation completes before the config directory or file
-# is touched. Usage: _boxa::write_resources_conf <global|project> <path> <memory> [memory_swap]
+# is touched. An empty Memory value removes both keys from the scope.
+# Usage: _boxa::write_resources_conf <global|project> <path> <memory> [memory_swap]
 _boxa::write_resources_conf() {
     local scope="$1" project_path="$2" memory_value="$3" memory_swap_value="${4:-}"
     local conf="${BOXA_RESOURCES_CONF:-$HOME/.config/boxa/resources.conf}"
@@ -128,6 +202,8 @@ _boxa::write_resources_conf() {
     local line parsed key value section="" target_section="" comment body lhs rhs
     local leading trailing output_started='' file_had_newline='' target_seen=''
     local memory_seen='' swap_seen=''
+
+    _BOXA_RESOURCES_CONF_CHANGED=
 
     case "$scope" in
         global) ;;
@@ -144,9 +220,42 @@ _boxa::write_resources_conf() {
             ;;
     esac
 
-    memory_bytes="$(_boxa::parse_size "$memory_value")" || return 1
     _boxa::reset_resources_cache
     _boxa::load_resources_conf
+
+    if [ -z "$memory_value" ]; then
+        if [ "$scope" = global ]; then
+            if [ -z "$_BOXA_RESOURCES_GLOBAL_MEMORY_SET" ] \
+                && [ -z "$_BOXA_RESOURCES_GLOBAL_MEMORY_SWAP_SET" ]; then
+                return 0
+            fi
+        elif [ -z "${_BOXA_RESOURCES_PROJECT_MEMORY[$project_path]+set}" ] \
+            && [ -z "${_BOXA_RESOURCES_PROJECT_MEMORY_SWAP[$project_path]+set}" ]; then
+            return 0
+        fi
+
+        temp="$(mktemp "${conf}.tmp.XXXXXX")" || return 1
+        if [ -s "$conf" ] \
+            && [ "$(tail -c 1 "$conf" | wc -l | tr -d ' ')" -gt 0 ]; then
+            file_had_newline=1
+        fi
+        _boxa::remove_resources_conf_keys "$scope" "$target_section" "$conf" "$temp"
+        if [ -n "$file_had_newline" ] && [ -s "$temp" ]; then
+            printf '\n' >> "$temp"
+        fi
+        chmod "$(stat -c '%a' "$conf" 2>/dev/null || stat -f '%Lp' "$conf")" "$temp" || {
+            rm -f "$temp"
+            return 1
+        }
+        mv "$temp" "$conf" || {
+            rm -f "$temp"
+            return 1
+        }
+        _boxa::reset_resources_cache
+        return 0
+    fi
+
+    memory_bytes="$(_boxa::parse_size "$memory_value")" || return 1
 
     if [ -n "$memory_swap_value" ]; then
         effective_swap="$memory_swap_value"
@@ -303,6 +412,7 @@ _boxa::write_resources_conf() {
         rm -f "$temp"
         return 1
     }
+    _BOXA_RESOURCES_CONF_CHANGED=1
     _boxa::reset_resources_cache
 }
 
@@ -507,7 +617,7 @@ _boxa::plan_resource_convergence() {
     desired_swap_display="$(_boxa::format_size "$desired_memory_swap")"
     _BOXA_RESOURCE_UPDATE_NOTICE="Memory limits updated for ${container}: memory ${live_memory_display} -> ${desired_memory_display}; memory+swap ${live_swap_display} -> ${desired_swap_display}."
     if [ -n "$one_shot" ]; then
-        _BOXA_RESOURCE_UPDATE_NOTICE+=" One-shot override; set ~/.config/boxa/resources.conf for a durable setting."
+        _BOXA_RESOURCE_UPDATE_NOTICE+=" One-shot override; use boxa mem set for a durable setting."
     fi
 
     host_warning="$(_boxa::memory_limit_host_warning "$desired_memory" "$host_total")"

@@ -38,6 +38,8 @@ Containers:
   boxa mem set <size> [project|path]
                                    Set a durable per-project Memory limit
   boxa mem set --global <size>   Set the durable global Memory limit
+  boxa mem unset [project|path]  Remove durable per-project Memory limits
+  boxa mem unset --global       Remove the durable global Memory limits
   boxa stop [name] [--clean]     Stop container (--clean removes volumes)
   boxa remove [name]             Remove project data (volumes)
 
@@ -173,6 +175,8 @@ Usage:
   boxa mem [project|path]
   boxa mem set <size> [project|path] [--swap <size>]
   boxa mem set --global <size> [--swap <size>]
+  boxa mem unset [project|path]
+  boxa mem unset --global
 
 Show one Project's configured Memory and Memory+swap limits, current Container
 usage, remaining headroom, and recent OOM evidence. The target defaults to the
@@ -183,6 +187,9 @@ platform does not expose per-process cgroup attribution. See ADR 0020.
 ~/.config/boxa/resources.conf. Its Project target also defaults to the current
 directory; an explicit running or stopped Project name, or existing path, is
 accepted.
+
+`mem unset` removes both limits from the selected scope, exposing the next
+configured or derived fallback.
 
 Examples:
   boxa mem
@@ -2216,6 +2223,34 @@ case "${1:-}" in
                      echo "boxa mem set --global does not accept a project or path." >&2
                      exit 1
                  fi
+             elif [ "${1:-}" = unset ]; then
+                 MODE="mem-unset"
+                 shift
+                 MEM_UNSET_GLOBAL=false
+                 MEM_UNSET_TARGET=
+                 while [ "$#" -gt 0 ]; do
+                     case "$1" in
+                         --global)
+                             MEM_UNSET_GLOBAL=true
+                             ;;
+                         -* )
+                             echo "Unknown flag for mem unset: $1" >&2
+                             exit 1
+                             ;;
+                         *)
+                             if [ -n "$MEM_UNSET_TARGET" ]; then
+                                 echo "Unexpected positional for mem unset: $1" >&2
+                                 exit 1
+                             fi
+                             MEM_UNSET_TARGET="$1"
+                             ;;
+                     esac
+                     shift
+                 done
+                 if [ "$MEM_UNSET_GLOBAL" = true ] && [ -n "$MEM_UNSET_TARGET" ]; then
+                     echo "boxa mem unset --global does not accept a project or path." >&2
+                     exit 1
+                 fi
              else
                  MEM_TARGET="${1:-}"
              fi
@@ -2489,6 +2524,45 @@ if [ "$MODE" = "mem-set" ]; then
         echo "Memory limit saved in the global resources.conf scope."
     else
         echo "Memory limit saved for $mem_set_path."
+    fi
+    exit 0
+fi
+
+# --- boxa mem unset ---------------------------------------------------------
+
+if [ "$MODE" = "mem-unset" ]; then
+    mem_unset_scope=project
+    mem_unset_path=
+    if [ "$MEM_UNSET_GLOBAL" = true ]; then
+        mem_unset_scope=global
+    else
+        _boxa::mem_resolve_target "$MEM_UNSET_TARGET" "$PWD" || exit 1
+        mem_unset_path="$_BOXA_MEM_PROJECT_PATH"
+        if [ -z "$mem_unset_path" ]; then
+            mem_unset_path="$(_boxa::container_project_path "$_BOXA_MEM_CONTAINER" 2>/dev/null || true)"
+        fi
+        if [[ "$mem_unset_path" != /* ]]; then
+            echo "Cannot determine the absolute host path for Project $_BOXA_MEM_PROJECT." >&2
+            echo "Pass an existing project path or start the Project once before unsetting its limit by name." >&2
+            exit 1
+        fi
+    fi
+
+    _boxa::write_resources_conf "$mem_unset_scope" "$mem_unset_path" "" || exit 1
+    if [ -z "$_BOXA_RESOURCES_CONF_CHANGED" ]; then
+        if [ "$mem_unset_scope" = global ]; then
+            echo "No global Memory limits are set."
+        else
+            echo "No Memory limits are set for $mem_unset_path."
+        fi
+        exit 0
+    fi
+
+    _boxa::sweep_running_resource_limits || true
+    if [ "$mem_unset_scope" = global ]; then
+        echo "Global Memory limits removed."
+    else
+        echo "Memory limits removed for $mem_unset_path."
     fi
     exit 0
 fi

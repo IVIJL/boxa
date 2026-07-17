@@ -9,7 +9,10 @@ trap 'rm -rf "$TEST_TMP"' EXIT
 
 export BOXA_OOM_ARCHIVE_DIR="$TEST_TMP/archive"
 export BOXA_MEMORY_DOCS_URL="https://example.test/docs/memory"
+export BOXA_RESOURCES_CONF="$TEST_TMP/resources.conf"
+export BOXA_MEMINFO_FILE="$TEST_TMP/meminfo"
 mkdir -p "$BOXA_OOM_ARCHIVE_DIR" "$TEST_TMP/My Project"
+printf 'MemTotal:       10485760 kB\n' > "$BOXA_MEMINFO_FILE"
 
 # shellcheck source-path=SCRIPTDIR source=../lib/naming.sh disable=SC1091
 source "$SCRIPT_DIR/../lib/naming.sh"
@@ -77,6 +80,17 @@ assert_eq "percentage has one decimal" "25.0%" "$(_boxa::mem_percentage 26843545
 assert_eq "percentage handles unlimited" "n/a" "$(_boxa::mem_percentage 1 max)"
 assert_eq "combined memory and swap limit" "1610612736" "$(_boxa::mem_combined_limit 1073741824 536870912)"
 assert_eq "combined unlimited limit" "max" "$(_boxa::mem_combined_limit max 0)"
+
+printf '%s\n' \
+    'memory = 8g' \
+    'memory_swap = 9g' \
+    "[$TEST_TMP/My Project]" \
+    'memory = 5g' > "$BOXA_RESOURCES_CONF"
+_boxa::reset_resources_cache
+effective_output=$(_boxa::mem_render_effective_limits "$TEST_TMP/My Project")
+assert_eq "effective limits show independent sources and durable hint" \
+    $'Effective Memory limit: 5g\nMemory limit source: project config\nEffective Memory+swap limit: 9g\nMemory+swap limit source: global config\nHint: use `boxa mem set` to change these limits durably.' \
+    "$effective_output"
 
 events_output=$(_boxa::mem_render_events $'low 1\nhigh 2\nmax 3\noom 4\noom_kill 5')
 assert_eq "render full memory.events" $'  low:      1\n  high:     2\n  max:      3\n  oom:      4\n  oom_kill: 5' "$events_output"

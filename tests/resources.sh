@@ -296,6 +296,61 @@ assert_eq "writer cache reset exposes new project Memory value" \
 assert_eq "writer stores --swap in the same project scope" \
     "8589934592" "$_BOXA_MEMORY_SWAP_BYTES"
 
+# --- Structure-preserving config removal -----------------------------------
+
+printf '%s\n' \
+    '# global' \
+    'memory = 8g' \
+    'memory_swap = 9g' \
+    '[/work/app]' \
+    'memory = 6g' \
+    'memory_swap = 7g' \
+    'unknown = preserve' \
+    '[/work/other]' \
+    'memory = 5g' > "$BOXA_RESOURCES_CONF"
+printf '%s\n' \
+    '# global' \
+    'memory = 8g' \
+    'memory_swap = 9g' \
+    '[/work/app]' \
+    'unknown = preserve' \
+    '[/work/other]' \
+    'memory = 5g' > "$expected_conf"
+_boxa::write_resources_conf project /work/app ''
+assert_file_eq "project unset removes both keys and preserves remaining section content" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+assert_eq "project unset reports a change" "1" "$_BOXA_RESOURCES_CONF_CHANGED"
+resolve_ok /work/app
+assert_eq "project unset exposes global Memory fallback" "8589934592" "$_BOXA_MEMORY_BYTES"
+assert_eq "project unset exposes global source" "global config" "$_BOXA_MEMORY_SOURCE"
+
+printf '%s\n' '# keep' '[/work/app]' 'memory = 6g' 'memory_swap = 7g' \
+    '[/work/other]' 'memory = 5g' > "$BOXA_RESOURCES_CONF"
+printf '%s\n' '# keep' '[/work/other]' 'memory = 5g' > "$expected_conf"
+_boxa::write_resources_conf project /work/app ''
+assert_file_eq "project unset drops a section left empty" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+printf '%s\n' '[/work/app]' 'memory = 6g' 'memory_swap = 7g' \
+    > "$BOXA_RESOURCES_CONF"
+: > "$expected_conf"
+_boxa::write_resources_conf project /work/app ''
+assert_file_eq "project unset leaves no blank line when the whole file is removed" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+printf '%s' $'# global\nmemory = 8g # remove\nmemory_swap=9g\nunknown = preserve\n[/work/app]\nmemory = 6g' \
+    > "$BOXA_RESOURCES_CONF"
+printf '%s' $'# global\nunknown = preserve\n[/work/app]\nmemory = 6g' > "$expected_conf"
+_boxa::write_resources_conf global '' ''
+assert_file_eq "global unset preserves unrelated bytes and final-newline state" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+cp "$BOXA_RESOURCES_CONF" "$expected_conf"
+_boxa::write_resources_conf project /work/missing ''
+assert_eq "unset missing scope reports no change" "" "$_BOXA_RESOURCES_CONF_CHANGED"
+assert_file_eq "unset missing scope leaves config untouched" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
 # --- Running-container sum seam --------------------------------------------
 
 printf '%s\n' 2147483648 3221225472 0 > "$BOXA_RUNNING_MEMORY_LIMITS_FILE"
