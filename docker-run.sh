@@ -1917,6 +1917,19 @@ _boxa::cli_override_container() {
     printf '%s' "$BOXA_CONTAINER_NAME"
 }
 
+# Run the invocation-time convergence sweep unless this invocation will mutate
+# durable resource limits. Those mutations sweep once after writing the config.
+_boxa::sweep_invocation_resource_limits() {
+    local exclude
+    if [ "${1:-}" = mem ] \
+        && { [ "${2:-}" = set ] || [ "${2:-}" = unset ]; }; then
+        return 0
+    fi
+
+    exclude="$(_boxa::cli_override_container "$@" 2>/dev/null || true)"
+    _boxa::sweep_running_resource_limits "$exclude" || true
+}
+
 list_running_containers() {
     local containers
     containers=$(docker ps --filter "name=^boxa-" --format '{{.Names}}\t{{.Status}}\t{{.RunningFor}}' | filter_user_containers)
@@ -2154,11 +2167,10 @@ fi
 
 # --- Memory-limit convergence sweep -----------------------------------------
 # Synchronous because changed Containers must be visible to the user. The
-# touched Container is skipped only for a one-shot override and converged on
-# its attach/restart path; every other running user Container is checked here.
-convergence_sweep_exclude="$(_boxa::cli_override_container "$@" 2>/dev/null || true)"
-_boxa::sweep_running_resource_limits "$convergence_sweep_exclude" || true
-unset convergence_sweep_exclude
+# sweep is deferred for durable mutations until after their config write. The
+# touched Container is skipped for a one-shot override and converged on its
+# attach/restart path; every other running user Container is checked here.
+_boxa::sweep_invocation_resource_limits "$@"
 
 # --- Subcommand parsing ------------------------------------------------------
 

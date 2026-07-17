@@ -25,6 +25,60 @@ assert_eq() {
     fi
 }
 
+# docker-run.sh is not source-safe, so extract the invocation-time resource
+# sweep helper and verify durable mutations defer their only convergence until
+# after the config write.
+invocation_sweep_extracted="$_TMPROOT/sweep_invocation_resource_limits.sh"
+awk '
+    /^_boxa::sweep_invocation_resource_limits\(\) \{$/ { capture=1 }
+    capture { print }
+    capture && /^\}$/ { exit }
+' "$BOXA_DIR/docker-run.sh" > "$invocation_sweep_extracted"
+if [ ! -s "$invocation_sweep_extracted" ]; then
+    printf 'FAIL  could not extract _boxa::sweep_invocation_resource_limits from docker-run.sh\n'
+    fail_count=$((fail_count + 1))
+else
+    # shellcheck source=/dev/null
+    source "$invocation_sweep_extracted"
+    invocation_calls="$_TMPROOT/invocation.calls"
+    : > "$invocation_calls"
+    desired_limit=old
+
+    # shellcheck disable=SC2317
+    _boxa::cli_override_container() { :; }
+    # shellcheck disable=SC2317
+    _boxa::sweep_running_resource_limits() {
+        printf 'converge:%s\n' "$desired_limit" >> "$invocation_calls"
+    }
+
+    _boxa::sweep_invocation_resource_limits mem set 2g
+    desired_limit=new
+    printf 'write:%s\n' "$desired_limit" >> "$invocation_calls"
+    _boxa::sweep_running_resource_limits
+    assert_eq "mem set converges only with the post-write limit" \
+        $'write:new\nconverge:new' "$(< "$invocation_calls")"
+
+    : > "$invocation_calls"
+    desired_limit=old
+    _boxa::sweep_invocation_resource_limits mem unset
+    desired_limit=fallback
+    printf 'write:%s\n' "$desired_limit" >> "$invocation_calls"
+    _boxa::sweep_running_resource_limits
+    assert_eq "mem unset converges only with the post-write fallback" \
+        $'write:fallback\nconverge:fallback' "$(< "$invocation_calls")"
+
+    : > "$invocation_calls"
+    desired_limit=current
+    _boxa::sweep_invocation_resource_limits mem
+    assert_eq "plain mem still runs the invocation sweep" \
+        "converge:current" "$(< "$invocation_calls")"
+
+    : > "$invocation_calls"
+    _boxa::sweep_invocation_resource_limits ls
+    assert_eq "other commands still run the invocation sweep" \
+        "converge:current" "$(< "$invocation_calls")"
+fi
+
 _boxa::plan_resource_convergence boxa-app 536870912 536870912 536870912 536870912 400000000
 assert_eq "matching limits skip update" "" "$_BOXA_RESOURCE_UPDATE_NEEDED"
 assert_eq "matching limits print nothing" "" "$_BOXA_RESOURCE_UPDATE_NOTICE"
