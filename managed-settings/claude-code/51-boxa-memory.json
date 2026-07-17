@@ -1,5 +1,15 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/boxa-memory-context.sh session-start"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "*",

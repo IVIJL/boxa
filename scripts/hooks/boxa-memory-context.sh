@@ -1,15 +1,16 @@
 #!/bin/sh
 # Boxa in-container Memory warning + OOM detection hook (ADR 0020).
 #
-# Fires as a PostToolUse hook (any tool) from BOTH Claude Code and Codex,
-# so the agent learns *at the moment it matters* that a process in this
-# project was OOM-killed or that memory is running out — before it retries
-# the thing that just got killed.
+# Fires as a SessionStart baseline hook and a PostToolUse observation hook
+# (any tool) from BOTH Claude Code and Codex, so the agent learns *at the
+# moment it matters* that a process in this project was OOM-killed or that
+# memory is running out — before it retries the thing that just got killed.
 #
 # Registration (delivery per ADR 0011, baked into the image):
 #   - Claude Code: /etc/claude-code/managed-settings.d/51-boxa-memory.json
-#     (PostToolUse, matcher "*").
-#   - Codex CLI: /etc/codex/managed_config.toml [hooks] PostToolUse.
+#     (SessionStart plus PostToolUse, matcher "*").
+#   - Codex CLI: /etc/codex/managed_config.toml [hooks] SessionStart and
+#     PostToolUse.
 #     VERIFIED on codex-cli 0.144.5: the managed-config hook schema accepts
 #     PostToolUse entries (same HookHandlerConfig shape as the SessionStart
 #     identity hook), so the SessionStart "N processes were OOM-killed since
@@ -17,6 +18,10 @@
 #     both agents receive the same per-tool-call signal. If a future Codex
 #     version drops PostToolUse, reintroduce that fallback here and document
 #     the asymmetry in this header.
+#
+# At SessionStart, the hook only snapshots the current counter and usage band
+# into state, silently. This establishes the baseline before the first tool
+# call without adding any external process to the silent path.
 #
 # Per tool call:
 #   Silent path (budget ~1.4 ms): read this Container's cgroup
@@ -44,7 +49,9 @@
 # State: /tmp/boxa-memory-hook.<user>.state on the container-private rootfs
 # (NOT a bind mount), so it survives across tool calls and sessions within
 # this Container but cannot leak into another Container. A counter
-# regression (cgroup recreated, stale /tmp) reseeds silently. This whole
+# regression (cgroup recreated, stale /tmp) reseeds silently. If PostToolUse
+# finds no valid state and oom_kill is already positive, it reports that
+# count once: the first tool call may itself have been killed. This whole
 # layer is best-effort observability; only the cgroup enforces (ADR 0020).
 #
 # Host no-op: guards on /etc/boxa/identity.json like the identity hook —
@@ -307,9 +314,9 @@ memhook_main() {
     read -r mh_limit 2>/dev/null < "$mh_cgdir/memory.max" || mh_limit=
     memhook_pct "$mh_usage" "$mh_limit"
 
-    if ! memhook_load_state "$mh_state"; then
-        # First run in this Container (or malformed state): seed silently.
-        # Kills that predate the hook are the host sweep's job (OOM archive).
+    if [ "${1:-}" = "session-start" ]; then
+        # Establish the baseline before the first tool call. SessionStart is
+        # deliberately seed-only and silent, even with a positive counter.
         mh_band=0
         if [ -n "$MEMHOOK_PCT" ]; then
             memhook_band_transition 0 "$MEMHOOK_PCT"
@@ -317,6 +324,23 @@ memhook_main() {
         fi
         memhook_save_state "$mh_state" "$MEMHOOK_OOM_KILL" "$mh_band"
         exit 0
+    fi
+
+    if ! memhook_load_state "$mh_state"; then
+        if [ "$MEMHOOK_OOM_KILL" -eq 0 ]; then
+            # No baseline and no kills: initialize silently. A positive
+            # counter instead remains reportable because the first tool call
+            # may have incremented it before this PostToolUse hook ran.
+            mh_band=0
+            if [ -n "$MEMHOOK_PCT" ]; then
+                memhook_band_transition 0 "$MEMHOOK_PCT"
+                mh_band=$MEMHOOK_NEW_BAND
+            fi
+            memhook_save_state "$mh_state" "$MEMHOOK_OOM_KILL" "$mh_band"
+            exit 0
+        fi
+        MEMHOOK_STATE_OOM=0
+        MEMHOOK_STATE_BAND=0
     fi
 
     memhook_oom_action "$MEMHOOK_STATE_OOM" "$MEMHOOK_OOM_KILL"

@@ -55,7 +55,7 @@ _boxa::oom_parse_dmesg() {
     local killed_re='Killed[[:space:]]process[[:space:]]([0-9]+)[[:space:]]\(([^)]*)\).*anon-rss:([0-9]+)kB'
 
     while IFS= read -r line || [ -n "$line" ]; do
-        if [[ "$line" =~ ^\[([0-9]+\.[0-9]+)\] ]]; then
+        if [[ "$line" =~ ^\[[[:space:]]*([0-9]+\.[0-9]+)\] ]]; then
             timestamp="${BASH_REMATCH[1]}"
             latest="$timestamp"
         else

@@ -171,7 +171,7 @@ run_hook() {
     BOXA_MEMHOOK_STATE="$E2E/state" \
     BOXA_MEMHOOK_DMESG_FILE="$E2E/dmesg" \
     BOXA_MEMHOOK_UPTIME_FILE="$E2E/uptime" \
-    sh "$HOOK" < /dev/null
+    sh "$HOOK" "${1:-}" < /dev/null
 }
 
 context_of() {
@@ -183,6 +183,34 @@ assert_eq "e2e: first run seeds silently" "" "$out"
 assert_eq "e2e: first run rc 0" "0" "$rc"
 out=$(run_hook)
 assert_eq "e2e: quiet steady state stays silent" "" "$out"
+
+# SessionStart establishes the baseline before any tool call. An already
+# positive counter is historical at session start and stays silent afterward.
+rm -f "$E2E/state"
+printf 'low 0\nhigh 0\nmax 4\noom 4\noom_kill 4\noom_group_kill 0\n' \
+    > "$E2E/cgroup/memory.events"
+out=$(run_hook session-start); rc=$?
+assert_eq "e2e: SessionStart seeds positive baseline silently" "" "$out"
+assert_eq "e2e: SessionStart seed exits 0" "0" "$rc"
+out=$(run_hook)
+assert_eq "e2e: seeded historical kills stay silent" "" "$out"
+
+# Without a SessionStart state, a positive counter on the first PostToolUse
+# means that the first tool call may have been killed: report once, then seed.
+rm -f "$E2E/state"
+printf 'low 0\nhigh 0\nmax 1\noom 1\noom_kill 1\noom_group_kill 0\n' \
+    > "$E2E/cgroup/memory.events"
+printf '%s\n' "$kill_line" > "$E2E/dmesg"
+out=$(run_hook)
+assert_contains "e2e: first-call kill without baseline warns" "OOM-killed" \
+    "$(context_of "$out")"
+out=$(run_hook)
+assert_eq "e2e: first-call kill is reported exactly once" "" "$out"
+
+# Restore a clean baseline for the existing band/dedup scenarios.
+printf 'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n' \
+    > "$E2E/cgroup/memory.events"
+run_hook session-start > /dev/null
 
 printf '891289600\n' > "$E2E/cgroup/memory.current"   # 83%
 out=$(run_hook)

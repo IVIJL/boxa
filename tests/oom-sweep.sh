@@ -117,6 +117,22 @@ run_fixture boxa.dmesg
 assert_eq "repeat does not duplicate archive" "1" "$(archive_count)"
 assert_eq "repeat does not re-notify" "1" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
 
+# Default dmesg pads short uptimes after `[`. A boot-time OOM must still be
+# parsed, archived, and deduplicated on a repeated snapshot.
+reset_case
+run_fixture padded-boot.dmesg
+padded_record="$BOXA_OOM_ARCHIVE_DIR/boxa-media-0.000050.log"
+assert_eq "padded boot-time event archived once" "1" "$(archive_count)"
+assert_eq "padded boot-time event notified once" "1" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+assert_contains "padded boot-time archive keeps timestamp" \
+    "Event time: kernel timestamp 0.000050 seconds since boot" "$padded_record"
+assert_contains "padded boot-time archive keeps victim" \
+    "Kernel-selected victim: boot-worker (PID 42)" "$padded_record"
+run_fixture padded-boot.dmesg
+assert_eq "padded boot-time repeat does not duplicate archive" "1" "$(archive_count)"
+assert_eq "padded boot-time repeat does not re-notify" "1" \
+    "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+
 # Docker memcg events not named boxa-* and host OOMs are both ignored.
 reset_case
 run_fixture non-boxa.dmesg
