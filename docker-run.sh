@@ -2168,7 +2168,7 @@ CLI_MEMORY=
 CLI_MEMORY_SWAP=
 
 case "${2:-}" in
-    -h|--help|help) show_command_help "${1:-}" ;;
+    -h|--help) show_command_help "${1:-}" ;;
 esac
 
 case "${1:-}" in
@@ -2518,7 +2518,7 @@ if [ "$MODE" = "mem-set" ]; then
     mem_set_bytes="$(_boxa::parse_size "$MEM_SET_SIZE")"
     mem_set_host_total="$(_boxa::host_memtotal_bytes 2>/dev/null || true)"
     _boxa::memory_limit_host_warning "$mem_set_bytes" "$mem_set_host_total"
-    _boxa::joint_exhaustion_warning "$mem_set_bytes" "$mem_set_host_total"
+    _boxa::joint_exhaustion_warning 0 "$mem_set_host_total" effective
     _boxa::sweep_running_resource_limits || true
     if [ "$mem_set_scope" = global ]; then
         echo "Memory limit saved in the global resources.conf scope."

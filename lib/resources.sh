@@ -759,20 +759,40 @@ _boxa::exited_oom_marker() {
     fi
 }
 
-# Sum HostConfig.Memory for running user Containers. A newline-delimited file
-# of byte values in BOXA_RUNNING_MEMORY_LIMITS_FILE replaces Docker in tests.
+# Sum Memory limits for running user Containers. By default these are the live
+# HostConfig values. In effective mode, resolve each Container's Project path
+# against the current resources.conf; this projects a just-written config
+# change before the convergence sweep applies it. BOXA_RUNNING_MEMORY_LIMITS_FILE
+# replaces Docker in tests. Its original one-byte-value-per-line format remains
+# valid; effective-mode records add a tab and the absolute Project path.
 _boxa::running_memory_limit_sum() {
-    local limits sum=0 limit
+    local mode="${1:-live}" limits sum=0 limit project_path
     if [ -n "${BOXA_RUNNING_MEMORY_LIMITS_FILE:-}" ]; then
         limits="$(cat "$BOXA_RUNNING_MEMORY_LIMITS_FILE")"
     else
         local -a containers=()
+        local name
         mapfile -t containers < <(docker ps --filter 'name=^boxa-' --format '{{.Names}}')
         [ "${#containers[@]}" -gt 0 ] || { printf '0'; return 0; }
-        limits="$(docker inspect --format '{{.HostConfig.Memory}}' "${containers[@]}")"
+        if [ "$mode" = effective ]; then
+            limits=
+            for name in "${containers[@]}"; do
+                limit="$(docker inspect --format '{{.HostConfig.Memory}}' "$name" 2>/dev/null)" \
+                    || return 1
+                project_path="$(_boxa::container_project_path "$name" 2>/dev/null || true)"
+                limits+="${limits:+$'\n'}${limit}"$'\t'"${project_path}"
+            done
+        else
+            limits="$(docker inspect --format '{{.HostConfig.Memory}}' "${containers[@]}")"
+        fi
     fi
 
-    while IFS= read -r limit; do
+    [ "$mode" != effective ] || _boxa::reset_resources_cache
+    while IFS=$'\t' read -r limit project_path; do
+        if [ "$mode" = effective ] && [[ "$project_path" == /* ]]; then
+            _boxa::resolve_resources "$project_path" || return 1
+            limit="$_BOXA_MEMORY_BYTES"
+        fi
         [[ "$limit" =~ ^[0-9]+$ ]] || continue
         sum=$((sum + limit))
     done <<< "$limits"
@@ -781,20 +801,20 @@ _boxa::running_memory_limit_sum() {
 
 # True when running limits plus a proposed Container limit exceed host RAM.
 _boxa::would_jointly_exhaust_host() {
-    local proposed="$1" host_total="${2:-}" running_total
+    local proposed="$1" host_total="${2:-}" sum_mode="${3:-live}" running_total
     if [ -z "$host_total" ]; then
         host_total="$(_boxa::host_memtotal_bytes)" || return 1
     fi
-    running_total="$(_boxa::running_memory_limit_sum)" || return 1
+    running_total="$(_boxa::running_memory_limit_sum "$sum_mode")" || return 1
     [ "$((running_total + proposed))" -gt "$host_total" ]
 }
 
 # Print the canonical shared-capacity warning when the proposed limit plus
 # running Containers' current limits exceeds host RAM.
 _boxa::joint_exhaustion_warning() {
-    local proposed="$1" host_total="${2:-}"
+    local proposed="$1" host_total="${2:-}" sum_mode="${3:-live}"
     if [ -n "$host_total" ] \
-        && _boxa::would_jointly_exhaust_host "$proposed" "$host_total"; then
+        && _boxa::would_jointly_exhaust_host "$proposed" "$host_total" "$sum_mode"; then
         printf 'WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop.\n'
     fi
 }

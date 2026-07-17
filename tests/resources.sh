@@ -396,6 +396,35 @@ assert_eq "joint-exhaustion warning reuses canonical wording" \
     "WARNING: Running boxa Containers can jointly exhaust host RAM; use the .wslconfig VM backstop." \
     "$(_boxa::joint_exhaustion_warning 6442450944 10737418240)"
 
+seed_conf \
+    'memory = 1g' \
+    '[/work/target]' \
+    'memory = 5g' \
+    '[/work/other]' \
+    'memory = 2g'
+printf '%s\t%s\n' \
+    4294967296 /work/target \
+    2147483648 /work/other \
+    > "$BOXA_RUNNING_MEMORY_LIMITS_FILE"
+assert_eq "projected sum replaces target Container old limit" "7516192768" \
+    "$(_boxa::running_memory_limit_sum effective)"
+assert_fail "project update projected sum stays within host RAM" \
+    _boxa::would_jointly_exhaust_host 0 10737418240 effective
+
+seed_conf \
+    'memory = 4g' \
+    '[/work/special]' \
+    'memory = 2g'
+printf '%s\t%s\n' \
+    1073741824 /work/first \
+    1073741824 /work/second \
+    1073741824 /work/special \
+    > "$BOXA_RUNNING_MEMORY_LIMITS_FILE"
+assert_eq "projected sum applies global limit to every inheriting Container" "10737418240" \
+    "$(_boxa::running_memory_limit_sum effective)"
+assert_ok "global update projected sum can exhaust host RAM" \
+    _boxa::would_jointly_exhaust_host 0 9663676416 effective
+
 # --- `boxa ls` MEM cell -------------------------------------------------------
 
 assert_eq "mem cell usage/limit percent" "2.3g/6.5g 35%" \

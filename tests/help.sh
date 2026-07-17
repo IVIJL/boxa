@@ -78,6 +78,10 @@ assert_contains "unknown command is named" \
 assert_contains "unknown command points at boxa help" \
     "Run 'boxa help' for the command overview." "$unknown_output"
 
+literal_help_output="$(run_boxa stop help 2>&1 || true)"
+assert_contains "literal help target reaches command parsing" \
+    "Container boxa-help is not running." "$literal_help_output"
+
 if [ "$fail_count" -gt 0 ]; then
     printf '\n%d test(s) failed.\n' "$fail_count"
     exit 1
