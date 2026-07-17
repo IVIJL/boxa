@@ -46,9 +46,9 @@
 #        only after usage falls back below 75 %, so hovering at a threshold
 #        does not warn continuously.
 #
-# State: /tmp/boxa-memory-hook.<user>.state on the container-private rootfs
-# (NOT a bind mount), so it survives across tool calls and sessions within
-# this Container but cannot leak into another Container. A counter
+# State: /tmp/boxa-memory-hook.<user>.<session>.state on the
+# container-private rootfs (NOT a bind mount), so concurrent agent sessions
+# keep independent baselines and warning bands. A counter
 # regression (cgroup recreated, stale /tmp) reseeds silently. If PostToolUse
 # finds no valid state and oom_kill is already positive, it reports that
 # count once: the first tool call may itself have been killed. This whole
@@ -60,13 +60,63 @@
 # Test seams (tests/memory-context.sh sources with BOXA_MEMHOOK_NO_MAIN=1):
 #   BOXA_MEMHOOK_IDENTITY_FILE  identity guard file (default /etc/boxa/...)
 #   BOXA_MEMHOOK_CGROUP_DIR     dir with memory.events/current/max
-#   BOXA_MEMHOOK_STATE          state file path
+#   BOXA_MEMHOOK_STATE          exact state file path (unit-test override)
+#   BOXA_MEMHOOK_STATE_DIR      state directory (default /tmp)
 #   BOXA_MEMHOOK_DMESG_FILE     read kernel log from file instead of dmesg
 #   BOXA_MEMHOOK_UPTIME_FILE    /proc/uptime override for the "when" field
 
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-tested; return via MEMHOOK_* globals — no subshells)
 # ---------------------------------------------------------------------------
+
+# memhook_read_session_id
+# Reads the one-line hook JSON from stdin and sets MEMHOOK_SESSION_ID. Both
+# Claude Code and Codex provide the top-level `session_id` string. This uses
+# shell builtins only because it runs before every silent PostToolUse path.
+memhook_read_session_id() {
+    MEMHOOK_SESSION_ID=
+    mrsi_input=
+    IFS= read -r mrsi_input || :
+    case $mrsi_input in
+        *'"session_id"'*) ;;
+        *) return 0 ;;
+    esac
+    mrsi_value=${mrsi_input#*'"session_id"'}
+    mrsi_value=${mrsi_value#*:}
+    mrsi_tab='	'
+    while :; do
+        case $mrsi_value in
+            ' '* | "$mrsi_tab"*) mrsi_value=${mrsi_value#?} ;;
+            *) break ;;
+        esac
+    done
+    case $mrsi_value in
+        '"'*)
+            mrsi_value=${mrsi_value#?}
+            MEMHOOK_SESSION_ID=${mrsi_value%%\"*}
+            ;;
+    esac
+}
+
+# memhook_sanitize_key <value>
+# Sets MEMHOOK_SAFE_KEY to a filename-safe, bounded key. Unsupported bytes
+# become underscores; the caller supplies a non-empty fallback first.
+memhook_sanitize_key() {
+    MEMHOOK_SAFE_KEY=
+    msk_rest=$1
+    msk_len=0
+    while [ -n "$msk_rest" ] && [ "$msk_len" -lt 96 ]; do
+        msk_char=${msk_rest%"${msk_rest#?}"}
+        msk_rest=${msk_rest#?}
+        case $msk_char in
+            [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-])
+                MEMHOOK_SAFE_KEY=$MEMHOOK_SAFE_KEY$msk_char
+                ;;
+            *) MEMHOOK_SAFE_KEY=${MEMHOOK_SAFE_KEY}_ ;;
+        esac
+        msk_len=$(( msk_len + 1 ))
+    done
+}
 
 # memhook_read_oom_kill <memory.events path>
 # Sets MEMHOOK_OOM_KILL to the oom_kill counter (0 if unreadable/absent).
@@ -303,8 +353,20 @@ memhook_main() {
     mh_identity=${BOXA_MEMHOOK_IDENTITY_FILE:-/etc/boxa/identity.json}
     [ -f "$mh_identity" ] || exit 0
 
+    memhook_read_session_id
+    mh_session_id=${MEMHOOK_SESSION_ID:-ppid-${PPID:-$$}}
+    memhook_sanitize_key "$mh_session_id"
+    mh_session_key=$MEMHOOK_SAFE_KEY
+
     mh_cgdir=${BOXA_MEMHOOK_CGROUP_DIR:-/sys/fs/cgroup}
-    mh_state=${BOXA_MEMHOOK_STATE:-/tmp/boxa-memory-hook.${USER:-agent}.state}
+    if [ -n "${BOXA_MEMHOOK_STATE:-}" ]; then
+        mh_state=$BOXA_MEMHOOK_STATE
+    else
+        mh_state_dir=${BOXA_MEMHOOK_STATE_DIR:-/tmp}
+        memhook_sanitize_key "${USER:-agent}"
+        mh_user_key=$MEMHOOK_SAFE_KEY
+        mh_state=$mh_state_dir/boxa-memory-hook.$mh_user_key.$mh_session_key.state
+    fi
 
     memhook_read_oom_kill "$mh_cgdir/memory.events"
 
@@ -315,6 +377,13 @@ memhook_main() {
     memhook_pct "$mh_usage" "$mh_limit"
 
     if [ "${1:-}" = "session-start" ]; then
+        if [ -z "${BOXA_MEMHOOK_STATE:-}" ]; then
+            # SessionStart is already the non-steady path: prune abandoned
+            # session state with one best-effort external call.
+            find "$mh_state_dir" -maxdepth 1 -type f \
+                -name "boxa-memory-hook.$mh_user_key.*.state" \
+                -mtime +7 -delete 2>/dev/null || :
+        fi
         # Establish the baseline before the first tool call. SessionStart is
         # deliberately seed-only and silent, even with a positive counter.
         mh_band=0

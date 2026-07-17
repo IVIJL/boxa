@@ -166,12 +166,30 @@ printf '9000.00 12345.00\n' > "$E2E/uptime"
 : > "$E2E/dmesg"
 
 run_hook() {
+    local event=${1:-PostToolUse} session_id=${2:-session-default} input hook_arg=${1:-}
+    if [ "$event" = "SessionStart" ]; then
+        hook_arg=session-start
+        input=$(printf '{"hook_event_name":"SessionStart","session_id":"%s"}\n' \
+            "$session_id")
+    else
+        input=$(printf '{"hook_event_name":"PostToolUse","session_id":"%s"}\n' \
+            "$session_id")
+    fi
     BOXA_MEMHOOK_IDENTITY_FILE="$E2E/identity.json" \
     BOXA_MEMHOOK_CGROUP_DIR="$E2E/cgroup" \
-    BOXA_MEMHOOK_STATE="$E2E/state" \
+    BOXA_MEMHOOK_STATE_DIR="$E2E" \
     BOXA_MEMHOOK_DMESG_FILE="$E2E/dmesg" \
     BOXA_MEMHOOK_UPTIME_FILE="$E2E/uptime" \
-    sh "$HOOK" "${1:-}" < /dev/null
+    USER=tester sh "$HOOK" "$hook_arg" <<< "$input"
+}
+
+run_hook_without_session_id() {
+    BOXA_MEMHOOK_IDENTITY_FILE="$E2E/identity.json" \
+    BOXA_MEMHOOK_CGROUP_DIR="$E2E/cgroup" \
+    BOXA_MEMHOOK_STATE_DIR="$E2E" \
+    BOXA_MEMHOOK_DMESG_FILE="$E2E/dmesg" \
+    BOXA_MEMHOOK_UPTIME_FILE="$E2E/uptime" \
+    USER=fallback sh "$HOOK" "$1" <<< "{\"hook_event_name\":\"$2\"}"
 }
 
 context_of() {
@@ -184,9 +202,59 @@ assert_eq "e2e: first run rc 0" "0" "$rc"
 out=$(run_hook)
 assert_eq "e2e: quiet steady state stays silent" "" "$out"
 
+# Each agent session owns its baseline and warning-band transitions. Starting
+# B must not overwrite A, and A reporting a crossing must not silence B.
+printf 'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n' \
+    > "$E2E/cgroup/memory.events"
+printf '104857600\n' > "$E2E/cgroup/memory.current"
+out=$(run_hook SessionStart 'session/A'); rc=$?
+assert_eq "e2e: session A starts silently" "" "$out"
+printf 'low 0\nhigh 0\nmax 1\noom 1\noom_kill 1\noom_group_kill 0\n' \
+    > "$E2E/cgroup/memory.events"
+out=$(run_hook SessionStart 'session B'); rc=$?
+assert_eq "e2e: session B starts silently" "" "$out"
+assert_eq "e2e: session A id is sanitized in state path" "yes" \
+    "$([ -f "$E2E/boxa-memory-hook.tester.session_A.state" ] && printf yes)"
+assert_eq "e2e: session B has a separate state file" "yes" \
+    "$([ -f "$E2E/boxa-memory-hook.tester.session_B.state" ] && printf yes)"
+out=$(run_hook PostToolUse 'session/A')
+assert_contains "e2e: SessionStart B does not reset A baseline" "OOM-killed" \
+    "$(context_of "$out")"
+printf '891289600\n' > "$E2E/cgroup/memory.current"
+out=$(run_hook PostToolUse 'session/A')
+assert_contains "e2e: session A reports 80% crossing" \
+    "83% of its Memory limit" "$(context_of "$out")"
+out=$(run_hook PostToolUse 'session B')
+assert_contains "e2e: session B independently reports 80% crossing" \
+    "83% of its Memory limit" "$(context_of "$out")"
+
+old_state="$E2E/boxa-memory-hook.tester.expired.state"
+: > "$old_state"
+touch -d '9 days ago' "$old_state"
+run_hook SessionStart cleanup-session > /dev/null
+assert_eq "e2e: SessionStart prunes expired session state" "no" \
+    "$([ -e "$old_state" ] && printf yes || printf no)"
+
+# Defensive fallback: inputs without session_id remain stable across events
+# from the same parent process, rather than using the per-user shared state.
+printf '104857600\n' > "$E2E/cgroup/memory.current"
+out=$(run_hook_without_session_id session-start SessionStart); rc=$?
+assert_eq "e2e: missing session_id fallback starts silently" "" "$out"
+fallback_state=
+for candidate in "$E2E"/boxa-memory-hook.fallback.ppid-*.state; do
+    if [ -f "$candidate" ]; then fallback_state=$candidate; fi
+done
+assert_contains "e2e: missing session_id uses PPID-scoped path" \
+    "boxa-memory-hook.fallback.ppid-" "$fallback_state"
+printf 'low 0\nhigh 0\nmax 2\noom 2\noom_kill 2\noom_group_kill 0\n' \
+    > "$E2E/cgroup/memory.events"
+out=$(run_hook_without_session_id '' PostToolUse)
+assert_contains "e2e: missing session_id fallback keeps baseline" "OOM-killed" \
+    "$(context_of "$out")"
+
 # SessionStart establishes the baseline before any tool call. An already
 # positive counter is historical at session start and stays silent afterward.
-rm -f "$E2E/state"
+rm -f "$E2E"/boxa-memory-hook.tester.*.state
 printf 'low 0\nhigh 0\nmax 4\noom 4\noom_kill 4\noom_group_kill 0\n' \
     > "$E2E/cgroup/memory.events"
 out=$(run_hook session-start); rc=$?
@@ -197,7 +265,7 @@ assert_eq "e2e: seeded historical kills stay silent" "" "$out"
 
 # Without a SessionStart state, a positive counter on the first PostToolUse
 # means that the first tool call may have been killed: report once, then seed.
-rm -f "$E2E/state"
+rm -f "$E2E"/boxa-memory-hook.tester.*.state
 printf 'low 0\nhigh 0\nmax 1\noom 1\noom_kill 1\noom_group_kill 0\n' \
     > "$E2E/cgroup/memory.events"
 printf '%s\n' "$kill_line" > "$E2E/dmesg"
@@ -284,7 +352,7 @@ out=$(run_hook)
 assert_eq "e2e: counter regression reseeds silently" "" "$out"
 
 # --- unlimited (memory.max = max) disables bands, keeps oom path ---
-rm -f "$E2E/state"
+rm -f "$E2E"/boxa-memory-hook.tester.*.state
 printf 'max\n' > "$E2E/cgroup/memory.max"
 printf '996147200\n' > "$E2E/cgroup/memory.current"
 run_hook > /dev/null                                   # seed
