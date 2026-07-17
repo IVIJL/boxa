@@ -58,6 +58,7 @@ export BOXA_OOM_ARCHIVE_DIR="$TEST_TMP/archive"
 export BOXA_OOM_STATE_FILE="$TEST_TMP/archive/state"
 export BOXA_OOM_DOCKER_CMD="$DOCKER_STUB"
 export BOXA_OOM_NOTIFY_CMD="$NOTIFY_STUB"
+export BOXA_OOM_NOTIFY_LOCK_STALE_SECONDS=60
 export BOXA_OOM_TEST_NOTIFICATIONS="$TEST_TMP/notifications"
 export BOXA_OOM_BOOT_ID_FILE="$TEST_TMP/boot_id"
 
@@ -161,6 +162,33 @@ run_fixture boxa.dmesg
 assert_eq "later sweep does not re-notify after retry success" \
     "2" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
 unset BOXA_OOM_TEST_NOTIFY_FAIL_ONCE
+
+# A sweep interrupted while it owns a notification leaves the atomic claim
+# behind. Stale claims are reclaimed and delivered once; fresh claims may
+# still belong to a concurrent sweep and must be left untouched.
+reset_case
+stale_pending="$BOXA_OOM_ARCHIVE_DIR/stale.log.notify-pending"
+printf '%s\n%s\n' 'Stale notification' 'Stale notification body' \
+    > "${stale_pending}.lock"
+touch -d '2 minutes ago' "${stale_pending}.lock"
+run_fixture empty.dmesg
+assert_eq "stale notification lock is reclaimed and delivered" \
+    "1" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+assert_eq "successful stale-lock delivery removes the claim" \
+    "missing" "$([ -e "${stale_pending}.lock" ] && printf present || printf missing)"
+run_fixture empty.dmesg
+assert_eq "reclaimed notification is not delivered again" \
+    "1" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+
+reset_case
+fresh_pending="$BOXA_OOM_ARCHIVE_DIR/fresh.log.notify-pending"
+printf '%s\n%s\n' 'Fresh notification' 'Fresh notification body' \
+    > "${fresh_pending}.lock"
+run_fixture empty.dmesg
+assert_eq "fresh notification lock is not delivered concurrently" \
+    "0" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+assert_eq "fresh notification lock remains claimed" \
+    "present" "$([ -e "${fresh_pending}.lock" ] && printf present || printf missing)"
 
 # The systemd cgroup driver reports Docker IDs in docker-<id>.scope paths.
 systemd_parsed=$(_boxa::oom_parse_dmesg < "$FIXTURE_DIR/systemd.dmesg")

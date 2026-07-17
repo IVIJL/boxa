@@ -16,6 +16,7 @@ BOXA_OOM_ARCHIVE_DIR="${BOXA_OOM_ARCHIVE_DIR:-/var/log/boxa/oom}"
 BOXA_OOM_STATE_FILE="${BOXA_OOM_STATE_FILE:-$BOXA_OOM_ARCHIVE_DIR/.last-seen-kernel-timestamp}"
 BOXA_OOM_DOCKER_CMD="${BOXA_OOM_DOCKER_CMD:-docker}"
 BOXA_OOM_NOTIFY_CMD="${BOXA_OOM_NOTIFY_CMD:-deliver-allow-for-notification.sh}"
+BOXA_OOM_NOTIFY_LOCK_STALE_SECONDS="${BOXA_OOM_NOTIFY_LOCK_STALE_SECONDS:-600}"
 
 # Read dmesg through a fixture seam in tests. Production deliberately uses the
 # default timestamp format: `[seconds.frac]` is stable, sortable kernel truth.
@@ -298,8 +299,29 @@ _boxa::oom_deliver_pending_notification() {
     return 1
 }
 
+_boxa::oom_reclaim_stale_notification_locks() {
+    local claim pending now mtime
+    case "$BOXA_OOM_NOTIFY_LOCK_STALE_SECONDS" in
+        *[!0-9]*|"") return 0 ;;
+    esac
+    now=$(date +%s) || return 0
+
+    for claim in "$BOXA_OOM_ARCHIVE_DIR"/*.notify-pending.lock; do
+        [ -e "$claim" ] || continue
+        mtime=$(stat -c %Y "$claim" 2>/dev/null) \
+            || mtime=$(stat -f %m "$claim" 2>/dev/null) \
+            || continue
+        [ "$((now - mtime))" -gt "$BOXA_OOM_NOTIFY_LOCK_STALE_SECONDS" ] \
+            || continue
+        pending="${claim%.lock}"
+        [ ! -e "$pending" ] || continue
+        mv "$claim" "$pending" 2>/dev/null || true
+    done
+}
+
 _boxa::oom_retry_pending_notifications() {
     local pending
+    _boxa::oom_reclaim_stale_notification_locks
     for pending in "$BOXA_OOM_ARCHIVE_DIR"/*.notify-pending; do
         [ -e "$pending" ] || continue
         _boxa::oom_deliver_pending_notification "$pending" || true
