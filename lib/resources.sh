@@ -255,6 +255,34 @@ _boxa::validate_global_project_pairs() {
     _BOXA_RESOURCES_GLOBAL_MEMORY_SWAP_SET="$old_swap_set"
 }
 
+# Reject a project unset if removing its overrides would resolve to an invalid
+# Memory and Memory+swap pair.
+_boxa::validate_project_unset_pair() {
+    local project_path="$1" validation_error
+    local old_memory="${_BOXA_RESOURCES_PROJECT_MEMORY[$project_path]-}"
+    local old_swap="${_BOXA_RESOURCES_PROJECT_MEMORY_SWAP[$project_path]-}"
+    local old_memory_set="${_BOXA_RESOURCES_PROJECT_MEMORY[$project_path]+set}"
+    local old_swap_set="${_BOXA_RESOURCES_PROJECT_MEMORY_SWAP[$project_path]+set}"
+
+    unset '_BOXA_RESOURCES_PROJECT_MEMORY[$project_path]'
+    unset '_BOXA_RESOURCES_PROJECT_MEMORY_SWAP[$project_path]'
+
+    if ! validation_error="$(_boxa::resolve_resources "$project_path" 2>&1)"; then
+        [ -z "$old_memory_set" ] \
+            || _BOXA_RESOURCES_PROJECT_MEMORY["$project_path"]="$old_memory"
+        [ -z "$old_swap_set" ] \
+            || _BOXA_RESOURCES_PROJECT_MEMORY_SWAP["$project_path"]="$old_swap"
+        printf 'Invalid resulting resource limits for project section [%s]: %s\n' \
+            "$project_path" "$validation_error" >&2
+        return 1
+    fi
+
+    [ -z "$old_memory_set" ] \
+        || _BOXA_RESOURCES_PROJECT_MEMORY["$project_path"]="$old_memory"
+    [ -z "$old_swap_set" ] \
+        || _BOXA_RESOURCES_PROJECT_MEMORY_SWAP["$project_path"]="$old_swap"
+}
+
 # Replace or remove the targeted Memory keys without sourcing or normalising the config.
 # Existing lines retain their formatting and comments; unrelated bytes pass
 # through unchanged. Validation completes before the config directory or file
@@ -277,8 +305,9 @@ _boxa::write_resources_conf() {
                 printf 'Resource limits require an absolute host project path: %s\n' "$project_path" >&2
                 return 1
             fi
-            if [[ "$project_path" == *'#'* ]]; then
-                printf "Cannot update project Memory limits for path containing '#': %s\n" \
+            if [[ "$project_path" == *'#'* || "$project_path" == *$'\r'* \
+                || "$project_path" == *$'\n'* ]]; then
+                printf "Cannot update project Memory limits for path containing '#', CR, or LF: %q\n" \
                     "$project_path" >&2
                 printf 'resources.conf cannot represent this path; use boxa --memory SIZE <path> for a one-shot override.\n' >&2
                 return 1
@@ -307,6 +336,8 @@ _boxa::write_resources_conf() {
 
         if [ "$scope" = global ]; then
             _boxa::validate_global_project_pairs '' '' || return 1
+        else
+            _boxa::validate_project_unset_pair "$project_path" || return 1
         fi
 
         temp="$(mktemp "${conf}.tmp.XXXXXX")" || return 1

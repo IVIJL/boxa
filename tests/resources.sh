@@ -290,6 +290,19 @@ assert_contains "mem unset error points to the one-shot --memory workaround" \
 assert_file_eq "rejected mem unset leaves config byte-identical" \
     "$expected_conf" "$BOXA_RESOURCES_CONF"
 
+for invalid_path in $'/work/carriage\rreturn' $'/work/line\nfeed'; do
+    cp "$BOXA_RESOURCES_CONF" "$expected_conf"
+    assert_fail "mem set rejects a project path containing CR or LF" \
+        _boxa::write_resources_conf project "$invalid_path" 8g
+    assert_file_eq "rejected CR/LF mem set leaves config byte-identical" \
+        "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+    assert_fail "mem unset rejects a project path containing CR or LF" \
+        _boxa::write_resources_conf project "$invalid_path" ''
+    assert_file_eq "rejected CR/LF mem unset leaves config byte-identical" \
+        "$expected_conf" "$BOXA_RESOURCES_CONF"
+done
+
 printf '%s\n' '# keep' '[/work/app]' 'memory = 6g' > "$BOXA_RESOURCES_CONF"
 printf '%s\n' '# keep' 'memory = 8g' 'memory_swap = 9g' '[/work/app]' 'memory = 6g' > "$expected_conf"
 _boxa::write_resources_conf global '' 8g 9g
@@ -377,6 +390,20 @@ assert_eq "project unset reports a change" "1" "$_BOXA_RESOURCES_CONF_CHANGED"
 resolve_ok /work/app
 assert_eq "project unset exposes global Memory fallback" "8589934592" "$_BOXA_MEMORY_BYTES"
 assert_eq "project unset exposes global source" "global config" "$_BOXA_MEMORY_SOURCE"
+
+printf '%s\n' 'memory = 8g' 'memory_swap = 7g' \
+    '[/work/masked]' 'memory = 5g' > "$BOXA_RESOURCES_CONF"
+cp "$BOXA_RESOURCES_CONF" "$expected_conf"
+if _boxa::write_resources_conf project /work/masked '' 2> "$writer_stderr"; then
+    printf 'FAIL  project unset rejects invalid inherited effective pair\n      expected failure\n'
+    fail_count=$((fail_count + 1))
+else
+    printf 'PASS  project unset rejects invalid inherited effective pair\n'
+fi
+assert_contains "project unset error names the offending project section" \
+    "[/work/masked]" "$(< "$writer_stderr")"
+assert_file_eq "invalid inherited pair after project unset leaves config untouched" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
 
 printf '%s\n' '# keep' '[/work/app]' 'memory = 6g' 'memory_swap = 7g' \
     '[/work/other]' 'memory = 5g' > "$BOXA_RESOURCES_CONF"
