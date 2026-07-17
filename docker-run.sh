@@ -1,4 +1,6 @@
 #!/bin/bash
+# Sources below use runtime-resolved BOXA_DIR paths with source= annotations.
+# shellcheck disable=SC1091
 # Boxa uses bash 4+ features (mapfile, associative arrays). macOS ships
 # bash 3.2, so transparently re-exec under a newer bash if one is installed
 # (Homebrew), otherwise fail with an actionable message.
@@ -26,6 +28,8 @@ show_help() {
 Boxa — portable dev container with default-deny firewall
 
 Usage:
+
+Containers:
   boxa [--ssh-config] [--memory SIZE] [--memory-swap SIZE] [path]
                                    Start/attach container for project
   boxa <name>                    Attach to running boxa-<name>
@@ -33,113 +37,104 @@ Usage:
   boxa mem [project|path]        Show per-project memory diagnostics
   boxa stop [name] [--clean]     Stop container (--clean removes volumes)
   boxa remove [name]             Remove project data (volumes)
+
+Ports & connect:
   boxa port <port>               Expose port via Traefik
   boxa ports [--all] [--external]
-                                   List active port routes (default: running
-                                   containers, only listening ports)
-  boxa connect                   Pick source, target boxaes, and services
+                                   List active port routes
+  boxa connect                   Pick source, targets, and services
   boxa connect <target> <port>   Forward one TCP port to another boxa
-                                   (use 10.0.2.2:<local-port> from inner Docker)
   boxa connections               List cross-boxa TCP forwards
-  boxa build [flags]             Build/rebuild the boxa image
-  boxa update                    Update boxa (pull repo + rebuild image)
-  boxa doctor                    Repair host provisioning regardless of repo
-                                   state: silently fixes unconditional steps,
-                                   reports skipped/declined elective steps.
-  boxa doctor --fix [step…]      Also repair elective steps: all of them, or
-                                   only the named step ids (run plain 'boxa
-                                   doctor' to list the ids).
+
+Firewall:
+  boxa allow [domain]            List or add allowed firewall domain
+  boxa deny [domain]             Remove allowed domain (interactive)
+  boxa blocked                   Show blocked DNS queries, allow interactively
+  boxa allow-for [N] [name]      Open/status an Allow-for window
+  boxa allow-for --stop [name]   Close the active window immediately
+
+Agent-browser:
+  boxa agent-browser <cmd> [args]
+                                   Manage the Agent-browser command family
+
+MCP:
+  boxa mcp <cmd> [args]          Manage MCP servers for boxa Containers
+
+DNS:
   boxa dns-install [--local|--external]
                                    Configure host resolver for *.test (per-OS)
   boxa dns-status                Show DNS mode + resolver state + verification
   boxa dns-uninstall             Remove host resolver config + dns.conf
-  boxa uninstall [--purge-ca]    Remove everything (containers, volumes, image).
-                                   --purge-ca also strips the mkcert root CA
-                                   from system trust stores (UAC on WSL2).
+
+Maintenance:
+  boxa build [--no-cache|--clean|--progress=plain]
+                                   Build/rebuild the boxa image
+  boxa update                    Update boxa (pull repo + rebuild image)
+  boxa doctor [--fix [step…]]    Check or repair host provisioning
   boxa prune [--all]             Remove old build cache (--all = everything)
+  boxa uninstall [--purge-ca]    Remove everything (containers, volumes, image).
   boxa claude-token              Generate/regenerate Claude Code token
-  boxa allow [domain]            List or add allowed firewall domain
-                                   (entry matches domain + all subdomains)
-  boxa deny [domain]             Remove allowed domain (interactive)
-  boxa blocked                   Show blocked DNS queries, allow interactively
-  boxa allow-for [N] [name]      Open an Allow-for window for N min (default 15)
-                                   in one container; non-allowlist domains are
-                                   passively allowed and recorded. No args =
-                                   status of CWD's container, or start 15-min
-                                   window if none active. See ADR 0009.
-  boxa allow-for --stop [name]   Close the active window immediately
-  boxa agent-browser <cmd> [name]
-                                   Manage the Agent-browser session for a
-                                   container. <cmd> is start | stop | status
-                                   | open | allow-for | allow | deny |
-                                   blocked. Launches Host agent Chrome on the
-                                   host and the in-container CDP bridge.
-                                   See ADR 0010.
-  boxa agent-browser allow-for <N> [name]
-                                   Open a network window for N minutes (proxy
-                                   in harvest mode + JSONL log). Pass --stop
-                                   to close immediately.
-  boxa agent-browser allow [domain]
-                                   List or add an Agent-browser allowlist
-                                   entry. Unlike `boxa allow`, matches
-                                   ONLY the literal host — quote a glob for
-                                   subdomains (e.g. '*.example.com'). Auto-
-                                   pairs apex↔www (qr.cz → also www.qr.cz).
-                                   SIGHUPs every live proxy.
-  boxa agent-browser deny <domain>
-                                   Remove an Agent-browser allowlist entry
-                                   and its apex↔www counterpart (symmetric
-                                   with `allow`). SIGHUPs every live proxy.
-  boxa agent-browser blocked [-p name]
-                                   Pick from the last Agent-browser session's
-                                   denied hosts (live or archived proxy log)
-                                   and allow them. Resolves -p → CWD basename
-                                   → picker over (live sessions ∪ containers
-                                   with archived logs).
-  boxa mcp <cmd> [args]          Manage MCP servers for boxa Containers.
-                                   <cmd> is import | list | render | doctor |
-                                   add | install | enable | disable | remove.
-                                   Read-only today: 'mcp import' (dry-run
-                                   discovery) and 'mcp list --inherited'. See
-                                   ADR 0013.
+  boxa sync-skills               Sync host skills to all running containers
+
+Editors & misc:
   boxa cursor [name]             Open Cursor attached to running boxa
   boxa code [name]               Open VS Code attached to running boxa
   boxa clip                      Grab clipboard image for container use
-  boxa sync-skills               Sync host skills to all running containers
   boxa ssh-config [add|edit]     Manage boxa SSH config
-
-Build flags:
-  boxa build                     Build image (uses cache)
-  boxa build --no-cache          Full rebuild without cache
-  boxa build --clean             Wipe build cache + dangling images, then rebuild
-  boxa build --progress=plain    Show full build log
 
 Examples:
   boxa                           Mount CWD at host project path inside container
   boxa ~/projects/app            Mount specific project
-  boxa --ssh-config ~/app        Mount with full host SSH config
-  boxa --memory 4g ~/app         One-shot Memory limit override
-  boxa ssh-config add            Add SSH host to boxa config
-  boxa cursor                     Open Cursor for CWD project
-  boxa cursor my-app              Open Cursor for specific boxa
-  boxa code                       Open VS Code for CWD project
-  boxa code my-app                Open VS Code for specific boxa
-  boxa stop my-app               Stop specific container
-  boxa stop --clean              Stop + remove Docker/history volumes
-  boxa remove                    Interactive project data cleanup
   boxa port 3000                 Route 3000.<project>.test (and external fallback URL)
-  boxa connect                   Interactive cross-boxa service picker
-  boxa connect api 5432          Forward current boxa -> boxa-api:5432
-  boxa connect db 5432 15432     Use an explicit local forward port
   boxa allow pypi.org            Allow pypi.org (and *.pypi.org) through firewall
-  boxa deny                      Interactive domain removal
-  boxa blocked                   See blocked queries, allow with fzf
-  boxa allow-for 30              Open a 30-min Allow-for window in CWD's container
-  boxa allow-for 30 myapp        Open a 30-min window in 'myapp'
-  boxa allow-for --stop          Close the active window in CWD's container
+  boxa cursor                    Open Cursor for CWD project
 EOF
     exit 0
 }
+
+# Pending per-command help for issue 02. This prose was intentionally moved
+# out of the overview so its behavioral details remain available to that slice.
+: <<'BOXA_COMMAND_HELP_DETAILS'
+boxa ports defaults to running containers and only listening ports.
+Inner Docker connects to a forwarded port at 10.0.2.2:<local-port>.
+
+boxa doctor repairs host provisioning regardless of repo state: it silently
+fixes unconditional steps and reports skipped or declined elective steps.
+With --fix [step…], it repairs all elective steps or only the named step ids;
+plain boxa doctor lists those ids.
+
+boxa uninstall --purge-ca also strips the mkcert root CA from system trust
+stores (UAC on WSL2).
+
+boxa allow entries match the domain and all subdomains.
+boxa allow-for opens a window for N minutes (default 15) in one container;
+non-allowlist domains are passively allowed and recorded. With no arguments it
+shows the CWD container's status, or starts a 15-minute window if none is active.
+See ADR 0009.
+
+boxa agent-browser commands are start, stop, status, open, allow-for, allow,
+deny, and blocked. The command launches Host agent Chrome on the host and the
+in-container CDP bridge. See ADR 0010.
+boxa agent-browser allow-for opens a network window for N minutes (proxy in
+harvest mode plus JSONL log); --stop closes it immediately.
+boxa agent-browser allow matches only the literal host, unlike boxa allow.
+Quote a glob for subdomains (for example, '*.example.com'). It automatically
+pairs apex and www hosts (qr.cz also adds www.qr.cz) and SIGHUPs every live
+proxy.
+boxa agent-browser deny removes an entry and its apex/www counterpart, then
+SIGHUPs every live proxy.
+boxa agent-browser blocked picks from the last session's denied hosts in a live
+or archived proxy log and allows them. It resolves -p, then the CWD basename,
+then offers a picker over live sessions and containers with archived logs.
+
+boxa mcp commands are import, list, render, doctor, add, install, enable,
+disable, and remove. Read-only commands are currently mcp import (dry-run
+discovery) and mcp list --inherited. See ADR 0013.
+
+boxa build uses cache by default. --no-cache performs a full rebuild;
+--clean wipes build cache and dangling images before rebuilding; and
+--progress=plain shows the full build log.
+BOXA_COMMAND_HELP_DETAILS
 
 SSH_WARNING=""
 BOXA_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
