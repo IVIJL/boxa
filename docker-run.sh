@@ -1735,14 +1735,25 @@ list_running_containers() {
     if [ -z "$containers" ]; then
         echo "No running boxa containers."
     else
-        printf '%-25s %-50s %s\n' "NAME" "URL" "STATUS"
+        printf '%-25s %-50s %-20s %s\n' "NAME" "URL" "STATUS" "MEM"
         local scheme
         scheme="$(boxa::url_scheme)"
         while IFS=$'\t' read -r name status running; do
-            local project url
+            local project url mem_probe
             project="${name#boxa-}"
             url="${scheme}://$(boxa::route_host_display "$project" '<port>')"
-            printf '%-25s %-50s %s\n' "$name" "$url" "$status"
+            # Memory posture costs one read-only exec per running container,
+            # only when ls runs: the private cgroup namespace exposes the
+            # container's own memcg at the cgroup root (ADR 0020). A container
+            # that dies mid-ls degrades to a "-" cell via _boxa::mem_cell.
+            mem_probe=$(docker exec -u root "$name" sh -c \
+                'cat /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.max &&
+                 awk '\''$1 == "oom_kill" { print $2 }'\'' /sys/fs/cgroup/memory.events' \
+                2>/dev/null) || mem_probe=""
+            # MEM sits last: the OOM marker's "×" is multibyte and would skew
+            # printf's byte-counted padding of any column after it.
+            printf '%-25s %-50s %-20s %s\n' "$name" "$url" "$status" \
+                "$(_boxa::mem_cell "$mem_probe")"
         done <<< "$containers"
     fi
 
@@ -1752,8 +1763,27 @@ list_running_containers() {
     if [ -n "$exited" ]; then
         echo ""
         echo "Exited (use 'boxa <name>' to restart):"
+        # Lifetime OOM flags for the whole section in one batched inspect —
+        # no exec on exited containers. A container removed between the ps
+        # snapshot and the inspect just misses from the map (no marker);
+        # the inspect still reports the survivors.
+        local -A exited_oom=()
+        local -a exited_names=()
+        local iname iflag marker
         while IFS=$'\t' read -r name status; do
-            printf '  %-25s %s\n' "$name" "$status"
+            exited_names+=("$name")
+        done <<< "$exited"
+        while IFS=$'\t' read -r iname iflag; do
+            [ -n "$iname" ] && exited_oom["${iname#/}"]="$iflag"
+        done < <(docker inspect --format $'{{.Name}}\t{{.State.OOMKilled}}' \
+            "${exited_names[@]}" 2>/dev/null || true)
+        while IFS=$'\t' read -r name status; do
+            marker="$(_boxa::exited_oom_marker "${exited_oom[$name]:-}" "${name#boxa-}")"
+            if [ -n "$marker" ]; then
+                printf '  %-25s %-28s %s\n' "$name" "$status" "$marker"
+            else
+                printf '  %-25s %s\n' "$name" "$status"
+            fi
         done <<< "$exited"
     fi
 }
