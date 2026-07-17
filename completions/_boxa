@@ -27,6 +27,7 @@ _boxa() {
             commands=(
                 'help:Show help message'
                 'ls:List running containers'
+                'mem:Show per-project memory diagnostics'
                 'stop:Stop container (--clean removes volumes)'
                 'remove:Remove project data (volumes)'
                 'port:Expose port via Traefik'
@@ -65,7 +66,7 @@ _boxa() {
                         _describe 'flags' flags
                     fi
                     ;;
-                cursor|code|remove)
+                mem|cursor|code|remove)
                     _boxa_containers
                     ;;
                 allow-for)

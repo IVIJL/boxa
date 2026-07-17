@@ -30,6 +30,7 @@ Usage:
                                    Start/attach container for project
   boxa <name>                    Attach to running boxa-<name>
   boxa ls                        List running containers
+  boxa mem [project|path]        Show per-project memory diagnostics
   boxa stop [name] [--clean]     Stop container (--clean removes volumes)
   boxa remove [name]             Remove project data (volumes)
   boxa port <port>               Expose port via Traefik
@@ -182,6 +183,11 @@ source "$BOXA_DIR/lib/naming.sh"
 # Per-project Memory and Memory+swap limit resolution (ADR 0020).
 # shellcheck source=lib/resources.sh
 source "$BOXA_DIR/lib/resources.sh"
+
+# Per-project Memory autopsy: cgroup live data, inspect post-mortem state,
+# project-aggregate RSS, OOM archives, and concrete recovery commands.
+# shellcheck source=lib/mem-report.sh
+source "$BOXA_DIR/lib/mem-report.sh"
 
 # Picker module — single + multi interactive selection with consistent UX
 # across fzf and the no-fzf fallback. See lib/picker.sh and
@@ -1982,6 +1988,7 @@ CLI_MEMORY_SWAP=
 case "${1:-}" in
     -h|--help|help) show_help ;;
     ls)      MODE="ls";      shift ;;
+    mem)     MODE="mem";     shift; MEM_TARGET="${1:-}" ;;
     stop)    MODE="stop";    shift; PROJECT_FILTER=""
              # Parse --clean flag and optional project name (any order)
              for arg in "$@"; do
@@ -2211,6 +2218,13 @@ esac
 if [ "$MODE" = "ls" ]; then
     list_running_containers
     exit 0
+fi
+
+# --- boxa mem [project|path] -----------------------------------------------
+
+if [ "$MODE" = "mem" ]; then
+    _boxa::mem_report "${MEM_TARGET:-}"
+    exit $?
 fi
 
 # --- boxa build [flags] ----------------------------------------------------
