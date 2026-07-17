@@ -173,24 +173,25 @@ _boxa::mem_recommended_size() {
 }
 
 _boxa::mem_render_recommendations() {
-    local project="$1" project_path="${2:-}" size="$3" target
+    local project_path="${2:-}" size="$3" target=""
     if [ -n "$project_path" ]; then
         printf -v target '%q' "$project_path"
-    else
-        printf -v target '%q' "$project"
     fi
 
     printf '\nRecommended next commands:\n'
-    printf '  Temporary raise (one shot): boxa --memory %s %s\n' "$size" "$target"
-    printf '  Durable raise: edit ~/.config/boxa/resources.conf and add:\n'
     if [ -n "$project_path" ]; then
+        printf '  Temporary raise (one shot): boxa --memory %s %s\n' "$size" "$target"
+        printf '  Durable raise: edit ~/.config/boxa/resources.conf and add:\n'
         printf '    [%s]\n' "$project_path"
     else
-        printf '    [/absolute/path/to/%s]\n' "$project"
+        printf '  Durable raise: edit ~/.config/boxa/resources.conf and add (substitute your project path):\n'
+        printf '    [/absolute/path/to/project]\n'
     fi
     printf '    memory = %s\n' "$size"
     printf '    memory_swap = %s\n' "$size"
-    printf '  Diagnose again: boxa mem %s\n' "$target"
+    if [ -n "$project_path" ]; then
+        printf '  Diagnose again: boxa mem %s\n' "$target"
+    fi
     printf '  Docs: %s\n' "$BOXA_MEMORY_DOCS_URL"
 }
 

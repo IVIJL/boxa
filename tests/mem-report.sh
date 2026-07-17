@@ -99,6 +99,8 @@ assert_ok "RSS listing uses resources formatter" grep -Fq "512m" <<< "$ps_output
 assert_ok "RSS listing remains project process data" grep -Fq "node server.js" <<< "$ps_output"
 
 recommendations=$(_boxa::mem_render_recommendations api "$TEST_TMP/My Project" 8g)
+assert_ok "known path is used for one-shot raise" \
+    grep -Fq "boxa --memory 8g $TEST_TMP/My\\ Project" <<< "$recommendations"
 assert_eq "recommended next commands block" "
 Recommended next commands:
   Temporary raise (one shot): boxa --memory 8g $TEST_TMP/My\\ Project
@@ -108,6 +110,12 @@ Recommended next commands:
     memory_swap = 8g
   Diagnose again: boxa mem $TEST_TMP/My\\ Project
   Docs: https://example.test/docs/memory" "$recommendations"
+
+recommendations=$(_boxa::mem_render_recommendations api "" 12g)
+assert_fail "removed container omits unusable one-shot raise" \
+    grep -Fq "boxa --memory" <<< "$recommendations"
+assert_ok "removed container keeps durable path hint" \
+    grep -Fq "[/absolute/path/to/project]" <<< "$recommendations"
 assert_eq "recommended size doubles current limit" "8g" "$(_boxa::mem_recommended_size 4294967296)"
 assert_eq "removed container still gets concrete size" "12g" "$(_boxa::mem_recommended_size '')"
 
