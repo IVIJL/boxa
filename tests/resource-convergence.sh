@@ -72,6 +72,60 @@ assert_eq "limit below host RAM does not warn" "" "$_BOXA_RESOURCE_UPDATE_WARNIN
 _boxa::plan_resource_convergence boxa-app 1073741824 1073741824 17179869184 17179869184 "" "" ""
 assert_eq "unavailable host RAM skips unsafe-limit warning" "" "$_BOXA_RESOURCE_UPDATE_WARNING"
 
+# The first needed convergence update sweeps OOM evidence synchronously; all
+# later updates in the same invocation reuse the once-only guard.
+pre_update_boxa_dir="$_TMPROOT/pre-update-boxa"
+pre_update_calls="$_TMPROOT/pre-update.calls"
+mkdir -p "$pre_update_boxa_dir/scripts"
+# shellcheck disable=SC2016 # Expanded by the generated stub at runtime.
+printf '%s\n' \
+    '#!/bin/sh' \
+    'printf "sweep\n" >> "$BOXA_RESOURCE_TEST_PRE_UPDATE_CALLS"' \
+    > "$pre_update_boxa_dir/scripts/sweep-oom-events.sh"
+chmod +x "$pre_update_boxa_dir/scripts/sweep-oom-events.sh"
+export BOXA_RESOURCE_TEST_PRE_UPDATE_CALLS="$pre_update_calls"
+_BOXA_OOM_PRE_UPDATE_SWEEP_DONE=
+BOXA_DIR="$pre_update_boxa_dir" _boxa::sweep_oom_before_resource_update
+BOXA_DIR="$pre_update_boxa_dir" _boxa::sweep_oom_before_resource_update
+assert_eq "pre-update OOM sweep runs once per invocation" \
+    "1" "$(wc -l < "$pre_update_calls" | tr -d ' ')"
+
+converge_extracted="$_TMPROOT/converge_container_resources.sh"
+awk '
+    /^_boxa::converge_container_resources\(\) \{$/ { capture=1 }
+    capture { print }
+    capture && /^\}$/ { exit }
+' "$BOXA_DIR/docker-run.sh" > "$converge_extracted"
+if [ ! -s "$converge_extracted" ]; then
+    printf 'FAIL  could not extract _boxa::converge_container_resources from docker-run.sh\n'
+    fail_count=$((fail_count + 1))
+else
+    # shellcheck source=/dev/null
+    source "$converge_extracted"
+    convergence_calls="$_TMPROOT/convergence.calls"
+    export BOXA_RESOURCE_TEST_PRE_UPDATE_CALLS="$convergence_calls"
+    _BOXA_OOM_PRE_UPDATE_SWEEP_DONE=
+
+    # shellcheck disable=SC2317
+    _boxa::resolve_resources() {
+        _BOXA_MEMORY_BYTES=2147483648
+        _BOXA_MEMORY_SWAP_BYTES=2147483648
+        _BOXA_HOST_MEMTOTAL_BYTES=8589934592
+    }
+    # shellcheck disable=SC2317
+    docker() {
+        case "$1" in
+            inspect) printf '%s\n' '1073741824 1073741824' ;;
+            update) printf '%s\n' 'docker:update' >> "$convergence_calls" ;;
+        esac
+    }
+
+    BOXA_DIR="$pre_update_boxa_dir" \
+        _boxa::converge_container_resources boxa-app /work/app >/dev/null
+    assert_eq "OOM events archive before the first resource update" \
+        $'sweep\ndocker:update' "$(< "$convergence_calls")"
+fi
+
 # docker-run.sh is not source-safe, so extract only the restart helper and
 # verify its stopped-Container convergence wiring with mocked dependencies.
 extracted="$_TMPROOT/restart_exited_container.sh"

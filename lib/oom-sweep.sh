@@ -155,15 +155,23 @@ _boxa::oom_write_state() {
 }
 
 # Print `<container> <limit-bytes>` for a Docker id. Inspect normally provides
-# both values. A `docker ps -a --no-trunc` fallback preserves correlation if
-# the container disappears between listing and inspection; its limit then
-# degrades to unknown instead of aborting the sweep.
+# both values. A `docker ps -a --no-trunc` fallback preserves correlation for
+# an indeterminate inspect failure; its limit then degrades to unknown instead
+# of aborting the sweep. Return 3 when Docker explicitly confirms the id is
+# absent, distinct from a transient failure (return 1).
 _boxa::oom_inspect_container() {
     local container_id="$1" output name="" limit="" listed_id listed_name
     if output=$("$BOXA_OOM_DOCKER_CMD" inspect \
-        --format '{{.Name}} {{.HostConfig.Memory}}' "$container_id" 2>/dev/null); then
+        --format '{{.Name}} {{.HostConfig.Memory}}' "$container_id" 2>&1); then
         read -r name limit <<< "$output"
     else
+        output="${output,,}"
+        case "$output" in
+            *"no such object"*"$container_id"* \
+                | *"no such container"*"$container_id"* \
+                | *"not found"*"$container_id"* \
+                | *"$container_id"*"not found"*) return 3 ;;
+        esac
         output=$("$BOXA_OOM_DOCKER_CMD" ps -a --no-trunc \
             --format '{{.ID}} {{.Names}}' 2>/dev/null) || return 1
         while read -r listed_id listed_name; do
@@ -308,6 +316,9 @@ _boxa::oom_process_event() {
     else
         local inspect_rc=$?
         [ "$inspect_rc" -eq 2 ] && return 0
+        # Accepted evidence loss: a Container removed outside boxa can no
+        # longer be tied to a Project. Boxa removal paths sweep first.
+        [ "$inspect_rc" -eq 3 ] && return 0
         return 1
     fi
     IFS=$'\t' read -r container limit <<< "$inspected"

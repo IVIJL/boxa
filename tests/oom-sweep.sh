@@ -13,11 +13,23 @@ NOTIFY_STUB="$TEST_TMP/notify"
 
 cat > "$DOCKER_STUB" <<'STUB'
 #!/bin/bash
+id="${@: -1}"
+if [ "${1:-}" = "inspect" ] && [ -n "${BOXA_OOM_TEST_INSPECT_CALLS:-}" ]; then
+    printf '%s\n' "$id" >> "$BOXA_OOM_TEST_INSPECT_CALLS"
+fi
+if [ "${BOXA_OOM_TEST_DOCKER_MODE:-}" = "absent" ] \
+    && [ "${1:-}" = "inspect" ]; then
+    printf 'Error: No such object: %s\n' "$id" >&2
+    exit 1
+fi
+if [ "${BOXA_OOM_TEST_DOCKER_MODE:-}" = "transient" ]; then
+    printf 'Cannot connect to the Docker daemon\n' >&2
+    exit 1
+fi
 if [ "${1:-}" = "ps" ]; then
     printf 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc boxa-gone\n'
     exit 0
 fi
-id="${@: -1}"
 case "$id" in
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
         printf '/boxa-media 5368709120\n'
@@ -101,6 +113,7 @@ reset_case() {
     rm -f "$BOXA_OOM_TEST_NOTIFICATIONS"
     mkdir -p "$BOXA_OOM_ARCHIVE_DIR"
     set_boot_id boot-a
+    unset BOXA_OOM_TEST_DOCKER_MODE BOXA_OOM_TEST_INSPECT_CALLS
 }
 
 run_fixture() {
@@ -204,6 +217,35 @@ unknown_record="$BOXA_OOM_ARCHIVE_DIR/boxa-gone-30000.300000.log"
 assert_eq "vanished inspect result still archived" "1" "$(archive_count)"
 assert_contains "vanished container limit is unknown" "Memory limit: unknown" "$unknown_record"
 assert_contains "unknown-limit notification stays grammatical" "Project gone hit a memory limit." "$BOXA_OOM_TEST_NOTIFICATIONS"
+
+# A Container explicitly reported absent by Docker cannot be correlated after
+# out-of-band removal. Drop that evidence silently and advance past it.
+reset_case
+export BOXA_OOM_TEST_DOCKER_MODE=absent
+export BOXA_OOM_TEST_INSPECT_CALLS="$TEST_TMP/absent-inspect-calls"
+run_fixture boxa.dmesg
+assert_eq "absent container event is not archived" "0" "$(archive_count)"
+assert_eq "absent container event is not notified" \
+    "0" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+IFS= read -r state_line < "$BOXA_OOM_STATE_FILE"
+assert_eq "absent container advances the cutoff" "12346.000000" "$state_line"
+run_fixture boxa.dmesg
+assert_eq "advanced absent event is not retried" \
+    "1" "$(line_count "$BOXA_OOM_TEST_INSPECT_CALLS")"
+
+# Daemon/transient inspect failures retain the cutoff and retry later.
+reset_case
+export BOXA_OOM_TEST_DOCKER_MODE=transient
+export BOXA_OOM_TEST_INSPECT_CALLS="$TEST_TMP/transient-inspect-calls"
+run_fixture boxa.dmesg
+assert_eq "transient inspect failure is not archived" "0" "$(archive_count)"
+assert_eq "transient inspect failure is not notified" \
+    "0" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+assert_eq "transient inspect failure holds the cutoff" "missing" \
+    "$([ -f "$BOXA_OOM_STATE_FILE" ] && printf present || printf missing)"
+run_fixture boxa.dmesg
+assert_eq "transient inspect failure is retried" \
+    "2" "$(line_count "$BOXA_OOM_TEST_INSPECT_CALLS")"
 
 # A backwards latest timestamp resets the cutoff and admits the new boot.
 reset_case

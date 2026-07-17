@@ -24,6 +24,18 @@ _BOXA_HOST_MEMTOTAL_BYTES=
 _BOXA_RESOURCE_UPDATE_NEEDED=
 _BOXA_RESOURCE_UPDATE_NOTICE=
 _BOXA_RESOURCE_UPDATE_WARNING=
+_BOXA_OOM_PRE_UPDATE_SWEEP_DONE=
+
+# Run at the first convergence update only. Ordering invariant: archive events
+# under the pre-update limit before converging.
+_boxa::sweep_oom_before_resource_update() {
+    [ -z "$_BOXA_OOM_PRE_UPDATE_SWEEP_DONE" ] || return 0
+    _BOXA_OOM_PRE_UPDATE_SWEEP_DONE=1
+    if [ -n "${BOXA_DIR:-}" ] \
+        && [ -x "$BOXA_DIR/scripts/sweep-oom-events.sh" ]; then
+        "$BOXA_DIR/scripts/sweep-oom-events.sh" || true
+    fi
+}
 
 _boxa::reset_resources_cache() {
     _BOXA_RESOURCES_CONF_LOADED=

@@ -1705,6 +1705,7 @@ _boxa::converge_container_resources() {
         "$_BOXA_HOST_MEMTOTAL_BYTES"
     [ -n "$_BOXA_RESOURCE_UPDATE_NEEDED" ] || return 0
 
+    _boxa::sweep_oom_before_resource_update
     if docker update --memory "$desired_memory" --memory-swap "$desired_memory_swap" \
             "$name" >/dev/null 2>&1; then
         printf '%s\n' "$_BOXA_RESOURCE_UPDATE_NOTICE"
