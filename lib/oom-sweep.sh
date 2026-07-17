@@ -208,7 +208,7 @@ _boxa::oom_format_rss() {
 
 # Create the final archive path with noclobber semantics. That makes the
 # archive itself the concurrency-safe dedup record when two detached sweeps
-# overlap: exactly one writer wins and only that writer sends a notification.
+# overlap: exactly one writer wins and queues a notification.
 _boxa::oom_archive_event() {
     local timestamp="$1" container="$2" project="$3" limit="$4"
     local victim_pid="$5" victim_name="$6" victim_rss_kb="$7"
@@ -245,15 +245,57 @@ _boxa::oom_archive_event() {
 _boxa::oom_notify_event() {
     local project="$1" victim_name="$2"
     local title="Boxa memory limit: $project"
-    local limit_sentence
+    local limit_sentence body pending tmp
     if [ "$OOM_LIMIT_TEXT" = "unknown" ]; then
         limit_sentence="Project $project hit a memory limit."
     else
         limit_sentence="Project $project hit its $OOM_LIMIT_TEXT memory limit."
     fi
-    local body="$limit_sentence Killed by the kernel: $victim_name, $OOM_RSS_TEXT RSS. The project keeps running."
-    "$BOXA_OOM_NOTIFY_CMD" --notification "$title" "$body" \
-        "$OOM_ARCHIVE_PATH" >/dev/null 2>&1
+    body="$limit_sentence Killed by the kernel: $victim_name, $OOM_RSS_TEXT RSS. The project keeps running."
+    pending="${OOM_ARCHIVE_PATH}.notify-pending"
+    tmp="${pending}.tmp.$$"
+
+    # Publish only complete markers. The archive is already durable, so a
+    # marker write failure must not hold back the scan cutoff.
+    if ! printf '%s\n%s\n' "$title" "$body" > "$tmp" 2>/dev/null \
+        || ! mv -f "$tmp" "$pending" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    _boxa::oom_deliver_pending_notification "$pending"
+}
+
+_boxa::oom_deliver_pending_notification() {
+    local pending="$1"
+    local claim="${pending}.lock"
+    local archive="${pending%.notify-pending}" title="" body=""
+
+    # Concurrent sweeps claim by atomic rename, matching the allow-for
+    # notification flow. A missing marker means another sweep owns it.
+    mv "$pending" "$claim" 2>/dev/null || return 0
+    if ! {
+        IFS= read -r title
+        IFS= read -r body
+    } < "$claim"; then
+        mv "$claim" "$pending" 2>/dev/null || rm -f "$claim"
+        return 1
+    fi
+
+    if "$BOXA_OOM_NOTIFY_CMD" --notification "$title" "$body" \
+        "$archive" >/dev/null 2>&1; then
+        rm -f "$claim"
+        return 0
+    fi
+    mv "$claim" "$pending" 2>/dev/null || rm -f "$claim"
+    return 1
+}
+
+_boxa::oom_retry_pending_notifications() {
+    local pending
+    for pending in "$BOXA_OOM_ARCHIVE_DIR"/*.notify-pending; do
+        [ -e "$pending" ] || continue
+        _boxa::oom_deliver_pending_notification "$pending" || true
+    done
 }
 
 _boxa::oom_process_event() {
@@ -293,10 +335,12 @@ _boxa::oom_sweep() {
     local row kind timestamp container_id victim_pid victim_name victim_rss_kb
     local -a parsed=()
 
+    mkdir -p "$BOXA_OOM_ARCHIVE_DIR" 2>/dev/null || return 0
+    _boxa::oom_retry_pending_notifications
+
     # A failed read is not an empty snapshot: retain all state so a later
     # sweep with permission to read the kernel log can still see old events.
     dmesg_snapshot=$(_boxa::oom_read_dmesg) || return 0
-    mkdir -p "$BOXA_OOM_ARCHIVE_DIR" 2>/dev/null || return 0
 
     previous=$(_boxa::oom_read_state)
     mapfile -t parsed < <(printf '%s' "$dmesg_snapshot" | _boxa::oom_parse_dmesg)

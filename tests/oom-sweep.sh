@@ -34,6 +34,11 @@ STUB
 cat > "$NOTIFY_STUB" <<'STUB'
 #!/bin/bash
 printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$BOXA_OOM_TEST_NOTIFICATIONS"
+if [ -n "${BOXA_OOM_TEST_NOTIFY_FAIL_ONCE:-}" ] \
+    && [ -f "$BOXA_OOM_TEST_NOTIFY_FAIL_ONCE" ]; then
+    rm -f "$BOXA_OOM_TEST_NOTIFY_FAIL_ONCE"
+    exit 1
+fi
 STUB
 chmod +x "$DOCKER_STUB" "$NOTIFY_STUB"
 
@@ -82,6 +87,11 @@ archive_count() {
         2>/dev/null | wc -l | tr -d ' '
 }
 
+pending_notification_count() {
+    find "$BOXA_OOM_ARCHIVE_DIR" -maxdepth 1 -type f -name '*.notify-pending' \
+        2>/dev/null | wc -l | tr -d ' '
+}
+
 set_boot_id() {
     printf '%s\n' "$1" > "$BOXA_OOM_BOOT_ID_FILE"
 }
@@ -116,6 +126,28 @@ assert_contains "notification wording" "Killed by the kernel: ugrep, 3.8 GiB RSS
 run_fixture boxa.dmesg
 assert_eq "repeat does not duplicate archive" "1" "$(archive_count)"
 assert_eq "repeat does not re-notify" "1" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+
+# A transient backend failure leaves one retry marker. The next sweep retries
+# the already-archived event, while a successful retry removes the marker so
+# later sweeps stay deduplicated.
+reset_case
+export BOXA_OOM_TEST_NOTIFY_FAIL_ONCE="$TEST_TMP/notify-fail-once"
+: > "$BOXA_OOM_TEST_NOTIFY_FAIL_ONCE"
+run_fixture boxa.dmesg
+assert_eq "failed notification still archives the event" "1" "$(archive_count)"
+assert_eq "failed notification leaves one retry marker" \
+    "1" "$(pending_notification_count)"
+assert_eq "failed notification dispatches once" \
+    "1" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+run_fixture boxa.dmesg
+assert_eq "next sweep retries the failed notification" \
+    "2" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+assert_eq "successful retry removes the marker" \
+    "0" "$(pending_notification_count)"
+run_fixture boxa.dmesg
+assert_eq "later sweep does not re-notify after retry success" \
+    "2" "$(line_count "$BOXA_OOM_TEST_NOTIFICATIONS")"
+unset BOXA_OOM_TEST_NOTIFY_FAIL_ONCE
 
 # The systemd cgroup driver reports Docker IDs in docker-<id>.scope paths.
 systemd_parsed=$(_boxa::oom_parse_dmesg < "$FIXTURE_DIR/systemd.dmesg")
