@@ -277,6 +277,12 @@ _boxa::write_resources_conf() {
                 printf 'Resource limits require an absolute host project path: %s\n' "$project_path" >&2
                 return 1
             fi
+            if [[ "$project_path" == *'#'* ]]; then
+                printf "Cannot update project Memory limits for path containing '#': %s\n" \
+                    "$project_path" >&2
+                printf 'resources.conf cannot represent this path; use boxa --memory SIZE <path> for a one-shot override.\n' >&2
+                return 1
+            fi
             target_section="$project_path"
             ;;
         *)

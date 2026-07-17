@@ -257,6 +257,39 @@ printf '%s\n' 'memory = 7g' '[/work/other]' 'memory = 6g' '' \
 _boxa::write_resources_conf project '/work/new project' 8g 9g
 assert_file_eq "missing project section is appended" "$expected_conf" "$BOXA_RESOURCES_CONF"
 
+printf '%s' $'# keep byte-identical\nmemory = 7g' > "$BOXA_RESOURCES_CONF"
+cp "$BOXA_RESOURCES_CONF" "$expected_conf"
+writer_stderr="$_TMPROOT/writer.stderr"
+if _boxa::write_resources_conf project '/work/C#' 8g 2> "$writer_stderr"; then
+    printf 'FAIL  mem set rejects a project path containing #\n      expected failure\n'
+    fail_count=$((fail_count + 1))
+else
+    printf 'PASS  mem set rejects a project path containing #\n'
+fi
+assert_contains "mem set error names the unrepresentable project path" \
+    "/work/C#" "$(< "$writer_stderr")"
+assert_contains "mem set error explains the resources.conf limitation" \
+    "resources.conf cannot represent" "$(< "$writer_stderr")"
+assert_contains "mem set error points to the one-shot --memory workaround" \
+    "--memory" "$(< "$writer_stderr")"
+assert_file_eq "rejected mem set leaves config byte-identical" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
+if _boxa::write_resources_conf project '/work/C#' '' 2> "$writer_stderr"; then
+    printf 'FAIL  mem unset rejects a project path containing #\n      expected failure\n'
+    fail_count=$((fail_count + 1))
+else
+    printf 'PASS  mem unset rejects a project path containing #\n'
+fi
+assert_contains "mem unset error names the unrepresentable project path" \
+    "/work/C#" "$(< "$writer_stderr")"
+assert_contains "mem unset error explains the resources.conf limitation" \
+    "resources.conf cannot represent" "$(< "$writer_stderr")"
+assert_contains "mem unset error points to the one-shot --memory workaround" \
+    "--memory" "$(< "$writer_stderr")"
+assert_file_eq "rejected mem unset leaves config byte-identical" \
+    "$expected_conf" "$BOXA_RESOURCES_CONF"
+
 printf '%s\n' '# keep' '[/work/app]' 'memory = 6g' > "$BOXA_RESOURCES_CONF"
 printf '%s\n' '# keep' 'memory = 8g' 'memory_swap = 9g' '[/work/app]' 'memory = 6g' > "$expected_conf"
 _boxa::write_resources_conf global '' 8g 9g
