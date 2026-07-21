@@ -557,6 +557,23 @@ assert_eq "mem cell garbage probe degrades" "-" \
 assert_eq "mem cell zero max degrades" "-" "$(_boxa::mem_cell $'1\n0\n0')"
 assert_eq "mem cell non-numeric oom count degrades" "-" \
     "$(_boxa::mem_cell $'1073741824\nmax\nnope')"
+assert_eq "mem cell subtracts reclaimable cache" "1g/3g 33%" \
+    "$(_boxa::mem_cell $'2147483648\n3221225472\n0\n1073741824')"
+assert_eq "mem cell clamps effective usage at zero" "0k/1g 0%" \
+    "$(_boxa::mem_cell $'536870912\n1073741824\n0\n1073741824')"
+assert_eq "mem cell non-numeric reclaimable degrades" "-" \
+    "$(_boxa::mem_cell $'536870912\n1073741824\n0\nevil')"
+
+assert_eq "effective usage subtracts reclaimable cache and slab" "400" \
+    "$(_boxa::effective_usage_bytes 1000 $'anon 350\ninactive_file 300\nactive_file 200\nslab_reclaimable 100\nslab_unreclaimable 50')"
+assert_eq "effective usage clamps at zero" "0" \
+    "$(_boxa::effective_usage_bytes 100 $'inactive_file 300')"
+assert_eq "effective usage without stat text is raw current" "1000" \
+    "$(_boxa::effective_usage_bytes 1000 '')"
+assert_eq "effective usage ignores malformed stat values" "700" \
+    "$(_boxa::effective_usage_bytes 1000 $'inactive_file evil\nactive_file 300')"
+assert_fail "effective usage rejects malformed current" \
+    _boxa::effective_usage_bytes max 'inactive_file 1'
 
 # --- Exited-Container OOM marker ---------------------------------------------
 

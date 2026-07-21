@@ -1822,15 +1822,25 @@ _boxa::container_project_path() {
         }'
 }
 
-# Read current cgroup usage. BOXA_MEMORY_USAGE_FILE is the no-Docker unit-test
-# seam; production reads the unified-cgroup value from inside the Container.
+# Read current effective cgroup usage (memory.current minus reclaimable cache
+# per _boxa::effective_usage_bytes), so a warm page cache does not trip the
+# shrink-safety warning — the kernel evicts it before an OOM. The probe's
+# first line is memory.current; the rest is memory.stat (absent on error, which
+# degrades to raw usage). BOXA_MEMORY_USAGE_FILE is the no-Docker unit-test
+# seam and already holds the final effective value.
 _boxa::container_memory_usage_bytes() {
-    local name="$1"
+    local name="$1" probe current stat
     if [ -n "${BOXA_MEMORY_USAGE_FILE:-}" ]; then
         cat "$BOXA_MEMORY_USAGE_FILE"
-    else
-        docker exec "$name" cat /sys/fs/cgroup/memory.current 2>/dev/null
+        return
     fi
+    probe=$(docker exec "$name" sh -c \
+        'cat /sys/fs/cgroup/memory.current &&
+         { cat /sys/fs/cgroup/memory.stat 2>/dev/null || :; }' \
+        2>/dev/null) || return 1
+    current="${probe%%$'\n'*}"
+    stat="${probe#*$'\n'}"
+    _boxa::effective_usage_bytes "$current" "$stat"
 }
 
 # Converge one existing Container. Config/CLI validation errors are returned to
@@ -1949,7 +1959,10 @@ list_running_containers() {
             # that dies mid-ls degrades to a "-" cell via _boxa::mem_cell.
             mem_probe=$(docker exec -u root "$name" sh -c \
                 'cat /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.max &&
-                 awk '\''$1 == "oom_kill" { print $2 }'\'' /sys/fs/cgroup/memory.events' \
+                 awk '\''$1 == "oom_kill" { print $2 }'\'' /sys/fs/cgroup/memory.events &&
+                 { awk '\''$1 == "inactive_file" || $1 == "active_file" ||
+                       $1 == "slab_reclaimable" { r += $2 } END { print r + 0 }'\'' \
+                     /sys/fs/cgroup/memory.stat 2>/dev/null || echo 0; }' \
                 2>/dev/null) || mem_probe=""
             # MEM sits last: the OOM marker's "×" is multibyte and would skew
             # printf's byte-counted padding of any column after it.

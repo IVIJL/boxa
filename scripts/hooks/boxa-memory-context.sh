@@ -25,10 +25,11 @@
 #
 # Per tool call:
 #   Silent path (budget ~1.4 ms): read this Container's cgroup
-#   memory.events / memory.current / memory.max (readable despite the ro
-#   cgroupfs mount; verified), compare the oom_kill counter and the usage
-#   band against a state file, and exit 0 with empty stdout when nothing
-#   changed. Empty stdout means "no additional context" to both agents.
+#   memory.events / memory.current / memory.stat / memory.max (readable
+#   despite the ro cgroupfs mount; verified), compute the effective usage
+#   (memory.current minus reclaimable cache — see memhook_read_usage),
+#   compare the oom_kill counter and the usage band against a state file,
+#   and exit 0 with empty stdout when nothing changed. Empty stdout means "no additional context" to both agents.
 #   This path spawns no external process (no command substitution either —
 #   helper functions return via MEMHOOK_* globals to avoid subshell forks).
 #
@@ -44,7 +45,8 @@
 #     2. Memory warning bands (CONTEXT.md `### Memory`): warn once on
 #        entering the 80 % band and once on entering the 90 % band; re-arm
 #        only after usage falls back below 75 %, so hovering at a threshold
-#        does not warn continuously.
+#        does not warn continuously. Bands are computed from EFFECTIVE
+#        usage (cache excluded), so a warm page cache never trips them.
 #
 # State: /tmp/boxa-memory-hook.<user>.<session>.state on the
 # container-private rootfs (NOT a bind mount), so concurrent agent sessions
@@ -59,7 +61,7 @@
 #
 # Test seams (tests/memory-context.sh sources with BOXA_MEMHOOK_NO_MAIN=1):
 #   BOXA_MEMHOOK_IDENTITY_FILE  identity guard file (default /etc/boxa/...)
-#   BOXA_MEMHOOK_CGROUP_DIR     dir with memory.events/current/max
+#   BOXA_MEMHOOK_CGROUP_DIR     dir with memory.events/current/stat/max
 #   BOXA_MEMHOOK_STATE          exact state file path (unit-test override)
 #   BOXA_MEMHOOK_STATE_DIR      state directory (default /tmp)
 #   BOXA_MEMHOOK_DMESG_FILE     read kernel log from file instead of dmesg
@@ -131,6 +133,41 @@ memhook_read_oom_kill() {
             esac
         fi
     done < "$1"
+}
+
+# memhook_read_usage <cgroup dir>
+# Sets MEMHOOK_USAGE to the effective usage in bytes: memory.current minus
+# the reclaimable portion the kernel evicts before an OOM kill
+# (inactive_file + active_file + slab_reclaimable from memory.stat), clamped
+# at zero. Raw memory.current counts a warm page cache as usage, so bands
+# computed from it warn on cache-heavy but healthy Projects; effective usage
+# only grows with real demand (anon + unreclaimable kernel memory). A
+# missing/unreadable memory.stat degrades to raw memory.current; an
+# unreadable memory.current leaves MEMHOOK_USAGE empty (no band logic then).
+# Builtin-only: this runs on the silent per-tool-call path.
+memhook_read_usage() {
+    MEMHOOK_USAGE=
+    mru_current=
+    read -r mru_current 2>/dev/null < "$1/memory.current" || mru_current=
+    case $mru_current in *[!0-9]* | '') return 0 ;; esac
+    mru_reclaimable=0
+    if [ -r "$1/memory.stat" ]; then
+        while IFS=' ' read -r mru_key mru_val; do
+            case $mru_key in
+                inactive_file | active_file | slab_reclaimable)
+                    case $mru_val in
+                        *[!0-9]* | '') ;;
+                        *) mru_reclaimable=$(( mru_reclaimable + mru_val )) ;;
+                    esac
+                    ;;
+            esac
+        done < "$1/memory.stat"
+    fi
+    if [ "$mru_reclaimable" -ge "$mru_current" ]; then
+        MEMHOOK_USAGE=0
+    else
+        MEMHOOK_USAGE=$(( mru_current - mru_reclaimable ))
+    fi
 }
 
 # memhook_pct <usage_bytes> <limit_bytes>
@@ -329,7 +366,7 @@ memhook_oom_message() {
         om_count="$1 processes in this project were OOM-killed"
     fi
 
-    MEMHOOK_MSG_OOM="[boxa memory] $om_count by the kernel since the last tool call (Memory limit: $2, usage now: $3); $om_victim
+    MEMHOOK_MSG_OOM="[boxa memory] $om_count by the kernel since the last tool call (Memory limit: $2, effective usage now: $3); $om_victim
 - The kernel selected the victim by its oom_score heuristic (observed to favor the largest process) — it is NOT necessarily the command you just ran; the victim may be a background process or a nested Docker workload.
 - The Container keeps running; only the victim died. Do not retry the killed work as-is — at the same Memory limit it will likely be killed again. $MEMHOOK_RAISE"
 }
@@ -338,9 +375,9 @@ memhook_oom_message() {
 # Sets MEMHOOK_MSG_BAND.
 memhook_band_message() {
     if [ "$1" -eq 90 ]; then
-        MEMHOOK_MSG_BAND="[boxa memory] Memory warning: this project is at ${2}% of its Memory limit ($3 of $4). An OOM kill is imminent if usage keeps growing — the kernel will pick a victim by heuristic. Avoid starting new memory-heavy processes and free memory now (the limit covers everything in the Container, nested Docker workloads included). $MEMHOOK_RAISE"
+        MEMHOOK_MSG_BAND="[boxa memory] Memory warning: this project is at ${2}% of its Memory limit ($3 of $4, reclaimable file cache excluded — this is real demand). An OOM kill is imminent if usage keeps growing — the kernel will pick a victim by heuristic. Avoid starting new memory-heavy processes and free memory now (the limit covers everything in the Container, nested Docker workloads included). $MEMHOOK_RAISE"
     else
-        MEMHOOK_MSG_BAND="[boxa memory] Memory warning: this project is at ${2}% of its Memory limit ($3 of $4). The limit counts everything in the Container — your processes plus nested Docker workloads. Past 90% an OOM kill becomes likely; consider bounding memory-heavy work. $MEMHOOK_RAISE"
+        MEMHOOK_MSG_BAND="[boxa memory] Memory warning: this project is at ${2}% of its Memory limit ($3 of $4, reclaimable file cache excluded — this is real demand). The limit counts everything in the Container — your processes plus nested Docker workloads. Past 90% an OOM kill becomes likely; consider bounding memory-heavy work. $MEMHOOK_RAISE"
     fi
 }
 
@@ -370,9 +407,9 @@ memhook_main() {
 
     memhook_read_oom_kill "$mh_cgdir/memory.events"
 
-    mh_usage=
+    memhook_read_usage "$mh_cgdir"
+    mh_usage=$MEMHOOK_USAGE
     mh_limit=
-    read -r mh_usage 2>/dev/null < "$mh_cgdir/memory.current" || mh_usage=
     read -r mh_limit 2>/dev/null < "$mh_cgdir/memory.max" || mh_limit=
     memhook_pct "$mh_usage" "$mh_limit"
 

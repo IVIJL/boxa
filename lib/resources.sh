@@ -755,23 +755,57 @@ _boxa::plan_resource_convergence() {
     fi
 }
 
+# Effective memory usage: memory.current minus the reclaimable portion the
+# kernel evicts before an OOM kill — inactive_file + active_file (page cache)
+# + slab_reclaimable, per memory.stat — clamped at zero. Raw memory.current
+# counts a warm page cache as usage, so a cache-heavy but healthy Project
+# would read as nearly full; every boxa usage surface reports this effective
+# value instead (ADR 0020 amendment). Missing memory.stat keys contribute
+# zero, so an empty stat text degrades to raw memory.current.
+_boxa::effective_usage_bytes() {
+    local current="$1" stat="${2:-}" key value reclaimable=0
+    [[ "$current" =~ ^[0-9]+$ ]] || return 1
+    while read -r key value; do
+        [[ "$value" =~ ^[0-9]+$ ]] || continue
+        case "$key" in
+            inactive_file|active_file|slab_reclaimable)
+                reclaimable=$((reclaimable + value)) ;;
+        esac
+    done <<< "$stat"
+    if [ "$reclaimable" -ge "$current" ]; then
+        printf '0'
+    else
+        printf '%s' "$((current - reclaimable))"
+    fi
+}
+
 # Render the `boxa ls` MEM cell from a raw in-container cgroup probe: three
 # whitespace-separated fields — memory.current in bytes, memory.max in bytes
-# or the literal "max" (no limit), and the memory.events oom_kill count. Any
-# missing or malformed field degrades to "-" (the Container may have died
-# mid-probe); the cell must never break the table. A non-zero oom_kill count
-# appends a marker: OOM kills happened during the Container's lifetime — the
+# or the literal "max" (no limit), and the memory.events oom_kill count —
+# plus an optional fourth, the reclaimable byte sum from memory.stat (see
+# _boxa::effective_usage_bytes), subtracted so the cell shows effective
+# usage. An absent fourth field means zero (raw usage); any missing or
+# malformed field degrades to "-" (the Container may have died mid-probe);
+# the cell must never break the table. A non-zero oom_kill count appends a
+# marker: OOM kills happened during the Container's lifetime — the
 # Container itself keeps running (ADR 0020).
 _boxa::mem_cell() {
     local probe="${1:-}"
     local -a fields=()
     read -r -d '' -a fields <<< "$probe" || true
     local current="${fields[0]:-}" max="${fields[1]:-}" oom_kill="${fields[2]:-}"
+    local reclaimable="${fields[3]:-0}"
     local cell percent
 
-    if [[ ! "$current" =~ ^[0-9]+$ ]] || [[ ! "$oom_kill" =~ ^[0-9]+$ ]]; then
+    if [[ ! "$current" =~ ^[0-9]+$ ]] || [[ ! "$oom_kill" =~ ^[0-9]+$ ]] \
+        || [[ ! "$reclaimable" =~ ^[0-9]+$ ]]; then
         printf -- '-'
         return 0
+    fi
+    if [ "$reclaimable" -ge "$current" ]; then
+        current=0
+    else
+        current=$((current - reclaimable))
     fi
     if [ "$max" = "max" ]; then
         cell="no limit"

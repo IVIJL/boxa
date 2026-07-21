@@ -191,14 +191,27 @@ but that is a heuristic, **not a guarantee**. The victim is not necessarily
 the command you just ran; it may be a background process or a nested Docker
 workload. The container keeps running.
 
+All usage figures below are **effective memory usage**: `memory.current`
+minus the reclaimable share the kernel evicts before resorting to an OOM
+kill — page cache (`inactive_file` + `active_file`) and reclaimable slab,
+read from `memory.stat`. Raw `memory.current` counts a warm file cache as
+usage, so a healthy Project that just ran a big test suite or database
+workload would read nearly full and trip warnings for no reason. Effective
+usage grows only with real demand (anonymous memory plus unreclaimable
+kernel memory), so a warning means memory is genuinely being consumed. The
+limit itself needs no such correction: under pressure the kernel drops the
+cache first, and an OOM kill happens only when real demand reaches the
+limit.
+
 Where the story surfaces:
 
 - **`boxa ls`** — the `MEM` column shows `usage/limit percent` (for example
   `1.2g/6.5g 18%`) and appends a `!oom×N` marker when OOM kills happened
   during the container's lifetime. Exited containers whose lifetime flag is
   set are marked `oom seen during run — see 'boxa mem <project>'`.
-- **`boxa mem [project|path]`** — the deep dive: live usage against both
-  limits, the cgroup's `memory.events` counters (`oom_kill` is the
+- **`boxa mem [project|path]`** — the deep dive: live effective usage
+  against both limits (plus raw `memory.current` and its reclaimable
+  share), the cgroup's `memory.events` counters (`oom_kill` is the
   authoritative per-Project kill count), top processes by RSS as a **project
   aggregate** (nested DinD containers cannot be attributed individually — see
   troubleshooting below), the most recent **OOM archive** entries, and
@@ -209,8 +222,9 @@ Where the story surfaces:
 - **Agent hook message** — inside the container, a PostToolUse hook (Claude
   Code and Codex) tells the agent at the next tool call that a process was
   OOM-killed, with the victim's name and RSS, and warns it not to retry the
-  killed work as-is. The same hook raises a **Memory warning** when usage
-  enters the 80 % or 90 % band of the Memory limit — once per band entry,
+  killed work as-is. The same hook raises a **Memory warning** when
+  effective usage enters the 80 % or 90 % band of the Memory limit — once
+  per band entry,
   re-arming only after usage falls back below 75 %, so hovering at a threshold
   warns once, not continuously.
 - **The OOM archive** — a durable per-event record under `/var/log/boxa/oom/`

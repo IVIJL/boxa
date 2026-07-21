@@ -104,6 +104,31 @@ memhook_pct 858993459200 1073741824000
 assert_eq "pct: 800GiB/1000GiB no overflow" "80" "$MEMHOOK_PCT"
 
 # ---------------------------------------------------------------------------
+# Unit: effective usage reader (memory.current minus reclaimable cache)
+# ---------------------------------------------------------------------------
+
+usage_dir="$_TMPROOT/usage"
+mkdir -p "$usage_dir"
+printf '1000000\n' > "$usage_dir/memory.current"
+printf 'anon 350000\ninactive_file 300000\nactive_file 200000\nslab_reclaimable 100000\nslab_unreclaimable 50000\n' \
+    > "$usage_dir/memory.stat"
+memhook_read_usage "$usage_dir"
+assert_eq "usage: subtracts reclaimable cache and slab" "400000" "$MEMHOOK_USAGE"
+printf 'inactive_file 900000\nactive_file 200000\n' > "$usage_dir/memory.stat"
+memhook_read_usage "$usage_dir"
+assert_eq "usage: clamps at zero" "0" "$MEMHOOK_USAGE"
+printf 'inactive_file evil\nactive_file 200000\n' > "$usage_dir/memory.stat"
+memhook_read_usage "$usage_dir"
+assert_eq "usage: malformed stat value is ignored" "800000" "$MEMHOOK_USAGE"
+rm -f "$usage_dir/memory.stat"
+memhook_read_usage "$usage_dir"
+assert_eq "usage: missing memory.stat degrades to raw current" "1000000" \
+    "$MEMHOOK_USAGE"
+printf 'garbage\n' > "$usage_dir/memory.current"
+memhook_read_usage "$usage_dir"
+assert_eq "usage: non-numeric memory.current stays empty" "" "$MEMHOOK_USAGE"
+
+# ---------------------------------------------------------------------------
 # Unit: memory.events reader
 # ---------------------------------------------------------------------------
 
@@ -350,6 +375,23 @@ printf 'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n' \
     > "$E2E/cgroup/memory.events"
 out=$(run_hook)
 assert_eq "e2e: counter regression reseeds silently" "" "$out"
+
+# --- a warm page cache never trips the bands (effective usage) ---
+printf '996147200\n' > "$E2E/cgroup/memory.current"    # 95% raw
+printf 'inactive_file 400000000\nactive_file 200000000\nslab_reclaimable 25000000\n' \
+    > "$E2E/cgroup/memory.stat"                        # effective ~35%
+out=$(run_hook)
+assert_eq "e2e: cache-heavy 95% raw usage stays silent" "" "$out"
+printf 'inactive_file 1000000\n' > "$E2E/cgroup/memory.stat"
+out=$(run_hook)                                        # effective ~92%
+ctx=$(context_of "$out")
+assert_contains "e2e: real demand past 90% still warns" \
+    "OOM kill is imminent" "$ctx"
+assert_contains "e2e: band warning says cache is excluded" \
+    "reclaimable file cache excluded" "$ctx"
+rm -f "$E2E/cgroup/memory.stat"
+printf '536870912\n' > "$E2E/cgroup/memory.current"    # 50% — re-arm
+run_hook > /dev/null
 
 # --- unlimited (memory.max = max) disables bands, keeps oom path ---
 rm -f "$E2E"/boxa-memory-hook.tester.*.state

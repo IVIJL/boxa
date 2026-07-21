@@ -237,19 +237,26 @@ _boxa::mem_cgroup_value() {
 }
 
 _boxa::mem_report_running() {
-    local container="$1" usage memory_limit swap_usage swap_limit combined events ps_rows
+    local container="$1" usage stat effective memory_limit swap_usage swap_limit combined events ps_rows
     usage=$(_boxa::mem_cgroup_value "$container" memory.current)
+    stat=$(_boxa::mem_cgroup_value "$container" memory.stat)
     memory_limit=$(_boxa::mem_cgroup_value "$container" memory.max)
     swap_usage=$(_boxa::mem_cgroup_value "$container" memory.swap.current)
     swap_limit=$(_boxa::mem_cgroup_value "$container" memory.swap.max)
     events=$(_boxa::mem_cgroup_value "$container" memory.events)
     combined=$(_boxa::mem_combined_limit "$memory_limit" "$swap_limit" 2>/dev/null || printf unknown)
+    effective=$(_boxa::effective_usage_bytes "$usage" "$stat" 2>/dev/null) || effective="$usage"
 
     printf 'Status: running\n'
-    printf 'Memory usage: %s / %s (%s)\n' \
-        "$(_boxa::mem_format_value "$usage")" \
+    printf 'Memory usage (effective, reclaimable cache excluded): %s / %s (%s)\n' \
+        "$(_boxa::mem_format_value "$effective")" \
         "$(_boxa::mem_format_limit "$memory_limit")" \
-        "$(_boxa::mem_percentage "$usage" "$memory_limit")"
+        "$(_boxa::mem_percentage "$effective" "$memory_limit")"
+    if [[ "$usage" =~ ^[0-9]+$ ]] && [[ "$effective" =~ ^[0-9]+$ ]]; then
+        printf '  memory.current: %s (of which reclaimable page cache + slab: %s — evicted by the kernel before any OOM)\n' \
+            "$(_boxa::mem_format_value "$usage")" \
+            "$(_boxa::mem_format_value "$((usage - effective))")"
+    fi
     printf 'Swap usage: %s\n' "$(_boxa::mem_format_value "$swap_usage")"
     printf 'Memory+swap limit: %s\n' "$(_boxa::mem_format_limit "$combined")"
     printf '\nmemory.events:\n'

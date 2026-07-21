@@ -163,6 +163,23 @@ no daemon anywhere.
   void the limit (a limit above host RAM warns that protection is void, but
   is not refused).
 
+## Amendment (2026-07-21) — usage surfaces report effective usage
+
+`memory.current` counts the page cache, so every usage surface built on it
+(`boxa ls` MEM, `boxa mem`, the 80 %/90 % Memory warning bands, the
+shrink-safety check) read nearly full on cache-heavy but healthy Projects —
+agents received Memory warnings whose cause was a warm file cache, not real
+demand. All of these surfaces now report **effective memory usage**:
+`memory.current` minus `inactive_file` + `active_file` + `slab_reclaimable`
+from `memory.stat` (clamped at zero; a missing `memory.stat` degrades to
+raw `memory.current`). Subtracting only `inactive_file` (the Docker/
+Kubernetes "working set") was considered and rejected: repeated test or
+database reads keep large amounts of evictable cache in `active_file`, so
+the false warnings would remain. Enforcement is untouched — the kernel
+already evicts reclaimable cache before OOM-killing, which is exactly why
+effective usage is the honest distance-to-OOM metric. The hook computes the
+subtraction with shell builtins, preserving the fork-free silent path.
+
 ## References
 
 - `docker-run.sh` — `DOCKER_ARGS` (`--memory`/`--memory-swap` on create),

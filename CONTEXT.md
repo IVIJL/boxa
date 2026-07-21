@@ -248,6 +248,18 @@ immediately instead of dragging the host into swap thrashing. Raising
 it above the **Memory limit** grants exactly the difference as swap.
 _Avoid_: swap limit (the value is a total, not an amount of swap)
 
+**Effective memory usage**:
+A **Project**'s `memory.current` minus what the kernel reclaims before
+resorting to an OOM kill — page cache (`inactive_file` +
+`active_file`) and reclaimable slab, per `memory.stat`. Every boxa
+usage surface (`boxa ls`, `boxa mem`, the **Memory warning** bands,
+the shrink-safety check) reports this value, because raw
+`memory.current` counts a warm file cache as usage and reads nearly
+full on a healthy, cache-heavy Project. The **Memory limit** itself
+needs no such correction: the kernel evicts the cache before killing.
+_Avoid_: real memory usage (vague), working set (Kubernetes term that
+subtracts only `inactive_file`)
+
 **OOM archive**:
 The durable per-event record of an OOM kill in a **Project**, captured
 from the kernel log at first sighting so it outlives both the
@@ -257,8 +269,9 @@ The kernel log is the source; the archive is the record.
 _Avoid_: oom log, kill log
 
 **Memory warning**:
-The banded notice raised when a **Project** crosses 80 % or 90 % of
-its **Memory limit**. Fires only on entering a band and re-arms only
+The banded notice raised when a **Project**'s **Effective memory
+usage** crosses 80 % or 90 % of its **Memory limit**. Fires only on
+entering a band and re-arms only
 after usage falls back below it, so a Project hovering at a threshold
 warns once, not continuously.
 _Avoid_: memory pressure (PSI is a different kernel concept)
