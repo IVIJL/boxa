@@ -76,7 +76,7 @@ Maintenance:
                                    Build/rebuild the boxa image
   boxa update                    Update boxa (pull repo + rebuild image)
   boxa doctor [--fix [step…]]    Check or repair host provisioning
-  boxa prune [--all]             Remove old build cache (--all = everything)
+  boxa prune [--all]             Remove build cache + dangling images (never volumes)
   boxa uninstall [--purge-ca]    Remove everything (containers, volumes, image).
   boxa claude-token              Generate/regenerate Claude Code token
   boxa sync-skills               Sync host skills to all running containers
@@ -282,7 +282,18 @@ EOF
             "$BOXA_DIR/scripts/dns-install.sh" --help
             ;;
         update)         printf 'boxa update                    Update boxa (pull repo + rebuild image)\n' ;;
-        prune)          printf 'boxa prune [--all]             Remove old build cache (--all = everything)\n' ;;
+        prune)
+            cat <<'EOF'
+Usage: boxa prune [--all]
+
+Free Docker disk space: build cache and dangling images only. Volumes —
+project data — are NEVER touched; volumes are deleted only by boxa remove,
+boxa stop --clean, and boxa uninstall.
+
+By default a build-cache reserve of the boxa image size + 2 GB is kept so
+the next boxa build stays fast; --all wipes the entire build cache instead.
+EOF
+            ;;
         claude-token)   printf 'boxa claude-token              Generate/regenerate Claude Code token\n' ;;
         sync-skills)    printf 'boxa sync-skills               Sync host skills to all running containers\n' ;;
         cursor)         printf 'boxa cursor [name]             Open Cursor attached to running boxa\n' ;;
