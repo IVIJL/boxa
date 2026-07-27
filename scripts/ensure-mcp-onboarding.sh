@@ -92,6 +92,10 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 0
 fi
 
+# First reconcile any legacy profiles. This is non-interactive and each later
+# onboarding step remains explicit; migration itself never installs or grants
+# trust. Failure is soft here and remains visible via `boxa mcp migrate`.
+_run_py migrate-text >/dev/null 2>&1 || true
 status_json="$(_run_py onboarding-status 2>/dev/null || true)"
 if [ -z "$status_json" ]; then
     $QUIET_IF_NOOP || warn "Could not read MCP onboarding status; skipping."
@@ -152,8 +156,9 @@ case "$ans" in
             _run_py import-text || true
         fi
         echo ""
-        echo "To import Container-safe servers:  boxa mcp import --apply"
-        echo "To add a brand-new boxa server:  boxa mcp add ..."
+        echo "Next (definition only): boxa mcp import --apply --import-id <id>"
+        echo "Then separately: boxa mcp install <entry>"
+        echo "Finally, for one Project: boxa mcp activate <entry> --for claude|codex"
         _run_py onboarding-mark-seen imported || \
             warn "Note: could not record onboarding state; you may be asked again."
         ;;

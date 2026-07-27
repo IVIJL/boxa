@@ -31,16 +31,42 @@ from typing import Optional
 
 from . import import_result, inherited_list_result
 from .add import AddError, add_server
+from .catalog import (
+    CATALOG_VERSION,
+    CatalogError,
+    definition_changes_from_spec,
+    degradation_status,
+    add_entry as catalog_add_entry,
+    entries_sorted as catalog_entries_sorted,
+    load_catalog as catalog_load,
+    mode_preview as catalog_mode_preview,
+    resolve_entry as catalog_resolve,
+    set_execution_mode as catalog_set_execution_mode,
+)
+from .activation import (
+    ActivationError,
+    activate as activate_catalog,
+    deactivate as deactivate_catalog,
+    effective_catalog,
+    load_activations,
+    remove_catalog_entry,
+    update_catalog_entry,
+)
 from .apply import (
     ApplyConflictError,
     ScopeOverride,
     apply_selection,
     is_applicable,
 )
+from .catalog_import import (
+    CatalogImportConflictError,
+    import_definitions,
+)
 from .candidate import Candidate
 from .classify import classify_candidate
 from .merge import MergedCandidate, merge_candidates
 from . import onboarding
+from .migration import MigrationError, migrate_legacy
 from .projects import VolumeProbe, enumerate_project_targets
 from .providers import ClaudeProvider, CodexProvider
 from .render import (
@@ -59,6 +85,11 @@ from .install import (
     UnsupportedRuntimeError,
     install_server,
 )
+from .readiness import (
+    ReadinessError,
+    install as install_catalog_entry,
+    readiness as catalog_readiness,
+)
 from .writer import RenderWriteError, write_plan
 from .lifecycle import (
     DoctorReport,
@@ -68,6 +99,7 @@ from .lifecycle import (
     RemoveResult,
     ToggleResult,
     apply_doctor_fixes,
+    catalog_project_status,
     effective_list,
     remove_server,
     run_doctor,
@@ -521,13 +553,10 @@ def _apply_payload(merged: list[MergedCandidate], sel: _Selection) -> dict:
     if selected is None:
         return {"error": "selection"}
     try:
-        result = apply_selection(selected, sel.overrides or None)
-    except ApplyConflictError as exc:
+        result = import_definitions(selected)
+    except (ApplyConflictError, CatalogImportConflictError) as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return {"error": "conflict"}
-    _emit_secret_scopes(
-        [(a.scope, a.project_key) for a in result.applied if a.copied_secret_keys]
-    )
     return result.to_dict()
 
 
@@ -544,52 +573,27 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
     if selected is None:
         return 2
     try:
-        result = apply_selection(selected, sel.overrides or None)
-    except ApplyConflictError as exc:
+        result = import_definitions(selected)
+    except (ApplyConflictError, CatalogImportConflictError) as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return 2
 
-    # Issue 17: surface the scopes a secret VALUE landed in so the host front-end
-    # can prompt for `boxa mcp reload` when a relevant Container is running.
-    _emit_secret_scopes(
-        [(a.scope, a.project_key) for a in result.applied if a.copied_secret_keys]
-    )
-
-    if not result.applied and not result.skipped:
-        sys.stdout.write("No candidates applied.\n")
+    if not result.imported and not result.skipped:
+        sys.stdout.write("No definitions imported.\n")
         return 0
 
-    for a in result.applied:
-        scope_label = a.scope
-        if a.project_key:
-            scope_label = f"{a.scope} ({a.project_key})"
-        sys.stdout.write(f"Applied {a.name}\n")
+    for a in result.imported:
+        sys.stdout.write(f"Imported definition {a.name}\n")
         sys.stdout.write(f"  import id: {a.import_id}\n")
-        sys.stdout.write(f"  scope    : {scope_label}\n")
-        sys.stdout.write(f"  profile  : {a.profile_path}\n")
-        if a.copied_secret_keys:
-            sys.stdout.write(
-                "  secrets  : copied "
-                f"{', '.join(a.copied_secret_keys)} to {a.secrets_path} "
-                "(values not shown)\n"
-            )
-        else:
-            sys.stdout.write("  secrets  : none copied\n")
+        sys.stdout.write(f"  catalog  : {a.catalog_name} ({a.catalog_id})\n")
+        sys.stdout.write(f"  changed  : {'yes' if a.changed else 'no (already present)'}\n")
 
     for s in result.skipped:
         sys.stdout.write(
             f"Skipped {s['name']} ({s['importId']}): {s['reason']}\n"
         )
 
-    # NOTE: agent config is NOT written here. The shell front-end runs
-    # auto-render right after a successful apply (unless --no-render), and that
-    # step prints exactly what it wrote (or that it was skipped). So this summary
-    # must not claim "nothing was modified" — that would be false on the default
-    # path; it only states the profile result and points at the render step.
-    sys.stdout.write(
-        "\nProfile updated. Agent config (Claude Code / Codex) is written by the "
-        "render step that follows (use --no-render to skip it).\n"
-    )
+    sys.stdout.write("\nCatalog definitions updated only. Nothing was installed, activated, or rendered.\n")
     return 0
 
 
@@ -1270,6 +1274,8 @@ def _run_wrapper(argv: list[str]) -> int:
     failures map to clear, SECRET-FREE stderr messages and a non-zero exit.
     """
     project_key: Optional[str] = None
+    catalog_id: Optional[str] = None
+    consumer: Optional[str] = None
     server: Optional[str] = None
     i = 0
     while i < len(argv):
@@ -1282,6 +1288,18 @@ def _run_wrapper(argv: list[str]) -> int:
             project_key = argv[i]
         elif arg.startswith("--project="):
             project_key = arg[len("--project="):]
+        elif arg == "--catalog-id":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("boxa-mcp-run: --catalog-id requires a value\n")
+                return 2
+            catalog_id = argv[i]
+        elif arg == "--consumer":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("boxa-mcp-run: --consumer requires a value\n")
+                return 2
+            consumer = argv[i]
         elif arg.startswith("-"):
             sys.stderr.write(f"boxa-mcp-run: unknown flag {arg!r}\n")
             return 2
@@ -1302,7 +1320,11 @@ def _run_wrapper(argv: list[str]) -> int:
         return 2
 
     try:
-        return runner_run(server, project_key)
+        if catalog_id is None and consumer is None:
+            return runner_run(server, project_key)
+        return runner_run(
+            server, project_key, catalog_id=catalog_id, consumer=consumer
+        )
     except NotInsideContainerError as exc:
         sys.stderr.write(f"boxa-mcp-run: {exc}\n")
         return 3
@@ -1534,6 +1556,509 @@ def _cmd_add(argv: list[str], as_json: bool) -> int:
         "\nProfile updated. Agent config (Claude Code / Codex) is written by the "
         "render step that follows (use --no-render to skip it).\n"
     )
+    return 0
+
+
+def _catalog_payload() -> dict[str, object]:
+    entries = catalog_entries_sorted()
+    for entry in entries:
+        entry["isolationStatus"] = degradation_status(entry) or "isolated"
+    return {"version": CATALOG_VERSION, "entries": entries}
+
+
+def _render_catalog_text(entries: list[dict[str, object]]) -> int:
+    if not entries:
+        sys.stdout.write("MCP catalog is empty. Catalog membership does not activate tools.\n")
+        return 0
+    headers = ("NAME", "ID", "MODE", "RUNTIME", "ISOLATION", "READINESS")
+    rows = [
+        (
+            str(entry["name"]),
+            str(entry["id"]),
+            str(entry["executionMode"]),
+            str(entry["runtimeKind"]),
+            degradation_status(entry) or "isolated",
+            str(entry["readiness"]["summary"]),  # type: ignore[index]
+        )
+        for entry in entries
+    ]
+    widths = [len(value) for value in headers]
+    for row in rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+    sys.stdout.write(
+        "  ".join(value.ljust(widths[index]) for index, value in enumerate(headers))
+        + "\n"
+    )
+    for row in rows:
+        sys.stdout.write(
+            "  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip()
+            + "\n"
+        )
+    sys.stdout.write("Catalog membership does not activate or start an MCP server.\n")
+    return 0
+
+
+def _cmd_catalog(argv: list[str], as_json: bool) -> int:
+    if argv:
+        sys.stderr.write("mcp.cli: catalog takes no arguments\n")
+        return 2
+    try:
+        payload = _catalog_payload()
+    except CatalogError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    if as_json:
+        return _emit(payload)
+    return _render_catalog_text(payload["entries"])  # type: ignore[arg-type]
+
+
+def _cmd_catalog_picker(argv: list[str]) -> int:
+    if argv:
+        sys.stderr.write("mcp.cli: catalog-picker takes no arguments\n")
+        return 2
+    try:
+        entries = catalog_entries_sorted()
+    except CatalogError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    for entry in entries:
+        sys.stdout.write(f"{entry['id']}\t{entry['name']}\n")
+    return 0
+
+
+def _cmd_catalog_resolve(argv: list[str]) -> int:
+    if len(argv) != 1:
+        return 2
+    try:
+        entry_id, entry = catalog_resolve(catalog_load(), argv[0])
+    except CatalogError:
+        return 1
+    return _emit({"id": entry_id, "name": entry["name"]})
+
+
+def _cmd_catalog_mode_preview(argv: list[str], as_json: bool) -> int:
+    if len(argv) != 2:
+        sys.stderr.write("mcp.cli: mode requires <entry> <execution-mode>\n")
+        return 2
+    try:
+        preview = catalog_mode_preview(argv[0], argv[1])
+    except CatalogError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 2
+    if as_json:
+        return _emit({"version": CATALOG_VERSION, "preview": preview})
+    sys.stdout.write("MCP execution mode change preview:\n")
+    sys.stdout.write(f"  name       : {preview['name']}\n")
+    sys.stdout.write(f"  stable id  : {preview['id']}\n")
+    sys.stdout.write(f"  current    : {preview['currentMode']}\n")
+    sys.stdout.write(f"  requested  : {preview['requestedMode']}\n")
+    sys.stdout.write(
+        "  command    : " + " ".join(str(v) for v in preview["command"]) + "\n"
+    )
+    sys.stdout.write(f"  runtime    : {preview['runtimeKind']}\n")
+    if preview.get("image"):
+        sys.stdout.write(f"  image      : {preview['image']}\n")
+    sys.stdout.write("  access boundary:\n")
+    for item in preview["access"]:
+        sys.stdout.write(f"    - {item}\n")
+    return 0
+
+
+def _cmd_catalog_mode_apply(argv: list[str], as_json: bool) -> int:
+    if len(argv) != 3 or argv[2] != "--yes":
+        sys.stderr.write(
+            "mcp.cli: mode apply requires <entry> <execution-mode> --yes\n"
+        )
+        return 2
+    try:
+        preview = catalog_mode_preview(argv[0], argv[1])
+        entry = catalog_set_execution_mode(argv[0], argv[1])
+    except (CatalogError, ActivationError, ValueError) as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 2
+    if as_json:
+        return _emit(
+            {"version": CATALOG_VERSION, "preview": preview, "entry": entry}
+        )
+    sys.stdout.write(
+        f"MCP catalog entry {entry['name']!r} now uses "
+        f"{entry['executionMode']} ({entry['id']}).\n"
+    )
+    return 0
+
+
+def _parse_catalog_mutation(argv: list[str], command: str) -> Optional[tuple[str, list[str]]]:
+    if not argv:
+        sys.stderr.write(f"mcp.cli: {command} requires an entry name or id\n")
+        return None
+    if "--" in argv:
+        marker = argv.index("--")
+        before, spec = argv[:marker], argv[marker + 1:]
+    else:
+        before, spec = argv, []
+    if len(before) != 1:
+        sys.stderr.write(f"mcp.cli: {command} takes exactly one entry name or id\n")
+        return None
+    return before[0], spec
+
+
+def _cmd_catalog_add(argv: list[str], as_json: bool) -> int:
+    parsed = _parse_catalog_mutation(argv, "catalog add")
+    if parsed is None:
+        return 2
+    name, spec = parsed
+    if not spec:
+        sys.stderr.write("mcp.cli: catalog add requires a command spec after '--'\n")
+        return 2
+    try:
+        entry = catalog_add_entry(name, spec)
+    except CatalogError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 2
+    if as_json:
+        return _emit({"version": CATALOG_VERSION, "entry": entry})
+    sys.stdout.write(f"Added MCP catalog entry {entry['name']!r}.\n")
+    sys.stdout.write(f"  id       : {entry['id']}\n")
+    sys.stdout.write(f"  mode     : {entry['executionMode']}\n")
+    sys.stdout.write(f"  runtime  : {entry['runtimeKind']}\n")
+    sys.stdout.write("Catalog membership does not activate or start the server.\n")
+    return 0
+
+
+def _cmd_catalog_remove(argv: list[str], as_json: bool) -> int:
+    allow_tracked = "--allow-tracked-codex-config" in argv
+    argv = [arg for arg in argv if arg != "--allow-tracked-codex-config"]
+    parsed = _parse_catalog_mutation(argv, "catalog remove")
+    if parsed is None:
+        return 2
+    token, spec = parsed
+    if spec:
+        sys.stderr.write("mcp.cli: catalog remove does not accept a command spec\n")
+        return 2
+    try:
+        result = remove_catalog_entry(
+            token, allow_tracked_codex_config=allow_tracked
+        )
+    except (CatalogError, ActivationError) as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 2
+    if as_json:
+        payload = result.to_dict()
+        payload["version"] = CATALOG_VERSION
+        payload["reloadRequired"] = bool(result.affected)
+        return _emit(payload)
+    sys.stdout.write(
+        f"Removed MCP catalog entry {result.entry['name']!r} ({result.entry['id']}); "
+        "its stable identity is destroyed.\n"
+    )
+    for affected in result.affected:
+        consumers = ", ".join(affected["consumers"])
+        sys.stdout.write(
+            f"  removed activation: {affected['projectKey']} ({consumers})\n"
+        )
+    if result.affected:
+        sys.stdout.write(
+            "Affected consumer configs were re-rendered. New launches are blocked; "
+            "already-connected servers were not terminated. Reload/restart the "
+            "named agents to drop live connections.\n"
+        )
+    sys.stdout.write("Inherited/manual agent MCP entries were not touched.\n")
+    return 0
+
+
+def _cmd_catalog_update(argv: list[str], as_json: bool) -> int:
+    if not argv:
+        sys.stderr.write("mcp.cli: catalog update requires an entry name or id\n")
+        return 2
+    token = argv[0]
+    rest = argv[1:]
+    if "--" in rest:
+        marker = rest.index("--")
+        options, spec = rest[:marker], rest[marker + 1:]
+    else:
+        options, spec = rest, []
+    changes: dict[str, object] = {}
+    allow_tracked = False
+    i = 0
+    while i < len(options):
+        option = options[i]
+        if option == "--allow-tracked-codex-config":
+            allow_tracked = True
+            i += 1
+            continue
+        if option not in {"--name", "--description"} or i + 1 >= len(options):
+            sys.stderr.write(
+                "mcp.cli: catalog update accepts --name <name>, "
+                "--description <text>, --allow-tracked-codex-config, and an "
+                "optional command spec after '--'\n"
+            )
+            return 2
+        changes[option[2:]] = options[i + 1]
+        i += 2
+    try:
+        _entry_id, current = catalog_resolve(catalog_load(), token)
+        if spec:
+            changes.update(
+                definition_changes_from_spec(
+                    str(changes.get("name", current["name"])), spec
+                )
+            )
+        if not changes:
+            raise CatalogError("catalog update requires at least one change")
+        result = update_catalog_entry(
+            token,
+            changes,
+            allow_tracked_codex_config=allow_tracked,
+        )
+    except (CatalogError, ActivationError) as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    if as_json:
+        payload = result.to_dict()
+        payload["version"] = CATALOG_VERSION
+        payload["reloadRequired"] = bool(result.affected)
+        payload["liveConnectionsTerminated"] = False
+        return _emit(payload)
+    kind = "runtime-affecting" if result.runtime_affecting else "cosmetic"
+    sys.stdout.write(
+        f"Updated MCP catalog entry {result.entry['name']!r} "
+        f"({result.entry['id']}); {kind} update.\n"
+    )
+    for affected in result.affected:
+        sys.stdout.write(
+            f"  affected: {affected['projectKey']} "
+            f"({', '.join(affected['consumers'])})\n"
+        )
+    if result.affected:
+        sys.stdout.write(
+            "Affected consumer configs/runtime were switched transactionally. "
+            "Already-connected servers were not terminated; reload/restart the "
+            "named agents to use the updated definition.\n"
+        )
+    return 0
+
+
+def _parse_activation(argv: list[str], command: str) -> Optional[tuple[str, str, list[str], bool, bool]]:
+    token: Optional[str] = None
+    project: Optional[str] = None
+    consumers: list[str] = []
+    allow_tracked_codex_config = False
+    accept_degraded = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--project":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write(f"mcp.cli: {command} --project requires a value\n")
+                return None
+            project = argv[i]
+        elif arg == "--for":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write(f"mcp.cli: {command} --for requires a consumer\n")
+                return None
+            consumers.extend(value for value in argv[i].split(",") if value)
+        elif arg == "--allow-tracked-codex-config":
+            allow_tracked_codex_config = True
+        elif arg == "--accept-degraded-secret-isolation":
+            accept_degraded = True
+        elif arg.startswith("-"):
+            sys.stderr.write(f"mcp.cli: unknown {command} argument {arg!r}\n")
+            return None
+        elif token is None:
+            token = arg
+        else:
+            sys.stderr.write(f"mcp.cli: {command} takes exactly one entry name or id\n")
+            return None
+        i += 1
+    if not token or not project:
+        sys.stderr.write(f"mcp.cli: {command} requires <entry> --project <absolute-path>\n")
+        return None
+    return token, project, consumers, allow_tracked_codex_config, accept_degraded
+
+
+def _cmd_activate(argv: list[str], as_json: bool) -> int:
+    parsed = _parse_activation(argv, "activate")
+    if parsed is None:
+        return 2
+    token, project, consumers, allow_tracked, accept_degraded = parsed
+    if not consumers:
+        sys.stderr.write("mcp.cli: non-interactive activation requires --for claude, codex, or both\n")
+        return 2
+    try:
+        result = activate_catalog(
+            token, project, consumers,
+            allow_tracked_codex_config=allow_tracked,
+            accept_degraded_secret_isolation=accept_degraded,
+        )
+    except ActivationError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    if as_json:
+        return _emit(result.to_dict())
+    sys.stdout.write(
+        f"Activated MCP catalog entry {result.entry['name']!r} for "
+        f"{', '.join(result.consumers)} in Project {result.project_key}.\n"
+    )
+    sys.stdout.write("Selected consumer configs were re-rendered; reload/restart the agents to connect.\n")
+    return 0
+
+
+def _cmd_activation_degradation(argv: list[str], as_json: bool) -> int:
+    parsed = _parse_activation(argv, "activation-degradation")
+    if parsed is None:
+        return 2
+    token, _project, consumers, allow_tracked, accept_degraded = parsed
+    if consumers or allow_tracked or accept_degraded:
+        sys.stderr.write("mcp.cli: activation-degradation accepts only entry and Project\n")
+        return 2
+    try:
+        _entry_id, entry = catalog_resolve(catalog_load(), token)
+    except CatalogError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    status = degradation_status(entry) or "isolated"
+    if as_json:
+        return _emit({"isolationStatus": status})
+    sys.stdout.write(status + "\n")
+    return 0
+
+
+def _cmd_readiness(argv: list[str], as_json: bool) -> int:
+    parsed = _parse_activation(argv, "readiness")
+    if parsed is None:
+        return 2
+    token, project, consumers, allow_tracked, accept_degraded = parsed
+    if consumers or allow_tracked or accept_degraded:
+        sys.stderr.write("mcp.cli: readiness does not accept activation flags\n")
+        return 2
+    try:
+        report = catalog_readiness(token, os.path.realpath(project))
+    except ReadinessError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    if as_json:
+        _emit(report.to_dict())
+    else:
+        state = "ready" if report.ready else "not ready"
+        sys.stdout.write(
+            f"MCP catalog entry {report.entry['name']!r} is {state} for "
+            f"Project {report.project_key}.\n"
+        )
+        for check in report.checks:
+            marker = "ok" if check.ready else "missing"
+            sys.stdout.write(f"  {marker:7} {check.kind}: {check.label}\n")
+    return 0 if report.ready else 1
+
+
+def _cmd_catalog_install(argv: list[str], as_json: bool) -> int:
+    parsed = _parse_activation(argv, "install")
+    if parsed is None:
+        return 2
+    token, project, consumers, allow_tracked, accept_degraded = parsed
+    if consumers or allow_tracked or accept_degraded:
+        sys.stderr.write("mcp.cli: install does not accept activation flags\n")
+        return 2
+    try:
+        report = install_catalog_entry(token, os.path.realpath(project))
+    except ReadinessError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    if as_json:
+        return _emit(report.to_dict())
+    sys.stdout.write(
+        f"Prepared MCP catalog entry {report.entry['name']!r} for "
+        f"Project {report.project_key}.\n"
+    )
+    for action in report.actions:
+        sys.stdout.write(f"  {action}\n")
+    state = "ready" if report.readiness.ready else "not ready"
+    sys.stdout.write(f"Readiness after install: {state}. No activation or agent config changed.\n")
+    for check in report.readiness.missing:
+        sys.stdout.write(f"  missing {check.kind}: {check.label}\n")
+    return 0 if report.readiness.ready else 1
+
+
+def _cmd_deactivate(argv: list[str], as_json: bool) -> int:
+    parsed = _parse_activation(argv, "deactivate")
+    if parsed is None:
+        return 2
+    token, project, consumers, allow_tracked, accept_degraded = parsed
+    if accept_degraded:
+        sys.stderr.write("mcp.cli: deactivate does not accept degradation acknowledgement\n")
+        return 2
+    if consumers:
+        sys.stderr.write("mcp.cli: deactivate does not accept --for; it removes the activation\n")
+        return 2
+    try:
+        result = deactivate_catalog(
+            token,
+            project,
+            allow_tracked_codex_config=allow_tracked,
+        )
+    except (ActivationError, CatalogError) as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    if as_json:
+        payload = result.to_dict()
+        payload["reloadRequired"] = bool(result.consumers)
+        payload["liveConnectionsTerminated"] = False
+        return _emit(payload)
+    sys.stdout.write(
+        f"Deactivated MCP catalog entry {result.entry['name']!r} in Project {result.project_key}.\n"
+    )
+    sys.stdout.write(
+        "Selected consumer configs were re-rendered. New launches are blocked; an already-connected "
+        "server was not terminated. Reload/restart affected agents"
+        + (f" ({', '.join(result.consumers)})" if result.consumers else "")
+        + " to drop that live connection.\n"
+    )
+    return 0
+
+
+def _cmd_catalog_effective_list(argv: list[str], as_json: bool) -> int:
+    if len(argv) != 2 or argv[0] != "--project":
+        sys.stderr.write("mcp.cli: catalog effective list requires --project <absolute-path>\n")
+        return 2
+    try:
+        status = catalog_project_status(argv[1])
+        entries = status["entries"]
+        legacy = effective_list(project_keys=[os.path.realpath(argv[1])])
+    except (ActivationError, CatalogError, LifecycleError) as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    if as_json:
+        return _emit({
+            "projectKey": status["projectKey"],
+            "catalogEntries": entries,
+            "legacyProfile": legacy.to_dict(),
+        })
+    if not entries:
+        sys.stdout.write("No MCP catalog entries are available; this Project has no activations.\n")
+    else:
+        headers = ("NAME", "CATALOG", "READINESS", "ACTIVATION", "CONSUMERS", "RENDERS", "MODE / USER", "ISOLATION")
+        rows = [
+            (
+                e["name"],
+                "member",
+                e["readiness"]["state"],
+                e["activation"],
+                ",".join(e["consumers"]) or "-",
+                ",".join(f"{consumer}:{state}" for consumer, state in e["renders"].items()) or "-",
+                f"{e['executionMode']} / {e['executionUser']}",
+                e["isolationStatus"],
+            )
+            for e in entries
+        ]
+        widths = [max(len(headers[i]), *(len(str(row[i])) for row in rows)) for i in range(len(headers))]
+        sys.stdout.write("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))) + "\n")
+        for row in rows:
+            sys.stdout.write("  ".join(str(row[i]).ljust(widths[i]) for i in range(len(headers))).rstrip() + "\n")
+    if legacy.entries:
+        sys.stdout.write("\nLegacy MCP profile entries (kept until migration issue 08):\n")
+        _render_effective_table(legacy)
     return 0
 
 
@@ -1818,6 +2343,58 @@ def main(argv: list[str]) -> int:
         return _cmd_list(rest, as_json=True)
     if command == "list-text":
         return _cmd_list(rest, as_json=False)
+    if command == "catalog-json":
+        return _cmd_catalog(rest, as_json=True)
+    if command == "catalog-text":
+        return _cmd_catalog(rest, as_json=False)
+    if command == "catalog-picker":
+        return _cmd_catalog_picker(rest)
+    if command == "catalog-resolve":
+        return _cmd_catalog_resolve(rest)
+    if command == "catalog-mode-preview-json":
+        return _cmd_catalog_mode_preview(rest, as_json=True)
+    if command == "catalog-mode-preview-text":
+        return _cmd_catalog_mode_preview(rest, as_json=False)
+    if command == "catalog-mode-apply-json":
+        return _cmd_catalog_mode_apply(rest, as_json=True)
+    if command == "catalog-mode-apply-text":
+        return _cmd_catalog_mode_apply(rest, as_json=False)
+    if command == "catalog-add-json":
+        return _cmd_catalog_add(rest, as_json=True)
+    if command == "catalog-add-text":
+        return _cmd_catalog_add(rest, as_json=False)
+    if command == "catalog-remove-json":
+        return _cmd_catalog_remove(rest, as_json=True)
+    if command == "catalog-remove-text":
+        return _cmd_catalog_remove(rest, as_json=False)
+    if command == "catalog-update-json":
+        return _cmd_catalog_update(rest, as_json=True)
+    if command == "catalog-update-text":
+        return _cmd_catalog_update(rest, as_json=False)
+    if command == "activate-json":
+        return _cmd_activate(rest, as_json=True)
+    if command == "activate-text":
+        return _cmd_activate(rest, as_json=False)
+    if command == "activation-degradation-text":
+        return _cmd_activation_degradation(rest, as_json=False)
+    if command == "activation-degradation-json":
+        return _cmd_activation_degradation(rest, as_json=True)
+    if command == "readiness-json":
+        return _cmd_readiness(rest, as_json=True)
+    if command == "readiness-text":
+        return _cmd_readiness(rest, as_json=False)
+    if command == "catalog-install-json":
+        return _cmd_catalog_install(rest, as_json=True)
+    if command == "catalog-install-text":
+        return _cmd_catalog_install(rest, as_json=False)
+    if command == "deactivate-json":
+        return _cmd_deactivate(rest, as_json=True)
+    if command == "deactivate-text":
+        return _cmd_deactivate(rest, as_json=False)
+    if command == "catalog-effective-list-json":
+        return _cmd_catalog_effective_list(rest, as_json=True)
+    if command == "catalog-effective-list-text":
+        return _cmd_catalog_effective_list(rest, as_json=False)
     if command == "enable-json":
         return _cmd_toggle(rest, enabled=True, as_json=True)
     if command == "enable-text":
@@ -1871,6 +2448,24 @@ def main(argv: list[str]) -> int:
         return _cmd_project_targets(rest, as_json=True)
     if command == "project-targets-text":
         return _cmd_project_targets(rest, as_json=False)
+    if command in ("migrate-json", "migrate-text"):
+        if rest:
+            sys.stderr.write("mcp.cli: migrate takes no arguments\n")
+            return 2
+        try:
+            result = migrate_legacy()
+        except (MigrationError, ActivationError, CatalogError, OSError, ValueError) as exc:
+            sys.stderr.write(f"mcp.cli: {exc}\n")
+            return 2
+        if command == "migrate-json":
+            return _emit(result)
+        count = len(result.get("definitions", []))
+        state = "completed" if result.get("changed") else "already complete"
+        sys.stdout.write(
+            f"Legacy MCP migration {state}: {count} definition(s); "
+            "global activations: 0. Legacy source retained.\n"
+        )
+        return 0
     if command == "onboarding-status":
         # One-time MCP onboarding eligibility (issue 10). The install/update
         # shell hook reads this to decide whether to offer the import wizard.

@@ -26,8 +26,8 @@ For each relay connection the broker:
      ``mcp.protocol``);
   2. resolves the IN-SCOPE effective profile (global + THIS Container's Project,
      keyed from the Container identity file) and refuses any server not in it;
-  3. spawns a FRESH server process per connection as ``boxa-mcp``, bridging
-     its stdio to the socket so the agent talks MCP straight through.
+  3. spawns a service-isolated process as ``boxa-mcp`` and bridges stdio, or
+     returns a secret-free agent-trusted plan for the ``node`` launcher.
 
 The broker ALWAYS runs, even with an empty or missing profile, so a server
 imported into a running Container is serviceable on the next session without a
@@ -52,10 +52,11 @@ import threading
 from typing import Optional
 
 from .identity import inside_container, project_key, project_name
+from .docker_adapter import DockerAdapterError, build_plan as build_docker_plan
 from .profile import global_profile_path, load_profile, project_profile_path
 from .protocol import (
     ProtocolError,
-    decode_request,
+    decode_request_details,
     encode_exit,
     encode_reply,
     read_line,
@@ -63,6 +64,15 @@ from .protocol import (
 from .projects import sanitize_basename
 from .runner import RunnerError, _resolve_env, _server_argv
 from .secrets import global_secrets_path, project_secrets_path
+from .trusted import (
+    DOCKER_SOCKET as _DOCKER_SOCKET,
+    SSH_SOCKET as _SSH_SOCKET,
+    TrustedAuthorizationError,
+    authorize_entry,
+    build_launch_plan,
+    load_runtime_snapshot,
+    path_is_socket as _is_socket,
+)
 
 # Default broker socket. It lives on the NEUTRAL `boxa-bridge` runtime path
 # (ADR 0014, issue 19), NOT inside the 0700 boxa-mcp secret dir: connecting
@@ -108,6 +118,7 @@ _PROXY_CHUNK = 64 * 1024
 # handshake completes, since the subsequent stdio proxy is legitimately idle for
 # long stretches between MCP messages.
 _HANDSHAKE_TIMEOUT_SECONDS = 10.0
+_RAW_DOCKER_ENV = {"DOCKER_HOST", "DOCKER_CONTEXT", "XDG_RUNTIME_DIR"}
 
 
 class BrokerError(RuntimeError):
@@ -300,8 +311,17 @@ def _build_spawn(
         overlay = _resolve_env(spec, secrets_path, server)
     except RunnerError as exc:
         raise BrokerError(str(exc)) from exc
+    forbidden = sorted(set(overlay) & _RAW_DOCKER_ENV)
+    if forbidden:
+        raise BrokerError(
+            f"service-isolated server {server!r} declares raw Docker environment: "
+            + ", ".join(forbidden)
+        )
 
-    child_env = dict(os.environ)
+    child_env = {
+        key: value for key, value in os.environ.items()
+        if key in {"HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "TZ"}
+    }
     # Strip the broker's OWN control-plane variables from the child environment.
     # A spawned MCP server has no business knowing where the broker reads secret
     # VALUES from (BOXA_MCP_SECRETS_DIR) or where the broker socket lives: the
@@ -325,20 +345,6 @@ def _build_spawn(
     # profile still wins.
     home = child_env.get("HOME") or os.path.expanduser("~")
     child_env["XDG_CONFIG_HOME"] = os.path.join(home, ".config")
-    # Point a docker/podman-launcher server at the Container's rootless Docker
-    # daemon (ADR 0014 "Update 2026-05-31"). DOCKER_HOST + XDG_RUNTIME_DIR are
-    # the image ENV the broker inherits; they are NOT secrets and are the ONLY
-    # variables added back here (issue 15 strips the broker's control-plane vars
-    # above — that hardening stays intact). XDG_RUNTIME_DIR is the docker socket's
-    # RUNTIME dir, distinct from XDG_CONFIG_HOME (config) set just above. We only
-    # propagate a value the broker actually has, so an image without rootless
-    # Docker simply leaves the child without these (a non-Docker server is
-    # unaffected). The socket itself is reachable because start-rootless-docker.sh
-    # re-groups it to boxa-bridge, of which boxa-mcp is a member.
-    for _docker_var in ("DOCKER_HOST", "XDG_RUNTIME_DIR"):
-        _docker_val = os.environ.get(_docker_var)
-        if _docker_val:
-            child_env[_docker_var] = _docker_val
     child_env.update(overlay)
     # Spawn the server in the agent session's cwd (relay-supplied) so project-
     # local servers resolve relative paths against the session, not the broker's
@@ -346,6 +352,122 @@ def _build_spawn(
     # the broker's own cwd) when it is missing or unusable.
     spawn_cwd = _resolve_spawn_cwd(requested_cwd)
     return argv, child_env, spawn_cwd
+
+
+def _load_catalog_runtime() -> dict:
+    try:
+        return load_runtime_snapshot()
+    except TrustedAuthorizationError as exc:
+        raise BrokerError(str(exc)) from exc
+
+
+def _build_catalog_spawn(
+    server: str,
+    requested_key: Optional[str],
+    requested_cwd: Optional[str],
+    catalog_id: str,
+    consumer: str,
+) -> tuple[list[str], dict, Optional[str]]:
+    """Authorize a catalog launch against current Project activation state."""
+    entry, own_key = _authorize_catalog_entry(
+        server, requested_key, catalog_id, consumer
+    )
+    if entry.get("executionMode") != "service-isolated":
+        raise BrokerError(f"server {server!r} is not service-isolated (refused)")
+    spec = {
+        "command": entry.get("command"),
+        "envKeys": entry.get("envKeys", []),
+        "secretEnvKeys": entry.get("secretEnvKeys", []),
+        "env": entry.get("env", {}),
+    }
+    try:
+        argv = _server_argv(spec, server)
+        secrets = _staged_secrets_path(os.path.basename(project_secrets_path(own_key)))
+        overlay = _resolve_env(
+            spec, secrets, str(entry.get("secretStoreKey") or server)
+        )
+    except RunnerError as exc:
+        raise BrokerError(str(exc)) from exc
+    forbidden = sorted(set(overlay) & _RAW_DOCKER_ENV)
+    if forbidden:
+        raise BrokerError(
+            f"service-isolated server {server!r} declares raw Docker environment: "
+            + ", ".join(forbidden)
+        )
+    child_env = {
+        key: value for key, value in os.environ.items()
+        if key in {"HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "TZ"}
+    }
+    for control in (_SECRETS_DIR_ENV, _SOCKET_PATH_ENV):
+        child_env.pop(control, None)
+    home = child_env.get("HOME") or os.path.expanduser("~")
+    child_env["XDG_CONFIG_HOME"] = os.path.join(home, ".config")
+    child_env.update(overlay)
+    return argv, child_env, _resolve_spawn_cwd(requested_cwd)
+
+
+def _build_docker_adapter_plan(
+    server: str, requested_key: Optional[str], requested_cwd: Optional[str],
+    catalog_id: str, consumer: str,
+) -> dict:
+    entry, own_key = _authorize_catalog_entry(
+        server, requested_key, catalog_id, consumer
+    )
+    try:
+        spec = {
+            "command": entry.get("command"),
+            "envKeys": entry.get("envKeys", []),
+            "secretEnvKeys": entry.get("secretEnvKeys", []),
+            "env": entry.get("env", {}),
+        }
+        secrets = _staged_secrets_path(os.path.basename(project_secrets_path(own_key)))
+        overlay = _resolve_env(
+            spec, secrets, str(entry.get("secretStoreKey") or server)
+        )
+        return build_docker_plan(
+            entry, catalog_id, consumer, own_key, requested_cwd, overlay
+        )
+    except (RunnerError, DockerAdapterError) as exc:
+        raise BrokerError(str(exc)) from exc
+
+
+def _authorize_catalog_entry(
+    server: str,
+    requested_key: Optional[str],
+    catalog_id: str,
+    consumer: str,
+) -> tuple[dict, str]:
+    """Bind stable identity, this active Project, and selected consumer."""
+    own_key = project_key()
+    if not requested_key or not own_key or requested_key.rstrip("/") != own_key.rstrip("/"):
+        raise BrokerError(
+            f"refusing catalog server {server!r}: requested Project is not this Container's Project"
+        )
+    runtime = _load_catalog_runtime()
+    try:
+        entry = authorize_entry(runtime, server, own_key, catalog_id, consumer)
+    except TrustedAuthorizationError as exc:
+        raise BrokerError(str(exc)) from exc
+    return entry, own_key
+
+
+def _build_agent_trusted_plan(
+    server: str,
+    requested_key: Optional[str],
+    requested_cwd: Optional[str],
+    catalog_id: str,
+    consumer: str,
+) -> dict:
+    """Return a deterministic, secret-free node launch authorization."""
+    entry, _own_key = _authorize_catalog_entry(
+        server, requested_key, catalog_id, consumer
+    )
+    try:
+        return build_launch_plan(
+            entry, catalog_id, consumer, requested_cwd, socket_probe=_is_socket
+        )
+    except TrustedAuthorizationError as exc:
+        raise BrokerError(str(exc)) from exc
 
 
 def _pump(src_fd: int, dst_fd: int, on_eof=None) -> None:
@@ -481,7 +603,9 @@ def _handle(conn: socket.socket) -> None:
     try:
         try:
             line = read_line(conn.recv)
-            server, project_key, requested_cwd = decode_request(line)
+            server, project_key, requested_cwd, catalog_id, consumer = (
+                decode_request_details(line)
+            )
         except ProtocolError as exc:
             conn.sendall(encode_reply(False, f"bad handshake: {exc}"))
             return
@@ -496,9 +620,34 @@ def _handle(conn: socket.socket) -> None:
         conn.settimeout(None)
 
         try:
-            argv, child_env, spawn_cwd = _build_spawn(
-                server, project_key, requested_cwd
-            )
+            if catalog_id:
+                entry, _own_key = _authorize_catalog_entry(
+                    server, project_key, catalog_id, consumer or ""
+                )
+                if entry.get("executionMode") == "agent-trusted":
+                    launch = _build_agent_trusted_plan(
+                        server, project_key, requested_cwd, catalog_id,
+                        consumer or "",
+                    )
+                    # Authorization ends here. The broker never spawns an
+                    # agent-trusted process and never proxies its stdio.
+                    conn.sendall(encode_reply(True, launch=launch))
+                    return
+                if entry.get("runtimeKind") == "docker":
+                    launch = _build_docker_adapter_plan(
+                        server, project_key, requested_cwd, catalog_id,
+                        consumer or "",
+                    )
+                    conn.sendall(encode_reply(True, launch=launch))
+                    return
+                argv, child_env, spawn_cwd = _build_catalog_spawn(
+                    server, project_key, requested_cwd, catalog_id,
+                    consumer or "",
+                )
+            else:
+                argv, child_env, spawn_cwd = _build_spawn(
+                    server, project_key, requested_cwd
+                )
         except BrokerError as exc:
             conn.sendall(encode_reply(False, str(exc)))
             return
@@ -513,8 +662,16 @@ def _handle(conn: socket.socket) -> None:
                 cwd=spawn_cwd,
                 close_fds=True,
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             # Command name is non-secret (it is the profile's argv[0]).
+            if isinstance(exc, ValueError):
+                conn.sendall(
+                    encode_reply(
+                        False,
+                        f"failed to launch {server!r}: invalid OS-bound command or environment",
+                    )
+                )
+                return
             conn.sendall(
                 encode_reply(False, f"failed to launch {server!r}: {exc}")
             )

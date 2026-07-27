@@ -171,7 +171,10 @@ def _resolve_env(
     return overlay
 
 
-def run(server_name: str, project_key: Optional[str] = None) -> int:
+def run(
+    server_name: str, project_key: Optional[str] = None, *,
+    catalog_id: Optional[str] = None, consumer: Optional[str] = None,
+) -> int:
     """Relay one MCP server's stdio through the broker (ADR 0014).
 
     This no longer execs the server in-process. Under ADR 0014 the server runs
@@ -189,6 +192,11 @@ def run(server_name: str, project_key: Optional[str] = None) -> int:
     from .relay import run as relay_run
 
     try:
-        return relay_run(server_name, project_key=project_key)
+        if catalog_id is None and consumer is None:
+            return relay_run(server_name, project_key=project_key)
+        return relay_run(
+            server_name, project_key=project_key,
+            catalog_id=catalog_id, consumer=consumer,
+        )
     except RelayError as exc:
         raise RunnerError(str(exc)) from exc

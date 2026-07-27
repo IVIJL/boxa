@@ -104,6 +104,10 @@ class EntrypointBrokerTests(unittest.TestCase):
             r"install -d -o boxa-mcp -g boxa-mcp -m 0700 /run/boxa-mcp\b",
         )
 
+    def test_missing_readonly_catalog_runtime_mount_fails_closed(self):
+        self.assertIn("[ ! -d /run/boxa-mcp-runtime ]", self.text)
+        self.assertIn("catalog MCP launches will be refused", self.text)
+
     def test_broker_launched_with_clean_boxa_mcp_env(self):
         # The broker (and the servers it spawns) must run with boxa-mcp's own
         # HOME / npm cache, not root's inherited environment, so npx servers can
@@ -315,6 +319,22 @@ class DockerRunMountTests(unittest.TestCase):
         )
         self.assertRegex(
             self.text, r'BOXA_MCP_HOST_STORE="\$HOME/\.config/boxa/mcp"'
+        )
+
+    def test_secret_free_runtime_directory_has_separate_readonly_node_mount(self):
+        self.assertRegex(
+            self.text,
+            r'BOXA_MCP_RUNTIME_STORE="\$BOXA_MCP_HOST_STORE/runtime"',
+        )
+        self.assertRegex(self.text, r'mkdir -p "\$BOXA_MCP_RUNTIME_STORE"')
+        self.assertRegex(self.text, r'chmod 0755 "\$BOXA_MCP_RUNTIME_STORE"')
+        self.assertRegex(
+            self.text,
+            r'\$BOXA_MCP_RUNTIME_STORE:/run/boxa-mcp-runtime:ro',
+        )
+        self.assertNotRegex(
+            self.text,
+            r'\$BOXA_MCP_HOST_STORE:/run/boxa-mcp-runtime:ro',
         )
 
     def test_host_mcp_store_created_and_mounted_unconditionally(self):

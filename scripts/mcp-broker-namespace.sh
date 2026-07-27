@@ -139,18 +139,15 @@ main() {
     # + --regid + --init-groups resets UID, GID, and supplementary groups to
     # boxa-mcp's own. env -i then starts from a clean slate (setpriv preserves
     # the environment) and sets exactly boxa-mcp's runtime env — mirroring the
-    # entrypoint's prior inline launch (issue 15 hardening + issue 20 Docker
-    # propagation), now hoisted here so the broker runs in the namespace.
+    # entrypoint's prior inline launch, now hoisted here so the broker runs in
+    # the namespace. Raw Docker variables are intentionally absent (ADR 0021).
     #
     #   * HOME + npm/npx cache under boxa-mcp's own writable HOME (npx servers);
     #   * XDG_CONFIG_HOME -> the GATED host MCP store mount so the broker reads the
     #     live secret-free profile (node-unreadable 0700 parent);
     #   * BOXA_MCP_SECRETS_DIR -> the private staged secret dir (issue 16);
-    #   * DOCKER_HOST + XDG_RUNTIME_DIR -> the rootless Docker daemon, so the broker
-    #     can forward them to docker-launcher servers it spawns (issue 20). Passed
-    #     from the (image-ENV) environment so they are not duplicated here; empty if
-    #     this image has no rootless Docker, in which case the broker forwards
-    #     nothing (broker.py only propagates non-empty values).
+    #   * /run/boxa-mcp-runtime -> inherited dedicated read-only, secret-free
+    #     host snapshot mount shared with the independent node relay validator;
     #   * a minimal PATH including npm-global bin (npx/node) + system dirs.
     exec setpriv --reuid=boxa-mcp --regid=boxa-mcp --init-groups \
         -- env -i \
@@ -159,8 +156,6 @@ main() {
             LOGNAME=boxa-mcp \
             XDG_CONFIG_HOME=/run/boxa-mcp/host \
             BOXA_MCP_SECRETS_DIR=/run/boxa-mcp/secrets \
-            DOCKER_HOST="$DOCKER_HOST" \
-            XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
             npm_config_cache=/home/boxa-mcp/.npm \
             XDG_CACHE_HOME=/home/boxa-mcp/.cache \
             PATH=/usr/local/share/npm-global/bin:/usr/local/bin:/usr/bin:/bin \

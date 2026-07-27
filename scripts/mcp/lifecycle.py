@@ -28,7 +28,10 @@ even then only key NAMES are ever reported.
 from __future__ import annotations
 
 import os
+import json
 import shutil
+import subprocess
+import tomllib
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -138,7 +141,7 @@ def _entries_from_profile(
     """
     try:
         profile = load_profile(path)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         raise LifecycleError(f"cannot read MCP profile {path}: {exc}") from exc
     servers = profile.get("servers", {})
     if not isinstance(servers, dict):
@@ -696,7 +699,7 @@ def _profile_validity_findings() -> list[Finding]:
             continue
         try:
             load_profile(path)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             findings.append(
                 Finding(
                     severity=SEVERITY_ERROR,
@@ -1012,6 +1015,11 @@ def run_doctor() -> DoctorReport:
     inside = identity.inside_container()
     report = DoctorReport(inside_container=inside)
 
+    # ADR 0021 catalog diagnostics.  Keep these alongside the legacy checks
+    # during the one-way migration window; catalog state is the authoritative
+    # operating path and each finding names its boundary explicitly.
+    report.findings.extend(_catalog_doctor_findings())
+
     # Context check.
     if not inside:
         report.findings.append(
@@ -1046,6 +1054,18 @@ def run_doctor() -> DoctorReport:
                 fixable=True,
             )
         )
+
+    # A completed one-way migration deliberately retains legacy profiles only
+    # for recovery. They must never become an authoritative render source again.
+    migrated = False
+    try:
+        from .migration import migration_path
+        with open(migration_path(), encoding="utf-8") as fh:
+            migrated = json.load(fh).get("status") == "complete"
+    except (OSError, ValueError, AttributeError):
+        pass
+    if migrated:
+        return report
 
     # Profile validity. A malformed profile blocks render drift / env checks for
     # that file, so collect those findings and skip the plan-based checks if any
@@ -1205,6 +1225,34 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
                 )
             )
 
+    # Catalog activation renders and the secret-free runtime snapshot are
+    # derived state.  Repairing them is safe, but a tracked Codex config is an
+    # explicit repository mutation and therefore never enters this branch.
+    catalog_codes = {f.code for f in report.findings if f.fixable}
+    if "catalog-runtime-drift" in catalog_codes:
+        try:
+            from .activation import refresh_runtime
+            refresh_runtime()
+            result.actions.append("refreshed the secret-free MCP runtime snapshot")
+        except (OSError, ValueError, RuntimeError) as exc:
+            render_failures.append(Finding(SEVERITY_ERROR, "catalog-runtime-fix-failed", f"runtime snapshot repair failed: {exc}", "Run 'boxa mcp doctor --fix' again after fixing the catalog/activation store."))
+    if "catalog-claude-render-drift" in catalog_codes:
+        try:
+            from .activation import render_claude_activations
+            render_claude_activations()
+            result.actions.append("restored Claude Code activation renders")
+        except (OSError, ValueError, RuntimeError) as exc:
+            render_failures.append(Finding(SEVERITY_ERROR, "catalog-render-fix-failed", f"Claude render repair failed: {exc}", "Inspect the Claude config and re-run 'boxa mcp doctor --fix'."))
+    if "catalog-codex-render-drift" in catalog_codes:
+        try:
+            from .activation import _render_codex_activation, load_activations
+            data = load_activations()
+            for project, records in data.get("projects", {}).items():
+                if any("codex" in record.get("consumers", []) for record in records.values()):
+                    _render_codex_activation(data, project, allow_tracked=False)
+            result.actions.append("restored untracked Codex activation renders")
+        except (OSError, ValueError, RuntimeError) as exc:
+            render_failures.append(Finding(SEVERITY_ERROR, "catalog-render-fix-failed", f"Codex render repair failed: {exc}", "Inspect the Codex config and re-run 'boxa mcp doctor --fix'."))
     # Re-run doctor to capture what remains after the fixes, so the user sees the
     # honest post-fix state (e.g. a still-missing env var, or a wrapper we could
     # not relink). A render write that hard-failed is surfaced on top of the
@@ -1212,3 +1260,171 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
     after = run_doctor()
     result.remaining = render_failures + list(after.findings)
     return result
+
+
+def _catalog_render_state(project: str, entry_id: str, entry: dict[str, Any], consumer: str) -> tuple[str, bool]:
+    """Return (state, tracked) for one derived consumer record, secret-free."""
+    from .activation import codex_config_path
+    from .providers.claude import render_target_path
+
+    name = rendered_name(str(entry["name"]))
+    expected_args = ["--catalog-id", entry_id, "--consumer", consumer, "--project", project, entry["name"]]
+    if consumer == "claude":
+        try:
+            with open(render_target_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+            value = data.get("projects", {}).get(project, {}).get("mcpServers", {}).get(name)
+        except (OSError, ValueError, AttributeError):
+            return "drift", False
+        ok = isinstance(value, dict) and value.get("command") == WRAPPER_COMMAND and value.get("args") == expected_args
+        return ("rendered" if ok else "drift"), False
+
+    path = codex_config_path(project)
+    try:
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+        value = data.get("mcp_servers", {}).get(name)
+    except (OSError, ValueError, AttributeError):
+        value = None
+    tracked = False
+    try:
+        relative = os.path.relpath(path, project)
+        tracked = subprocess.run(
+            ["git", "-C", project, "ls-files", "--error-unmatch", "--", relative],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        ).returncode == 0
+    except OSError:
+        pass
+    ok = isinstance(value, dict) and value.get("command") == WRAPPER_COMMAND and value.get("args") == expected_args
+    return ("rendered" if ok else "drift"), tracked
+
+
+def catalog_project_status(project: str, probe: Optional[object] = None) -> dict[str, Any]:
+    """Unified catalog -> readiness -> activation -> render -> mode snapshot."""
+    from .activation import canonical_project, load_activations
+    from .catalog import degradation_status, load_catalog
+    from .readiness import ProjectProbe, ReadinessError, readiness_for_entry
+
+    key = canonical_project(project)
+    catalog = load_catalog()
+    activations = load_activations()
+    records = activations.get("projects", {}).get(key, {})
+    rows: list[dict[str, Any]] = []
+    local_probe = probe if probe is not None else ProjectProbe()
+    for entry_id, entry in sorted(catalog["entries"].items(), key=lambda item: (item[1]["name"].casefold(), item[0])):
+        record = records.get(entry_id)
+        try:
+            ready_report = readiness_for_entry(entry, key, local_probe, secret_name=str(entry.get("secretStoreKey") or entry["name"]))
+            readiness = {
+                "state": "ready" if ready_report.ready else "not-ready",
+                "container": ready_report.container,
+                "checks": [check.to_dict() for check in ready_report.checks],
+            }
+        except ReadinessError as exc:
+            readiness = {"state": "target-stopped", "container": "", "checks": [], "message": str(exc)}
+        consumers = list(record.get("consumers", [])) if isinstance(record, dict) else []
+        renders = {}
+        tracked = False
+        for consumer in consumers:
+            state, is_tracked = _catalog_render_state(key, entry_id, entry, consumer)
+            renders[consumer] = state
+            tracked = tracked or is_tracked
+        rows.append({
+            "id": entry_id,
+            "name": entry["name"],
+            "catalogMember": True,
+            "runtimeKind": entry["runtimeKind"],
+            "readiness": readiness,
+            "activation": "activated" if record and record.get("enabled", True) else "inactive",
+            "consumers": consumers,
+            "renders": renders,
+            "executionMode": entry["executionMode"],
+            "executionUser": "node" if entry["executionMode"] == "agent-trusted" else "boxa-mcp",
+            "isolationStatus": degradation_status(entry) or "isolated",
+            "degradedSecretIsolationAcknowledged": activations.get("acknowledgements", {}).get(key, {}).get(entry_id) is True,
+            "trackedCodexConfig": tracked,
+        })
+    return {"projectKey": key, "entries": rows}
+
+
+def _catalog_doctor_findings(probe: Optional[object] = None) -> list[Finding]:
+    """Catalog/activation diagnostics; never includes env values."""
+    from .activation import load_activations, runtime_path
+    from .catalog import CatalogError, _stored_secret_keys, catalog_path, load_catalog
+    findings: list[Finding] = []
+    try:
+        catalog = load_catalog()
+    except CatalogError as exc:
+        message = str(exc)
+        if "agent-trusted" in message and "secret env keys" in message:
+            return [Finding(SEVERITY_ERROR, "trusted-secrets-forbidden", "The MCP catalog contains an agent-trusted entry with a forbidden MCP secret contract.", "Remove the secret contract and retained MCP-store value before granting agent trust; doctor --fix will not change trust or credentials.")]
+        return [Finding(SEVERITY_ERROR, "catalog-malformed", f"MCP catalog is malformed: {message}", f"Repair the host-owned catalog at {catalog_path()}.")]
+    try:
+        activations = load_activations()
+    except (OSError, ValueError, RuntimeError) as exc:
+        return [Finding(SEVERITY_ERROR, "activations-malformed", f"MCP activation store is malformed: {exc}", "Repair the host-owned activation store; doctor will not infer activations or trust.")]
+
+    # Trust belongs to catalog identity, not activation.  Check every trusted
+    # definition (including inactive entries) and reveal only the presence bit:
+    # no secret key name, value, or store path enters a finding.
+    for entry_id, entry in catalog["entries"].items():
+        if entry.get("executionMode") != "agent-trusted":
+            continue
+        try:
+            retained = bool(_stored_secret_keys(entry))
+        except (OSError, ValueError):
+            findings.append(Finding(
+                SEVERITY_ERROR,
+                "trusted-secret-store-unreadable",
+                f"Cannot verify retained MCP secrets for agent-trusted entry {entry['name']!r} ({entry_id}).",
+                "Repair the MCP secret store, then remove retained values before using agent trust; doctor --fix will not inspect or change credentials.",
+                False,
+            ))
+            continue
+        if retained:
+            findings.append(Finding(
+                SEVERITY_ERROR,
+                "trusted-secrets-forbidden",
+                f"Agent-trusted MCP {entry['name']!r} ({entry_id}) retains forbidden MCP-store values.",
+                "Remove all retained MCP-store values for this stable catalog identity before using agent trust; doctor --fix will not change credentials or trust.",
+                False,
+            ))
+
+    for project, records in activations.get("projects", {}).items():
+        for entry_id in records:
+            if entry_id not in catalog["entries"]:
+                findings.append(Finding(SEVERITY_ERROR, "stale-activation-reference", f"Project {project} has an activation for missing catalog id {entry_id}.", "Deactivate/remove the stale host-owned record explicitly; doctor --fix will not guess.", False))
+        try:
+            status = catalog_project_status(project, probe)
+        except (OSError, ValueError, RuntimeError) as exc:
+            findings.append(Finding(SEVERITY_ERROR, "catalog-status-failed", f"Cannot inspect MCP status for Project {project}: {exc}", "Repair the catalog/activation stores."))
+            continue
+        for row in status["entries"]:
+            if row["activation"] != "activated":
+                continue
+            if row["readiness"]["state"] == "target-stopped":
+                findings.append(Finding(SEVERITY_WARN, "activation-target-stopped", f"Activated MCP {row['name']!r} targets stopped Project {project}; readiness cannot be evaluated.", f"Start the Project, then run 'boxa mcp readiness {row['id']} --project {project}'."))
+            elif row["readiness"]["state"] != "ready":
+                missing = ", ".join(check["label"] for check in row["readiness"]["checks"] if not check["ready"])
+                findings.append(Finding(SEVERITY_WARN, "activation-not-ready", f"Activated MCP {row['name']!r} is not ready in Project {project}: {missing}.", f"Run 'boxa mcp install {row['id']} --project {project}', satisfy prerequisites, then re-check readiness."))
+            if row["executionMode"] == "agent-trusted" and catalog["entries"][row["id"]].get("secretEnvKeys"):
+                findings.append(Finding(SEVERITY_ERROR, "trusted-secrets-forbidden", f"Agent-trusted MCP {row['name']!r} declares forbidden MCP-store secrets.", "Deactivate it and remove the secret contract/value before granting agent trust."))
+            if row["isolationStatus"] == "degraded-secret-isolation":
+                findings.append(Finding(SEVERITY_WARN, "degraded-secret-isolation", f"MCP server {row['name']!r} in Project {project} has degraded-secret-isolation: node owns the Docker daemon and can inspect its container environment.", "Use a secret-free image or wait for Docker execution and per-server credential isolation."))
+            for consumer, render_state in row["renders"].items():
+                if render_state == "rendered":
+                    continue
+                tracked = consumer == "codex" and row["trackedCodexConfig"]
+                code = f"catalog-{consumer}-render-drift"
+                repair = ("Re-run activation with --allow-tracked-codex-config after reviewing the repository change." if tracked else "boxa mcp doctor --fix")
+                findings.append(Finding(SEVERITY_WARN, code, f"{consumer} render drift for activated MCP {row['name']!r} in Project {project}." + (" The Codex config is tracked." if tracked else ""), repair, not tracked))
+
+    expected = {"version": 1, "catalogVersion": catalog["version"], "entries": catalog["entries"], "projects": activations.get("projects", {})}
+    try:
+        with open(runtime_path(), encoding="utf-8") as fh:
+            actual = json.load(fh)
+    except (OSError, ValueError):
+        actual = None
+    if actual != expected:
+        findings.append(Finding(SEVERITY_WARN, "catalog-runtime-drift", "The secret-free MCP runtime snapshot is missing or out of sync with catalog activations.", "boxa mcp doctor --fix", True))
+    return findings

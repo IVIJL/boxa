@@ -198,9 +198,8 @@ class FallbackDecisionTests(unittest.TestCase):
 
     def test_broker_env_matches_credential_drop(self):
         # The launch must carry the issue-15 clean boxa-mcp env: own HOME, npm
-        # cache, gated profile mount, private secrets dir — plus the issue-20
-        # Docker daemon pointers forwarded from the image ENV (so the broker can
-        # propagate them to docker-launcher servers it spawns).
+        # cache, gated profile mount and private secrets dir. Raw Docker daemon
+        # pointers must not enter the broker/service environment.
         body = (
             self._EXEC_STUB
             + "\n"
@@ -224,10 +223,10 @@ class FallbackDecisionTests(unittest.TestCase):
             "npm_config_cache=/home/boxa-mcp/.npm",
             "XDG_CONFIG_HOME=/run/boxa-mcp/host",
             "BOXA_MCP_SECRETS_DIR=/run/boxa-mcp/secrets",
-            "DOCKER_HOST=unix:///run/user/1000/docker.sock",
-            "XDG_RUNTIME_DIR=/run/user/1000",
         ):
             self.assertIn(token, out.stdout, f"missing {token!r} in launch")
+        self.assertNotIn("DOCKER_HOST=", out.stdout)
+        self.assertNotIn("XDG_RUNTIME_DIR=", out.stdout)
 
 
 if __name__ == "__main__":  # pragma: no cover

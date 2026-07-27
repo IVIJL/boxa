@@ -116,6 +116,13 @@ if [ "$(id -u)" = "0" ]; then
         install -d -o boxa-mcp -g boxa-bridge -m 2770 /run/boxa-bridge
         install -d -o boxa-mcp -g boxa-mcp -m 0700 /run/boxa-mcp
         install -d -o boxa-mcp -g boxa-mcp -m 0700 /run/boxa-mcp/secrets
+        # docker-run mounts the secret-free host authorization snapshot as its
+        # own read-only DIRECTORY here. Do not synthesize a writable fallback:
+        # broker and node relay must both fail closed when the host mount is
+        # absent, rather than trusting bridge-socket state.
+        if [ ! -d /run/boxa-mcp-runtime ]; then
+            echo "boxa: WARNING: read-only MCP runtime snapshot mount is missing; catalog MCP launches will be refused." >&2
+        fi
 
         # Gate the host MCP store mount (ADR 0014, issue 16). docker-run.sh
         # bind-mounts host ~/.config/boxa/mcp read-only at

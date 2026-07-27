@@ -4383,6 +4383,13 @@ DOCKER_ARGS+=(-v "$HOME/.codex:/home/node/.codex")
 # entrypoint root phase gates the in-container mount to boxa-mcp 0700 regardless.
 BOXA_MCP_HOST_STORE="$HOME/.config/boxa/mcp"
 mkdir -p "$BOXA_MCP_HOST_STORE"
+# Agent-trusted authorization snapshot: a dedicated SECRET-FREE subdirectory
+# mounted separately read-only at a fixed node-readable Container path. The
+# directory (not one file) is mounted so host atomic os.replace updates remain
+# visible to running Containers. Secret stores are siblings outside this mount.
+BOXA_MCP_RUNTIME_STORE="$BOXA_MCP_HOST_STORE/runtime"
+mkdir -p "$BOXA_MCP_RUNTIME_STORE"
+chmod 0755 "$BOXA_MCP_RUNTIME_STORE"
 # Normalize EXISTING store perms to broker-readable BEFORE the mount (host-side).
 # save_profile()/ensure_store_dir() only fix NEWLY written profiles; a store dir
 # or profile created by an older version (0700/0600) or under a restrictive host
@@ -4407,6 +4414,7 @@ done < <(find "$BOXA_MCP_HOST_STORE" -maxdepth 2 -type f \
     \( -name 'profile.json' -o \( -path "$BOXA_MCP_HOST_STORE/projects/*.json" -a ! -name '*.secrets.json' \) \) \
     -print0 2>/dev/null)
 DOCKER_ARGS+=(-v "$BOXA_MCP_HOST_STORE:/run/boxa-mcp/host/boxa/mcp:ro")
+DOCKER_ARGS+=(-v "$BOXA_MCP_RUNTIME_STORE:/run/boxa-mcp-runtime:ro")
 
 # SSH config: --ssh-config uses full host config, otherwise boxa-specific config
 BOXA_SSH_CONFIG="$HOME/.config/boxa/ssh_config"

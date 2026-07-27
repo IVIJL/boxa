@@ -399,10 +399,7 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
         self.assertNotIn(broker._SECRETS_DIR_ENV, env)
         self.assertNotIn(broker._SOCKET_PATH_ENV, env)
 
-    def test_build_spawn_propagates_docker_env(self):
-        # ADR 0014 "Update 2026-05-31": a docker-launcher server must point at the
-        # Container's rootless daemon, so DOCKER_HOST + XDG_RUNTIME_DIR (the image
-        # ENV the broker inherits) are propagated into the child.
+    def test_build_spawn_does_not_propagate_ambient_docker_env(self):
         self._set_env(
             DOCKER_HOST="unix:///run/user/1000/docker.sock",
             XDG_RUNTIME_DIR="/run/user/1000",
@@ -413,10 +410,10 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
                 fh,
             )
         _argv, env, _cwd = broker._build_spawn("ctx", None)
-        self.assertEqual(env["DOCKER_HOST"], "unix:///run/user/1000/docker.sock")
-        self.assertEqual(env["XDG_RUNTIME_DIR"], "/run/user/1000")
+        self.assertNotIn("DOCKER_HOST", env)
+        self.assertNotIn("XDG_RUNTIME_DIR", env)
 
-    def test_build_spawn_docker_env_propagation_keeps_issue15_stripping(self):
+    def test_build_spawn_docker_env_stripping_keeps_issue15_stripping(self):
         # The Docker vars are the ONLY additions: the issue-15 hardening that
         # strips BOXA_MCP_SECRETS_DIR and the broker socket pointer must still
         # hold even with DOCKER_HOST/XDG_RUNTIME_DIR present in the broker env.
@@ -433,7 +430,8 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
         _argv, env, _cwd = broker._build_spawn("ctx", None)
         self.assertNotIn(broker._SECRETS_DIR_ENV, env)
         self.assertNotIn(broker._SOCKET_PATH_ENV, env)
-        self.assertEqual(env["DOCKER_HOST"], "unix:///run/user/1000/docker.sock")
+        self.assertNotIn("DOCKER_HOST", env)
+        self.assertNotIn("XDG_RUNTIME_DIR", env)
 
     def test_build_spawn_omits_docker_env_when_broker_lacks_it(self):
         # On an image without rootless Docker the broker has no DOCKER_HOST, so a
@@ -447,6 +445,25 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
         _argv, env, _cwd = broker._build_spawn("ctx", None)
         self.assertNotIn("DOCKER_HOST", env)
         self.assertNotIn("XDG_RUNTIME_DIR", env)
+
+    def test_build_spawn_refuses_explicit_raw_docker_environment(self):
+        with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
+            json.dump(
+                {
+                    "version": 1,
+                    "servers": {
+                        "ctx": {
+                            "command": {"argv": ["mycmd"]},
+                            "env": {"DOCKER_HOST": "unix:///run/user/1000/docker.sock"},
+                            "envKeys": ["DOCKER_HOST"],
+                            "secretEnvKeys": [],
+                        }
+                    },
+                },
+                fh,
+            )
+        with self.assertRaisesRegex(BrokerError, "raw Docker environment"):
+            broker._build_spawn("ctx", None)
 
     def test_build_spawn_profile_override_wins_over_redirect(self):
         # An explicit per-server XDG_CONFIG_HOME in the profile must still win
@@ -680,6 +697,25 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
         with open(f, "w") as fh:
             fh.write("x")
         self.assertIsNone(broker._resolve_spawn_cwd(f))
+
+    def test_handler_converts_popen_value_error_to_secret_free_refusal(self):
+        secret = "must-never-leak-value"
+        with open(os.path.join(self.cfg_root, "profile.json"), "w") as fh:
+            json.dump(
+                {"version": 1, "servers": {"ctx": {"command": {"argv": ["mycmd"]}}}},
+                fh,
+            )
+        client, server = socket.socketpair()
+        with mock.patch("subprocess.Popen", side_effect=ValueError(secret)):
+            thread = threading.Thread(target=broker._handle, args=(server,))
+            thread.start()
+            client.sendall(protocol.encode_request("ctx", None))
+            ok, error = protocol.decode_reply(protocol.read_line(client.recv))
+            thread.join(timeout=5)
+        client.close()
+        self.assertFalse(ok)
+        self.assertIn("invalid OS-bound command or environment", error or "")
+        self.assertNotIn(secret, error or "")
 
     def test_resolve_spawn_cwd_accepts_usable_dir(self):
         self.assertEqual(

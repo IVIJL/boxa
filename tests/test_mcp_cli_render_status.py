@@ -6,8 +6,9 @@ Run with:
     python3 -m unittest tests.test_mcp_cli_render_status   # from repo root
     python3 tests/test_mcp_cli_render_status.py            # standalone
 
-`boxa mcp import --apply --json` and `boxa mcp add ... --json` run a secret
-write, then auto-render, then a `_finish_secret_write` cleanup. The bug fixed in
+`boxa mcp add ... --json` runs a secret write and auto-render. ADR 0021 changed
+`boxa mcp import --apply --json` to definition-only catalog import, so it must
+not invoke render at all. The bug fixed in
 issue 18: the JSON branch returned the cleanup's exit status, which masked a
 failed auto-render and made the command falsely report success. These tests
 drive the bash cmd_* functions directly (sourcing mcp-cli.sh, which only runs
@@ -79,12 +80,12 @@ _ADD_JSON_CALL = "cmd_add --json --global ctx7 -- npx -y @upstash/context7-mcp@l
 
 
 class JsonRenderStatusTest(unittest.TestCase):
-    def test_apply_json_propagates_render_failure(self) -> None:
+    def test_apply_json_is_definition_only_and_ignores_render_seam(self) -> None:
         proc = _run_harness(_APPLY_JSON_CALL, render_fails=True)
-        self.assertNotEqual(
+        self.assertEqual(
             proc.returncode,
             0,
-            msg=f"apply --json should exit non-zero on render failure; "
+            msg=f"definition-only apply --json must not invoke render; "
             f"got 0\nstdout={proc.stdout}\nstderr={proc.stderr}",
         )
 

@@ -123,14 +123,14 @@ RUN groupadd --system boxa-mcp && \
 
 # boxa-bridge group (ADR 0014, issue 19) — the SHARED-RUNTIME-SOCKET bridge.
 # Created ONLY inside the image, never on the host: the sockets that use it live
-# in /run (broker socket; future Docker socket), so the group never reaches host
+# in /run (the broker control socket), so the group never reaches host
 # files and the system-assigned GID is irrelevant (it never leaves the
 # Container). BOTH node and boxa-mcp are members. This is how the relay (node)
 # reaches the broker socket WITHOUT being in boxa-mcp's primary group: the
 # socket is group-owned `boxa-bridge` 0660 in a 0770 dir, so the broker
 # (boxa-mcp) owns/serves it and node connects via the bridge — credentials and
-# private homes stay owner-only and out of reach. The bridge is ONLY for sockets,
-# never for the secret store (which stays 0700/0400 owner-only to boxa-mcp).
+# private homes stay owner-only and out of reach. The bridge is ONLY for Boxa
+# control-plane sockets, never the node-owned Docker socket or the secret store.
 RUN groupadd --system boxa-bridge && \
     usermod -aG boxa-bridge node && \
     usermod -aG boxa-bridge boxa-mcp

@@ -601,8 +601,8 @@ class CliSelectionTest(ApplyEnv):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn(_SECRET_VALUE, proc.stdout)
         payload = json.loads(proc.stdout)
-        self.assertEqual(len(payload["applied"]), 1)
-        self.assertIn("PROJECT_API_KEY", proc.stdout)  # name only
+        self.assertEqual(len(payload["imported"]), 1)
+        self.assertTrue(payload["definitionOnly"])
 
 
 class CliWizardWiringTest(ApplyEnv):
@@ -675,10 +675,10 @@ class CliWizardWiringTest(ApplyEnv):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn(_SECRET_VALUE, proc.stdout)
         payload = json.loads(proc.stdout)
-        self.assertEqual(len(payload["applied"]), 1)
-        self.assertEqual(payload["applied"][0]["scope"], "global")
-        # Wrote the GLOBAL profile, not the source Project's.
-        self.assertTrue(os.path.isfile(global_profile_path()))
+        self.assertEqual(len(payload["imported"]), 1)
+        self.assertTrue(payload["definitionOnly"])
+        # ADR 0021 import is scope-neutral catalog membership only.
+        self.assertFalse(os.path.isfile(global_profile_path()))
         self.assertFalse(os.path.isfile(profile_path("project", _PROJECT_KEY)))
 
     def test_override_global_source_to_project(self) -> None:
@@ -695,9 +695,9 @@ class CliWizardWiringTest(ApplyEnv):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(len(payload["applied"]), 1)
-        self.assertEqual(payload["applied"][0]["scope"], "project")
-        self.assertTrue(os.path.isfile(profile_path("project", _PROJECT_KEY)))
+        self.assertEqual(len(payload["imported"]), 1)
+        self.assertTrue(payload["definitionOnly"])
+        self.assertFalse(os.path.isfile(profile_path("project", _PROJECT_KEY)))
 
     def test_override_rejects_relative_project_key(self) -> None:
         # The wizard must only ever pass a resolved ABSOLUTE host path; a bare
@@ -768,8 +768,8 @@ class CliWizardWiringTest(ApplyEnv):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
-        applied_names = {a["name"] for a in payload["applied"]}
-        self.assertIn("good", applied_names)
+        imported_names = {a["name"] for a in payload["imported"]}
+        self.assertIn("good", imported_names)
         _ = good_id
 
 

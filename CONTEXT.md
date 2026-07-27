@@ -156,49 +156,161 @@ boundaries, Windows APIs, or other resources the **Container** should not
 see directly.
 _Avoid_: external MCP server, outside MCP server
 
+**MCP catalog**:
+The user-wide set of prepared **Container MCP server** definitions available for
+explicit activation in any **Project**. Catalog membership never exposes or
+starts a server by itself.
+_Avoid_: global MCP profile, global MCP servers
+
+The catalog and host-owned activations survive host restart, Boxa stop, and
+Container recreation. Installed npm and Docker runtimes use the Project's
+persistent runtime state; consumer renders and the secret-free runtime snapshot
+are derived repairable artifacts. Moving or cloning a Project changes its
+**Project key** and therefore does not carry activations to the new path.
+
+**MCP catalog entry**:
+A durable server definition in the **MCP catalog**, with an identity independent
+of its user-facing name. Updates and renames preserve that identity and its
+**MCP execution mode**; removal destroys both, and a later same-named entry is
+new. Cosmetic metadata may change independently. A runtime-affecting update of
+an active entry is atomic: every activated Project must be running and pass
+readiness for the new definition before the catalog and rendered agent configs
+change. Removal also deletes every **MCP activation** that references the entry.
+_Avoid_: global server, catalog name
+
+**MCP readiness**:
+Whether an **MCP catalog entry** has the runtime and prerequisites needed to
+start successfully for a target **Project**. It is a deterministic local check,
+not a live assertion about an external service. Only a ready entry can be
+activated. Readiness and activation require the target Boxa to be running;
+activation never starts it implicitly.
+_Avoid_: installed status, enabled status
+
+**MCP activation**:
+The user's explicit choice to expose one **MCP catalog entry** to agents in one
+**Project**. It requires **MCP readiness** and never carries over automatically
+to another Project. It is the durable source of truth and makes the server
+immediately active for its selected agent consumers.
+Consumer selection may differ between agents in the same Project. Boxa renders
+Claude Code through its host-owned Project configuration. Because Codex exposes
+Project-scoped MCP only through the trusted repository's `.codex/config.toml`,
+Boxa renders its managed section there as a derived local artifact and excludes
+an otherwise untracked file through `.git/info/exclude`; the host-owned
+activation remains the source of truth. It refuses to change a tracked Codex
+config without explicit user authorization and always preserves non-Boxa
+content.
+Removing an activation prevents new connections but does not terminate an
+already connected server process.
+_Avoid_: global enable, inherited MCP
+
 **MCP profile**:
-The selected set of **MCP servers** exposed to agents for a **Project**.
-The effective profile combines user-wide MCP choices with Project-specific
-choices.
-_Avoid_: MCP config, MCP preset
+The set of **MCP activations** currently selected for one **Project**. A fresh
+Project has an empty profile until the user makes a selection.
+_Avoid_: MCP config, MCP preset, effective global profile
 
 **Inherited MCP server**:
 An **MCP server** discovered from an existing agent configuration that was
-not created by boxa. It can be proposed for a **MCP profile**, but is not
+not created by boxa. It can be proposed for the **MCP catalog**, but is not
 trusted as boxa-managed merely because its configuration is visible inside
 the **Container**.
 _Avoid_: existing MCP server, user MCP server
 
 **Boxa MCP server**:
-An **MCP server** that boxa has explicitly added to a **MCP profile**.
+An **MCP server** represented by an **MCP catalog entry**.
 _Avoid_: managed MCP server
 
-**MCP broker**:
-A long-running process, run as the **boxa-mcp** account, that spawns
-**Container MCP servers** on demand and injects their credentials. Started by
-the entrypoint root phase before the privilege drop, so the agent cannot launch
-or read it. See ADR 0014.
+**MCP execution mode**:
+The catalog-defined identity boundary for a **Container MCP server**. It is
+either `service-isolated` or `agent-trusted`; user-facing output also names the
+concrete Container account used by the selected mode. The mode cannot change
+while the server has any **MCP activation**.
+_Avoid_: trust boolean, trust level, run-as flag
 
-**MCP relay**:
-The `boxa-mcp-run` command rendered into agent config. Runs as the agent user,
-connects to the **MCP broker**'s socket, and proxies stdio for one server; it
-never sees credential values.
-_Avoid_: MCP wrapper (the rendered command relays to the broker; it no longer
-launches the server directly)
+**Service-isolated MCP server**:
+The default **Container MCP server**, running as **boxa-mcp** with full Project
+capabilities but without access to the agent user's private files, credentials,
+process identity, or raw rootless Docker socket. Docker-packaged servers are
+started through the **MCP Docker launch adapter**, which does not mount that
+socket into them. This isolation is from the agent, not from other
+service-isolated servers, which remain one credential trust domain. A temporary
+exception applies to secrets injected into a Docker-packaged server: because
+the daemon is owned by `node`, the agent user can inspect its container
+environment. This degraded guarantee is reported by MCP status and doctor; its
+first activation requires explicit acknowledgement, including a dedicated flag
+for non-interactive use. It remains visible until Docker execution and
+per-server credentials gain a stronger boundary.
+_Avoid_: untrusted MCP server, restricted MCP server
+
+**Agent-trusted MCP server**:
+A **Container MCP server** whose **MCP catalog** definition the user has
+explicitly authorized to share the agent user's identity and private
+filesystem/socket context, but not the agent process's ambient environment. It
+starts from a deterministic agent-user baseline: fixed home, XDG, executable
+path, and known Docker/SSH socket locations when present, plus only explicitly
+declared non-secret catalog environment. It does not inherit arbitrary session
+variables or bearer tokens from the launching agent process. The identity
+applies wherever that definition is activated; a Project chooses only
+whether to activate it, not which identity it uses. The agent can use this
+authorization but cannot grant it through the boxa-managed MCP path, and
+discovery never infers it. This authorization does not constrain commands the
+agent runs independently as its own user. It has the same Project access as a
+**Service-isolated MCP server** plus the agent user's raw Docker capability; the
+additional trust crosses the agent identity and private-state boundary, not the
+Project boundary. It uses credentials already available in the agent user's
+private context and never
+receives values from the **MCP secret store**. An entry cannot use this mode
+while it declares secret environment keys or retains values in that store.
+The CLI mode is always `agent-trusted`; “node-trusted access boundary” may
+describe the concrete fact that it runs as Container user `node`, but is not a
+second mode name.
+_Avoid_: node-trusted MCP server, trusted MCP server, full-access MCP server
+
+**MCP broker**:
+A long-running process, run as the **boxa-mcp** account, that authorizes
+**Container MCP server** launches against the active **MCP profile**. It spawns
+**Service-isolated MCP servers** and supplies the **Boxa MCP launcher** with an
+authorization proposal for **Agent-trusted MCP servers**. Because the broker
+shares its UID with Service-isolated children, the proposal is not itself a
+trust root: the launcher independently validates it against the secret-free,
+host-owned MCP runtime snapshot mounted read-only at a node-readable path. See
+ADR 0014 and ADR 0021.
+
+**Boxa MCP launcher**:
+The `boxa-mcp-run` command rendered into agent config. It runs as the agent user
+and asks the **MCP broker** to authorize one server against the effective **MCP
+profile**. It relays stdio to a broker-spawned **Service-isolated MCP server** or
+launches an authorized **Agent-trusted MCP server** as the agent user. Before an
+Agent-trusted launch it independently binds stable catalog identity, exact
+Project activation, consumer, mode, command, declared non-secret environment,
+working directory, and fixed socket pointers against the host-owned read-only
+runtime snapshot; a forged or replaced broker socket cannot expand that
+authority.
+_Avoid_: MCP relay, MCP wrapper
+
+**MCP Docker launch adapter**:
+The constrained node-side path used to start a Docker-packaged
+**Service-isolated MCP server** through the agent user's rootless daemon. It
+allows the catalog-declared image, Project mount, environment, and stdio but
+does not expose the raw Docker socket to the server. Because `node` owns the
+daemon, secrets injected into such a container are inspectable by the agent;
+this is an explicit temporary limitation, not part of the normal secret-store
+guarantee.
+_Avoid_: Docker proxy, Docker sandbox
 
 **boxa-mcp**:
-The unprivileged Container service account that runs **Container MCP servers**
-and is the only non-root identity allowed to read the **MCP secret store**.
-Distinct from the agent user (`node`), but a **peer-equal citizen** of it: a full,
-sudo-less Container user with the same practical reach (workspace read/write,
-rootless Docker) as the agent. The only asymmetry is privacy — `node` cannot read
-its secrets, and neither account sees the other's private files. See ADR 0014.
-_Avoid_: MCP user, mcp-runner
+The unprivileged Container service account that runs **Service-isolated MCP
+servers** and is the only non-root identity allowed to read the **MCP secret store**.
+Distinct from the agent user (`node`), it is a full, sudo-less Container user
+with the same workspace read/write reach. It does not
+receive the agent user's raw Docker socket; Docker-packaged servers use the
+**MCP Docker launch adapter**. See ADR 0014 and its superseding decisions.
+_Avoid_: MCP user, mcp-runner, peer-equal citizen
 
 **boxa-bridge**:
 A Container-internal group whose members are both `node` and **boxa-mcp**, used
-to share only the runtime sockets (the **MCP broker** socket and the rootless
-Docker socket) between the two accounts. It exists only inside the **Container**
+to share Boxa control-plane runtime sockets such as the **MCP broker** socket
+between the two accounts. It does not grant a **Service-isolated MCP server**
+the agent user's raw Docker socket. It exists only inside the **Container**
 (never on the host) and replaces the earlier `node`-in-`boxa-mcp` cross-membership,
 so neither account belongs to the other's primary group. The workspace is shared
 separately via an idmapped mount, not via this group. See ADR 0014.
@@ -206,8 +318,11 @@ _Avoid_: mcp group, shared group
 
 **MCP secret store**:
 The credential values for **MCP servers**, kept host-side and delivered to the
-**MCP broker** only — never readable by the agent user inside the **Container**.
-The **MCP profile** is secret-free and references these by name.
+**MCP broker** only. For directly spawned **Service-isolated MCP servers** they
+are not readable by the agent user inside the **Container**. Secrets injected
+into a Docker-packaged server are a documented temporary exception because
+`node` owns and can inspect the rootless daemon's containers. The **MCP profile**
+is secret-free and references values by name.
 _Avoid_: MCP credentials file, secrets config
 
 ### Project / container
@@ -215,6 +330,12 @@ _Avoid_: MCP credentials file, secrets config
 **Project**:
 A user codebase mounted into a boxa container. Identified by the
 sanitized basename of its host path (see ADR 0005).
+
+**Project key**:
+The normalized absolute host path of a **Project**. MCP activations use it to
+distinguish Projects whose sanitized basenames collide. Moving or cloning a
+Project produces a different key and does not inherit activations.
+_Avoid_: Project UUID, stable Project ID
 
 **Container**:
 The Docker container `boxa-<project>` that runs the project's dev
@@ -346,24 +467,25 @@ _Avoid_: boxa check, boxa repair, boxa heal
 - The **Agent-browser proxy** is the single network exit point for
   **Host agent Chrome**. Chrome cannot reach the internet by any other
   path; the `--proxy-server` flag is non-negotiable.
-- A **Project** has one effective **MCP profile** at a time. It is formed
-  from the user's global MCP choices plus the Project's MCP choices; the
-  Project can explicitly disable a global choice when that capability is
-  unsafe or too noisy for the Project.
+- A **Project** has one effective **MCP profile** at a time, formed only from
+  its explicit **MCP activations**. The user-wide **MCP catalog** contributes
+  available definitions, never implicit selections.
 - An **Inherited MCP server** is not automatically a **Boxa MCP server**.
-  Boxa first classifies it and proposes how it should enter the **MCP
-  profile**.
-- The **MCP broker** runs **Container MCP servers** as **boxa-mcp**; the
-  agent reaches them only through an **MCP relay**, so credentials in the **MCP
-  secret store** never enter the agent user's reach (ADR 0014).
+  Boxa first classifies it and proposes how it should enter the **MCP catalog**;
+  import never activates or grants trust by itself.
+- The **MCP broker** runs **Service-isolated MCP servers** as **boxa-mcp** and
+  authorizes the **Boxa MCP launcher** to run **Agent-trusted MCP servers** as
+  the agent user. Credentials in the **MCP secret store** stay behind the
+  service boundary except for the documented node-inspectable Docker-container
+  environment limitation (ADR 0021).
 - The **MCP profile** is delivered into the **Container** live (read-only mount);
   the **MCP secret store** is staged privately for **boxa-mcp** and refreshed
   into a running **Container** by `boxa mcp reload`, not by a restart.
-- **boxa-mcp** and `node` are peer-equal: they share only the runtime sockets
-  (via the **boxa-bridge** group) and the workspace (via an idmapped mount);
-  everything else stays private to each account. None of this sharing touches the
-  host — the bridge group lives only in the **Container** and the idmapped mount
-  leaves host file ownership/permissions unchanged (ADR 0014).
+- **boxa-mcp** and `node` share the broker control plane (via the
+  **boxa-bridge** group) and the workspace (via an idmapped mount), but a
+  **Service-isolated MCP server** does not receive the node-owned raw Docker
+  socket. Docker-packaged servers use the **MCP Docker launch adapter**. None of
+  this sharing touches host ownership or permissions (ADR 0021).
 - A **Memory limit** binds the **Container** as one aggregate: nested
   DinD workloads count against it but cannot be attributed
   individually, so per-process and per-nested-container numbers are

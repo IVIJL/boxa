@@ -10,21 +10,12 @@ mkdir -p "$XDG_RUNTIME_DIR"
 
 SOCKET="$XDG_RUNTIME_DIR/docker.sock"
 
-# Share the rootless Docker socket with the `boxa-bridge` group (ADR 0014
-# "Update 2026-05-31"). The daemon runs as `node` and creates the socket
-# `node:node`, which `boxa-mcp` cannot reach. We are `node` here (this script
-# runs in the node phase, after the entrypoint drop), so we own the socket and
-# can re-group it WITHOUT root — honoring ADR 0003 (no setuid/NOPASSWD/persistent
-# root). Group `boxa-bridge` (both `node` and `boxa-mcp` are members, see the
-# Dockerfile) + `g+rw` lets a broker-spawned `docker`-launcher MCP server reach
-# the daemon, without adding `boxa-mcp` to `node`'s group and without changing
-# the socket's OWNER. Documented trade-off: this grants node-level Docker
-# capability to such a server (ADR 0014). Idempotent: safe to re-run.
-share_socket_with_bridge() {
-    # Only when the bridge group exists (image built with ADR 0014 issue 19+).
-    if getent group boxa-bridge >/dev/null 2>&1; then
-        chgrp boxa-bridge "$SOCKET" && chmod g+rw "$SOCKET"
-    fi
+# The socket remains node-owned and owner-only. boxa-bridge is exclusively the
+# broker-control bridge; sharing the Docker socket through it would let every
+# service-isolated process bypass the constrained Docker adapter by hardcoding
+# this path.
+secure_socket_for_node() {
+    chgrp node "$SOCKET" && chmod 0600 "$SOCKET"
 }
 
 # Pin inner-container DNS to the slirp4netns gateway (10.0.2.2). Without
@@ -47,7 +38,7 @@ fi
 # Skip if already running
 if [ -S "$SOCKET" ] && docker info >/dev/null 2>&1; then
     echo "Rootless Docker is already running."
-    share_socket_with_bridge
+    secure_socket_for_node
     exit 0
 fi
 
@@ -64,7 +55,7 @@ TIMEOUT=30
 for i in $(seq 1 "$TIMEOUT"); do
     if [ -S "$SOCKET" ]; then
         echo "Rootless Docker started successfully (${i}s)."
-        share_socket_with_bridge
+        secure_socket_for_node
         exit 0
     fi
     sleep 1

@@ -10,9 +10,9 @@ agent user ``node``:
      from any 0700 secret directory — connecting exposes only a pipe);
   2. send the handshake naming the requested server (and Project key), receive
      the broker's accept/refuse reply;
-  3. on accept, proxy this process's stdin/stdout to the socket so the agent
-     speaks MCP straight through to the server the broker spawned under the
-     ``boxa-mcp`` UID.
+  3. on a service-isolated accept, proxy stdio to the broker-spawned process;
+     on an agent-trusted accept, close the socket and launch the returned
+     secret-free plan locally as ``node`` from its deterministic environment.
 
 Because the server runs under a different UID behind the broker, the agent never
 becomes the server process and never sees its environment (secrets, issue 16).
@@ -27,19 +27,27 @@ from __future__ import annotations
 import os
 import selectors
 import socket
+import subprocess
 import sys
 from typing import Optional
 
 from .broker import socket_path
-from .identity import require_container
+from .identity import project_key as container_project_key, require_container
+from .docker_adapter import DockerAdapterError, validate_plan_shape
 from .protocol import (
     EXIT_TRAILER_SENTINEL,
     MAX_EXIT_TRAILER_BYTES,
     ProtocolError,
     decode_exit,
-    decode_reply,
+    decode_reply_details,
     encode_request,
     read_line,
+)
+from .trusted import (
+    TrustedAuthorizationError,
+    authorize_entry,
+    build_launch_plan,
+    load_runtime_snapshot,
 )
 
 _PROXY_CHUNK = 64 * 1024
@@ -47,6 +55,125 @@ _PROXY_CHUNK = 64 * 1024
 
 class RelayError(RuntimeError):
     """A relay failure with a user-actionable, SECRET-FREE message."""
+
+
+def _load_authorized_snapshot_entry(
+    server_name: str,
+    project_key: Optional[str],
+    catalog_id: Optional[str],
+    consumer: Optional[str],
+) -> dict:
+    """Independently bind every catalog request to host-owned state."""
+    own_key = container_project_key()
+    if (
+        not project_key
+        or not own_key
+        or project_key.rstrip("/") != own_key.rstrip("/")
+        or not catalog_id
+        or not consumer
+    ):
+        raise RelayError(
+            "agent-trusted launch lacks an exact Container Project, catalog ID, "
+            "or consumer binding"
+        )
+    try:
+        runtime = load_runtime_snapshot()
+        return authorize_entry(
+            runtime, server_name, own_key, catalog_id, consumer
+        )
+    except TrustedAuthorizationError as exc:
+        raise RelayError(
+            f"host-owned MCP runtime snapshot refused catalog launch: {exc}"
+        ) from exc
+
+
+def _validate_agent_trusted_plan(
+    plan: dict,
+    server_name: str,
+    project_key: Optional[str],
+    catalog_id: Optional[str],
+    consumer: Optional[str],
+    requested_cwd: Optional[str],
+) -> dict:
+    """Independently authorize an untrusted broker reply, fail closed."""
+    entry = _load_authorized_snapshot_entry(
+        server_name, project_key, catalog_id, consumer
+    )
+    try:
+        expected = build_launch_plan(
+            entry, catalog_id or "", consumer or "", requested_cwd
+        )
+    except TrustedAuthorizationError as exc:
+        raise RelayError(
+            f"host-owned MCP runtime snapshot refused agent-trusted launch: {exc}"
+        ) from exc
+    if plan != expected:
+        raise RelayError(
+            "broker returned an agent-trusted launch plan that does not exactly "
+            "match the host-owned MCP runtime snapshot"
+        )
+    return expected
+
+
+def _launch_agent_trusted(plan: dict) -> int:
+    """Launch an authorized plan locally as the existing node relay user."""
+    import pwd
+
+    try:
+        username = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        username = ""
+    if username != "node":
+        raise RelayError(
+            "agent-trusted MCP launch requires the Container account node"
+        )
+    try:
+        child = subprocess.Popen(  # noqa: S603 - broker-authorized argv, no shell
+            plan["argv"],
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            env=dict(plan["env"]),
+            cwd=plan.get("cwd"),
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise RelayError(f"failed to launch agent-trusted MCP: {exc}") from exc
+    return child.wait()
+
+
+def _validate_docker_plan(
+    plan: dict, server_name: str, project_key: Optional[str],
+    catalog_id: Optional[str], consumer: Optional[str], requested_cwd: Optional[str],
+) -> dict:
+    entry = _load_authorized_snapshot_entry(
+        server_name, project_key, catalog_id, consumer
+    )
+    try:
+        return validate_plan_shape(
+            plan, entry, catalog_id or "", consumer or "", project_key or "",
+            requested_cwd,
+        )
+    except DockerAdapterError as exc:
+        raise RelayError(f"host-owned MCP runtime snapshot refused Docker launch: {exc}") from exc
+
+
+def _launch_docker_adapter(plan: dict) -> int:
+    """Run only the validated docker CLI as node; nested server gets no socket."""
+    try:
+        child = subprocess.Popen(  # noqa: S603 - independently validated argv
+            plan["argv"], stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+            env={
+                "HOME": "/home/node", "USER": "node", "LOGNAME": "node",
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "DOCKER_HOST": "unix:///run/user/1000/docker.sock",
+            },
+            cwd=plan["cwd"], close_fds=True,
+        )
+    except OSError as exc:
+        raise RelayError(f"failed to launch service-isolated Docker MCP: {exc}") from exc
+    return child.wait()
 
 
 def _connect(path: str) -> socket.socket:
@@ -183,7 +310,10 @@ def _send_all(sock: socket.socket, data: bytes) -> None:
             continue
 
 
-def run(server_name: str, project_key: Optional[str] = None) -> int:
+def run(
+    server_name: str, project_key: Optional[str] = None, *,
+    catalog_id: Optional[str] = None, consumer: Optional[str] = None,
+) -> int:
     """Relay one MCP server's stdio through the broker. Returns an exit code.
 
     The same signature as the ADR 0013 runner so ``mcp.cli run`` is unchanged.
@@ -209,10 +339,12 @@ def run(server_name: str, project_key: Optional[str] = None) -> int:
         cwd = None
     sock = _connect(path)
     try:
-        sock.sendall(encode_request(server_name, project_key, cwd))
+        sock.sendall(encode_request(
+            server_name, project_key, cwd, catalog_id=catalog_id, consumer=consumer
+        ))
         try:
             reply = read_line(sock.recv)
-            ok, error = decode_reply(reply)
+            ok, error, launch = decode_reply_details(reply)
         except ProtocolError as exc:
             raise RelayError(
                 f"malformed reply from the boxa MCP broker: {exc}"
@@ -222,6 +354,30 @@ def run(server_name: str, project_key: Optional[str] = None) -> int:
                 f"the boxa MCP broker refused server {server_name!r}: "
                 f"{error or 'no reason given'}"
             )
+        if catalog_id is not None:
+            entry = _load_authorized_snapshot_entry(
+                server_name, project_key, catalog_id, consumer
+            )
+            if entry.get("executionMode") == "agent-trusted" and launch is None:
+                raise RelayError(
+                    "broker omitted the required agent-trusted launch plan; "
+                    "refusing to proxy through an untrusted socket peer"
+                )
+        if launch is not None:
+            # The socket peer is not trusted: a same-UID service child may have
+            # replaced it. Independently reconstruct the only authorized plan
+            # from the host-owned read-only snapshot before launching as node.
+            if launch.get("executionMode") == "service-isolated":
+                validated = _validate_docker_plan(
+                    launch, server_name, project_key, catalog_id, consumer, cwd
+                )
+                sock.close()
+                return _launch_docker_adapter(validated)
+            validated = _validate_agent_trusted_plan(
+                launch, server_name, project_key, catalog_id, consumer, cwd
+            )
+            sock.close()
+            return _launch_agent_trusted(validated)
         return _proxy(sock, sys.stdin.fileno(), sys.stdout.fileno())
     finally:
         try:

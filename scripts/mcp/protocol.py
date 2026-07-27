@@ -9,11 +9,10 @@ phases:
      replies with one newline-terminated JSON object reporting whether it
      accepted the request. No credential is ever carried in either direction:
      the handshake names a server, the reply reports a status.
-  2. **Stream** — on acceptance, both sides switch to a raw byte proxy: the
-     relay's stdin is forwarded to the spawned server's stdin and the server's
-     stdout is forwarded back to the relay's stdout. This is the MCP stdio
-     stream; the agent speaks MCP straight through to the server and never sees
-     the server's environment (the server runs under a different UID).
+  2. **Launch/stream** — a service-isolated acceptance switches both sides to a
+     raw byte proxy. An agent-trusted acceptance instead carries a secret-free,
+     deterministic launch plan; the relay closes the authorization socket and
+     starts that plan locally as ``node``.
   3. **Exit trailer** — once the spawned server's stdout reaches EOF (the server
      exited or closed stdout) the broker reaps the child and sends ONE final
      control frame carrying the server's exit status, then half-closes its write
@@ -58,7 +57,8 @@ class ProtocolError(RuntimeError):
 
 
 def encode_request(
-    server: str, project_key: Optional[str], cwd: Optional[str] = None
+    server: str, project_key: Optional[str], cwd: Optional[str] = None,
+    *, catalog_id: Optional[str] = None, consumer: Optional[str] = None,
 ) -> bytes:
     """Encode a relay -> broker handshake request (server name + scope + cwd).
 
@@ -75,6 +75,10 @@ def encode_request(
         obj["project"] = str(project_key)
     if cwd:
         obj["cwd"] = str(cwd)
+    if catalog_id:
+        obj["catalogId"] = str(catalog_id)
+    if consumer:
+        obj["consumer"] = str(consumer)
     return (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
 
 
@@ -86,6 +90,14 @@ def decode_request(line: bytes) -> tuple[str, Optional[str], Optional[str]]:
     touches a profile or spawns anything. ``cwd`` is optional (older relays omit
     it); the broker validates it before use and falls back to a safe default.
     """
+    server, project, cwd, _catalog_id, _consumer = decode_request_details(line)
+    return server, project, cwd
+
+
+def decode_request_details(
+    line: bytes,
+) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Decode the activation-aware request while legacy callers keep 3 fields."""
     try:
         obj = json.loads(line.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
@@ -101,10 +113,20 @@ def decode_request(line: bytes) -> tuple[str, Optional[str], Optional[str]]:
     cwd = obj.get("cwd")
     if cwd is not None and not isinstance(cwd, str):
         raise ProtocolError("handshake 'cwd' must be a string when present")
-    return server, (project or None), (cwd or None)
+    catalog_id = obj.get("catalogId")
+    consumer = obj.get("consumer")
+    if catalog_id is not None and (not isinstance(catalog_id, str) or not catalog_id):
+        raise ProtocolError("handshake 'catalogId' must be a non-empty string")
+    if consumer is not None and (not isinstance(consumer, str) or not consumer):
+        raise ProtocolError("handshake 'consumer' must be a non-empty string")
+    if bool(catalog_id) != bool(consumer):
+        raise ProtocolError("handshake catalogId and consumer must be supplied together")
+    return server, (project or None), (cwd or None), catalog_id, consumer
 
 
-def encode_reply(ok: bool, error: Optional[str] = None) -> bytes:
+def encode_reply(
+    ok: bool, error: Optional[str] = None, launch: Optional[dict[str, Any]] = None
+) -> bytes:
     """Encode a broker -> relay status reply (accepted, or refused + reason).
 
     The ``error`` text is SECRET-FREE by construction (the broker only ever puts
@@ -114,11 +136,21 @@ def encode_reply(ok: bool, error: Optional[str] = None) -> bytes:
     obj: dict[str, Any] = {"ok": bool(ok)}
     if not ok and error:
         obj["error"] = str(error)
+    if ok and launch is not None:
+        obj["launch"] = launch
     return (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
 
 
 def decode_reply(line: bytes) -> tuple[bool, Optional[str]]:
     """Decode a broker -> relay reply into ``(ok, error)``."""
+    ok, error, _launch = decode_reply_details(line)
+    return ok, error
+
+
+def decode_reply_details(
+    line: bytes,
+) -> tuple[bool, Optional[str], Optional[dict[str, Any]]]:
+    """Decode status plus an optional secret-free agent-trusted launch plan."""
     try:
         obj = json.loads(line.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
@@ -131,7 +163,33 @@ def decode_reply(line: bytes) -> tuple[bool, Optional[str]]:
     error = obj.get("error")
     if error is not None and not isinstance(error, str):
         raise ProtocolError("broker reply 'error' must be a string when present")
-    return ok, (error or None)
+    launch = obj.get("launch")
+    if launch is not None:
+        if not ok or not isinstance(launch, dict):
+            raise ProtocolError("broker reply 'launch' must be an object on success")
+        argv = launch.get("argv")
+        env = (
+            launch.get("env")
+            if launch.get("executionMode") == "agent-trusted"
+            else launch.get("environment")
+        )
+        cwd = launch.get("cwd")
+        if launch.get("executionMode") not in {"agent-trusted", "service-isolated"}:
+            raise ProtocolError("broker launch plan has invalid execution mode")
+        if not isinstance(argv, list) or not argv or any(
+            not isinstance(value, str) for value in argv
+        ):
+            raise ProtocolError("broker launch plan argv is invalid")
+        if not isinstance(env, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in env.items()
+        ):
+            raise ProtocolError("broker launch plan env is invalid")
+        if launch.get("executionMode") == "service-isolated" and launch.get("adapter") != "docker":
+            raise ProtocolError("broker service-isolated launch plan has invalid adapter")
+        if cwd is not None and not isinstance(cwd, str):
+            raise ProtocolError("broker launch plan cwd is invalid")
+    return ok, (error or None), launch
 
 
 # Sentinel prefixing the exit trailer. A raw NUL byte cannot occur inside an MCP

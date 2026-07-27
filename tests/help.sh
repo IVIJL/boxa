@@ -57,7 +57,7 @@ assert_eq "agent-browser -h uses unified text" \
 
 mcp_help="$(run_boxa help mcp)"
 assert_contains "mcp lists reload" "reload      Re-stage changed MCP secrets" "$mcp_help"
-assert_contains "mcp keeps ADR pointer" "ADR 0013" "$mcp_help"
+assert_contains "mcp keeps current ADR pointer" "ADR 0021" "$mcp_help"
 assert_eq "mcp -h uses unified text" "$mcp_help" "$(run_boxa mcp -h)"
 
 dns_install_help="$(run_boxa dns-install --help)"

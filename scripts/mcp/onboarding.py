@@ -133,6 +133,15 @@ def profile_exists() -> bool:
     profile.json with no servers does not count (a stray empty file should not
     suppress the first-run offer).
     """
+    # ADR 0021: a catalog definition is already-onboarded state even though it
+    # deliberately carries no Project activation.
+    try:
+        from .catalog import load_catalog
+
+        if load_catalog().get("entries"):
+            return True
+    except (OSError, ValueError):
+        return True
     if _profile_has_servers(global_profile_path()):
         return True
     projects_dir = os.path.join(config_root(), "projects")
@@ -206,33 +215,33 @@ def rearm() -> dict[str, Any]:
 # update when stdin/stdout are a TTY. Kept here (not in shell) so the wording is
 # unit-testable and consistent with the docs.
 OFFER_LINES = (
-    "Boxa can manage MCP servers for your Containers (ADR 0013).",
-    "It can scan your existing Claude Code / Codex MCP servers and import the",
-    "Container-safe ones into a boxa-managed profile (dry-run first; nothing",
-    "is applied without your confirmation).",
+    "Boxa can manage MCP servers for your Containers (ADR 0021).",
+    "Each step is separate and confirmed; a fresh Project starts with zero active MCPs:",
     "",
-    "  - Import existing host agent MCP config:  boxa mcp import",
-    "  - Add a brand-new boxa MCP server:      boxa mcp add ...",
+    "  1. Discover existing definitions:  boxa mcp import",
+    "  2. Import definitions only:        boxa mcp import --apply ...",
+    "  3. Install a selected runtime:      boxa mcp install <entry>",
+    "  4. Activate for one Project:        boxa mcp activate <entry> --for ...",
     "",
-    "v1 supports Container MCP servers only; Host MCP servers are detected and",
-    "explained but not launched.",
+    "Import never installs, activates, renders, or infers agent trust.",
 )
 
 # The non-interactive follow-up (install/update from CI/cron, or a piped shell):
 # never prompt, never open a picker — just point at the command to run later.
 FOLLOWUP_LINES = (
-    "Boxa MCP support is available. To discover and import your existing",
-    "Claude Code / Codex MCP servers (Container-safe ones), run:",
-    "    boxa mcp import",
-    "To add a brand-new boxa MCP server later:",
-    "    boxa mcp add ...",
+    "Boxa MCP support is available. Non-interactive setup never prompts:",
+    "  discover: boxa mcp import --json",
+    "  import definition only: boxa mcp import --apply --import-id <id>",
+    "  install runtime: boxa mcp install <entry> --project <path>",
+    "  activate explicitly: boxa mcp activate <entry> --project <path> --for claude|codex",
+    "A fresh Project has zero active MCP servers.",
 )
 
 # The short reminder printed on LATER updates (onboarding already seen, or a
 # profile already exists). Never prompts; just a one-liner pair of pointers.
 REMINDER_LINES = (
-    "Manage MCP servers with 'boxa mcp import' (existing host config) or",
-    "'boxa mcp add ...' (a new boxa MCP server). See 'boxa mcp --help'.",
+    "MCP steps stay separate: 'boxa mcp import', install, then Project activation.",
+    "Import is definition-only; see 'boxa mcp --help'.",
 )
 
 
