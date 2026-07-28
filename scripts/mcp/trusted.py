@@ -93,6 +93,18 @@ def parse_runtime_snapshot(raw: bytes) -> dict[str, Any]:
         raise TrustedAuthorizationError(
             "MCP runtime snapshot has malformed tracked .mcp.json consent"
         )
+    seeded_approvals = data.get("seededApprovals", {})
+    if not isinstance(seeded_approvals, dict) or any(
+        not isinstance(project, str)
+        or not project
+        or not isinstance(names, list)
+        or any(not isinstance(name, str) for name in names)
+        for project, names in seeded_approvals.items()
+    ):
+        raise TrustedAuthorizationError(
+            "MCP runtime snapshot has malformed seeded approvals"
+        )
+    data.setdefault("seededApprovals", seeded_approvals)
     try:
         for entry_id, entry in entries.items():
             _validate_entry(entry_id, entry)

@@ -78,7 +78,11 @@ class ConvergeTest(unittest.TestCase):
         return record
 
     def _write_snapshot(
-        self, records=None, projects=None, tracked_mcp_json=None
+        self,
+        records=None,
+        projects=None,
+        tracked_mcp_json=None,
+        seeded_approvals=None,
     ):
         if projects is None:
             projects = {self.project: records or {}}
@@ -90,6 +94,8 @@ class ConvergeTest(unittest.TestCase):
         }
         if tracked_mcp_json is not None:
             data["trackedMcpJson"] = tracked_mcp_json
+        if seeded_approvals is not None:
+            data["seededApprovals"] = seeded_approvals
         with open(self.snapshot, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
         return data
@@ -324,6 +330,31 @@ class ConvergeTest(unittest.TestCase):
         self.assertEqual(settings["unrelated"], {"keep": True})
         self.assertNotIn(
             "boxa-echo", settings.get("disabledMcpjsonServers", [])
+        )
+
+    def test_snapshot_seed_retires_approval_without_local_state(self):
+        name = "boxa-echo"
+        definition = activation.claude_server_definition(
+            self.entry["id"], self.project, self.entry
+        )
+        self._write_mcp({"mcpServers": {name: definition}})
+        settings_path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings_path))
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            json.dump({"enabledMcpjsonServers": [name]}, fh)
+        self._remove_converge_state()
+        self._write_snapshot(
+            {},
+            seeded_approvals={self.project + os.sep + ".": [name]},
+        )
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.removed, [name])
+        self.assertNotIn(name, self._mcp_data().get("mcpServers", {}))
+        self.assertNotIn(
+            name,
+            self._settings_data().get("enabledMcpjsonServers", []),
         )
 
     def test_tracked_mcp_change_without_snapshot_consent_skips_all_writes(self):
@@ -968,6 +999,29 @@ class ConvergeTest(unittest.TestCase):
             settings["disabledMcpjsonServers"], ["boxa-echo"]
         )
         self.assertNotIn("enableAllProjectMcpServers", settings)
+
+    def test_snapshot_seed_preserves_explicitly_disabled_server(self):
+        name = "boxa-echo"
+        self._write_snapshot(
+            self._desired_records(),
+            seeded_approvals={self.project: [name]},
+        )
+        settings_path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings_path))
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            json.dump({"disabledMcpjsonServers": [name]}, fh)
+        self._remove_converge_state()
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.seeded, [])
+        settings = self._settings_data()
+        self.assertNotIn(
+            name, settings.get("enabledMcpjsonServers", [])
+        )
+        self.assertEqual(
+            settings["disabledMcpjsonServers"], [name]
+        )
 
     def test_disabled_or_non_claude_snapshot_records_are_not_desired(self):
         self._write_snapshot(self._desired_records())

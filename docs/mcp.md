@@ -84,7 +84,9 @@ node-readable, secret-free runtime snapshot and re-asserts the Project's
 definitions are repaired, while foreign servers and unrelated settings remain
 untouched. Approval follows the same one-time seeding and recorded-decision
 rules as activation, so convergence does not re-enable a server the user
-disabled.
+disabled. The snapshot publishes the durable per-Project Boxa-seeded approval
+set; Container-local convergence state is only a cache, so recreation cannot
+lose the information needed to withdraw a retired approval.
 
 Convergence removes only a Boxa-owned entry that is no longer activated for
 Claude in the snapshot. A missing, empty, malformed, or unreadable snapshot is

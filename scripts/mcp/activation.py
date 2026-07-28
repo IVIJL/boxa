@@ -372,6 +372,21 @@ def _claude_git_paths(
     )
 
 
+def claude_tracked_state(project: str) -> bool:
+    """Return whether either derived Claude Project file is tracked."""
+    for path in (
+        claude_config_path(project),
+        claude_settings_path(project),
+    ):
+        git_paths = _claude_git_paths(project, path=path)
+        if (
+            git_paths is not None
+            and _codex_is_tracked(project, git_paths[0])
+        ):
+            return True
+    return False
+
+
 def _toml_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t")
 
@@ -646,17 +661,42 @@ def save_activation_store(data: dict[str, Any]) -> None:
     _atomic_json(activation_path(), data, _FILE_MODE)
 
 
-def refresh_runtime(activations: Optional[dict[str, Any]] = None) -> None:
-    """Publish the secret-free broker view; authoritative activation stays 0600."""
-    activations = activations if activations is not None else load_activations()
-    catalog = load_catalog()
-    payload = {
+def runtime_payload(
+    activations: dict[str, Any],
+    catalog: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Build the normalized secret-free runtime snapshot payload."""
+    catalog = catalog if catalog is not None else load_catalog()
+    state = _load_render_state()
+    seeded = state.get("seeded", {})
+    seeded_approvals = {}
+    if isinstance(seeded, dict):
+        for project, names in seeded.items():
+            if (
+                not isinstance(project, str)
+                or not project
+                or not isinstance(names, list)
+            ):
+                continue
+            normalized = sorted({
+                name for name in names if isinstance(name, str)
+            })
+            if normalized:
+                seeded_approvals[project] = normalized
+    return {
         "version": RUNTIME_VERSION,
         "catalogVersion": catalog["version"],
         "entries": catalog["entries"],
         "projects": activations["projects"],
         "trackedMcpJson": activations.get("trackedMcpJson", {}),
+        "seededApprovals": seeded_approvals,
     }
+
+
+def refresh_runtime(activations: Optional[dict[str, Any]] = None) -> None:
+    """Publish the secret-free broker view; authoritative activation stays 0600."""
+    activations = activations if activations is not None else load_activations()
+    payload = runtime_payload(activations)
     path = runtime_path()
     runtime_dir = os.path.dirname(path)
     os.makedirs(runtime_dir, mode=0o755, exist_ok=True)

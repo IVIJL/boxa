@@ -1252,6 +1252,17 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
             result.actions.append("restored Claude Code activation renders")
         except (OSError, ValueError, RuntimeError) as exc:
             render_failures.append(Finding(SEVERITY_ERROR, "catalog-render-fix-failed", f"Claude render repair failed: {exc}", "Inspect the Claude config and re-run 'boxa mcp doctor --fix'."))
+        else:
+            try:
+                from .activation import refresh_runtime
+                refresh_runtime()
+                runtime_action = (
+                    "refreshed the secret-free MCP runtime snapshot"
+                )
+                if runtime_action not in result.actions:
+                    result.actions.append(runtime_action)
+            except (OSError, ValueError, RuntimeError) as exc:
+                render_failures.append(Finding(SEVERITY_ERROR, "catalog-runtime-fix-failed", f"runtime snapshot repair failed after Claude render: {exc}", "Run 'boxa mcp doctor --fix' again after fixing the catalog/activation store."))
     if "catalog-codex-render-drift" in catalog_codes:
         try:
             from .activation import _render_codex_activation, load_activations
@@ -1273,6 +1284,7 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
 
 def _catalog_render_state(project: str, entry_id: str, entry: dict[str, Any], consumer: str) -> tuple[str, bool]:
     """Return (state, tracked) for one derived consumer record, secret-free."""
+    from . import activation
     from .activation import claude_config_path, codex_config_path
 
     name = rendered_name(str(entry["name"]))
@@ -1287,12 +1299,8 @@ def _catalog_render_state(project: str, entry_id: str, entry: dict[str, Any], co
             value = None
         tracked = False
         try:
-            relative = os.path.relpath(path, project)
-            tracked = subprocess.run(
-                ["git", "-C", project, "ls-files", "--error-unmatch", "--", relative],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-            ).returncode == 0
-        except OSError:
+            tracked = activation.claude_tracked_state(project)
+        except (OSError, activation.ActivationError):
             pass
         ok = isinstance(value, dict) and value.get("command") == WRAPPER_COMMAND and value.get("args") == expected_args
         return ("rendered" if ok else "drift"), tracked
@@ -1454,13 +1462,8 @@ def _catalog_doctor_findings(probe: Optional[object] = None) -> list[Finding]:
                 tracked_label = "Codex config" if consumer == "codex" else ".mcp.json"
                 findings.append(Finding(SEVERITY_WARN, code, f"{consumer} render drift for activated MCP {row['name']!r} in Project {project}." + (f" The {tracked_label} is tracked." if tracked else ""), repair, not tracked, project))
 
-    expected = {
-        "version": 1,
-        "catalogVersion": catalog["version"],
-        "entries": catalog["entries"],
-        "projects": activations.get("projects", {}),
-        "trackedMcpJson": activations.get("trackedMcpJson", {}),
-    }
+    from .activation import runtime_payload
+    expected = runtime_payload(activations, catalog)
     try:
         with open(runtime_path(), encoding="utf-8") as fh:
             actual = json.load(fh)

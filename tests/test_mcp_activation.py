@@ -1196,6 +1196,88 @@ class ActivationTest(unittest.TestCase):
             "catalog-runtime-drift", {finding.code for finding in fixed.remaining}
         )
 
+    def test_doctor_republishes_runtime_after_claude_render_repair(self):
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+        data = self._claude_data()
+        del data["mcpServers"]["boxa-echo"]
+        with open(
+            activation.claude_config_path(self.project),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(data, fh)
+        with open(
+            activation.render_state_path(), "w", encoding="utf-8"
+        ) as fh:
+            json.dump({"projects": {}, "seeded": {}}, fh)
+
+        findings = lifecycle._catalog_doctor_findings()
+        codes = {finding.code for finding in findings}
+        self.assertIn("catalog-runtime-drift", codes)
+        self.assertIn("catalog-claude-render-drift", codes)
+
+        fixed = lifecycle.apply_doctor_fixes(
+            lifecycle.DoctorReport(False, findings)
+        )
+
+        self.assertNotIn(
+            "catalog-runtime-drift",
+            {finding.code for finding in fixed.remaining},
+        )
+
+    def test_runtime_publishes_normalized_seeded_approvals(self):
+        state = {
+            "projects": {},
+            "seeded": {
+                self.project: [
+                    "boxa-zed",
+                    7,
+                    "boxa-echo",
+                    "boxa-echo",
+                ],
+                "/empty": [],
+                "/junk": "boxa-junk",
+                3: ["boxa-number"],
+            },
+        }
+        with mock.patch.object(
+            activation, "_load_render_state", return_value=state
+        ):
+            activation.refresh_runtime()
+
+            with open(activation.runtime_path(), "rb") as fh:
+                runtime = trusted.parse_runtime_snapshot(fh.read())
+            self.assertEqual(
+                runtime["seededApprovals"],
+                {self.project: ["boxa-echo", "boxa-zed"]},
+            )
+            self.assertNotIn(
+                "catalog-runtime-drift",
+                {
+                    finding.code
+                    for finding in lifecycle._catalog_doctor_findings()
+                },
+            )
+        legacy = dict(runtime)
+        legacy.pop("seededApprovals")
+        self.assertEqual(
+            trusted.parse_runtime_snapshot(
+                json.dumps(legacy).encode()
+            )["seededApprovals"],
+            {},
+        )
+        malformed = dict(runtime)
+        malformed["seededApprovals"] = {self.project: "boxa-echo"}
+        with self.assertRaisesRegex(
+            trusted.TrustedAuthorizationError,
+            "malformed seeded approvals",
+        ):
+            trusted.parse_runtime_snapshot(
+                json.dumps(malformed).encode()
+            )
+
     def test_tracked_mcp_drift_is_reported_and_not_doctor_fixable(self):
         self._init_git()
         activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
@@ -1227,6 +1309,59 @@ class ActivationTest(unittest.TestCase):
             lifecycle.DoctorReport(False, findings)
         )
         self.assertEqual(os.stat(path).st_mtime_ns, before)
+
+    def test_tracked_claude_settings_make_render_drift_not_fixable(self):
+        self._init_git()
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+        settings_path = activation.claude_settings_path(self.project)
+        self._git("add", "-f", ".claude/settings.local.json")
+        self._git("commit", "-qm", "track Claude Project settings")
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            json.dump({"enabledMcpjsonServers": []}, fh)
+        data = self._claude_data()
+        del data["mcpServers"]["boxa-echo"]
+        with open(
+            activation.claude_config_path(self.project),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(data, fh)
+
+        probe = mock.Mock()
+        probe.find_running.return_value = "boxa-project"
+        probe.command_path.return_value = "/bin/cat"
+        status = lifecycle.catalog_project_status(self.project, probe)
+        row = next(
+            item for item in status["entries"]
+            if item["id"] == self.entry["id"]
+        )
+        self.assertTrue(row["trackedMcpJson"])
+        finding = next(
+            item for item in lifecycle._catalog_doctor_findings(probe)
+            if item.code == "catalog-claude-render-drift"
+        )
+        self.assertFalse(finding.fixable)
+        self.assertIn("--allow-tracked-mcp-json", finding.repair)
+
+    def test_nested_project_claude_tracked_state_uses_git_toplevel(self):
+        repo = activation.canonical_project(
+            os.path.join(self.tmp.name, "repo")
+        )
+        nested = activation.canonical_project(
+            os.path.join(repo, "nested")
+        )
+        os.makedirs(os.path.join(nested, ".claude"))
+        self._git("init", "-q", cwd=repo)
+        settings_path = activation.claude_settings_path(nested)
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
+        self._git(
+            "add", "nested/.claude/settings.local.json", cwd=repo
+        )
+
+        self.assertTrue(activation.claude_tracked_state(nested))
 
     def test_multi_project_claude_preflight_refuses_all_before_write(self):
         self._init_git()

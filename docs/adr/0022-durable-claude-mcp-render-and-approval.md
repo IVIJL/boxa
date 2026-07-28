@@ -108,11 +108,12 @@ own; both only shrink the window. The guarantee comes from re-asserting the
 intended state before the user needs it.
 
 A convergence step reads the secret-free broker runtime snapshot — which
-already carries both catalog entries and per-Project activations, and is
-readable by the Container's agent account — and repairs the rendered
+already carries catalog entries and per-Project activations, and now also
+publishes each Project's Boxa-seeded approval set — and repairs the rendered
 `.mcp.json` and the approval files for the Projects mounted in that Container.
-It runs at Container start and at shell initialization, and is a no-op when
-the state already matches.
+The published set survives Container recreation, while the Container-local
+convergence state remains a cache. Convergence runs at Container start and at
+shell initialization, and is a no-op when the state already matches.
 
 Convergence never removes a rendered entry that is still present in the
 snapshot. It removes only what the snapshot no longer carries, which is to

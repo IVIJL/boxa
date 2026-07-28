@@ -92,14 +92,25 @@ def _resolve_project(project: str | None) -> str | None:
     return activation.canonical_project(candidate)
 
 
-def _snapshot_records(snapshot: dict[str, Any], project: str) -> dict[str, Any]:
-    projects = snapshot["projects"]
-    records = projects.get(project)
-    if isinstance(records, dict):
-        return records
+def _snapshot_project_value(
+    snapshot: dict[str, Any],
+    field: str,
+    project: str,
+) -> Any:
+    projects = snapshot.get(field, {})
+    value = projects.get(project)
+    if value is not None:
+        return value
     for key, candidate in projects.items():
         if os.path.realpath(key) == project:
             return candidate
+    return None
+
+
+def _snapshot_records(snapshot: dict[str, Any], project: str) -> dict[str, Any]:
+    records = _snapshot_project_value(snapshot, "projects", project)
+    if isinstance(records, dict):
+        return records
     return {}
 
 
@@ -314,7 +325,13 @@ def converge(
             state, state_existing = _load_state()
             desired = set(definitions)
             previously_owned = _state_names(state, "projects", resolved)
-            previously_seeded = _state_names(state, "seeded", resolved)
+            snapshot_seeded = _snapshot_project_value(
+                snapshot, "seededApprovals", resolved
+            )
+            previously_seeded = (
+                _state_names(state, "seeded", resolved)
+                | set(snapshot_seeded or [])
+            )
             mcp_preimage, existing, data = _read_mcp_document(resolved)
             block = data.get("mcpServers")
             if block is None:
