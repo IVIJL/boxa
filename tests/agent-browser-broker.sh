@@ -3344,6 +3344,154 @@ unset -f command
 unset -f host_platform::detect
 
 # ----------------------------------------------------------------------------
+# F27 — unusable host ports: Windows exclusion ranges + learned ban list
+#
+# On WSL2 + Docker Desktop the CDP hop traverses the Windows host, which
+# refuses ports Windows has reserved (Hyper-V/WinNAT blocks). The picker must
+# never offer such a port, and a port that failed the CDP smoke test must be
+# remembered across runs.
+# ----------------------------------------------------------------------------
+
+# Pretend we are on WSL2 and stub `netsh.exe` with real-world output (the
+# admin-reserved row carries a trailing `*`; the header is localisable, hence
+# the numeric-only parse).
+# shellcheck disable=SC2317
+host_platform::detect() { printf 'wsl2\n'; }
+# shellcheck disable=SC2317
+netsh.exe() {
+cat <<'NETSH'
+
+Protocol tcp Port Exclusion Ranges
+
+Start Port    End Port
+----------    --------
+      5357        5357
+     49691       49790
+     50000       50059     *
+
+* - Administered port exclusions.
+NETSH
+}
+
+_PORT_EXCLUSIONS=""
+_PORT_EXCLUSIONS_LOADED=""
+_load_windows_port_exclusions
+assert_eq "F27 netsh parse: three ranges, numeric rows only" \
+    "5357-5357 49691-49790 50000-50059 " "$_PORT_EXCLUSIONS"
+
+_port_is_windows_excluded 49719; rc=$?
+assert_eq "F27 49719 inside 49691-49790 is excluded (rc 0)" "0" "$rc"
+_port_is_windows_excluded 50387; rc=$?
+assert_eq "F27 50387 outside every stubbed range (rc 1)" "1" "$rc"
+_port_is_windows_excluded 49691; rc=$?
+assert_eq "F27 lower bound is inclusive (rc 0)" "0" "$rc"
+_port_is_windows_excluded 49790; rc=$?
+assert_eq "F27 upper bound is inclusive (rc 0)" "0" "$rc"
+_port_is_windows_excluded 49690; rc=$?
+assert_eq "F27 one below the range is fine (rc 1)" "1" "$rc"
+_port_is_windows_excluded 5357; rc=$?
+assert_eq "F27 single-port range matches (rc 0)" "0" "$rc"
+
+# Off WSL2 the exclusion set stays empty — no Windows layer, nothing to skip.
+# shellcheck disable=SC2317
+host_platform::detect() { printf 'linux\n'; }
+_PORT_EXCLUSIONS="x"
+_PORT_EXCLUSIONS_LOADED=""
+_load_windows_port_exclusions
+assert_eq "F27 native Linux: no exclusion lookup" "x" "$_PORT_EXCLUSIONS"
+# shellcheck disable=SC2317
+host_platform::detect() { printf 'wsl2\n'; }
+
+# --- learned ban list: persistence, TTL pruning, cache coherence ---
+BAN_TMPDIR="$(mktemp -d)"
+# Consumed by the sourced broker helpers (_ban_port mkdir), not by this file.
+# shellcheck disable=SC2034
+AGENT_USER_STATE_DIR="$BAN_TMPDIR"
+AGENT_PORT_BAN_FILE="$BAN_TMPDIR/unusable-host-ports"
+
+_PORT_BANS=""
+_PORT_BANS_LOADED=""
+_ban_port 40001 cdp-smoke-test-failed
+_port_is_banned 40001; rc=$?
+assert_eq "F27 freshly banned port is banned in-process (rc 0)" "0" "$rc"
+_port_is_banned 40002; rc=$?
+assert_eq "F27 unrelated port is not banned (rc 1)" "1" "$rc"
+
+# Fresh process: the ban survives via the file.
+_PORT_BANS=""
+_PORT_BANS_LOADED=""
+_port_is_banned 40001; rc=$?
+assert_eq "F27 ban persists across runs (rc 0)" "0" "$rc"
+
+# A non-numeric port is ignored rather than written as a junk row.
+ban_lines_before="$(grep -c . "$AGENT_PORT_BAN_FILE")"
+_ban_port "not-a-port" junk
+assert_eq "F27 non-numeric ban is a no-op" \
+    "$ban_lines_before" "$(grep -c . "$AGENT_PORT_BAN_FILE")"
+
+# TTL: an entry older than the window is dropped from the cache AND pruned
+# from the file, so the list cannot grow without bound as Windows re-rolls
+# its exclusion blocks on every reboot.
+printf '40009\t1\tancient\n' >> "$AGENT_PORT_BAN_FILE"
+_PORT_BANS=""
+_PORT_BANS_LOADED=""
+_port_is_banned 40009; rc=$?
+assert_eq "F27 expired ban is not enforced (rc 1)" "1" "$rc"
+assert_eq "F27 expired ban is pruned from the file" \
+    "0" "$(grep -c '^40009	' "$AGENT_PORT_BAN_FILE" || true)"
+assert_eq "F27 live ban survives the prune" \
+    "1" "$(grep -c '^40001	' "$AGENT_PORT_BAN_FILE" || true)"
+
+# Concurrent bans all survive: the append and the TTL prune share one lock,
+# so a row written while another process is rewriting the file is not lost.
+# `_PORT_BANS_LOADED=1` in each child skips the load (the point here is the
+# append path), and an expired row makes the parent's load take the
+# rewrite branch alongside them.
+printf '40099\t1\tancient\n' >> "$AGENT_PORT_BAN_FILE"
+for conc_port in 41001 41002 41003 41004 41005 41006 41007 41008 41009 41010; do
+    ( _PORT_BANS_LOADED=1; _ban_port "$conc_port" concurrent ) &
+done
+_PORT_BANS=""
+_PORT_BANS_LOADED=""
+_load_banned_ports
+wait
+conc_found=0
+for conc_port in 41001 41002 41003 41004 41005 41006 41007 41008 41009 41010; do
+    grep -q "^${conc_port}	" "$AGENT_PORT_BAN_FILE" && conc_found=$((conc_found + 1))
+done
+assert_eq "F27 10 concurrent bans survive a simultaneous prune" "10" "$conc_found"
+
+# --- picker skips blocked candidates ---
+# Every candidate blocked -> empty output (callers `_die` on empty; returning
+# non-zero from a command substitution under `set -e` would abort silently).
+_PORT_EXCLUSIONS="1-65535 "
+_PORT_EXCLUSIONS_LOADED=1
+AGENT_PORT_PICK_ATTEMPTS=3
+picked="$(_pick_free_port 2>/dev/null)"
+assert_eq "F27 all candidates blocked: picker echoes nothing" "" "$picked"
+_pick_free_port >/dev/null 2>&1; rc=$?
+assert_eq "F27 exhaustion still returns rc 0 (no silent set -e abort)" "0" "$rc"
+
+# Nothing blocked -> a real port, and diagnostics never leak onto stdout
+# (callers capture stdout as the port value).
+_PORT_EXCLUSIONS=""
+_PORT_EXCLUSIONS_LOADED=1
+_PORT_BANS=""
+_PORT_BANS_LOADED=1
+# Read by the sourced `_pick_free_port`, not by this file.
+# shellcheck disable=SC2034
+AGENT_PORT_PICK_ATTEMPTS=40
+picked="$(_pick_free_port 2>/dev/null)"
+case "$picked" in
+    ''|*[!0-9]*) assert_eq "F27 unblocked pick returns a bare port number" "<number>" "$picked" ;;
+    *)           assert_eq "F27 unblocked pick returns a bare port number" "ok" "ok" ;;
+esac
+
+rm -rf "$BAN_TMPDIR"
+unset -f netsh.exe
+unset -f host_platform::detect
+
+# ----------------------------------------------------------------------------
 echo "----------------------------------------"
 if [ "$fail_count" -eq 0 ]; then
     echo "ALL TESTS PASSED"

@@ -157,6 +157,19 @@ Common WSL2 gotchas:
   automatically; on Docker-CE-inside-WSL2 (no Docker Desktop),
   `docker-run.sh` passes `--add-host=host.docker.internal:host-gateway` so the
   in-container socat bridge can still reach the host-side Chrome.
+- **Windows-reserved host ports**: the CDP hop goes container →
+  `host.docker.internal` → Docker Desktop → Windows loopback → WSL
+  localhostForwarding. That last hop cannot publish a port Windows has
+  reserved (Hyper-V/WinNAT carve out ~1200 ports in blocks of 100 above
+  49152 — see `netsh int ipv4 show excludedportrange protocol=tcp`), so a
+  session that drew such a port died with `CDP NOT reachable` even though
+  Chrome was healthy. The broker now reads those ranges up front (WSL2
+  only) and skips them when picking, and any port that still fails the CDP
+  smoke test with Chrome alive is appended to a learned ban list at
+  `~/.local/state/boxa/agent-browser/unusable-host-ports` so later starts
+  avoid it. Entries expire after 30 days (`BOXA_AGENT_PORT_BAN_TTL_DAYS`)
+  because Windows re-rolls its reservations on reboot; delete the file to
+  clear the list by hand.
 
 ### Native Linux + macOS
 

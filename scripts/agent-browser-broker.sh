@@ -310,18 +310,239 @@ _local_hms() {
 
 # --- Free-port discovery -----------------------------------------------------
 
+# A host port being FREE is not the same as it being USABLE for the CDP
+# hop. On WSL2 + Docker Desktop the in-container bridge reaches Chrome via
+# `host.docker.internal` (192.168.65.254), which Docker Desktop forwards to
+# the Windows host loopback, which WSL's localhostForwarding then maps back
+# into this distro. That last hop cannot publish a port that Windows has
+# RESERVED — Hyper-V/WinNAT carve out ~1200 ports in blocks of 100 inside
+# the 49152+ range (`netsh int ipv4 show excludedportrange`). The kernel
+# here happily hands us one of those (the local ephemeral range is
+# 32768–60999, so a few percent of picks land in a reserved block); Chrome
+# then binds it fine, but the container's SYN gets an RST from the Docker
+# Desktop forwarder and the CDP smoke test fails — the session rolls back
+# with no hint that the PORT was the problem.
+#
+# Two layers keep the picker off those ports:
+#
+#   1. Windows exclusion ranges, read once per run from `netsh` (WSL2 only)
+#      — known-bad ports are never even offered.
+#   2. A learned ban list persisted under the user's agent-browser state,
+#      written when a session dies on an unreachable CDP port. This catches
+#      whatever `netsh` does NOT report (Docker Desktop's own reservations,
+#      third-party listeners on the Windows side). Entries expire after
+#      AGENT_PORT_BAN_TTL_DAYS because Windows re-rolls its exclusion
+#      blocks on reboot — without a TTL the list would only ever grow.
+AGENT_PORT_BAN_FILE="${AGENT_USER_STATE_DIR}/unusable-host-ports"
+AGENT_PORT_BAN_TTL_DAYS="${BOXA_AGENT_PORT_BAN_TTL_DAYS:-30}"
+# Bounded retry so an exhausted/misparsed exclusion set can't spin forever.
+AGENT_PORT_PICK_ATTEMPTS="${BOXA_AGENT_PORT_PICK_ATTEMPTS:-40}"
+
+# Cache globals — populated lazily, once per process.
+_PORT_EXCLUSIONS=""           # "start-end start-end ..."
+_PORT_EXCLUSIONS_LOADED=""
+_PORT_BANS=""                 # " port port ... " (space-delimited, padded)
+_PORT_BANS_LOADED=""
+
+# Read the Windows TCP port exclusion ranges. No-op (empty set) off WSL2 or
+# when netsh is unreachable — every other platform reaches the host through
+# a plain socket with no Windows layer to reserve anything.
+_load_windows_port_exclusions() {
+    [ -z "$_PORT_EXCLUSIONS_LOADED" ] || return 0
+    _PORT_EXCLUSIONS_LOADED=1
+    [ "$(host_platform::detect 2>/dev/null || true)" = "wsl2" ] || return 0
+    local netsh=""
+    if command -v netsh.exe >/dev/null 2>&1; then
+        netsh="netsh.exe"
+    elif [ -x /mnt/c/Windows/System32/netsh.exe ]; then
+        # PATH may lack the Windows interop dirs (cron, sudo -i, trimmed
+        # environments); fall back to the canonical location.
+        netsh="/mnt/c/Windows/System32/netsh.exe"
+    else
+        return 0
+    fi
+    # Output is a header plus `<start> <end>` rows (an admin-reserved row
+    # carries a trailing `*`). Numeric-only matching survives localised
+    # Windows headers, which differ per install language.
+    _PORT_EXCLUSIONS="$("$netsh" int ipv4 show excludedportrange protocol=tcp 2>/dev/null \
+        | tr -d '\r' \
+        | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { printf "%s-%s ", $1, $2 }' \
+        || true)"
+}
+
+# rc=0 when $1 falls inside a Windows exclusion range.
+_port_is_windows_excluded() {
+    local port="$1" range start end
+    _load_windows_port_exclusions
+    [ -n "$_PORT_EXCLUSIONS" ] || return 1
+    for range in $_PORT_EXCLUSIONS; do
+        start="${range%-*}"
+        end="${range#*-}"
+        if [ "$port" -ge "$start" ] && [ "$port" -le "$end" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Run a command (function name + args) under the exclusive ban-list lock.
+# Mirrors `_with_xhost_grant_lock`: fd 9 on a lockfile inside a subshell, so
+# the lock releases on every exit path, and a host without `flock` degrades
+# to unserialized with a single warning rather than failing.
+#
+# CRITICAL SECTION CONTRACT: the body runs in a SUBSHELL, so it cannot set
+# globals in the caller — locked helpers communicate by writing to stdout,
+# which the caller captures. Keeping the file I/O (and only that) in here
+# means the TTL prune's read-modify-write cannot interleave with another
+# broker's ban append and silently drop it.
+_PORT_BAN_FLOCK_WARNED=0
+_with_port_ban_lock() {
+    local lockfile="${AGENT_PORT_BAN_FILE}.lock"
+    if ! command -v flock >/dev/null 2>&1; then
+        if [ "$_PORT_BAN_FLOCK_WARNED" = 0 ]; then
+            _warn "agent-browser: 'flock' not found; the unusable-port list is updated UNSERIALIZED (a concurrent start could drop a learned ban). Install util-linux to close it."
+            _PORT_BAN_FLOCK_WARNED=1
+        fi
+        "$@"
+        return $?
+    fi
+    mkdir -p "$AGENT_USER_STATE_DIR" 2>/dev/null || true
+    if ! { : >> "$lockfile"; } 2>/dev/null; then
+        if [ "$_PORT_BAN_FLOCK_WARNED" = 0 ]; then
+            _warn "agent-browser: cannot create ${lockfile}; the unusable-port list is updated UNSERIALIZED."
+            _PORT_BAN_FLOCK_WARNED=1
+        fi
+        "$@"
+        return $?
+    fi
+    (
+        flock -x 9 \
+            || _warn "agent-browser: could not acquire the unusable-port lock; updating the list UNSERIALIZED."
+        "$@"
+    ) 9>>"$lockfile"
+}
+
+# Locked body: drop rows older than the TTL, rewrite the file when anything
+# expired (temp + rename), and echo the surviving ports one per line. Runs
+# entirely inside `_with_port_ban_lock`, so the read and the rewrite are one
+# indivisible step with respect to concurrent appends.
+_prune_ban_file_and_emit() {
+    [ -f "$AGENT_PORT_BAN_FILE" ] || return 0
+    local cutoff port ts reason kept="" live="" expired=0
+    cutoff=$(($(date +%s) - AGENT_PORT_BAN_TTL_DAYS * 86400))
+    while IFS=$'\t' read -r port ts reason || [ -n "$port" ]; do
+        case "$port" in ''|*[!0-9]*) continue ;; esac
+        case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+        if [ "$ts" -lt "$cutoff" ]; then
+            expired=$((expired + 1))
+            continue
+        fi
+        live="${live}${port}
+"
+        kept="${kept}${port}	${ts}	${reason}
+"
+    done < "$AGENT_PORT_BAN_FILE"
+    if [ "$expired" -gt 0 ]; then
+        local tmp="${AGENT_PORT_BAN_FILE}.tmp.$$"
+        if printf '%s' "$kept" > "$tmp" 2>/dev/null; then
+            mv -f "$tmp" "$AGENT_PORT_BAN_FILE" 2>/dev/null || rm -f "$tmp"
+        else
+            rm -f "$tmp" 2>/dev/null || true
+        fi
+    fi
+    printf '%s' "$live"
+}
+
+# Locked body: append one ban row. O_APPEND makes the single short write
+# atomic on its own; taking the lock additionally keeps it from landing in
+# the window between the prune's read and its rename.
+_append_ban_row() {
+    printf '%s\t%s\t%s\n' "$1" "$(date +%s)" "$2" \
+        >> "$AGENT_PORT_BAN_FILE" 2>/dev/null || true
+}
+
+# Load the learned ban list, dropping entries older than the TTL.
+# File format, one per line: `<port>\t<epoch>\t<reason>`.
+_load_banned_ports() {
+    [ -z "$_PORT_BANS_LOADED" ] || return 0
+    _PORT_BANS_LOADED=1
+    [ -f "$AGENT_PORT_BAN_FILE" ] || return 0
+    local live port
+    live="$(_with_port_ban_lock _prune_ban_file_and_emit)"
+    while read -r port; do
+        [ -n "$port" ] || continue
+        _PORT_BANS="${_PORT_BANS} ${port}"
+    done <<< "$live"
+    [ -n "$_PORT_BANS" ] && _PORT_BANS="${_PORT_BANS} "
+    return 0
+}
+
+# rc=0 when $1 is on the learned ban list.
+_port_is_banned() {
+    _load_banned_ports
+    case "$_PORT_BANS" in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Record a port as unusable. The in-process cache is updated too so a
+# repick within this same run skips it immediately. `_load_banned_ports`
+# runs FIRST and completes its own locked section before the append takes
+# the lock — sequential, never nested, so no self-deadlock.
+_ban_port() {
+    local port="$1" reason="${2:-unreachable}"
+    case "$port" in ''|*[!0-9]*) return 0 ;; esac
+    _load_banned_ports
+    mkdir -p "$AGENT_USER_STATE_DIR" 2>/dev/null || true
+    _with_port_ban_lock _append_ban_row "$port" "$reason"
+    if [ -z "$_PORT_BANS" ]; then
+        _PORT_BANS=" ${port} "
+    else
+        _PORT_BANS="${_PORT_BANS}${port} "
+    fi
+}
+
 # Bind a TCP socket to port 0 and read back the kernel's assignment. Python3
 # is in the boxa host install set (mkcert, dns-install both use it), so
 # this is safe; the alternative `bash + /dev/tcp` cannot ask the kernel to
 # pick a free port, only test specific ones.
+#
+# Candidates that are Windows-excluded or ban-listed are discarded and the
+# kernel is asked again. Echoes nothing on exhaustion — every caller already
+# treats empty output as fatal (`_die`), and returning non-zero from a
+# command substitution under `set -e` would abort with no message at all.
+# Diagnostics go to stderr (`_warn`): `_log` writes to stdout, which this
+# function's callers capture as the port value.
 _pick_free_port() {
-    python3 - <<'PY'
+    local attempt=0 port skipped=0
+    while [ "$attempt" -lt "$AGENT_PORT_PICK_ATTEMPTS" ]; do
+        attempt=$((attempt + 1))
+        port="$(python3 - <<'PY'
 import socket
 s = socket.socket()
 s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()
 PY
+        )" || return 0
+        [ -n "$port" ] || return 0
+        if _port_is_windows_excluded "$port"; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if _port_is_banned "$port"; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if [ "$skipped" -gt 0 ]; then
+            _warn "Skipped ${skipped} host port candidate(s) reserved by Windows or previously found unreachable."
+        fi
+        printf '%s\n' "$port"
+        return 0
+    done
+    _warn "Exhausted ${AGENT_PORT_PICK_ATTEMPTS} host port candidates — all were Windows-reserved or ban-listed (${AGENT_PORT_BAN_FILE})."
+    return 0
 }
 
 _windows_primary_work_area() {
@@ -3377,6 +3598,13 @@ EOF
     # the LinuxKit VM, not the host — the socat bind will fail there and
     # we treat that as "no relay needed".
     local relay_pid=""
+    # True only on the path where the CDP hop leaves this machine: the relay
+    # socat could not bind the resolved IP because it belongs to the Docker
+    # Desktop VM, so the container reaches Chrome through Docker Desktop's
+    # magic forwarding. Combined with WSL2 that is exactly the route a
+    # Windows port reservation can break — the learned-ban gate below keys
+    # off it so no other failure mode pollutes the list.
+    local relay_bind_declined=false
     local resolved_hdi
     # `getent ahostsv4` (vs `getent hosts`) forces IPv4-only resolution. On
     # Docker Desktop dual-stack setups host.docker.internal carries both an
@@ -3458,6 +3686,7 @@ EOF
                 _warn "  The relay is required on this host (host.docker.internal -> ${resolved_hdi}); the CDP smoke test will fail without it."
             else
                 _log "Host relay did not bind ${resolved_hdi}:${cdp_port}; proceeding without it (Docker Desktop magic forwarding expected)."
+                relay_bind_declined=true
             fi
         fi
         # Track the relay PID (may be empty — the cleanup guards on it) so a
@@ -3845,6 +4074,25 @@ EOF
         _warn "  Diagnose with:"
         _warn "    docker exec ${container} curl -v http://127.0.0.1:${BRIDGE_CONTAINER_PORT}/json/version"
         _warn "    docker exec ${container} getent hosts host.docker.internal"
+        # Learn from the failure — but ONLY on the one route where the host
+        # port can be the culprit: WSL2 with the CDP hop going through Docker
+        # Desktop's magic forwarding (relay bind declined), Chrome still
+        # alive. There a Windows-side reservation `netsh` did not report will
+        # refuse exactly this port on every future start, so banning it is
+        # what makes the next attempt work.
+        #
+        # Every other failure mode must NOT write to the list: a dead Chrome
+        # (stderr already dumped above), a native-Linux/macOS relay or bridge
+        # problem, or the ufw case handled right below are all port-agnostic,
+        # and banning on them would steadily poison a global list with
+        # perfectly good ports.
+        if [ "$relay_bind_declined" = true ] \
+            && [ "$(host_platform::detect 2>/dev/null || true)" = "wsl2" ] \
+            && _pid_alive_on_host "$chrome_pid"; then
+            _ban_port "$cdp_port" "cdp-smoke-test-failed"
+            _warn "  Host port ${cdp_port} recorded as unusable in ${AGENT_PORT_BAN_FILE}"
+            _warn "  (expires after ${AGENT_PORT_BAN_TTL_DAYS} days); the next start picks a different port — just retry."
+        fi
         # Common failure on native Linux with ufw: the container sits on a
         # custom Docker bridge (devproxy, br-<hash>) rather than docker0,
         # so the SYN from container to host.docker.internal arrives on
