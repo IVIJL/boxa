@@ -634,6 +634,7 @@ class Finding:
     message: str
     repair: str = ""
     fixable: bool = False
+    project: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -644,6 +645,8 @@ class Finding:
         }
         if self.repair:
             out["repair"] = self.repair
+        if self.project is not None:
+            out["project"] = self.project
         return out
 
 
@@ -1236,10 +1239,16 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
             result.actions.append("refreshed the secret-free MCP runtime snapshot")
         except (OSError, ValueError, RuntimeError) as exc:
             render_failures.append(Finding(SEVERITY_ERROR, "catalog-runtime-fix-failed", f"runtime snapshot repair failed: {exc}", "Run 'boxa mcp doctor --fix' again after fixing the catalog/activation store."))
-    if "catalog-claude-render-drift" in catalog_codes:
+    claude_projects = {
+        finding.project for finding in report.findings
+        if finding.code == "catalog-claude-render-drift"
+        and finding.fixable
+        and finding.project
+    }
+    if claude_projects:
         try:
             from .activation import render_claude_activations
-            render_claude_activations()
+            render_claude_activations(projects=claude_projects)
             result.actions.append("restored Claude Code activation renders")
         except (OSError, ValueError, RuntimeError) as exc:
             render_failures.append(Finding(SEVERITY_ERROR, "catalog-render-fix-failed", f"Claude render repair failed: {exc}", "Inspect the Claude config and re-run 'boxa mcp doctor --fix'."))
@@ -1443,7 +1452,7 @@ def _catalog_doctor_findings(probe: Optional[object] = None) -> list[Finding]:
                     if tracked else "boxa mcp doctor --fix"
                 )
                 tracked_label = "Codex config" if consumer == "codex" else ".mcp.json"
-                findings.append(Finding(SEVERITY_WARN, code, f"{consumer} render drift for activated MCP {row['name']!r} in Project {project}." + (f" The {tracked_label} is tracked." if tracked else ""), repair, not tracked))
+                findings.append(Finding(SEVERITY_WARN, code, f"{consumer} render drift for activated MCP {row['name']!r} in Project {project}." + (f" The {tracked_label} is tracked." if tracked else ""), repair, not tracked, project))
 
     expected = {
         "version": 1,

@@ -8,6 +8,7 @@ import re
 import stat
 import subprocess
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -232,6 +233,10 @@ def claude_config_path(project: str) -> str:
 
 def claude_settings_path(project: str) -> str:
     return os.path.join(project, ".claude", "settings.local.json")
+
+
+def _project_directory_exists(project: str) -> bool:
+    return os.path.isdir(project)
 
 
 def _codex_git_paths(project: str) -> tuple[str, str, str]:
@@ -511,6 +516,10 @@ def _commit_activation_render(
     )
     tracked_mcp_json = data.setdefault("trackedMcpJson", {})
     for claude_project in _claude_render_projects(data, state):
+        if not _project_directory_exists(claude_project):
+            if not data["projects"].get(claude_project):
+                tracked_mcp_json.pop(claude_project, None)
+            continue
         (
             _path,
             _exclude,
@@ -542,10 +551,11 @@ def _commit_activation_render(
             claude_config_path(claude_project),
             claude_settings_path(claude_project),
         )
-        git_paths = _claude_git_paths(claude_project)
-        if git_paths is not None:
-            _relative, exclude_path, _claude_path = git_paths
-            paths += (exclude_path,)
+        if _project_directory_exists(claude_project):
+            git_paths = _claude_git_paths(claude_project)
+            if git_paths is not None:
+                _relative, exclude_path, _claude_path = git_paths
+                paths += (exclude_path,)
     if render_codex:
         _relative, exclude_path, codex_path = _codex_git_paths(project)
         paths += (codex_path, exclude_path)
@@ -1143,6 +1153,8 @@ def _claude_render_plan(
     state: dict[str, Any],
 ) -> tuple[str, Optional[str], Optional[str], bool, str, str, list[str]]:
     path = claude_config_path(project)
+    if not _project_directory_exists(project):
+        return path, None, None, False, "", "", []
     try:
         with open(path, encoding="utf-8") as fh:
             existing = fh.read()
@@ -1200,7 +1212,10 @@ def _claude_render_plan(
     )
 
 
-def _retire_old_claude_render(state: dict[str, Any]) -> None:
+def _retire_old_claude_render(
+    state: dict[str, Any],
+    selected_projects: Optional[set[str]] = None,
+) -> None:
     """Purge only Project-scoped catalog renders from Claude's rewritten file."""
     path = render_target_path()
     try:
@@ -1219,6 +1234,11 @@ def _retire_old_claude_render(state: dict[str, Any]) -> None:
     old = state.get("projects") if isinstance(state.get("projects"), dict) else {}
     changed = False
     for project, record in projects.items():
+        if (
+            selected_projects is not None
+            and project not in selected_projects
+        ):
+            continue
         if not isinstance(record, dict):
             continue
         names = old.get(project, [])
@@ -1260,10 +1280,17 @@ def _preflight_claude_lifecycle(
     state: dict[str, Any],
     *,
     consented: frozenset[str],
+    projects: Optional[Iterable[str]] = None,
 ) -> None:
     """Validate every Project render before any lifecycle store is changed."""
     refusals: list[str] = []
-    for project in _claude_render_projects(activations, state):
+    render_projects = (
+        _claude_render_projects(activations, state)
+        if projects is None else sorted(set(projects))
+    )
+    for project in render_projects:
+        if not _project_directory_exists(project):
+            continue
         (
             path, _exclude, _relative, tracked, existing, rendered, names,
         ) = _claude_render_plan(activations, project, catalog, state)
@@ -1284,37 +1311,69 @@ def render_claude_activations(
     activations: Optional[dict[str, Any]] = None,
     *,
     consented: frozenset[str] = frozenset(),
+    projects: Optional[Iterable[str]] = None,
 ) -> None:
     activations = activations if activations is not None else load_activations()
     catalog = load_catalog()
     state = _load_render_state()
+    render_projects = (
+        _claude_render_projects(activations, state)
+        if projects is None else sorted(set(projects))
+    )
     _preflight_claude_lifecycle(
-        catalog, activations, state, consented=consented
+        catalog, activations, state, consented=consented,
+        projects=render_projects,
     )
     plans = [
-        _claude_render_plan(activations, project, catalog, state)
-        for project in _claude_render_projects(activations, state)
+        (
+            project,
+            _claude_render_plan(activations, project, catalog, state),
+        )
+        for project in render_projects
     ]
     settings_plans = {
-        os.path.dirname(path): _claude_settings_plan(
-            os.path.dirname(path),
+        project: _claude_settings_plan(
+            project,
             names,
             state,
             retire=(
-                _claude_seeded_names(state, os.path.dirname(path))
+                _claude_seeded_names(state, project)
                 - set(names)
             ),
         )
-        for (
-            path, _exclude_path, _relative, _tracked, _existing, _rendered, names,
+        for project, (
+            _path, _exclude_path, _relative, _tracked, _existing, _rendered,
+            names,
         ) in plans
+        if _project_directory_exists(project)
     }
-    _retire_old_claude_render(state)
-    new_state: dict[str, list[str]] = {}
-    new_seeded: dict[str, list[str]] = {}
-    for (
+    scoped = projects is not None
+    _retire_old_claude_render(
+        state, set(render_projects) if scoped else None
+    )
+    old_projects = (
+        state.get("projects")
+        if isinstance(state.get("projects"), dict) else {}
+    )
+    old_seeded = (
+        state.get("seeded")
+        if isinstance(state.get("seeded"), dict) else {}
+    )
+    new_state: dict[str, list[str]] = dict(old_projects) if scoped else {}
+    new_seeded: dict[str, list[str]] = dict(old_seeded) if scoped else {}
+    for project, (
         path, exclude_path, relative, tracked, existing, rendered, names,
     ) in plans:
+        if not _project_directory_exists(project):
+            if activations["projects"].get(project):
+                if project in old_projects:
+                    new_state[project] = old_projects[project]
+                if project in old_seeded:
+                    new_seeded[project] = old_seeded[project]
+            else:
+                new_state.pop(project, None)
+                new_seeded.pop(project, None)
+            continue
         if rendered != existing:
             if rendered:
                 _atomic_text(path, rendered)
@@ -1331,10 +1390,11 @@ def render_claude_activations(
         ):
             _ensure_local_exclude(exclude_path, relative)
         if names:
-            project = os.path.dirname(path)
             new_state[project] = names
             new_seeded[project] = names
-        project = os.path.dirname(path)
+        else:
+            new_state.pop(project, None)
+            new_seeded.pop(project, None)
         settings_plan = settings_plans[project]
         if settings_plan is not None:
             settings_path, settings_existing, settings_rendered = settings_plan
@@ -1580,10 +1640,11 @@ def _catalog_transaction_paths(
         paths.extend((codex_path, exclude_path))
     for project in claude_projects:
         paths.extend((claude_config_path(project), claude_settings_path(project)))
-        git_paths = _claude_git_paths(project)
-        if git_paths is not None:
-            _relative, exclude_path, _claude_path = git_paths
-            paths.append(exclude_path)
+        if _project_directory_exists(project):
+            git_paths = _claude_git_paths(project)
+            if git_paths is not None:
+                _relative, exclude_path, _claude_path = git_paths
+                paths.append(exclude_path)
     # One Project can only appear once today, but preserve one exact pre-image
     # if future consumer records introduce duplicates.
     return list(dict.fromkeys(paths))

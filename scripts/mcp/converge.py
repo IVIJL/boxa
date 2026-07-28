@@ -420,6 +420,13 @@ def converge(
                     resolved,
                 )
 
+            write_paths = [mcp_path, settings_path, state_path()]
+            if exclude_plan is not None:
+                write_paths.append(exclude_plan[0])
+            preimages = [
+                activation._snapshot_file(path) for path in write_paths
+            ]
+
             if mcp_changed:
                 activation._atomic_text(mcp_path, rendered)
             if settings_plan is not None:
@@ -440,6 +447,21 @@ def converge(
                 activation._ensure_local_exclude(exclude_path, relative)
 
             if _read_snapshot_bytes(snapshot_path) != snapshot_raw:
+                rollback_errors: list[str] = []
+                for preimage in reversed(preimages):
+                    try:
+                        activation._restore_file(preimage)
+                    except OSError as exc:
+                        rollback_errors.append(
+                            f"{preimage.path}: {exc}"
+                        )
+                if rollback_errors:
+                    return _skipped(
+                        "MCP runtime snapshot changed after convergence "
+                        "writes and rollback was incomplete: "
+                        + "; ".join(rollback_errors),
+                        resolved,
+                    )
                 continue
         except (
             activation.ActivationError,

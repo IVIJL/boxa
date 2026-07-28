@@ -15,7 +15,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-from mcp import activation, broker, trusted  # noqa: E402
+from mcp import activation, broker, lifecycle, trusted  # noqa: E402
 from mcp.catalog import (  # noqa: E402
     add_entry,
     load_catalog,
@@ -188,6 +188,77 @@ class CatalogLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(
             set(runtime["projects"]), set(self.projects)
+        )
+
+    def test_doctor_repairs_only_fixable_claude_projects(self):
+        for project in self.projects:
+            subprocess.run(
+                ["git", "-C", project, "config", "user.email",
+                 "boxa-tests@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", project, "config", "user.name", "Boxa Tests"],
+                check=True,
+            )
+            self._activate(project, ["claude"])
+
+        fixable_path = activation.claude_config_path(self.projects[0])
+        tracked_path = activation.claude_config_path(self.projects[1])
+        subprocess.run(
+            ["git", "-C", self.projects[1], "add", "-f", ".mcp.json"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", self.projects[1], "commit", "-qm",
+             "track mcp config"],
+            check=True,
+        )
+        for path in (fixable_path, tracked_path):
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            del data["mcpServers"]["boxa-echo"]
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+                fh.write("\n")
+        with open(tracked_path, "rb") as fh:
+            tracked_before = fh.read()
+
+        findings = lifecycle._catalog_doctor_findings()
+        claude_findings = [
+            finding for finding in findings
+            if finding.code == "catalog-claude-render-drift"
+        ]
+        self.assertEqual(
+            {finding.project for finding in claude_findings},
+            set(self.projects),
+        )
+        self.assertEqual(
+            {
+                finding.project for finding in claude_findings
+                if finding.fixable
+            },
+            {self.projects[0]},
+        )
+
+        fixed = lifecycle.apply_doctor_fixes(
+            lifecycle.DoctorReport(False, findings)
+        )
+
+        with open(fixable_path, encoding="utf-8") as fh:
+            self.assertIn("boxa-echo", json.load(fh)["mcpServers"])
+        with open(tracked_path, "rb") as fh:
+            self.assertEqual(fh.read(), tracked_before)
+        remaining = [
+            finding for finding in fixed.remaining
+            if finding.code == "catalog-claude-render-drift"
+        ]
+        self.assertTrue(
+            any(
+                finding.project == self.projects[1]
+                and not finding.fixable
+                for finding in remaining
+            )
         )
 
     def test_runtime_snapshot_failure_after_catalog_write_rolls_back_all(self):

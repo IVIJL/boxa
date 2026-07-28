@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -474,6 +475,62 @@ class ActivationTest(unittest.TestCase):
         with open(activation.render_state_path(), encoding="utf-8") as fh:
             state = json.load(fh)
         self.assertEqual(state["seeded"][self.project], ["boxa-echo"])
+
+    def test_vanished_project_does_not_block_lifecycle_or_get_recreated(self):
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+        with open(activation.render_state_path(), encoding="utf-8") as fh:
+            before_state = json.load(fh)
+        vanished_projects = before_state["projects"][self.project]
+        vanished_seeded = before_state["seeded"][self.project]
+        shutil.rmtree(self.project)
+
+        other = activation.canonical_project(
+            os.path.join(self.tmp.name, "other")
+        )
+        os.makedirs(other)
+        real_git_paths = activation._claude_git_paths
+
+        def reject_git_for_vanished(project):
+            if project == self.project:
+                raise AssertionError("Git inspected for vanished Project")
+            return real_git_paths(project)
+
+        with mock.patch.object(
+            activation,
+            "_claude_git_paths",
+            side_effect=reject_git_for_vanished,
+        ):
+            activation.activate(
+                "inactive", other, ["claude"], ReadyProbe(other)
+            )
+            self.assertFalse(os.path.exists(self.project))
+            self.assertIn(
+                self.entry["id"],
+                activation.load_activations()["projects"][self.project],
+            )
+            with open(
+                activation.render_state_path(), encoding="utf-8"
+            ) as fh:
+                state = json.load(fh)
+            self.assertEqual(
+                state["projects"][self.project], vanished_projects
+            )
+            self.assertEqual(
+                state["seeded"][self.project], vanished_seeded
+            )
+
+            activation.deactivate("echo", self.project)
+
+        self.assertFalse(os.path.exists(self.project))
+        self.assertNotIn(
+            self.project, activation.load_activations()["projects"]
+        )
+        with open(activation.render_state_path(), encoding="utf-8") as fh:
+            state = json.load(fh)
+        self.assertNotIn(self.project, state["projects"])
+        self.assertNotIn(self.project, state["seeded"])
 
     def test_recorded_approval_wins_when_boxa_seed_is_withdrawn(self):
         activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))

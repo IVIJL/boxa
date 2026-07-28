@@ -500,6 +500,45 @@ class ConvergeTest(unittest.TestCase):
             set(self._mcp_data()["mcpServers"]), {"boxa-other"}
         )
 
+    def test_snapshot_change_after_writes_restores_exact_preimages(self):
+        self._write_snapshot(self._desired_records())
+        mcp_path = activation.claude_config_path(self.project)
+        settings_path = activation.claude_settings_path(self.project)
+        state_path = converge.state_path()
+        preimages = {
+            mcp_path: b'{"manual":"mcp"}\n',
+            settings_path: b'{"manual":"settings"}\n',
+            state_path: b'{"manual":"state"}\n',
+        }
+        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        for path, content in preimages.items():
+            with open(path, "wb") as fh:
+                fh.write(content)
+        with open(self.snapshot, "rb") as fh:
+            snapshot_raw = fh.read()
+        reads = 0
+
+        def stale_only_after_writes(_path):
+            nonlocal reads
+            reads += 1
+            if reads % 3:
+                return snapshot_raw
+            return snapshot_raw + b"\n"
+
+        with mock.patch.object(
+            converge,
+            "_read_snapshot_bytes",
+            side_effect=stale_only_after_writes,
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("kept changing", result.reason)
+        for path, content in preimages.items():
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), content)
+
     def test_render_change_before_commit_is_left_untouched_and_skipped(self):
         self._write_snapshot(self._desired_records())
         mcp_path = activation.claude_config_path(self.project)
