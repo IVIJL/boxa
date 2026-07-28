@@ -173,6 +173,19 @@ class _FileSnapshot:
     mode: int = 0
 
 
+@dataclass(frozen=True)
+class ClaudeRenderStatus:
+    names: tuple[str, ...]
+    mcp_json_path: str
+    mcp_json_changes: bool
+    mcp_json_tracked: bool
+    settings_path: str
+    settings_changes: bool
+    settings_tracked: bool
+    settings_changed_names: frozenset[str]
+    requires_consent: bool
+
+
 def _snapshot_file(path: str) -> _FileSnapshot:
     try:
         info = os.stat(path, follow_symlinks=False)
@@ -1155,11 +1168,11 @@ def _claude_settings_plan(
     retire: Optional[set[str]] = None,
     existing_document: Optional[tuple[bool, str]] = None,
 ) -> Optional[tuple[str, str, str]]:
-    to_seed = set(rendered_names) - _claude_seeded_names(state, project)
     approved, rejected = _observed_claude_decisions(project)
 
     path = claude_settings_path(project)
     if existing_document is not None and not existing_document[0]:
+        exists = False
         existing = existing_document[1]
         data = {}
     else:
@@ -1169,8 +1182,10 @@ def _claude_settings_plan(
                     existing = fh.read()
             else:
                 existing = existing_document[1]
+            exists = True
             data = json.loads(existing)
         except FileNotFoundError:
+            exists = False
             existing = ""
             data = {}
         except (OSError, ValueError) as exc:
@@ -1180,6 +1195,11 @@ def _claude_settings_plan(
     if not isinstance(data, dict):
         raise ActivationError(f"Claude Project settings is not an object: {path}")
 
+    to_seed = (
+        set(rendered_names)
+        if not exists
+        else set(rendered_names) - _claude_seeded_names(state, project)
+    )
     enabled = data.get("enabledMcpjsonServers", [])
     if not (
         isinstance(enabled, list)
@@ -1319,6 +1339,94 @@ def _claude_render_plan(
     )
 
 
+def _claude_settings_memberships(document: str) -> tuple[set[str], set[str]]:
+    if not document:
+        return set(), set()
+    data = json.loads(document)
+    enabled = data.get("enabledMcpjsonServers", [])
+    disabled = data.get("disabledMcpjsonServers", [])
+    return set(enabled), set(disabled)
+
+
+def claude_render_status(
+    project: str,
+    *,
+    activations: Optional[dict[str, Any]] = None,
+    catalog: Optional[dict[str, Any]] = None,
+    state: Optional[dict[str, Any]] = None,
+) -> ClaudeRenderStatus:
+    """Describe exactly which derived Claude Project bytes need repair."""
+    project = canonical_project(project)
+    mcp_json_path = claude_config_path(project)
+    settings_path = claude_settings_path(project)
+    if not _project_directory_exists(project):
+        return ClaudeRenderStatus(
+            names=(),
+            mcp_json_path=mcp_json_path,
+            mcp_json_changes=False,
+            mcp_json_tracked=False,
+            settings_path=settings_path,
+            settings_changes=False,
+            settings_tracked=False,
+            settings_changed_names=frozenset(),
+            requires_consent=False,
+        )
+
+    activations = (
+        activations if activations is not None else load_activations()
+    )
+    catalog = catalog if catalog is not None else load_catalog()
+    state = state if state is not None else _load_render_state()
+    (
+        mcp_json_path,
+        _exclude_path,
+        _relative,
+        mcp_json_tracked,
+        existing,
+        rendered,
+        names,
+    ) = _claude_render_plan(activations, project, catalog, state)
+    retire = _claude_seeded_names(state, project) - set(names)
+    settings_plan = _claude_settings_plan(
+        project, names, state, retire=retire
+    )
+    settings_git_paths = _claude_git_paths(project, path=settings_path)
+    settings_tracked = (
+        settings_git_paths is not None
+        and _codex_is_tracked(project, settings_git_paths[0])
+    )
+    settings_changed_names: set[str] = set()
+    if settings_plan is not None:
+        settings_path, settings_existing, settings_rendered = settings_plan
+        existing_enabled, existing_disabled = (
+            _claude_settings_memberships(settings_existing)
+        )
+        rendered_enabled, rendered_disabled = (
+            _claude_settings_memberships(settings_rendered)
+        )
+        settings_changed_names = (
+            existing_enabled ^ rendered_enabled
+        ) | (existing_disabled ^ rendered_disabled)
+    mcp_json_changes = rendered != existing
+    settings_changes = settings_plan is not None
+    requires_consent = (
+        mcp_json_changes and mcp_json_tracked
+    ) or (
+        settings_changes and settings_tracked
+    )
+    return ClaudeRenderStatus(
+        names=tuple(names),
+        mcp_json_path=mcp_json_path,
+        mcp_json_changes=mcp_json_changes,
+        mcp_json_tracked=mcp_json_tracked,
+        settings_path=settings_path,
+        settings_changes=settings_changes,
+        settings_tracked=settings_tracked,
+        settings_changed_names=frozenset(settings_changed_names),
+        requires_consent=requires_consent,
+    )
+
+
 def _retire_old_claude_render(
     state: dict[str, Any],
     selected_projects: Optional[set[str]] = None,
@@ -1407,34 +1515,18 @@ def _preflight_claude_lifecycle(
         if projects is None else sorted(set(projects))
     )
     for project in render_projects:
-        if not _project_directory_exists(project):
-            continue
-        (
-            path, _exclude, _relative, tracked, existing, rendered, names,
-        ) = _claude_render_plan(activations, project, catalog, state)
-        if tracked and rendered != existing and project not in consented:
-            refusals.append(path)
-        retire = _claude_seeded_names(state, project) - set(names)
-        settings_plan = _claude_settings_plan(
-            project, names, state, retire=retire
+        status = claude_render_status(
+            project,
+            activations=activations,
+            catalog=catalog,
+            state=state,
         )
-        if settings_plan is not None:
-            settings_path, settings_existing, settings_rendered = (
-                settings_plan
-            )
-            settings_git_paths = _claude_git_paths(
-                project, path=settings_path
-            )
-            settings_tracked = (
-                settings_git_paths is not None
-                and _codex_is_tracked(project, settings_git_paths[0])
-            )
-            if (
-                settings_tracked
-                and settings_rendered != settings_existing
-                and project not in consented
-            ):
-                refusals.append(settings_path)
+        if project in consented:
+            continue
+        if status.mcp_json_changes and status.mcp_json_tracked:
+            refusals.append(status.mcp_json_path)
+        if status.settings_changes and status.settings_tracked:
+            refusals.append(status.settings_path)
     if refusals:
         raise ActivationError(
             "tracked Claude Project files refused for: "

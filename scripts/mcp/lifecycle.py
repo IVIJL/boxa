@@ -1282,9 +1282,14 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
     return result
 
 
-def _catalog_render_state(project: str, entry_id: str, entry: dict[str, Any], consumer: str) -> tuple[str, bool]:
+def _catalog_render_state(
+    project: str,
+    entry_id: str,
+    entry: dict[str, Any],
+    consumer: str,
+    claude_status: Optional[object] = None,
+) -> tuple[str, bool]:
     """Return (state, tracked) for one derived consumer record, secret-free."""
-    from . import activation
     from .activation import claude_config_path, codex_config_path
 
     name = rendered_name(str(entry["name"]))
@@ -1297,12 +1302,22 @@ def _catalog_render_state(project: str, entry_id: str, entry: dict[str, Any], co
             value = data.get("mcpServers", {}).get(name)
         except (OSError, ValueError, AttributeError):
             value = None
-        tracked = False
-        try:
-            tracked = activation.claude_tracked_state(project)
-        except (OSError, activation.ActivationError):
-            pass
-        ok = isinstance(value, dict) and value.get("command") == WRAPPER_COMMAND and value.get("args") == expected_args
+        tracked = bool(
+            claude_status is not None
+            and getattr(claude_status, "requires_consent", False)
+        )
+        approval_drift = bool(
+            claude_status is not None
+            and name in getattr(
+                claude_status, "settings_changed_names", frozenset()
+            )
+        )
+        ok = (
+            isinstance(value, dict)
+            and value.get("command") == WRAPPER_COMMAND
+            and value.get("args") == expected_args
+            and not approval_drift
+        )
         return ("rendered" if ok else "drift"), tracked
 
     path = codex_config_path(project)
@@ -1327,6 +1342,7 @@ def _catalog_render_state(project: str, entry_id: str, entry: dict[str, Any], co
 
 def catalog_project_status(project: str, probe: Optional[object] = None) -> dict[str, Any]:
     """Unified catalog -> readiness -> activation -> render -> mode snapshot."""
+    from . import activation
     from .activation import canonical_project, load_activations
     from .catalog import degradation_status, load_catalog
     from .readiness import ProjectProbe, ReadinessError, readiness_for_entry
@@ -1337,6 +1353,20 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
     records = activations.get("projects", {}).get(key, {})
     rows: list[dict[str, Any]] = []
     local_probe = probe if probe is not None else ProjectProbe()
+    claude_status = None
+    if any(
+        "claude" in record.get("consumers", [])
+        for record in records.values()
+        if isinstance(record, dict)
+    ):
+        try:
+            claude_status = activation.claude_render_status(
+                key,
+                activations=activations,
+                catalog=catalog,
+            )
+        except (OSError, activation.ActivationError):
+            pass
     for entry_id, entry in sorted(catalog["entries"].items(), key=lambda item: (item[1]["name"].casefold(), item[0])):
         record = records.get(entry_id)
         try:
@@ -1353,7 +1383,13 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
         tracked_codex = False
         tracked_claude = False
         for consumer in consumers:
-            state, is_tracked = _catalog_render_state(key, entry_id, entry, consumer)
+            state, is_tracked = _catalog_render_state(
+                key,
+                entry_id,
+                entry,
+                consumer,
+                claude_status,
+            )
             renders[consumer] = state
             if consumer == "codex":
                 tracked_codex = tracked_codex or is_tracked

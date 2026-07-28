@@ -1310,6 +1310,111 @@ class ActivationTest(unittest.TestCase):
         )
         self.assertEqual(os.stat(path).st_mtime_ns, before)
 
+    def test_in_sync_tracked_settings_do_not_block_doctor_mcp_repair(self):
+        self._init_git()
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+        self._git("add", "-f", ".claude/settings.local.json")
+        self._git("commit", "-qm", "track in-sync Claude Project settings")
+        data = self._claude_data()
+        del data["mcpServers"]["boxa-echo"]
+        with open(
+            activation.claude_config_path(self.project),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+
+        findings = lifecycle._catalog_doctor_findings()
+        finding = next(
+            item for item in findings
+            if item.code == "catalog-claude-render-drift"
+        )
+        self.assertTrue(finding.fixable)
+        self.assertNotIn("--allow-tracked-mcp-json", finding.repair)
+
+        fixed = lifecycle.apply_doctor_fixes(
+            lifecycle.DoctorReport(False, findings)
+        )
+
+        self.assertIn("boxa-echo", self._claude_data()["mcpServers"])
+        self.assertNotIn(
+            "catalog-claude-render-drift",
+            {item.code for item in fixed.remaining},
+        )
+
+    def test_claude_render_status_is_empty_for_missing_project(self):
+        missing = os.path.join(self.tmp.name, "missing")
+
+        status = activation.claude_render_status(missing)
+
+        self.assertEqual(status.names, ())
+        self.assertFalse(status.mcp_json_changes)
+        self.assertFalse(status.mcp_json_tracked)
+        self.assertFalse(status.settings_changes)
+        self.assertFalse(status.settings_tracked)
+        self.assertEqual(status.settings_changed_names, frozenset())
+        self.assertFalse(status.requires_consent)
+
+    def test_doctor_repairs_deleted_claude_settings(self):
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+        settings_path = activation.claude_settings_path(self.project)
+        os.unlink(settings_path)
+
+        findings = lifecycle._catalog_doctor_findings()
+        finding = next(
+            item for item in findings
+            if item.code == "catalog-claude-render-drift"
+        )
+        self.assertTrue(finding.fixable)
+
+        fixed = lifecycle.apply_doctor_fixes(
+            lifecycle.DoctorReport(False, findings)
+        )
+
+        self.assertEqual(
+            self._claude_settings_data()["enabledMcpjsonServers"],
+            ["boxa-echo"],
+        )
+        self.assertNotIn(
+            "catalog-claude-render-drift",
+            {item.code for item in fixed.remaining},
+        )
+
+    def test_doctor_repairs_deleted_claude_settings_as_disabled(self):
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+        self._write_claude_decisions(disabled=["boxa-echo"])
+        os.unlink(activation.claude_settings_path(self.project))
+
+        findings = lifecycle._catalog_doctor_findings()
+        finding = next(
+            item for item in findings
+            if item.code == "catalog-claude-render-drift"
+        )
+        self.assertTrue(finding.fixable)
+
+        fixed = lifecycle.apply_doctor_fixes(
+            lifecycle.DoctorReport(False, findings)
+        )
+
+        settings = self._claude_settings_data()
+        self.assertEqual(
+            settings["disabledMcpjsonServers"], ["boxa-echo"]
+        )
+        self.assertNotIn(
+            "boxa-echo", settings.get("enabledMcpjsonServers", [])
+        )
+        self.assertNotIn(
+            "catalog-claude-render-drift",
+            {item.code for item in fixed.remaining},
+        )
+
     def test_tracked_claude_settings_make_render_drift_not_fixable(self):
         self._init_git()
         activation.activate(
@@ -1320,6 +1425,7 @@ class ActivationTest(unittest.TestCase):
         self._git("commit", "-qm", "track Claude Project settings")
         with open(settings_path, "w", encoding="utf-8") as fh:
             json.dump({"enabledMcpjsonServers": []}, fh)
+        self._write_claude_decisions(enabled=["boxa-echo"])
         data = self._claude_data()
         del data["mcpServers"]["boxa-echo"]
         with open(
