@@ -404,6 +404,87 @@ class ConvergeTest(unittest.TestCase):
         self.assertEqual(result.status, "converged")
         self.assertIn("boxa-echo", self._mcp_data()["mcpServers"])
 
+    def test_git_tracked_inspection_failure_skips_without_writes(self):
+        self._init_git()
+        self._write_snapshot(self._desired_records())
+        failure = activation.ActivationError(
+            "cannot determine whether .mcp.json is tracked: git failed"
+        )
+        with (
+            mock.patch.object(
+                activation, "_codex_is_tracked", side_effect=failure
+            ),
+            mock.patch.object(
+                activation,
+                "_atomic_text",
+                side_effect=AssertionError("unknown tracked state caused a write"),
+            ),
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.reason, str(failure))
+        self.assertFalse(
+            os.path.exists(activation.claude_config_path(self.project))
+        )
+        self.assertFalse(os.path.exists(converge.state_path()))
+
+    def test_snapshot_change_before_commit_replans_from_new_snapshot(self):
+        self._write_snapshot(self._desired_records())
+        original_read = converge._read_mcp_document
+        interleaved = False
+
+        def change_snapshot_after_plan(project):
+            nonlocal interleaved
+            result = original_read(project)
+            if not interleaved:
+                interleaved = True
+                self._write_snapshot({
+                    self.other["id"]: self._record(self.other)
+                })
+            return result
+
+        with mock.patch.object(
+            converge,
+            "_read_mcp_document",
+            side_effect=change_snapshot_after_plan,
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        self.assertEqual(
+            set(self._mcp_data()["mcpServers"]), {"boxa-other"}
+        )
+
+    def test_render_change_before_commit_is_left_untouched_and_skipped(self):
+        self._write_snapshot(self._desired_records())
+        mcp_path = activation.claude_config_path(self.project)
+        original_read = converge._read_mcp_document
+        concurrent = b'{"mcpServers":{"host":{"command":"fresh"}}}\n'
+        interleaved = False
+
+        def change_render_after_plan(project):
+            nonlocal interleaved
+            result = original_read(project)
+            if not interleaved:
+                interleaved = True
+                with open(mcp_path, "wb") as fh:
+                    fh.write(concurrent)
+            return result
+
+        with mock.patch.object(
+            converge,
+            "_read_mcp_document",
+            side_effect=change_render_after_plan,
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("concurrent write to the rendered file", result.reason)
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), concurrent)
+        self.assertFalse(os.path.exists(converge.state_path()))
+
     def test_foreign_servers_and_top_level_keys_survive_and_are_not_seeded(self):
         self._write_snapshot(self._desired_records())
         foreign = {"command": "foreign", "args": ["--keep"], "x": {"y": 1}}

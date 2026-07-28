@@ -1239,7 +1239,7 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
     if "catalog-claude-render-drift" in catalog_codes:
         try:
             from .activation import render_claude_activations
-            render_claude_activations(allow_tracked=False)
+            render_claude_activations()
             result.actions.append("restored Claude Code activation renders")
         except (OSError, ValueError, RuntimeError) as exc:
             render_failures.append(Finding(SEVERITY_ERROR, "catalog-render-fix-failed", f"Claude render repair failed: {exc}", "Inspect the Claude config and re-run 'boxa mcp doctor --fix'."))

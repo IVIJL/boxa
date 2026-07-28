@@ -129,6 +129,19 @@ consent is present. It may still repair approval or convergence state when
 the tracked file is already byte-identical, because those repairs do not
 modify the tracked repository file.
 
+Tracked-file consent is scoped to the Project explicitly mutated by the
+lifecycle command. Existing durable consent may authorize that Project during
+an incidental multi-Project re-render, but a flag supplied for one Project
+does not authorize or persist consent for another. Catalog-wide mutations may
+use the flag for their current render batch, but record no new durable consent.
+
+Container convergence cannot share the gated host mutation lock. Instead it
+revalidates the exact runtime snapshot bytes and both rendered-file pre-images
+immediately before writing, retries from a newer snapshot up to a fixed bound,
+and skips when a rendered file changed while the snapshot did not. It checks
+the snapshot again after writing so a concurrently published host mutation is
+replanned before convergence returns.
+
 ## Migration
 
 Boxa-written `boxa-*` entries in `~/.claude/.claude.json` are removed when the

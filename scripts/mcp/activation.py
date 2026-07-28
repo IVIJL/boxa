@@ -250,27 +250,69 @@ def _codex_git_paths(project: str) -> tuple[str, str, str]:
 
 
 def _codex_is_tracked(project: str, relative: str) -> bool:
-    proc = subprocess.run(
-        ["git", "-C", project, "ls-files", "--error-unmatch", "--", relative],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+    try:
+        proc = subprocess.run(
+            [
+                "git", "-C", project, "ls-files", "--error-unmatch", "--",
+                relative,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise ActivationError(
+            f"cannot determine whether {relative} is tracked in {project}: {exc}"
+        ) from exc
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    detail = (proc.stderr or "").strip()
+    raise ActivationError(
+        f"cannot determine whether {relative} is tracked in {project}"
+        + (f": {detail}" if detail else "")
     )
-    return proc.returncode == 0
 
 
 def _claude_git_paths(project: str) -> Optional[tuple[str, str, str]]:
     """Resolve local Git paths, while keeping non-repository Projects valid."""
+    path = claude_config_path(project)
     try:
         top_proc = subprocess.run(
             ["git", "-C", project, "rev-parse", "--show-toplevel"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
         )
-    except OSError:
-        return None
+    except OSError as exc:
+        raise ActivationError(
+            f"cannot determine whether {path} is inside a Git repository: {exc}"
+        ) from exc
     if top_proc.returncode != 0:
-        return None
-    top = os.path.realpath(top_proc.stdout.strip())
-    path = claude_config_path(project)
-    relative = os.path.relpath(path, top)
+        detail = (top_proc.stderr or top_proc.stdout).strip()
+        non_repository = (
+            "not a git repository" in detail.casefold()
+            or "this operation must be run in a work tree" in detail.casefold()
+        )
+        if non_repository:
+            return None
+        raise ActivationError(
+            f"cannot determine whether {path} is inside a Git repository"
+            + (f": {detail}" if detail else "")
+        )
+    top_output = top_proc.stdout.strip()
+    if not top_output:
+        raise ActivationError(
+            f"cannot determine whether {path} is inside a Git repository: "
+            "git rev-parse returned an empty repository path"
+        )
+    top = os.path.realpath(top_output)
+    try:
+        relative = os.path.relpath(path, top)
+    except ValueError as exc:
+        raise ActivationError(
+            f"Claude MCP config is outside the Project Git repository: {path}"
+        ) from exc
     if relative == ".." or relative.startswith(".." + os.sep):
         raise ActivationError(f"Claude MCP config is outside the Project Git repository: {path}")
     try:
@@ -291,9 +333,15 @@ def _claude_git_paths(project: str) -> Optional[tuple[str, str, str]]:
             f"cannot resolve local Git exclude for Claude MCP config {path}"
             + (f": {detail}" if detail else "")
         )
+    exclude_output = exclude_proc.stdout.strip()
+    if not exclude_output:
+        raise ActivationError(
+            f"cannot resolve local Git exclude for Claude MCP config {path}: "
+            "git rev-parse returned an empty exclude path"
+        )
     return (
         relative.replace(os.sep, "/"),
-        os.path.realpath(exclude_proc.stdout.strip()),
+        os.path.realpath(exclude_output),
         path,
     )
 
@@ -445,11 +493,21 @@ def _commit_activation_render(
     """
     catalog = load_catalog()
     state = _load_render_state()
+    durable_consented = {
+        consented_project
+        for consented_project, allowed
+        in data.get("trackedMcpJson", {}).items()
+        if allowed is True
+    }
+    consented = frozenset(
+        durable_consented
+        | ({project} if allow_tracked_mcp_json else set())
+    )
     _preflight_claude_lifecycle(
         catalog,
         data,
         state,
-        allow_tracked=allow_tracked_mcp_json,
+        consented=consented,
     )
     tracked_mcp_json = data.setdefault("trackedMcpJson", {})
     for claude_project in _claude_render_projects(data, state):
@@ -464,7 +522,7 @@ def _commit_activation_render(
         ) = _claude_render_plan(data, claude_project, catalog, state)
         if not tracked or not names:
             tracked_mcp_json.pop(claude_project, None)
-        elif allow_tracked_mcp_json:
+        elif allow_tracked_mcp_json and claude_project == project:
             tracked_mcp_json[claude_project] = True
     if render_codex:
         _preflight_codex_lifecycle(
@@ -494,7 +552,7 @@ def _commit_activation_render(
     snapshots = [_snapshot_file(path) for path in paths]
     try:
         save_activation_store(data)
-        render_claude_activations(data, allow_tracked=allow_tracked_mcp_json)
+        render_claude_activations(data, consented=consented)
         if render_codex:
             _render_codex_activation(
                 data,
@@ -995,20 +1053,30 @@ def _claude_settings_plan(
     state: dict[str, Any],
     *,
     retire: Optional[set[str]] = None,
+    existing_document: Optional[tuple[bool, str]] = None,
 ) -> Optional[tuple[str, str, str]]:
     to_seed = set(rendered_names) - _claude_seeded_names(state, project)
     approved, rejected = _observed_claude_decisions(project)
 
     path = claude_settings_path(project)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            existing = fh.read()
-        data = json.loads(existing)
-    except FileNotFoundError:
-        existing = ""
+    if existing_document is not None and not existing_document[0]:
+        existing = existing_document[1]
         data = {}
-    except (OSError, ValueError) as exc:
-        raise ActivationError(f"cannot read Claude Project settings {path}: {exc}") from exc
+    else:
+        try:
+            if existing_document is None:
+                with open(path, encoding="utf-8") as fh:
+                    existing = fh.read()
+            else:
+                existing = existing_document[1]
+            data = json.loads(existing)
+        except FileNotFoundError:
+            existing = ""
+            data = {}
+        except (OSError, ValueError) as exc:
+            raise ActivationError(
+                f"cannot read Claude Project settings {path}: {exc}"
+            ) from exc
     if not isinstance(data, dict):
         raise ActivationError(f"Claude Project settings is not an object: {path}")
 
@@ -1191,7 +1259,7 @@ def _preflight_claude_lifecycle(
     activations: dict[str, Any],
     state: dict[str, Any],
     *,
-    allow_tracked: bool,
+    consented: frozenset[str],
 ) -> None:
     """Validate every Project render before any lifecycle store is changed."""
     refusals: list[str] = []
@@ -1199,27 +1267,29 @@ def _preflight_claude_lifecycle(
         (
             path, _exclude, _relative, tracked, existing, rendered, names,
         ) = _claude_render_plan(activations, project, catalog, state)
-        if tracked and rendered != existing and not allow_tracked:
+        if tracked and rendered != existing and project not in consented:
             refusals.append(path)
         retire = _claude_seeded_names(state, project) - set(names)
         _claude_settings_plan(project, names, state, retire=retire)
     if refusals:
         raise ActivationError(
-            "tracked Claude MCP config requires --allow-tracked-mcp-json for: "
+            "tracked Claude MCP config refused for: "
             + ", ".join(refusals)
+            + "; grant consent by activating in that Project with "
+            "--allow-tracked-mcp-json"
         )
 
 
 def render_claude_activations(
     activations: Optional[dict[str, Any]] = None,
     *,
-    allow_tracked: bool = False,
+    consented: frozenset[str] = frozenset(),
 ) -> None:
     activations = activations if activations is not None else load_activations()
     catalog = load_catalog()
     state = _load_render_state()
     _preflight_claude_lifecycle(
-        catalog, activations, state, allow_tracked=allow_tracked
+        catalog, activations, state, consented=consented
     )
     plans = [
         _claude_render_plan(activations, project, catalog, state)
@@ -1562,12 +1632,24 @@ def _commit_catalog_render(
     claude_projects = (
         _claude_render_projects(activations, state) if render_consumers else []
     )
+    durable_consented = {
+        project
+        for project, allowed
+        in activations.get("trackedMcpJson", {}).items()
+        if allowed is True
+    }
+    # A catalog mutation has no single explicitly mutated Project. Its flag may
+    # authorize this batch, but never records new durable Project consent.
+    consented = frozenset(
+        durable_consented
+        | (set(claude_projects) if allow_tracked_mcp_json else set())
+    )
     if render_consumers:
         _preflight_claude_lifecycle(
             catalog,
             activations,
             state,
-            allow_tracked=allow_tracked_mcp_json,
+            consented=consented,
         )
     _preflight_codex_lifecycle(
         catalog,
@@ -1593,7 +1675,7 @@ def _commit_catalog_render(
             save_activation_store(activations)
         if render_consumers:
             render_claude_activations(
-                activations, allow_tracked=allow_tracked_mcp_json
+                activations, consented=consented
             )
             for project in codex_projects:
                 _render_codex_activation(

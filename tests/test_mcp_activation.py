@@ -701,6 +701,178 @@ class ActivationTest(unittest.TestCase):
         with open(activation.runtime_path(), encoding="utf-8") as fh:
             self.assertNotIn(self.project, json.load(fh)["trackedMcpJson"])
 
+    def test_tracked_mcp_consent_flag_does_not_authorize_another_project(self):
+        self._init_git()
+        other = activation.canonical_project(
+            os.path.join(self.tmp.name, "other")
+        )
+        os.makedirs(other)
+        self._git("init", "-q", cwd=other)
+        self._git(
+            "config", "user.email", "boxa-tests@example.invalid", cwd=other
+        )
+        self._git("config", "user.name", "Boxa Tests", cwd=other)
+        activation.activate("echo", other, ["claude"], ReadyProbe(other))
+        self._git("add", "-f", ".mcp.json", cwd=other)
+        self._git("commit", "-qm", "track rendered config", cwd=other)
+        other_path = activation.claude_config_path(other)
+        with open(other_path, "w", encoding="utf-8") as fh:
+            fh.write('{"mcpServers":{}}\n')
+
+        own_path = activation.claude_config_path(self.project)
+        with open(own_path, "w", encoding="utf-8") as fh:
+            fh.write('{"theme":"tracked"}\n')
+        self._git("add", ".mcp.json")
+        self._git("commit", "-qm", "track config")
+        paths = (
+            activation.activation_path(),
+            activation.runtime_path(),
+            activation.render_state_path(),
+            own_path,
+            other_path,
+            activation.claude_settings_path(other),
+        )
+        before = {}
+        for path in paths:
+            with open(path, "rb") as fh:
+                before[path] = fh.read()
+
+        with self.assertRaisesRegex(
+            activation.ActivationError, "allow-tracked-mcp-json"
+        ) as refused:
+            activation.activate(
+                "echo",
+                self.project,
+                ["claude"],
+                ReadyProbe(self.project),
+                allow_tracked_mcp_json=True,
+            )
+
+        self.assertIn(other_path, str(refused.exception))
+        for path in paths:
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), before[path])
+        self.assertNotIn(
+            other, activation.load_activations()["trackedMcpJson"]
+        )
+
+    def test_tracked_mcp_consent_is_recorded_only_for_mutated_project(self):
+        other = activation.canonical_project(
+            os.path.join(self.tmp.name, "other")
+        )
+        os.makedirs(other)
+        self._git("init", "-q", cwd=other)
+        self._git(
+            "config", "user.email", "boxa-tests@example.invalid", cwd=other
+        )
+        self._git("config", "user.name", "Boxa Tests", cwd=other)
+        activation.activate("echo", other, ["claude"], ReadyProbe(other))
+        self._git("add", "-f", ".mcp.json", cwd=other)
+        self._git("commit", "-qm", "track rendered config", cwd=other)
+
+        self._init_git()
+        own_path = activation.claude_config_path(self.project)
+        with open(own_path, "w", encoding="utf-8") as fh:
+            fh.write('{"theme":"tracked"}\n')
+        self._git("add", ".mcp.json")
+        self._git("commit", "-qm", "track config")
+
+        activation.activate(
+            "echo",
+            self.project,
+            ["claude"],
+            ReadyProbe(self.project),
+            allow_tracked_mcp_json=True,
+        )
+
+        self.assertEqual(
+            activation.load_activations()["trackedMcpJson"],
+            {self.project: True},
+        )
+
+    def test_durable_consent_authorizes_incidental_project_rerender(self):
+        other = activation.canonical_project(
+            os.path.join(self.tmp.name, "other")
+        )
+        os.makedirs(other)
+        self._git("init", "-q", cwd=other)
+        self._git(
+            "config", "user.email", "boxa-tests@example.invalid", cwd=other
+        )
+        self._git("config", "user.name", "Boxa Tests", cwd=other)
+        other_path = activation.claude_config_path(other)
+        with open(other_path, "w", encoding="utf-8") as fh:
+            fh.write('{"theme":"tracked"}\n')
+        self._git("add", ".mcp.json", cwd=other)
+        self._git("commit", "-qm", "track config", cwd=other)
+        activation.activate(
+            "echo",
+            other,
+            ["claude"],
+            ReadyProbe(other),
+            allow_tracked_mcp_json=True,
+        )
+        with open(other_path, "w", encoding="utf-8") as fh:
+            fh.write('{"theme":"drifted"}\n')
+
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+
+        self.assertIn("boxa-echo", self._claude_data(other)["mcpServers"])
+        self.assertEqual(
+            activation.load_activations()["trackedMcpJson"], {other: True}
+        )
+
+    def test_claude_git_inspection_distinguishes_failures_from_non_repo(self):
+        dubious = subprocess.CompletedProcess(
+            [], 128, stdout="", stderr="fatal: detected dubious ownership"
+        )
+        with mock.patch.object(activation.subprocess, "run", return_value=dubious):
+            with self.assertRaisesRegex(
+                activation.ActivationError,
+                "cannot determine whether .* is inside a Git repository",
+            ) as refused:
+                activation.activate(
+                    "echo",
+                    self.project,
+                    ["claude"],
+                    ReadyProbe(self.project),
+                )
+        self.assertIn("dubious ownership", str(refused.exception))
+        self.assertFalse(os.path.exists(activation.activation_path()))
+
+        non_repo = subprocess.CompletedProcess(
+            [],
+            128,
+            stdout="",
+            stderr="fatal: not a git repository (or any parent directories)",
+        )
+        with mock.patch.object(
+            activation.subprocess, "run", return_value=non_repo
+        ):
+            self.assertIsNone(activation._claude_git_paths(self.project))
+
+        with mock.patch.object(
+            activation.subprocess, "run", side_effect=OSError("git unavailable")
+        ):
+            with self.assertRaisesRegex(
+                activation.ActivationError,
+                "cannot determine whether .* is inside a Git repository",
+            ):
+                activation._claude_git_paths(self.project)
+
+    def test_codex_tracked_check_raises_on_git_inspection_failure(self):
+        failed = subprocess.CompletedProcess(
+            [], 128, stdout="", stderr="fatal: damaged repository metadata"
+        )
+        with mock.patch.object(activation.subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(
+                activation.ActivationError, "cannot determine whether"
+            ) as refused:
+                activation._codex_is_tracked(self.project, ".mcp.json")
+        self.assertIn("damaged repository metadata", str(refused.exception))
+
     def test_identical_tracked_mcp_rerender_is_noop_without_consent(self):
         self._init_git()
         activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
@@ -720,7 +892,7 @@ class ActivationTest(unittest.TestCase):
         self._git("commit", "-qm", "track rendered mcp config")
         before = os.stat(path).st_mtime_ns
 
-        activation.render_claude_activations(allow_tracked=False)
+        activation.render_claude_activations()
 
         self.assertEqual(os.stat(path).st_mtime_ns, before)
         with open(path, encoding="utf-8") as fh:

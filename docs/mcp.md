@@ -55,7 +55,9 @@ For Git Projects it adds either otherwise-untracked render target to
 `.git/info/exclude`, never `.gitignore`. A tracked `.mcp.json` requires
 `--allow-tracked-mcp-json`; a tracked Codex config requires
 `--allow-tracked-codex-config`. Doctor will not edit either tracked file
-without that authorization.
+without that authorization. The `.mcp.json` flag grants and records durable
+consent only for the Project explicitly targeted by that lifecycle command;
+it does not authorize another Project included in an incidental re-render.
 
 For Claude Code, activation also seeds the rendered server name once into
 `.claude/settings.local.json`. Boxa preserves unrelated Project settings and
@@ -90,6 +92,10 @@ If `.mcp.json` is tracked and its rendered bytes need to change, convergence
 refuses all writes for that Project unless a host activation previously
 recorded durable consent through `--allow-tracked-mcp-json`. An already
 in-sync tracked `.mcp.json` does not block approval-state repair.
+Convergence revalidates the snapshot and rendered files immediately before
+writing. A newly published snapshot is replanned; a rendered-file change
+without a snapshot change is reported as a concurrent host write and left for
+the next convergence.
 
 ## Execution identity
 

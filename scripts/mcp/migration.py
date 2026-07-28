@@ -412,7 +412,12 @@ def migrate_legacy() -> dict[str, Any]:
             activation.save_activations(activations)
             _remove_legacy_claude_entries()
             _remove_legacy_global_codex_entries()
-            activation.render_claude_activations(activations, allow_tracked=True)
+            activation.render_claude_activations(
+                activations,
+                consented=frozenset(
+                    activation._claude_render_projects(activations, state)
+                ),
+            )
             for project in sorted(codex_projects):
                 activation._render_codex_activation(activations, project, allow_tracked=True)
             manifest["status"] = "complete"

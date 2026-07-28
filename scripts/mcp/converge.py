@@ -14,6 +14,7 @@ from .render import is_managed_or_legacy, rendered_name
 
 IDENTITY_PATH = "/etc/boxa/identity.json"
 STATE_VERSION = 1
+MAX_CONVERGE_ATTEMPTS = 3
 
 
 @dataclass
@@ -122,15 +123,54 @@ def _desired_definitions(
     return definitions
 
 
-def _read_mcp_document(project: str) -> tuple[str, dict[str, Any]]:
-    path = activation.claude_config_path(project)
+def _read_bytes(path: str) -> bytes | None:
     try:
-        with open(path, encoding="utf-8") as fh:
-            existing = fh.read()
-        data = json.loads(existing)
+        with open(path, "rb") as fh:
+            return fh.read()
     except FileNotFoundError:
-        return "", {}
-    except (OSError, UnicodeError, ValueError) as exc:
+        return None
+    except OSError as exc:
+        raise activation.ActivationError(
+            f"cannot read rendered file {path}: {exc}"
+        ) from exc
+
+
+def _read_snapshot_bytes(path: str | None) -> bytes:
+    resolved_path = path or trusted.runtime_snapshot_path()
+    try:
+        info = os.lstat(resolved_path)
+        if not stat.S_ISREG(info.st_mode):
+            raise trusted.TrustedAuthorizationError(
+                f"MCP runtime snapshot is not a regular file: {resolved_path}"
+            )
+        with open(resolved_path, "rb") as fh:
+            return fh.read()
+    except trusted.TrustedAuthorizationError:
+        raise
+    except OSError as exc:
+        raise trusted.TrustedAuthorizationError(
+            f"cannot read host-owned MCP runtime snapshot: {exc}"
+        ) from exc
+
+
+def _read_runtime_snapshot(
+    path: str | None,
+) -> tuple[bytes, dict[str, Any]]:
+    raw = _read_snapshot_bytes(path)
+    return raw, trusted.parse_runtime_snapshot(raw)
+
+
+def _read_mcp_document(
+    project: str,
+) -> tuple[bytes | None, str, dict[str, Any]]:
+    path = activation.claude_config_path(project)
+    raw = _read_bytes(path)
+    if raw is None:
+        return None, "", {}
+    try:
+        existing = raw.decode("utf-8")
+        data = json.loads(existing)
+    except (UnicodeError, ValueError) as exc:
         raise activation.ActivationError(
             f"cannot read Claude MCP config {path}: {exc}"
         ) from exc
@@ -143,7 +183,7 @@ def _read_mcp_document(project: str) -> tuple[str, dict[str, Any]]:
         raise activation.ActivationError(
             f"Claude MCP config mcpServers is not an object: {path}"
         )
-    return existing, data
+    return raw, existing, data
 
 
 def _state_names(state: dict[str, Any], field: str, project: str) -> set[str]:
@@ -154,20 +194,29 @@ def _state_names(state: dict[str, Any], field: str, project: str) -> set[str]:
     return {name for name in names if isinstance(name, str)}
 
 
-def _settings_status(project: str) -> tuple[bool, set[str]]:
+def _settings_status(
+    project: str,
+) -> tuple[bytes | None, bool, str, set[str]]:
+    path = activation.claude_settings_path(project)
+    raw = _read_bytes(path)
+    if raw is None:
+        return None, False, "", set()
     try:
-        with open(activation.claude_settings_path(project), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return False, set()
-    except (OSError, UnicodeError, ValueError):
-        return True, set()
+        existing = raw.decode("utf-8")
+        data = json.loads(existing)
+    except (UnicodeError, ValueError):
+        return raw, True, raw.decode("utf-8", errors="replace"), set()
     if not isinstance(data, dict):
-        return True, set()
+        return raw, True, existing, set()
     names = data.get("disabledMcpjsonServers", [])
     if not isinstance(names, list):
-        return True, set()
-    return True, {name for name in names if isinstance(name, str)}
+        return raw, True, existing, set()
+    return (
+        raw,
+        True,
+        existing,
+        {name for name in names if isinstance(name, str)},
+    )
 
 
 def _set_project_names(
@@ -183,15 +232,19 @@ def _set_project_names(
         records.pop(project, None)
 
 
-def _ensure_excluded_after_change(project: str, desired: set[str]) -> None:
+def _exclude_after_change_plan(
+    project: str,
+    desired: set[str],
+) -> tuple[str, str] | None:
     if not desired:
-        return
+        return None
     git_paths = activation._claude_git_paths(project)
     if git_paths is None:
-        return
+        return None
     relative, exclude_path, _path = git_paths
     if not activation._codex_is_tracked(project, relative):
-        activation._ensure_local_exclude(exclude_path, relative)
+        return exclude_path, relative
+    return None
 
 
 def _skipped(reason: str, project: str | None = None) -> list[ConvergeResult]:
@@ -220,119 +273,195 @@ def converge(
     if not os.path.isdir(resolved):
         return _skipped("Project directory does not exist", resolved)
 
-    try:
-        snapshot = trusted.load_runtime_snapshot(snapshot_path)
-        definitions = _desired_definitions(snapshot, resolved)
-    except (trusted.TrustedAuthorizationError, OSError) as exc:
-        return _skipped(str(exc), resolved)
-
-    state, state_existing = _load_state()
-    desired = set(definitions)
-    previously_owned = _state_names(state, "projects", resolved)
-    previously_seeded = _state_names(state, "seeded", resolved)
-    existing, data = _read_mcp_document(resolved)
-    block = data.get("mcpServers")
-    if block is None:
-        block = {}
-
-    added: list[str] = []
-    removed: list[str] = []
-    repaired: list[str] = []
-    for name, definition in definitions.items():
-        if name not in block:
-            block[name] = definition
-            added.append(name)
-        elif block[name] != definition:
-            block[name] = definition
-            repaired.append(name)
-
-    for name, definition in list(block.items()):
-        boxa_command = (
-            isinstance(definition, dict)
-            and definition.get("command") == "boxa-mcp-run"
-        )
-        owned = name in previously_owned or (
-            is_managed_or_legacy(name) and boxa_command
-        )
-        if owned and name not in desired:
-            del block[name]
-            removed.append(name)
-
-    rendered = activation._render_mcp_json(
-        existing,
-        definitions,
-        set(removed),
-    ) or activation._json_document({})
-    mcp_changed = bool(added or removed or repaired)
-    tracked_mcp_json = snapshot.get("trackedMcpJson", {})
-    if (
-        mcp_changed
-        and activation._codex_is_tracked(resolved, ".mcp.json")
-        and tracked_mcp_json.get(resolved) is not True
-    ):
-        return _skipped(
-            "tracked Claude MCP config "
-            f"{activation.claude_config_path(resolved)} requires durable consent; "
-            "authorize it with "
-            "boxa mcp activate ... --allow-tracked-mcp-json",
-            resolved,
-        )
-
-    settings_exists, disabled_names = _settings_status(resolved)
-    disabled = disabled_names & desired
-    planning_state = json.loads(json.dumps(state))
-    # A missing approval document is repairable drift. Once it exists, the
-    # one-time marker protects removals from enabled and explicit rejections.
-    protected_seeded = (previously_seeded if settings_exists else set()) | disabled
-    _set_project_names(
-        planning_state, "seeded", resolved, protected_seeded
-    )
-    settings_plan = activation._claude_settings_plan(
-        resolved,
-        sorted(desired),
-        planning_state,
-        retire=previously_seeded - desired,
-    )
-    approval_changed = settings_plan is not None
-    seeded: list[str] = []
-    if settings_plan is not None:
-        settings_path, settings_existing, settings_rendered = settings_plan
+    for _attempt in range(MAX_CONVERGE_ATTEMPTS):
         try:
-            before = json.loads(settings_existing) if settings_existing else {}
-            after = json.loads(settings_rendered)
-            before_enabled = set(before.get("enabledMcpjsonServers", []))
-            after_enabled = set(after.get("enabledMcpjsonServers", []))
-            seeded = sorted((after_enabled - before_enabled) & desired)
-        except (AttributeError, TypeError, ValueError):
-            seeded = []
+            snapshot_raw, snapshot = _read_runtime_snapshot(snapshot_path)
+            definitions = _desired_definitions(snapshot, resolved)
+        except (trusted.TrustedAuthorizationError, OSError) as exc:
+            return _skipped(str(exc), resolved)
 
-    _set_project_names(state, "projects", resolved, desired)
-    _set_project_names(state, "seeded", resolved, desired)
-    state_rendered = activation._json_document(state)
-    state_changed = state_rendered != state_existing
+        try:
+            state, state_existing = _load_state()
+            desired = set(definitions)
+            previously_owned = _state_names(state, "projects", resolved)
+            previously_seeded = _state_names(state, "seeded", resolved)
+            mcp_preimage, existing, data = _read_mcp_document(resolved)
+            block = data.get("mcpServers")
+            if block is None:
+                block = {}
 
-    if mcp_changed:
-        activation._atomic_text(activation.claude_config_path(resolved), rendered)
-    if settings_plan is not None:
-        settings_path, settings_existing, settings_rendered = settings_plan
-        if settings_rendered != settings_existing:
-            activation._atomic_text(settings_path, settings_rendered)
-    if state_changed:
-        activation._atomic_text(state_path(), state_rendered)
-        os.chmod(state_path(), stat.S_IRUSR | stat.S_IWUSR)
+            added: list[str] = []
+            removed: list[str] = []
+            repaired: list[str] = []
+            for name, definition in definitions.items():
+                if name not in block:
+                    block[name] = definition
+                    added.append(name)
+                elif block[name] != definition:
+                    block[name] = definition
+                    repaired.append(name)
 
-    changed = mcp_changed or approval_changed or state_changed
-    if changed:
-        _ensure_excluded_after_change(resolved, desired)
-    return [
-        ConvergeResult(
-            status="converged" if changed else "in-sync",
-            reason=None,
-            project=resolved,
-            added=sorted(added),
-            removed=sorted(removed),
-            repaired=sorted(repaired),
-            seeded=seeded,
-            approval_changed=approval_changed,
-        )
-    ]
+            for name, definition in list(block.items()):
+                boxa_command = (
+                    isinstance(definition, dict)
+                    and definition.get("command") == "boxa-mcp-run"
+                )
+                owned = name in previously_owned or (
+                    is_managed_or_legacy(name) and boxa_command
+                )
+                if owned and name not in desired:
+                    del block[name]
+                    removed.append(name)
+
+            rendered = activation._render_mcp_json(
+                existing,
+                definitions,
+                set(removed),
+            ) or activation._json_document({})
+            mcp_changed = bool(added or removed or repaired)
+            tracked_mcp_json = snapshot.get("trackedMcpJson", {})
+            git_paths = (
+                activation._claude_git_paths(resolved)
+                if mcp_changed else None
+            )
+            mcp_tracked = (
+                git_paths is not None
+                and activation._codex_is_tracked(resolved, git_paths[0])
+            )
+            if (
+                mcp_changed
+                and mcp_tracked
+                and tracked_mcp_json.get(resolved) is not True
+            ):
+                return _skipped(
+                    "tracked Claude MCP config "
+                    f"{activation.claude_config_path(resolved)} requires "
+                    "durable consent; authorize it with "
+                    "boxa mcp activate ... --allow-tracked-mcp-json",
+                    resolved,
+                )
+
+            (
+                settings_preimage,
+                settings_exists,
+                settings_existing,
+                disabled_names,
+            ) = _settings_status(resolved)
+            disabled = disabled_names & desired
+            planning_state = json.loads(json.dumps(state))
+            # A missing approval document is repairable drift. Once it exists,
+            # the one-time marker protects removals from enabled and explicit
+            # rejections.
+            protected_seeded = (
+                previously_seeded if settings_exists else set()
+            ) | disabled
+            _set_project_names(
+                planning_state, "seeded", resolved, protected_seeded
+            )
+            settings_plan = activation._claude_settings_plan(
+                resolved,
+                sorted(desired),
+                planning_state,
+                retire=previously_seeded - desired,
+                existing_document=(settings_exists, settings_existing),
+            )
+            approval_changed = settings_plan is not None
+            seeded: list[str] = []
+            if settings_plan is not None:
+                (
+                    settings_path,
+                    settings_existing,
+                    settings_rendered,
+                ) = settings_plan
+                try:
+                    before = (
+                        json.loads(settings_existing)
+                        if settings_existing else {}
+                    )
+                    after = json.loads(settings_rendered)
+                    before_enabled = set(
+                        before.get("enabledMcpjsonServers", [])
+                    )
+                    after_enabled = set(
+                        after.get("enabledMcpjsonServers", [])
+                    )
+                    seeded = sorted(
+                        (after_enabled - before_enabled) & desired
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    seeded = []
+
+            _set_project_names(state, "projects", resolved, desired)
+            _set_project_names(state, "seeded", resolved, desired)
+            state_rendered = activation._json_document(state)
+            state_changed = state_rendered != state_existing
+            changed = mcp_changed or approval_changed or state_changed
+            exclude_plan = (
+                _exclude_after_change_plan(resolved, desired)
+                if changed else None
+            )
+
+            current_snapshot_raw = _read_snapshot_bytes(snapshot_path)
+            if current_snapshot_raw != snapshot_raw:
+                continue
+
+            mcp_path = activation.claude_config_path(resolved)
+            settings_path = activation.claude_settings_path(resolved)
+            concurrent_paths = []
+            if _read_bytes(mcp_path) != mcp_preimage:
+                concurrent_paths.append(mcp_path)
+            if _read_bytes(settings_path) != settings_preimage:
+                concurrent_paths.append(settings_path)
+            if concurrent_paths:
+                return _skipped(
+                    "concurrent write to the rendered file was detected for "
+                    + ", ".join(concurrent_paths)
+                    + "; the next convergence will repair it",
+                    resolved,
+                )
+
+            if mcp_changed:
+                activation._atomic_text(mcp_path, rendered)
+            if settings_plan is not None:
+                (
+                    settings_path,
+                    settings_existing,
+                    settings_rendered,
+                ) = settings_plan
+                if settings_rendered != settings_existing:
+                    activation._atomic_text(
+                        settings_path, settings_rendered
+                    )
+            if state_changed:
+                activation._atomic_text(state_path(), state_rendered)
+                os.chmod(state_path(), stat.S_IRUSR | stat.S_IWUSR)
+            if exclude_plan is not None:
+                exclude_path, relative = exclude_plan
+                activation._ensure_local_exclude(exclude_path, relative)
+
+            if _read_snapshot_bytes(snapshot_path) != snapshot_raw:
+                continue
+        except (
+            activation.ActivationError,
+            trusted.TrustedAuthorizationError,
+        ) as exc:
+            return _skipped(str(exc), resolved)
+
+        return [
+            ConvergeResult(
+                status="converged" if changed else "in-sync",
+                reason=None,
+                project=resolved,
+                added=sorted(added),
+                removed=sorted(removed),
+                repaired=sorted(repaired),
+                seeded=seeded,
+                approval_changed=approval_changed,
+            )
+        ]
+
+    return _skipped(
+        "MCP runtime snapshot kept changing during convergence; "
+        "the next convergence will retry",
+        resolved,
+    )

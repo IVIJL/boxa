@@ -52,11 +52,22 @@ def load_runtime_snapshot(path: Optional[str] = None) -> dict[str, Any]:
             raise TrustedAuthorizationError(
                 f"MCP runtime snapshot is not a regular file: {path}"
             )
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
+        with open(path, "rb") as fh:
+            raw = fh.read()
     except TrustedAuthorizationError:
         raise
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
+        raise TrustedAuthorizationError(
+            f"cannot read host-owned MCP runtime snapshot: {exc}"
+        ) from exc
+    return parse_runtime_snapshot(raw)
+
+
+def parse_runtime_snapshot(raw: bytes) -> dict[str, Any]:
+    """Validate the exact runtime snapshot bytes used by a consumer."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
         raise TrustedAuthorizationError(
             f"cannot read host-owned MCP runtime snapshot: {exc}"
         ) from exc
