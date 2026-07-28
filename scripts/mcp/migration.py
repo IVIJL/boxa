@@ -19,12 +19,13 @@ from .catalog import (
     runtime_kind,
     save_catalog,
 )
+from . import casfile
 from .profile import PROFILE_VERSION, config_root, global_profile_path, load_profile
 from .providers.claude import render_target_path
 from .providers.codex import default_config_path as codex_global_config_path
 from .render import WRAPPER_COMMAND, build_render_plan, is_managed_or_legacy
 from .secrets import load_secrets, project_secrets_path, save_secrets
-from .writer import _atomic_write, _strip_boxa_tables
+from .writer import _strip_boxa_tables, _swap_write
 
 
 MIGRATION_VERSION = 1
@@ -271,6 +272,7 @@ def _remove_legacy_claude_entries() -> None:
     data = _load_legacy_claude_config()
     if data is None:
         return
+    existing = casfile.read_bytes(path)
     changed = False
     block = data.get("mcpServers")
     if isinstance(block, dict):
@@ -301,9 +303,10 @@ def _remove_legacy_claude_entries() -> None:
                         record["disabledMcpServers"] = retained_disabled
                         changed = True
     # Claude Code owns this file. Rewriting it when nothing was removed would
-    # reformat foreign content for no reason, so only write on a real removal.
+    # reformat foreign content for no reason, so only write on a real removal —
+    # and only while the bytes this purge was derived from still hold.
     if changed:
-        activation._atomic_json(path, data, 0o600)
+        casfile.swap_json(path, existing, data, 0o600)
 
 
 def _remove_legacy_global_codex_entries() -> None:
@@ -315,7 +318,7 @@ def _remove_legacy_global_codex_entries() -> None:
         return
     stripped = _strip_boxa_tables(existing)
     if stripped != existing:
-        _atomic_write(path, stripped)
+        _swap_write(path, existing, stripped)
 
 
 def _render_target_retired() -> bool:
@@ -358,18 +361,31 @@ def _batch_consent(
     )
 
 
-def _claude_transaction_paths(claude_projects: list[str]) -> list[str]:
-    paths: list[str] = []
-    for project in claude_projects:
-        paths.append(activation.claude_config_path(project))
-        paths.append(activation.claude_settings_path(project))
-        if not activation._project_directory_exists(project):
-            continue
-        git_paths = activation._claude_git_paths(project)
-        if git_paths is not None:
-            _relative, exclude, _claude = git_paths
-            paths.append(exclude)
-    return paths
+def _compensate(
+    txn: casfile.Transaction, label: str, exc: BaseException
+) -> None:
+    """Take back a failed migration batch and report why it failed.
+
+    Restores only paths whose bytes are still Boxa's own, so a foreign edit
+    made after Boxa's write is reported rather than erased. Always raises.
+    """
+    errors, concurrent = txn.rollback()
+    problems = list(errors)
+    if concurrent:
+        problems.append(
+            "concurrent writes left in place for " + ", ".join(concurrent)
+        )
+    if problems:
+        raise MigrationError(
+            f"{label} failed and rollback was incomplete: "
+            + "; ".join(problems)
+        ) from exc
+    if isinstance(exc, casfile.ConcurrentModification):
+        raise MigrationError(
+            f"{label} refused: {exc.path} changed on disk while Boxa was "
+            "rendering it; nothing was written — re-run the command"
+        ) from exc
+    raise exc
 
 
 def _preflight_claude_batch(
@@ -417,35 +433,21 @@ def _upgrade_claude_render_target(*, allow_tracked_mcp_json: bool = False) -> bo
     _preflight_claude_batch(
         catalog, activations, state, consented, claude_projects
     )
-    paths = [
-        render_target_path(),
-        activation.render_state_path(),
-        activation.runtime_path(),
-        render_target_marker_path(),
-        *_claude_transaction_paths(claude_projects),
-    ]
-    snapshots = [activation._snapshot_file(path) for path in dict.fromkeys(paths)]
-    try:
-        _remove_legacy_claude_entries()
-        activation.render_claude_activations(activations, consented=consented)
-        # The render records the seeded approval set, so publish the runtime
-        # snapshot only after it: convergence must not read a snapshot that
-        # still omits a name Boxa has already seeded.
-        activation.refresh_runtime(activations)
-        _write_render_target_marker()
-    except Exception:
-        errors: list[str] = []
-        for snapshot in reversed(snapshots):
-            try:
-                activation._restore_file(snapshot)
-            except OSError as exc:
-                errors.append(f"{snapshot.path}: {exc}")
-        if errors:
-            raise MigrationError(
-                "Claude render-target retirement failed and rollback was "
-                "incomplete: " + "; ".join(errors)
+    # Every write below journals into this batch, so compensation restores
+    # exactly the bytes Boxa wrote and never a foreign edit made since.
+    with casfile.transaction() as txn:
+        try:
+            _remove_legacy_claude_entries()
+            activation.render_claude_activations(
+                activations, consented=consented
             )
-        raise
+            # The render records the seeded approval set, so publish the
+            # runtime snapshot only after it: convergence must not read a
+            # snapshot that still omits a name Boxa has already seeded.
+            activation.refresh_runtime(activations)
+            _write_render_target_marker()
+        except Exception as exc:
+            _compensate(txn, "Claude render-target retirement", exc)
     return True
 
 
@@ -575,19 +577,8 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
             "legacyRetained": True,
             "definitions": audit,
         }
-        paths = [
-            activation.catalog_path(), activation.activation_path(), activation.runtime_path(),
-            render_target_path(), activation.render_state_path(), migration_path(),
-            render_target_marker_path(),
-            codex_global_config_path(),
-            *secret_updates,
-        ]
-        for project in sorted(codex_projects):
-            _relative, exclude, codex = activation._codex_git_paths(project)
-            paths.extend((exclude, codex))
         state = activation._load_render_state()
         claude_projects = activation._claude_render_projects(activations, state)
-        paths.extend(_claude_transaction_paths(claude_projects))
         # Migration is a lifecycle write like any other: it may not touch a
         # tracked .mcp.json or .claude/settings.local.json without consent.
         # It has no single explicitly mutated Project, so — as for a
@@ -599,42 +590,36 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
         _preflight_claude_batch(
             catalog, activations, state, consented, claude_projects
         )
-        snapshots = [activation._snapshot_file(path) for path in dict.fromkeys(paths)]
-        try:
-            # A crash can bypass compensating rollback. Publish the secret-free
-            # plan first so retry retains the original rendered-consumer facts
-            # and chosen conflict identities even after partial config writes.
-            activation._atomic_json(migration_path(), manifest, 0o600)
-            save_catalog(catalog)
-            for path, store in secret_updates.items():
-                save_secrets(path, store)
-            activation.save_activation_store(activations)
-            _remove_legacy_claude_entries()
-            _remove_legacy_global_codex_entries()
-            activation.render_claude_activations(
-                activations, consented=consented
-            )
-            for project in sorted(codex_projects):
-                activation._render_codex_activation(activations, project, allow_tracked=True)
-            # The Claude render is what records the seeded approval set, so the
-            # runtime snapshot is published only after it. Publishing earlier
-            # would ship a snapshot without `seededApprovals`, and convergence
-            # would then treat an already-seeded name as new and re-enable a
-            # server the user had removed from the Project approval settings.
-            activation.refresh_runtime(activations)
-            _write_render_target_marker()
-            manifest["status"] = "complete"
-            activation._atomic_json(migration_path(), manifest, 0o600)
-        except Exception:
-            errors: list[str] = []
-            for snapshot in reversed(snapshots):
-                try:
-                    activation._restore_file(snapshot)
-                except OSError as exc:
-                    errors.append(f"{snapshot.path}: {exc}")
-            if errors:
-                raise MigrationError("migration failed and rollback was incomplete: " + "; ".join(errors))
-            raise
+        # Every store, render and marker write below journals into this
+        # batch, so compensation is derived from what Boxa actually wrote.
+        with casfile.transaction() as txn:
+            try:
+                # A crash can bypass compensating rollback. Publish the secret-free
+                # plan first so retry retains the original rendered-consumer facts
+                # and chosen conflict identities even after partial config writes.
+                activation._atomic_json(migration_path(), manifest, 0o600)
+                save_catalog(catalog)
+                for path, store in secret_updates.items():
+                    save_secrets(path, store)
+                activation.save_activation_store(activations)
+                _remove_legacy_claude_entries()
+                _remove_legacy_global_codex_entries()
+                activation.render_claude_activations(
+                    activations, consented=consented
+                )
+                for project in sorted(codex_projects):
+                    activation._render_codex_activation(activations, project, allow_tracked=True)
+                # The Claude render is what records the seeded approval set, so the
+                # runtime snapshot is published only after it. Publishing earlier
+                # would ship a snapshot without `seededApprovals`, and convergence
+                # would then treat an already-seeded name as new and re-enable a
+                # server the user had removed from the Project approval settings.
+                activation.refresh_runtime(activations)
+                _write_render_target_marker()
+                manifest["status"] = "complete"
+                activation._atomic_json(migration_path(), manifest, 0o600)
+            except Exception as exc:
+                _compensate(txn, "migration", exc)
         result = dict(manifest)
         result["changed"] = True
         return result

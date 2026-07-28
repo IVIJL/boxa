@@ -9,7 +9,7 @@ import stat
 from dataclasses import dataclass
 from typing import Any
 
-from . import activation, trusted
+from . import activation, casfile, trusted
 from .catalog import MUTATION_MARKER_NAME
 from .render import is_managed_or_legacy, rendered_name
 
@@ -19,12 +19,10 @@ STATE_VERSION = 1
 MAX_CONVERGE_ATTEMPTS = 3
 
 
-class _ConcurrentRender(Exception):
-    """A rendered file changed between planning and the commit write."""
-
-    def __init__(self, path: str) -> None:
-        super().__init__(path)
-        self.path = path
+# A rendered file changed between planning and the commit write. Raised by the
+# shared compare-and-swap primitive, so host renders and convergence report the
+# very same condition.
+_ConcurrentRender = casfile.ConcurrentModification
 
 
 class _SnapshotChanged(Exception):
@@ -154,30 +152,25 @@ def _desired_definitions(
 
 def _read_bytes(path: str) -> bytes | None:
     try:
-        with open(path, "rb") as fh:
-            return fh.read()
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
+        return casfile.read_bytes(path)
+    except casfile.WriteError as exc:
         raise activation.ActivationError(
             f"cannot read rendered file {path}: {exc}"
         ) from exc
 
 
-def _rollback_written_files(
-    written_files: list[tuple[activation._FileSnapshot, bytes | None]],
-) -> tuple[list[str], list[str]]:
-    rollback_errors: list[str] = []
-    concurrent_paths: list[str] = []
-    for preimage, postimage in reversed(written_files):
-        if _read_bytes(preimage.path) != postimage:
-            concurrent_paths.append(preimage.path)
-            continue
-        try:
-            activation._restore_file(preimage)
-        except OSError as exc:
-            rollback_errors.append(f"{preimage.path}: {exc}")
-    return rollback_errors, concurrent_paths
+def _swap(path: str, expected: bytes | None, text: str) -> None:
+    """Compare-and-swap a rendered file, journalled into the open batch.
+
+    The write goes through ``activation._atomic_text`` so convergence and the
+    host render share one writer (and one injection point in tests).
+    """
+    casfile.swap(
+        path,
+        expected,
+        text,
+        writer=lambda target, payload: activation._atomic_text(target, payload),
+    )
 
 
 def _read_snapshot_bytes(path: str | None) -> bytes:
@@ -618,115 +611,82 @@ def converge(
                     resolved,
                 )
 
-            # Every write below is compensated as one set: any later failure,
+            # Every write below goes through the shared compare-and-swap
+            # primitive and is journalled as one set: any later failure,
             # concurrent edit, snapshot republication or host mutation window
-            # restores the accumulated pre-images, so the Project is never
-            # left half-converged.
-            written_files: list[
-                tuple[activation._FileSnapshot, bytes | None]
-            ] = []
-            try:
-                if mcp_changed:
-                    preimage = activation._snapshot_file(mcp_path)
-                    if (
-                        preimage.data if preimage.existed else None
-                    ) != mcp_preimage:
-                        raise _ConcurrentRender(mcp_path)
-                    activation._atomic_text(mcp_path, rendered)
-                    postimage = _read_bytes(mcp_path)
-                    if postimage != (
-                        preimage.data if preimage.existed else None
-                    ):
-                        written_files.append((preimage, postimage))
-                if settings_plan is not None:
-                    (
-                        settings_path,
-                        settings_existing,
-                        settings_rendered,
-                    ) = settings_plan
-                    if settings_rendered != settings_existing:
-                        preimage = activation._snapshot_file(settings_path)
-                        if (
-                            preimage.data if preimage.existed else None
-                        ) != settings_preimage:
-                            raise _ConcurrentRender(settings_path)
-                        activation._atomic_text(
-                            settings_path, settings_rendered
+            # takes back exactly the bytes Boxa wrote, so the Project is never
+            # left half-converged — and never loses a foreign edit.
+            with casfile.transaction() as txn:
+                try:
+                    if mcp_changed:
+                        _swap(mcp_path, mcp_preimage, rendered)
+                    if settings_plan is not None:
+                        (
+                            settings_path,
+                            settings_existing,
+                            settings_rendered,
+                        ) = settings_plan
+                        if settings_rendered != settings_existing:
+                            _swap(
+                                settings_path,
+                                settings_preimage,
+                                settings_rendered,
+                            )
+                    if state_changed:
+                        convergence_state_path = state_path()
+                        _swap(
+                            convergence_state_path,
+                            state_existing.encode("utf-8"),
+                            state_rendered,
                         )
-                        postimage = _read_bytes(settings_path)
-                        if postimage != (
-                            preimage.data if preimage.existed else None
-                        ):
-                            written_files.append((preimage, postimage))
-                if state_changed:
-                    convergence_state_path = state_path()
-                    preimage = activation._snapshot_file(
-                        convergence_state_path
-                    )
-                    activation._atomic_text(
-                        convergence_state_path, state_rendered
-                    )
-                    os.chmod(
-                        convergence_state_path,
-                        stat.S_IRUSR | stat.S_IWUSR,
-                    )
-                    postimage = _read_bytes(convergence_state_path)
-                    if postimage != (
-                        preimage.data if preimage.existed else None
-                    ):
-                        written_files.append((preimage, postimage))
-                for exclude_plan in exclude_plans:
-                    exclude_path, relative = exclude_plan
-                    preimage = activation._snapshot_file(exclude_path)
-                    activation._ensure_local_exclude(exclude_path, relative)
-                    postimage = _read_bytes(exclude_path)
-                    if postimage != (
-                        preimage.data if preimage.existed else None
-                    ):
-                        written_files.append((preimage, postimage))
+                        os.chmod(
+                            convergence_state_path,
+                            stat.S_IRUSR | stat.S_IWUSR,
+                        )
+                    for exclude_plan in exclude_plans:
+                        exclude_path, relative = exclude_plan
+                        activation._ensure_local_exclude(exclude_path, relative)
 
-                # A host mutation that already wrote the Project files but has
-                # not yet republished the snapshot is invisible to the snapshot
-                # comparison alone, so observe its published window first.
-                if _mutation_in_progress(snapshot_path):
-                    raise _HostMutationInProgress()
-                if _read_snapshot_bytes(snapshot_path) != snapshot_raw:
-                    raise _SnapshotChanged()
-            except (
-                _ConcurrentRender,
-                _SnapshotChanged,
-                _HostMutationInProgress,
-                activation.ActivationError,
-                trusted.TrustedAuthorizationError,
-                OSError,
-            ) as exc:
-                if isinstance(exc, _ConcurrentRender):
-                    render_concurrent_paths.add(exc.path)
-                rollback_errors, rollback_concurrent = (
-                    _rollback_written_files(written_files)
-                )
-                if rollback_errors:
-                    return _skipped(
-                        _abort_reason(exc)
-                        + " and rollback was incomplete: "
-                        + "; ".join(rollback_errors),
-                        resolved,
-                    )
-                if rollback_concurrent:
-                    return _skipped(
-                        "concurrent write to the rendered file was detected "
-                        "after convergence writes for "
-                        + ", ".join(reversed(rollback_concurrent))
-                        + "; the next convergence will repair it",
-                        resolved,
-                    )
-                if isinstance(exc, _HostMutationInProgress):
-                    host_mutation_pending = True
-                elif not isinstance(
-                    exc, (_ConcurrentRender, _SnapshotChanged)
-                ):
-                    return _skipped(str(exc), resolved)
-                continue
+                    # A host mutation that already wrote the Project files but has
+                    # not yet republished the snapshot is invisible to the snapshot
+                    # comparison alone, so observe its published window first.
+                    if _mutation_in_progress(snapshot_path):
+                        raise _HostMutationInProgress()
+                    if _read_snapshot_bytes(snapshot_path) != snapshot_raw:
+                        raise _SnapshotChanged()
+                except (
+                    _ConcurrentRender,
+                    _SnapshotChanged,
+                    _HostMutationInProgress,
+                    activation.ActivationError,
+                    trusted.TrustedAuthorizationError,
+                    OSError,
+                ) as exc:
+                    if isinstance(exc, _ConcurrentRender):
+                        render_concurrent_paths.add(exc.path)
+                    rollback_errors, rollback_concurrent = txn.rollback()
+                    if rollback_errors:
+                        return _skipped(
+                            _abort_reason(exc)
+                            + " and rollback was incomplete: "
+                            + "; ".join(rollback_errors),
+                            resolved,
+                        )
+                    if rollback_concurrent:
+                        return _skipped(
+                            "concurrent write to the rendered file was detected "
+                            "after convergence writes for "
+                            + ", ".join(reversed(rollback_concurrent))
+                            + "; the next convergence will repair it",
+                            resolved,
+                        )
+                    if isinstance(exc, _HostMutationInProgress):
+                        host_mutation_pending = True
+                    elif not isinstance(
+                        exc, (_ConcurrentRender, _SnapshotChanged)
+                    ):
+                        return _skipped(str(exc), resolved)
+                    continue
         except (
             activation.ActivationError,
             trusted.TrustedAuthorizationError,

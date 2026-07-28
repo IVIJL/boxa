@@ -18,6 +18,7 @@ import re
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
+from . import casfile
 from .add import AddError, build_candidate, parse_spec
 from .apply import is_applicable, not_applicable_reason
 from .merge import MergedCandidate, compute_import_id
@@ -318,6 +319,14 @@ def save_catalog(catalog: dict[str, Any], path: Optional[str] = None) -> None:
     parent = os.path.dirname(path)
     os.makedirs(parent, mode=_DIR_MODE, exist_ok=True)
     os.chmod(parent, _DIR_MODE)
+    # Journalled (not compare-and-swapped): the catalog is Boxa-private and
+    # serialized by the mutation lock, but a failed batch must still take this
+    # write back exactly.
+    with casfile.record(path):
+        _write_catalog(catalog, path)
+
+
+def _write_catalog(catalog: dict[str, Any], path: str) -> None:
     tmp = f"{path}.tmp-{os.getpid()}"
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE)

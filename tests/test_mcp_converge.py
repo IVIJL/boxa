@@ -18,7 +18,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-from mcp import activation, catalog, cli, converge, trusted  # noqa: E402
+from mcp import activation, casfile, catalog, cli, converge, trusted  # noqa: E402
 from mcp.catalog import CATALOG_VERSION, add_entry, update_entry  # noqa: E402
 
 
@@ -877,7 +877,7 @@ class ConvergeTest(unittest.TestCase):
     def test_render_change_at_write_preimage_is_not_clobbered(self):
         self._write_snapshot(self._desired_records())
         mcp_path = activation.claude_config_path(self.project)
-        original_snapshot = activation._snapshot_file
+        original_snapshot = casfile.snapshot
         concurrent = []
 
         def change_mcp_before_snapshot(path):
@@ -893,8 +893,8 @@ class ConvergeTest(unittest.TestCase):
             return original_snapshot(path)
 
         with mock.patch.object(
-            activation,
-            "_snapshot_file",
+            casfile,
+            "snapshot",
             side_effect=change_mcp_before_snapshot,
         ):
             result = converge.converge(self.project)[0]
@@ -913,7 +913,7 @@ class ConvergeTest(unittest.TestCase):
         original_mcp = b'{"manual":"mcp"}\n'
         with open(mcp_path, "wb") as fh:
             fh.write(original_mcp)
-        original_snapshot = activation._snapshot_file
+        original_snapshot = casfile.snapshot
         concurrent = []
 
         def change_settings_before_snapshot(path):
@@ -930,8 +930,8 @@ class ConvergeTest(unittest.TestCase):
             return original_snapshot(path)
 
         with mock.patch.object(
-            activation,
-            "_snapshot_file",
+            casfile,
+            "snapshot",
             side_effect=change_settings_before_snapshot,
         ):
             result = converge.converge(self.project)[0]
@@ -1085,6 +1085,52 @@ class ConvergeTest(unittest.TestCase):
 
         self.assertEqual(result.status, "skipped")
         self.assertIn("host MCP mutation is in progress", result.reason)
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), original_mcp)
+        self.assertFalse(os.path.exists(converge.state_path()))
+
+    def test_concurrent_exclude_edit_survives_convergence_rollback(self):
+        """P2: rollback takes back only Boxa's own appended ignore rule."""
+        self._init_git()
+        self._write_snapshot(self._desired_records(), tracked_mcp_json={})
+        exclude_path = self._git(
+            "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
+        )
+        os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+        with open(exclude_path, "wb") as fh:
+            fh.write(b"build/\n")
+        mcp_path = activation.claude_config_path(self.project)
+        original_mcp = b'{"manual":"mcp"}\n'
+        with open(mcp_path, "wb") as fh:
+            fh.write(original_mcp)
+        edited = []
+
+        def edit_exclude_then_defer(snapshot_path):
+            with open(exclude_path, "rb") as fh:
+                current = fh.read()
+            if b"/.mcp.json" not in current:
+                # The pre-write probe: let this attempt reach the writes.
+                return False
+            if not edited:
+                edited.append(True)
+                # Another Git process appends its rule after Boxa appended its
+                # own, in the window before this attempt aborts.
+                with open(exclude_path, "ab") as fh:
+                    fh.write(b"secrets.env\n")
+            return True
+
+        with mock.patch.object(
+            converge,
+            "_mutation_in_progress",
+            side_effect=edit_exclude_then_defer,
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("host MCP mutation is in progress", result.reason)
+        self.assertTrue(edited)
+        with open(exclude_path, "rb") as fh:
+            self.assertEqual(fh.read(), b"build/\nsecrets.env\n")
         with open(mcp_path, "rb") as fh:
             self.assertEqual(fh.read(), original_mcp)
         self.assertFalse(os.path.exists(converge.state_path()))

@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from . import casfile
 from .catalog import (
     CatalogError,
     catalog_path,
@@ -173,30 +174,12 @@ def load_activations(path: Optional[str] = None) -> dict[str, Any]:
 
 
 def _atomic_json(path: str, data: dict[str, Any], mode: int) -> None:
-    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
-    tmp = f"{path}.tmp-{os.getpid()}"
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, sort_keys=True)
-            fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
+    """Write a Boxa-private JSON store, journalled for exact compensation."""
+    with casfile.record(path):
+        casfile.atomic_json(path, data, mode)
 
 
-@dataclass(frozen=True)
-class _FileSnapshot:
-    path: str
-    existed: bool
-    data: bytes = b""
-    mode: int = 0
+_FileSnapshot = casfile.FileSnapshot
 
 
 @dataclass(frozen=True)
@@ -214,52 +197,41 @@ class ClaudeRenderStatus:
 
 def _snapshot_file(path: str) -> _FileSnapshot:
     try:
-        info = os.stat(path, follow_symlinks=False)
-    except FileNotFoundError:
-        return _FileSnapshot(path=path, existed=False)
-    if not stat.S_ISREG(info.st_mode):
-        raise ActivationError(f"transaction path is not a regular file: {path}")
-    try:
-        with open(path, "rb") as fh:
-            data = fh.read()
-    except OSError as exc:
-        raise ActivationError(f"cannot snapshot transaction file {path}: {exc}") from exc
-    return _FileSnapshot(
-        path=path,
-        existed=True,
-        data=data,
-        mode=stat.S_IMODE(info.st_mode),
-    )
+        return casfile.snapshot(path)
+    except casfile.WriteError as exc:
+        raise ActivationError(str(exc)) from exc
 
 
 def _restore_file(snapshot: _FileSnapshot) -> None:
     """Restore exact pre-mutation bytes/existence without using render writes."""
-    if not snapshot.existed:
-        try:
-            os.unlink(snapshot.path)
-        except FileNotFoundError:
-            pass
-        return
-    os.makedirs(os.path.dirname(snapshot.path), mode=0o755, exist_ok=True)
-    tmp = f"{snapshot.path}.rollback-{os.getpid()}"
-    try:
-        fd = os.open(
-            tmp,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            snapshot.mode,
+    casfile.restore(snapshot)
+
+
+def _compensate(
+    txn: casfile.Transaction, label: str, exc: BaseException
+) -> None:
+    """Take back a failed batch and report why it failed. Always raises.
+
+    Rollback restores only paths whose bytes are still Boxa's own, so a foreign
+    edit made after Boxa's write is reported rather than erased.
+    """
+    errors, concurrent = txn.rollback()
+    problems = list(errors)
+    if concurrent:
+        problems.append(
+            "concurrent writes left in place for " + ", ".join(concurrent)
         )
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(snapshot.data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, snapshot.mode)
-        os.replace(tmp, snapshot.path)
-        os.chmod(snapshot.path, snapshot.mode)
-    finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
+    if problems:
+        raise ActivationError(
+            f"{label} failed and rollback was incomplete: "
+            + "; ".join(problems)
+        ) from exc
+    if isinstance(exc, casfile.ConcurrentModification):
+        raise ActivationError(
+            f"{label} refused: {exc.path} changed on disk while Boxa was "
+            "rendering it; nothing was written — re-run the command"
+        ) from exc
+    raise exc
 
 
 def _git_output(project: str, *args: str) -> str:
@@ -529,45 +501,34 @@ def _render_codex_activation(
     if rendered != existing:
         if not rendered and not os.path.exists(path):
             return
-        _atomic_text(path, rendered)
+        _swap_text(path, existing, rendered)
     if not tracked and region:
         _ensure_local_exclude(exclude_path, relative)
 
 
 def _atomic_text(path: str, text: str) -> None:
-    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
-    tmp = f"{path}.tmp-{os.getpid()}"
-    try:
-        mode = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
-    except FileNotFoundError:
-        mode = 0o644
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
+    """Low-level atomic replace; render writes must use :func:`_swap_text`."""
+    casfile.atomic_text(path, text)
+
+
+def _swap_text(path: str, expected: str, text: str) -> None:
+    """Replace a rendered file only while it still holds its planned pre-image.
+
+    ``expected`` is the text the render plan was derived from. A foreign edit
+    (Claude Code, the user) that landed since raises
+    ``casfile.ConcurrentModification`` instead of being clobbered.
+    """
+    casfile.swap(
+        path,
+        expected.encode("utf-8"),
+        text,
+        writer=lambda target, payload: _atomic_text(target, payload),
+    )
 
 
 def _ensure_local_exclude(path: str, relative: str) -> None:
-    pattern = "/" + relative
-    try:
-        with open(path, encoding="utf-8", newline="") as fh:
-            existing = fh.read()
-    except FileNotFoundError:
-        existing = ""
-    lines = existing.splitlines()
-    if pattern in lines:
-        return
-    separator = "" if not existing or existing.endswith("\n") else "\n"
-    _atomic_text(path, existing + separator + pattern + "\n")
+    """Append Boxa's ignore rule once; never rewrite Git's shared file."""
+    casfile.append_rule(path, "/" + relative)
 
 
 def _commit_activation_render(
@@ -601,7 +562,6 @@ def _commit_activation_render(
         consented=consented,
     )
     tracked_mcp_json = data.setdefault("trackedMcpJson", {})
-    settings_git_paths_by_project = {}
     for claude_project in _claude_render_projects(data, state):
         if not _project_directory_exists(claude_project):
             if not data["projects"].get(claude_project):
@@ -628,10 +588,6 @@ def _commit_activation_render(
             settings_git_paths = _claude_git_paths(
                 claude_project, path=settings_path
             )
-            if settings_plan is not None:
-                settings_git_paths_by_project[claude_project] = (
-                    settings_git_paths
-                )
             settings_tracked = (
                 settings_git_paths is not None
                 and _codex_is_tracked(
@@ -649,56 +605,22 @@ def _commit_activation_render(
             [project],
             allow_tracked=allow_tracked_codex_config,
         )
-    paths: tuple[str, ...] = (
-        activation_path(),
-        runtime_path(),
-        render_target_path(),
-        render_state_path(),
-    )
-    for claude_project in _claude_render_projects(data, state):
-        paths += (
-            claude_config_path(claude_project),
-            claude_settings_path(claude_project),
-        )
-        if _project_directory_exists(claude_project):
-            git_paths = _claude_git_paths(claude_project)
-            if git_paths is not None:
-                _relative, exclude_path, _path = git_paths
-                paths += (exclude_path,)
-            settings_git_paths = settings_git_paths_by_project.get(
-                claude_project
-            )
-            if settings_git_paths is not None:
-                _relative, exclude_path, _path = settings_git_paths
-                paths += (exclude_path,)
-    if render_codex:
-        _relative, exclude_path, codex_path = _codex_git_paths(project)
-        paths += (codex_path, exclude_path)
-    snapshots = [_snapshot_file(path) for path in paths]
-    try:
-        save_activation_store(data)
-        render_claude_activations(data, consented=consented)
-        if render_codex:
-            _render_codex_activation(
-                data,
-                project,
-                allow_tracked=allow_tracked_codex_config,
-                catalog=catalog,
-            )
-        refresh_runtime(data)
-    except Exception:
-        rollback_errors: list[str] = []
-        for snapshot in reversed(snapshots):
-            try:
-                _restore_file(snapshot)
-            except OSError as exc:
-                rollback_errors.append(f"{snapshot.path}: {exc}")
-        if rollback_errors:
-            raise ActivationError(
-                "MCP activation mutation failed and rollback was incomplete: "
-                + "; ".join(rollback_errors)
-            )
-        raise
+    # Every store and render below writes through the journal, so the batch is
+    # compensated from what Boxa actually wrote — no path list to keep in sync.
+    with casfile.transaction() as txn:
+        try:
+            save_activation_store(data)
+            render_claude_activations(data, consented=consented)
+            if render_codex:
+                _render_codex_activation(
+                    data,
+                    project,
+                    allow_tracked=allow_tracked_codex_config,
+                    catalog=catalog,
+                )
+            refresh_runtime(data)
+        except Exception as exc:
+            _compensate(txn, "MCP activation mutation", exc)
 
 
 def save_activations(data: dict[str, Any]) -> None:
@@ -1304,7 +1226,7 @@ def mirror_claude_decisions(project: str) -> bool:
             f"{path}; grant consent by activating in that Project with "
             "--allow-tracked-mcp-json"
         )
-    _atomic_text(path, rendered)
+    _swap_text(path, existing, rendered)
     if git_paths is not None and not tracked:
         _ensure_local_exclude(exclude_path, relative)
     return True
@@ -1534,7 +1456,9 @@ def _retire_old_claude_render(
                 record["disabledMcpServers"] = retained
                 changed = True
     if changed:
-        _atomic_text(path, _json_document(data))
+        # Claude Code owns this file too, so the purge is a compare-and-swap
+        # against the exact bytes the purge plan was derived from.
+        _swap_text(path, existing, _json_document(data))
 
 
 def _preflight_claude_lifecycle(
@@ -1571,25 +1495,6 @@ def _preflight_claude_lifecycle(
             + "; grant consent by activating in that Project with "
             "--allow-tracked-mcp-json"
         )
-
-
-def _claude_render_transaction_paths(render_projects: Iterable[str]) -> list[str]:
-    """Every file one Claude render batch can write, for exact compensation."""
-    paths = [render_state_path(), render_target_path()]
-    for project in render_projects:
-        paths.append(claude_config_path(project))
-        settings_path = claude_settings_path(project)
-        paths.append(settings_path)
-        if not _project_directory_exists(project):
-            continue
-        for git_paths in (
-            _claude_git_paths(project),
-            _claude_git_paths(project, path=settings_path),
-        ):
-            if git_paths is not None:
-                _relative, exclude_path, _path = git_paths
-                paths.append(exclude_path)
-    return list(dict.fromkeys(paths))
 
 
 def render_claude_activations(
@@ -1646,36 +1551,22 @@ def render_claude_activations(
             settings_tracked,
         )
     # The batch writes several unrelated files that cannot share a rename
-    # transaction, so take exact pre-images and compensate on any failure.
-    # Callers that already wrap this in a wider transaction simply restore the
-    # same bytes twice; a caller that does not (doctor --fix, migration
-    # replans) is no longer left with a half-written render.
-    snapshots = [
-        _snapshot_file(path)
-        for path in _claude_render_transaction_paths(render_projects)
-    ]
-    try:
-        _render_claude_batch(
-            activations,
-            state,
-            plans,
-            settings_plans,
-            scoped=projects is not None,
-            render_projects=render_projects,
-        )
-    except Exception:
-        rollback_errors: list[str] = []
-        for snapshot in reversed(snapshots):
-            try:
-                _restore_file(snapshot)
-            except OSError as exc:
-                rollback_errors.append(f"{snapshot.path}: {exc}")
-        if rollback_errors:
-            raise ActivationError(
-                "Claude render failed and rollback was incomplete: "
-                + "; ".join(rollback_errors)
+    # transaction, so journal every write and compensate on any failure.
+    # Callers that already wrap this in a wider transaction hand their records
+    # up on success; a caller that does not (doctor --fix, migration replans)
+    # is no longer left with a half-written render.
+    with casfile.transaction() as txn:
+        try:
+            _render_claude_batch(
+                activations,
+                state,
+                plans,
+                settings_plans,
+                scoped=projects is not None,
+                render_projects=render_projects,
             )
-        raise
+        except Exception as exc:
+            _compensate(txn, "Claude render", exc)
 
 
 def _render_claude_batch(
@@ -1715,12 +1606,11 @@ def _render_claude_batch(
             continue
         if rendered != existing:
             if rendered:
-                _atomic_text(path, rendered)
+                _swap_text(path, existing, rendered)
             else:
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
+                # Reached only when a non-empty pre-image renders away, so the
+                # pre-image is exact: an emptied file is a concurrent edit.
+                casfile.remove(path, existing.encode("utf-8"))
         if (
             exclude_path is not None
             and relative is not None
@@ -1740,7 +1630,9 @@ def _render_claude_batch(
         if settings_plan is not None:
             settings_path, settings_existing, settings_rendered = settings_plan
             if settings_rendered != settings_existing:
-                _atomic_text(settings_path, settings_rendered)
+                _swap_text(
+                    settings_path, settings_existing, settings_rendered
+                )
                 if settings_git_paths is not None and not settings_tracked:
                     settings_relative, settings_exclude, _path = (
                         settings_git_paths
@@ -1964,40 +1856,6 @@ def _catalog_secret_updates(
     return updates
 
 
-def _catalog_transaction_paths(
-    codex_projects: list[str],
-    claude_projects: list[str],
-    secret_paths: list[str],
-    *,
-    persist_activations: bool,
-    render_consumers: bool,
-) -> list[str]:
-    paths = [
-        catalog_path(),
-        runtime_path(),
-    ]
-    if persist_activations:
-        paths.append(activation_path())
-    if render_consumers:
-        paths.extend(
-            (render_target_path(), render_state_path())
-        )
-    paths.extend(secret_paths)
-    for project in codex_projects:
-        _relative, exclude_path, codex_path = _codex_git_paths(project)
-        paths.extend((codex_path, exclude_path))
-    for project in claude_projects:
-        paths.extend((claude_config_path(project), claude_settings_path(project)))
-        if _project_directory_exists(project):
-            git_paths = _claude_git_paths(project)
-            if git_paths is not None:
-                _relative, exclude_path, _claude_path = git_paths
-                paths.append(exclude_path)
-    # One Project can only appear once today, but preserve one exact pre-image
-    # if future consumer records introduce duplicates.
-    return list(dict.fromkeys(paths))
-
-
 def _preflight_codex_lifecycle(
     catalog: dict[str, Any],
     activations: dict[str, Any],
@@ -2066,50 +1924,30 @@ def _commit_catalog_render(
         codex_projects,
         allow_tracked=allow_tracked_codex_config,
     )
-    snapshots = [
-        _snapshot_file(path)
-        for path in _catalog_transaction_paths(
-            codex_projects,
-            claude_projects,
-            list(secret_updates),
-            persist_activations=persist_activations,
-            render_consumers=render_consumers,
-        )
-    ]
-    try:
-        save_catalog(catalog)
-        for path, store in secret_updates.items():
-            save_secrets(path, store)
-        if persist_activations:
-            save_activation_store(activations)
-        if render_consumers:
-            render_claude_activations(
-                activations, consented=consented
-            )
-            for project in codex_projects:
-                _render_codex_activation(
-                    activations,
-                    project,
-                    allow_tracked=allow_tracked_codex_config,
-                    catalog=catalog,
+    with casfile.transaction() as txn:
+        try:
+            save_catalog(catalog)
+            for path, store in secret_updates.items():
+                save_secrets(path, store)
+            if persist_activations:
+                save_activation_store(activations)
+            if render_consumers:
+                render_claude_activations(
+                    activations, consented=consented
                 )
-        # Broker authority is the final commit point. Until every fallible host
-        # store and consumer render above succeeds, concurrent launches keep
-        # reading the exact old runtime snapshot.
-        refresh_runtime(activations)
-    except Exception:
-        rollback_errors: list[str] = []
-        for snapshot in reversed(snapshots):
-            try:
-                _restore_file(snapshot)
-            except OSError as exc:
-                rollback_errors.append(f"{snapshot.path}: {exc}")
-        if rollback_errors:
-            raise ActivationError(
-                "MCP catalog mutation failed and rollback was incomplete: "
-                + "; ".join(rollback_errors)
-            )
-        raise
+                for project in codex_projects:
+                    _render_codex_activation(
+                        activations,
+                        project,
+                        allow_tracked=allow_tracked_codex_config,
+                        catalog=catalog,
+                    )
+            # Broker authority is the final commit point. Until every fallible
+            # host store and consumer render above succeeds, concurrent
+            # launches keep reading the exact old runtime snapshot.
+            refresh_runtime(activations)
+        except Exception as exc:
+            _compensate(txn, "MCP catalog mutation", exc)
 
 
 def _preflight_replacement(

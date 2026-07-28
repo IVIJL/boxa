@@ -29,6 +29,7 @@ import os
 import stat
 from typing import Any, Optional
 
+from . import casfile
 from .profile import _sanitize_project, config_root, ensure_store_dir
 
 SECRETS_VERSION = 1
@@ -104,6 +105,14 @@ def save_secrets(path: str, store: dict[str, Any]) -> None:
     the dir mode.
     """
     ensure_store_dir(os.path.dirname(path))
+    # Journalled (not compare-and-swapped): Boxa-private and lock-serialized,
+    # but a failed batch must take this write back exactly. The 0600
+    # choreography below is why this cannot use the shared text writer.
+    with casfile.record(path):
+        _write_secrets(path, store)
+
+
+def _write_secrets(path: str, store: dict[str, Any]) -> None:
     tmp = path + ".tmp"
     # Remove any stale temp file first so O_EXCL below always creates a fresh
     # one. A pre-existing temp (from a crashed run or manual creation) could

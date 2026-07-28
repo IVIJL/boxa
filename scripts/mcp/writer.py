@@ -34,6 +34,7 @@ import os
 import re
 from typing import Any
 
+from . import casfile
 from .providers import codex as codex_provider
 from .providers.claude import default_config_path as claude_default_config_path
 from .profile import config_root
@@ -44,6 +45,20 @@ class RenderWriteError(RuntimeError):
     """A render write failure with an actionable message."""
 
 
+def _swap_write(path: str, expected: str, text: str) -> None:
+    """Compare-and-swap a config the agent also owns (ADR 0022).
+
+    Raises ``casfile.ConcurrentModification`` — never clobbers — when the file
+    changed since the bytes this render was derived from.
+    """
+    casfile.swap(
+        path,
+        expected.encode("utf-8"),
+        text,
+        writer=lambda target, payload: _atomic_write(target, payload),
+    )
+
+
 def _atomic_write(path: str, text: str) -> None:
     """Write ``text`` to ``path`` atomically (temp file + replace).
 
@@ -52,10 +67,13 @@ def _atomic_write(path: str, text: str) -> None:
     """
     parent = os.path.dirname(path) or "."
     os.makedirs(parent, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    # Journalled so a failed migration/lifecycle batch takes the legacy render
+    # write back exactly (ADR 0022).
+    with casfile.record(path):
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
 
 
 # -- Claude Code (JSON) -------------------------------------------------------
@@ -186,7 +204,8 @@ def _strip_boxa_from_claude_file(path: str) -> None:
         return
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+            existing = fh.read()
+        data = json.loads(existing)
     except (OSError, ValueError):
         # Never let a stale/unparseable host file break the real render write.
         return
@@ -216,7 +235,9 @@ def _strip_boxa_from_claude_file(path: str) -> None:
                 changed = True
 
     if changed:
-        _atomic_write(path, json.dumps(data, indent=2, sort_keys=False) + "\n")
+        _swap_write(
+            path, existing, json.dumps(data, indent=2, sort_keys=False) + "\n"
+        )
 
 
 def _claude_entry(entry: PlannedEntry) -> dict[str, Any]:
@@ -259,10 +280,12 @@ def write_claude(plan: AgentPlan) -> None:
     """
     path = plan.config_path
     data: dict[str, Any]
+    existing = ""
     if os.path.isfile(path):
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
+                existing = fh.read()
+            data = json.loads(existing)
         except (OSError, ValueError) as exc:
             raise RenderWriteError(
                 f"cannot read Claude Code config to render into: {path}: {exc}"
@@ -327,7 +350,9 @@ def write_claude(plan: AgentPlan) -> None:
     if projects:
         data["projects"] = projects
 
-    _atomic_write(path, json.dumps(data, indent=2, sort_keys=False) + "\n")
+    _swap_write(
+        path, existing, json.dumps(data, indent=2, sort_keys=False) + "\n"
+    )
     _save_claude_render_state(claude_render_state)
 
     # Migration cleanup (ADR 0014): render now targets the Container-visible
@@ -522,7 +547,7 @@ def write_codex(plan: AgentPlan) -> None:
     result = "".join(parts)
     if result and not result.endswith("\n"):
         result += "\n"
-    _atomic_write(path, result)
+    _swap_write(path, existing, result)
 
 
 # -- orchestration ------------------------------------------------------------

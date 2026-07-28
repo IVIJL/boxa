@@ -2019,5 +2019,74 @@ class ActivationTest(unittest.TestCase):
         self.assertEqual(argv, ["/bin/cat"])
 
 
+    def test_concurrent_mcp_json_edit_between_plan_and_write_is_refused(self):
+        """P1: the plan's pre-image is revalidated immediately before the write."""
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+        mcp_path = activation.claude_config_path(self.project)
+        foreign = b'{"mcpServers":{"claude-own":{"command":"fresh"}}}\n'
+        before = None
+
+        def edit_after_plan(state, selected=None):
+            # Runs inside the render batch, after every plan was built.
+            with open(mcp_path, "wb") as fh:
+                fh.write(foreign)
+
+        with mock.patch.object(
+            activation, "_retire_old_claude_render", side_effect=edit_after_plan
+        ):
+            before = self._file_states()
+            with self.assertRaisesRegex(
+                activation.ActivationError, "changed on disk"
+            ):
+                activation.deactivate("echo", self.project)
+
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), foreign)
+        states = dict(self._file_states())
+        del states[mcp_path]
+        expected = dict(before)
+        del expected[mcp_path]
+        self.assertEqual(states, expected)
+        self.assertTrue(
+            next(
+                row for row in activation.effective_catalog(self.project)
+                if row["id"] == self.entry["id"]
+            )["activated"]
+        )
+
+    def test_concurrent_exclude_edit_survives_host_render_rollback(self):
+        """P2: rollback removes only Boxa's own appended ignore rule."""
+        self._init_git()
+        exclude_path = self._git(
+            "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
+        )
+        os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+        with open(exclude_path, "wb") as fh:
+            fh.write(b"build/\n")
+        real_atomic = activation._atomic_json
+
+        def fail_render_state(path, data, mode):
+            if path == activation.render_state_path():
+                # Another Git process appends its own rule in the window
+                # between Boxa's exclude write and this failure.
+                with open(exclude_path, "ab") as fh:
+                    fh.write(b"secrets.env\n")
+                raise OSError("forced render-state write failure")
+            return real_atomic(path, data, mode)
+
+        with mock.patch.object(
+            activation, "_atomic_json", side_effect=fail_render_state
+        ):
+            with self.assertRaisesRegex(OSError, "forced render-state"):
+                activation.activate(
+                    "echo", self.project, ["claude"], ReadyProbe(self.project)
+                )
+
+        with open(exclude_path, "rb") as fh:
+            self.assertEqual(fh.read(), b"build/\nsecrets.env\n")
+
+
 if __name__ == "__main__":
     unittest.main()

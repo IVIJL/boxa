@@ -201,6 +201,46 @@ operational or racing, restores the accumulated pre-images, so a Project is
 never left half-converged. A pre-image whose bytes changed under convergence is
 left alone rather than clobbered, and the skip names it.
 
+### One compare-and-swap primitive for every render write
+
+The stale-plan hazard is not specific to convergence. Boxa renders derived
+state into files it does not own alone: Claude Code writes `.mcp.json` and
+`.claude/settings.local.json`, Git and the user write `.git/info/exclude`. The
+host mutation lock serializes Boxa against Boxa and nothing else, so any plan
+built from a pre-image can be stale by the time it is written, on the host
+render path exactly as inside a Container.
+
+Boxa therefore has exactly one write primitive for these files (`mcp.casfile`),
+and every render, migration and rollback write goes through it:
+
+* **Compare-and-swap.** A write states the exact pre-image its content was
+  derived from — bytes, or "must not exist". The primitive re-reads the file
+  immediately before the atomic replace; on mismatch it writes nothing and
+  raises one distinct *concurrent modification* condition. It never retries by
+  itself: convergence retries from a newer snapshot up to its fixed bound and
+  then reports a skip, while a host lifecycle command aborts the whole batch
+  and names the path, because a host batch is a user-visible transaction, not a
+  background repair.
+* **Journalled compensation.** Writes inside a batch record what Boxa actually
+  wrote (pre-image and post-image). Rollback walks that journal newest-first
+  and restores a path only while its current bytes are still Boxa's own
+  post-image. A foreign edit made after Boxa's write is reported, never erased.
+  Nested batches hand their records to the enclosing batch, so an outer failure
+  still takes back inner writes. Because compensation is derived from the
+  journal rather than from a pre-declared path list, a batch can no longer
+  forget to snapshot a file it writes.
+* **Append-oriented shared files.** `.git/info/exclude` belongs to Git and the
+  user, so Boxa appends its rule once and never rewrites the file wholesale.
+  Compensation removes only Boxa's own appended line and leaves any concurrent
+  edit in place, rather than restoring a whole-file snapshot.
+
+Boxa-private stores that no foreign process writes — the catalog, the
+activation store, the runtime snapshot, the secret stores, the render and
+migration state — are journalled through the same primitive but not
+compare-and-swapped: they are serialized by the mutation lock, and the secret
+store keeps its own `0600`-before-write choreography. They participate in
+compensation exactly like a render write.
+
 A benign not-applicable convergence result, such as no identifiable Container
 Project, a missing Project directory, or a pristine installation where the
 runtime directory is mounted but the host has never published a snapshot,
