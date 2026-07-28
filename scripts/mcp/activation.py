@@ -609,14 +609,50 @@ def _claude_seeded_names(state: dict[str, Any], project: str) -> set[str]:
     return {name for name in names if isinstance(name, str)}
 
 
+def _observed_claude_decisions(project: str) -> tuple[set[str], set[str]]:
+    """Read Claude Code's Project decision without making its config authoritative."""
+    try:
+        with open(render_target_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, UnicodeError, ValueError):
+        return set(), set()
+    if not isinstance(data, dict):
+        return set(), set()
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        return set(), set()
+
+    canonical = canonical_project(project)
+    missing = object()
+    record = projects.get(project, missing)
+    if record is missing:
+        record = projects.get(canonical, missing)
+    if record is missing:
+        for key, candidate in projects.items():
+            if os.path.realpath(key) == canonical:
+                record = candidate
+                break
+    if record is missing:
+        return set(), set()
+    if not isinstance(record, dict):
+        return set(), set()
+
+    enabled = record.get("enabledMcpjsonServers", [])
+    disabled = record.get("disabledMcpjsonServers", [])
+    if not isinstance(enabled, list) or not isinstance(disabled, list):
+        return set(), set()
+    approved = {name for name in enabled if isinstance(name, str)}
+    rejected = {name for name in disabled if isinstance(name, str)}
+    return approved - rejected, rejected
+
+
 def _claude_settings_plan(
     project: str,
     rendered_names: list[str],
     state: dict[str, Any],
 ) -> Optional[tuple[str, str, str]]:
     to_seed = set(rendered_names) - _claude_seeded_names(state, project)
-    if not to_seed:
-        return None
+    approved, rejected = _observed_claude_decisions(project)
 
     path = claude_settings_path(project)
     try:
@@ -649,15 +685,39 @@ def _claude_settings_plan(
         )
 
     new_enabled = list(enabled)
+    new_disabled = list(disabled)
     for name in sorted(to_seed):
         if name not in new_enabled:
             new_enabled.append(name)
+    new_disabled = [name for name in new_disabled if name not in to_seed]
+
+    for name in sorted(approved):
+        if name not in new_enabled:
+            new_enabled.append(name)
+    new_disabled = [name for name in new_disabled if name not in approved]
+
+    new_enabled = [name for name in new_enabled if name not in rejected]
+    for name in sorted(rejected):
+        if name not in new_disabled:
+            new_disabled.append(name)
+
+    changed = new_enabled != enabled or new_disabled != disabled
+    if not changed:
+        return None
     data["enabledMcpjsonServers"] = new_enabled
-    if "disabledMcpjsonServers" in data:
-        data["disabledMcpjsonServers"] = [
-            name for name in disabled if name not in to_seed
-        ]
+    if new_disabled or "disabledMcpjsonServers" in data:
+        data["disabledMcpjsonServers"] = new_disabled
     return path, existing, _json_document(data)
+
+
+def mirror_claude_decisions(project: str) -> bool:
+    """Persist Claude Code's recorded decisions for one arbitrary Project."""
+    plan = _claude_settings_plan(canonical_project(project), [], {})
+    if plan is None:
+        return False
+    path, _existing, rendered = plan
+    _atomic_text(path, rendered)
+    return True
 
 
 def _claude_render_plan(
@@ -742,10 +802,10 @@ def _retire_old_claude_render(state: dict[str, Any]) -> None:
         data = json.loads(existing)
     except FileNotFoundError:
         return
-    except (OSError, ValueError) as exc:
-        raise ActivationError(f"cannot read Claude config {path}: {exc}") from exc
+    except (OSError, UnicodeError, ValueError):
+        return
     if not isinstance(data, dict):
-        raise ActivationError(f"Claude config is not an object: {path}")
+        return
     projects = data.get("projects")
     if not isinstance(projects, dict):
         return
@@ -858,11 +918,12 @@ def render_claude_activations(
             project = os.path.dirname(path)
             new_state[project] = names
             new_seeded[project] = names
-            settings_plan = settings_plans[project]
-            if settings_plan is not None:
-                settings_path, settings_existing, settings_rendered = settings_plan
-                if settings_rendered != settings_existing:
-                    _atomic_text(settings_path, settings_rendered)
+        project = os.path.dirname(path)
+        settings_plan = settings_plans[project]
+        if settings_plan is not None:
+            settings_path, settings_existing, settings_rendered = settings_plan
+            if settings_rendered != settings_existing:
+                _atomic_text(settings_path, settings_rendered)
     _atomic_json(
         render_state_path(),
         {"projects": new_state, "seeded": new_seeded},

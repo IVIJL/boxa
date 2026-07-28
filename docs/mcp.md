@@ -60,7 +60,9 @@ without that authorization.
 For Claude Code, activation also seeds the rendered server name once into
 `.claude/settings.local.json`. Boxa preserves unrelated Project settings and
 does not seed that name again after the user disables it; deactivation retires
-the seed so a later reactivation delivers approval again.
+the seed so a later reactivation delivers approval again. Decisions Claude Code
+records for Project servers, including foreign ones, are mirrored there as
+approval or rejection; unanswered servers remain unanswered.
 
 Deactivation, removal, or a runtime-affecting update re-renders selected
 consumers atomically. Restart/reload an already-running Claude or Codex session

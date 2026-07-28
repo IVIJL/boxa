@@ -115,6 +115,22 @@ class ActivationTest(unittest.TestCase):
         ) as fh:
             return json.load(fh)
 
+    def _write_claude_decisions(self, enabled=None, disabled=None, **record):
+        record["enabledMcpjsonServers"] = enabled or []
+        record["disabledMcpjsonServers"] = disabled or []
+        data = {
+            "theme": "keep",
+            "projects": {
+                self.project: record,
+                "/unrelated/project": {"setting": "keep"},
+            },
+        }
+        path = activation.render_target_path()
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        return path
+
     def test_activate_records_identity_project_and_consumer_only(self):
         result = activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
         self.assertTrue(result.changed)
@@ -264,6 +280,162 @@ class ActivationTest(unittest.TestCase):
             self._claude_settings_data()["enabledMcpjsonServers"],
             ["boxa-echo"],
         )
+
+    def test_unanswered_foreign_claude_server_is_not_mirrored(self):
+        path = activation.claude_config_path(self.project)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"mcpServers": {"foreign": {"command": "foreign"}}},
+                fh,
+            )
+        self._write_claude_decisions()
+
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+
+        settings = self._claude_settings_data()
+        self.assertNotIn("foreign", settings["enabledMcpjsonServers"])
+        self.assertNotIn("foreign", settings.get("disabledMcpjsonServers", []))
+
+    def test_approved_foreign_claude_server_is_mirrored(self):
+        self._write_claude_decisions(enabled=["foreign"])
+
+        self.assertTrue(activation.mirror_claude_decisions(self.project))
+
+        settings = self._claude_settings_data()
+        self.assertEqual(settings["enabledMcpjsonServers"], ["foreign"])
+        self.assertNotIn("disabledMcpjsonServers", settings)
+
+    def test_render_mirrors_decisions_without_boxa_rendered_claude_names(self):
+        data = activation.empty_activations()
+        data["projects"][self.project] = {
+            self.entry["id"]: {
+                "catalogId": self.entry["id"],
+                "consumers": ["codex"],
+                "enabled": True,
+            },
+        }
+        self._write_claude_decisions(enabled=["foreign"])
+
+        activation.render_claude_activations(data)
+
+        self.assertEqual(
+            self._claude_settings_data()["enabledMcpjsonServers"],
+            ["foreign"],
+        )
+
+    def test_rejected_foreign_claude_server_is_mirrored_only_as_disabled(self):
+        self._write_claude_decisions(disabled=["foreign"])
+
+        self.assertTrue(activation.mirror_claude_decisions(self.project))
+
+        settings = self._claude_settings_data()
+        self.assertEqual(settings["disabledMcpjsonServers"], ["foreign"])
+        self.assertNotIn("foreign", settings["enabledMcpjsonServers"])
+
+    def test_contradictory_claude_decision_is_mirrored_as_disabled(self):
+        self._write_claude_decisions(
+            enabled=["foreign"],
+            disabled=["foreign"],
+        )
+
+        activation.mirror_claude_decisions(self.project)
+
+        settings = self._claude_settings_data()
+        self.assertEqual(settings["disabledMcpjsonServers"], ["foreign"])
+        self.assertNotIn("foreign", settings["enabledMcpjsonServers"])
+
+    def test_recorded_rejection_wins_over_seed_on_every_render(self):
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+        self._write_claude_decisions(disabled=["boxa-echo"])
+
+        activation.render_claude_activations()
+        first = self._claude_settings_data()
+        activation.render_claude_activations()
+
+        self.assertEqual(self._claude_settings_data(), first)
+        self.assertEqual(first["disabledMcpjsonServers"], ["boxa-echo"])
+        self.assertNotIn("boxa-echo", first["enabledMcpjsonServers"])
+
+    def test_mirrored_claude_decisions_survive_source_loss(self):
+        data = activation.empty_activations()
+        data["projects"][self.project] = {
+            self.entry["id"]: {
+                "catalogId": self.entry["id"],
+                "consumers": ["codex"],
+                "enabled": True,
+            },
+        }
+        self._write_claude_decisions(
+            enabled=["approved"],
+            disabled=["rejected"],
+        )
+        activation.render_claude_activations(data)
+        expected = self._claude_settings_data()
+        os.unlink(activation.render_target_path())
+
+        activation.render_claude_activations(data)
+
+        self.assertEqual(self._claude_settings_data(), expected)
+
+    def test_claude_decision_mirror_preserves_unrelated_content_and_source(self):
+        settings_path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings_path))
+        original = {
+            "permissions": {"allow": ["Bash(git status:*)"]},
+            "enabledMcpjsonServers": ["manual-enabled"],
+            "disabledMcpjsonServers": ["manual-disabled"],
+        }
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            json.dump(original, fh, indent=2)
+            fh.write("\n")
+        source_path = self._write_claude_decisions(
+            enabled=["foreign-approved"],
+            disabled=["foreign-rejected"],
+        )
+        with open(source_path, "rb") as fh:
+            source_before = fh.read()
+
+        activation.mirror_claude_decisions(self.project)
+
+        settings = self._claude_settings_data()
+        self.assertEqual(settings["permissions"], original["permissions"])
+        self.assertEqual(
+            settings["enabledMcpjsonServers"],
+            ["manual-enabled", "foreign-approved"],
+        )
+        self.assertEqual(
+            settings["disabledMcpjsonServers"],
+            ["manual-disabled", "foreign-rejected"],
+        )
+        with open(source_path, "rb") as fh:
+            self.assertEqual(fh.read(), source_before)
+
+    def test_broken_claude_decision_source_is_ignored(self):
+        data = activation.empty_activations()
+        data["projects"][self.project] = {
+            self.entry["id"]: {
+                "catalogId": self.entry["id"],
+                "consumers": ["codex"],
+                "enabled": True,
+            },
+        }
+        path = activation.render_target_path()
+        malformed_sources = (
+            "{broken",
+            "[]",
+            '{"projects":[]}',
+            json.dumps({"projects": {self.project: {"enabledMcpjsonServers": "foreign"}}}),
+        )
+        for source in malformed_sources:
+            with self.subTest(source=source):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(source)
+
+                activation.render_claude_activations(data)
+
+                self.assertFalse(
+                    os.path.exists(activation.claude_settings_path(self.project))
+                )
 
     def test_deactivate_retires_seed_and_reactivation_seeds_again(self):
         activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
