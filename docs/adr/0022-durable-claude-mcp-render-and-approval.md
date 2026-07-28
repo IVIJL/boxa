@@ -243,18 +243,31 @@ and every render, migration and rollback write goes through it:
 * **Journalled compensation.** Writes inside a batch record what Boxa actually
   wrote (pre-image and post-image). Rollback walks that journal newest-first
   and restores a path only while its current bytes are still Boxa's own
-  post-image. A foreign edit made after Boxa's write is reported, never erased.
-  Nested batches hand their records to the enclosing batch, so an outer failure
-  still takes back inner writes. Because compensation is derived from the
-  journal rather than from a pre-declared path list, a batch can no longer
-  forget to snapshot a file it writes.
+  post-image. That comparison is conditional in exactly the same sense as the
+  forward one: the post-image is re-read inside the restore, after its temporary
+  file is complete and fsynced and immediately before the `os.replace` (or, for
+  a path Boxa created, immediately before the `unlink`), so an edit landing
+  while the rollback prepares its temporary file is refused instead of being
+  overwritten with stale bytes. The residual window is the same and only that:
+  the `replace`/`unlink` syscall itself. A foreign edit made after Boxa's write
+  is reported, never erased — and reported *alongside* the failure that
+  triggered the rollback, which is chained as the cause, so the unrestored path
+  is named without hiding why the batch failed. Nested batches hand their
+  records to the enclosing batch, so an outer failure still takes back inner
+  writes. Because compensation is derived from the journal rather than from a
+  pre-declared path list, a batch can no longer forget to snapshot a file it
+  writes.
 * **Append-oriented shared files.** `.git/info/exclude` belongs to Git and the
   user, so Boxa appends its rule once and never rewrites the file wholesale.
   The rule is written as a single `O_APPEND` write — atomic for a regular file,
   so there is no read-modify-write window in which a Git or user edit could be
   replaced by Boxa's snapshot, and the file keeps its inode and mode.
   Compensation removes only Boxa's own appended line and leaves any concurrent
-  edit in place, rather than restoring a whole-file snapshot.
+  edit in place, rather than restoring a whole-file snapshot. That removal — the
+  rewrite of the remaining lines, or the deletion of a file the append itself
+  created — is conditional on the exact bytes it was computed from, so an edit
+  landing between the undo's read and its write leaves the file untouched and is
+  reported instead.
 
 Boxa-private stores that no foreign process writes — the catalog, the
 activation store, the runtime snapshot, the secret stores, the render and

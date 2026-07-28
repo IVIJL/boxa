@@ -279,6 +279,56 @@ class CasFileTest(unittest.TestCase):
         self.assertIs(casfile.concurrent_conflict(translated), original)
         self.assertIsNone(casfile.concurrent_conflict(RuntimeError("other")))
 
+    def test_rollback_refuses_an_edit_landing_while_it_writes_its_temp_file(self):
+        """The compensation compares the post-image right before its replace."""
+        self._write(b"before\n")
+
+        with casfile.transaction() as txn:
+            casfile.swap(self.path, b"before\n", "after\n")
+            with self._edit_while_the_temp_file_is_written(b"foreign\n"):
+                errors, concurrent = txn.rollback()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(concurrent, [self.path])
+        self.assertEqual(self._read(), b"foreign\n")
+        # Nothing restored and no rollback temp residue left behind.
+        self.assertEqual(os.listdir(self.tmp.name), ["file.json"])
+
+    def test_append_undo_refuses_an_edit_landing_in_the_rewrite_window(self):
+        """Git may rewrite info/exclude while the undo prepares its temp file."""
+        self._write(b"build/\n")
+
+        with casfile.transaction() as txn:
+            casfile.append_rule(self.path, "/.mcp.json")
+            with self._edit_while_the_temp_file_is_written(b"rewritten\n"):
+                errors, concurrent = txn.rollback()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(concurrent, [self.path])
+        self.assertEqual(self._read(), b"rewritten\n")
+        self.assertEqual(os.listdir(self.tmp.name), ["file.json"])
+
+    def test_append_undo_does_not_unlink_a_file_edited_in_the_window(self):
+        """The removal of a file the append created is conditional too."""
+        real_restore = casfile.restore
+
+        def restore_after_a_foreign_edit(entry):
+            # The edit lands after the undo read the file and decided to remove
+            # it, in the instant before the removal itself.
+            self._write(b"git-wrote-this\n")
+            return real_restore(entry)
+
+        with casfile.transaction() as txn:
+            casfile.append_rule(self.path, "/.mcp.json")
+            with mock.patch.object(
+                casfile, "restore", side_effect=restore_after_a_foreign_edit
+            ):
+                errors, concurrent = txn.rollback()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(concurrent, [self.path])
+        self.assertEqual(self._read(), b"git-wrote-this\n")
+
     def test_record_journals_a_bespoke_write(self):
         self._write(b"before\n")
 

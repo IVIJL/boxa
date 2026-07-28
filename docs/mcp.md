@@ -148,12 +148,19 @@ What remains is the rename itself: the filesystem has no compare-and-swap
 rename, so an edit written in the same instant as Boxa's replace can still be
 lost. Everything before that instant is covered.
 
-Rollback is equally careful: it restores a file only while its bytes are still
-the ones Boxa wrote, so an edit made after Boxa's write is reported instead of
-being erased. `.git/info/exclude` is only ever appended to — a single atomic
-append, so a Git or user edit that lands while Boxa is writing survives — and a
-rollback removes just Boxa's own ignore line, leaving concurrent Git or user
-edits untouched.
+Rollback is equally careful, and checks at exactly the same last moment: it
+restores a file only while its bytes are still the ones Boxa wrote, re-read
+after the rollback's temporary file is complete and immediately before the
+replace, so an edit made after Boxa's write — including one landing while the
+rollback is preparing that temporary file — is reported instead of being erased.
+The unrestored path is named together with the failure that triggered the
+rollback, so you still see why the batch failed. The same single instant, the
+replace (or the delete of a file Boxa created), is all that remains uncovered.
+`.git/info/exclude` is only ever appended to — a single atomic append, so a Git
+or user edit that lands while Boxa is writing survives — and a rollback removes
+just Boxa's own ignore line, leaving concurrent Git or user edits untouched; if
+the file changed while the undo was computing that removal, Boxa leaves the file
+alone and reports it rather than deleting or rewriting the newer content.
 
 The convergence command exits `0` after convergence, an in-sync check, or a
 benign nothing-to-do result such as no Container Project. It exits `3` when an

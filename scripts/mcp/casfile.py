@@ -14,13 +14,18 @@ temporary file is being written is caught, not overwritten.
 The same journal that makes the check possible also makes compensation exact:
 :func:`transaction` records what Boxa actually wrote (pre-image + post-image)
 and :meth:`Transaction.rollback` restores a path only while its current bytes
-still equal Boxa's own post-image. A concurrent edit made *after* Boxa's write
-is reported, never overwritten.
+still equal Boxa's own post-image. The compensation path arms that post-image
+the same way, so the comparison is again the last thing before the replace: an
+edit landing while the rollback's temporary file is written is reported as a
+conflict, never overwritten with stale bytes. A rollback conflict is reported
+alongside — never instead of — the failure that triggered the rollback.
 
 ``.git/info/exclude`` is append-oriented and shared with Git, so it is written
 with :func:`append_rule`, which appends through ``O_APPEND`` — no read-modify-
 write window at all — and whose compensation removes only Boxa's own appended
-line and leaves every concurrent edit in place.
+line and leaves every concurrent edit in place; that removal is itself
+conditional on the exact bytes it was computed from, so a Git or user edit
+landing during the undo leaves the file untouched.
 
 An expected pre-image is existence-aware: ``None`` means "the file did not
 exist" and never compares equal to ``b""``, the pre-image of an existing empty
@@ -126,8 +131,16 @@ def snapshot(path: str) -> FileSnapshot:
 
 
 def restore(entry: FileSnapshot) -> None:
-    """Restore exact pre-mutation bytes/existence without a render write."""
+    """Restore exact pre-mutation bytes/existence without a render write.
+
+    Like the atomic writers, this HONOURS a pre-image armed by :func:`_arm`
+    (compensation arms Boxa's own post-image) and checks it as the last thing
+    before the ``unlink``/``os.replace``, so an edit landing while the temporary
+    file is prepared is refused instead of clobbered. Unarmed callers restore
+    unconditionally.
+    """
     if not entry.existed:
+        _verify_armed(entry.path)
         try:
             os.unlink(entry.path)
         except FileNotFoundError:
@@ -142,6 +155,9 @@ def restore(entry: FileSnapshot) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, entry.mode)
+        # Last act before the replace: honour an armed pre-image, so an edit
+        # that landed while this temporary file was written is refused here.
+        _verify_armed(entry.path)
         os.replace(tmp, entry.path)
         os.chmod(entry.path, entry.mode)
     finally:
@@ -338,18 +354,41 @@ def record(path: str) -> Iterator[None]:
 
 
 def undo(entry: WriteRecord) -> bool:
-    """Take back one write. False when a foreign process changed it since."""
+    """Take back one write. False when a foreign process changed it since.
+
+    The post-image is compared twice, exactly as the forward path compares the
+    pre-image: once up front, so a doomed restore never even creates a temporary
+    file, and once inside :func:`restore` immediately before the replace — so an
+    edit landing while the rollback's temporary file is written is reported as a
+    conflict instead of being overwritten with stale bytes.
+    """
     current = read_bytes(entry.path)
     if entry.appended is not None:
         return _undo_append(entry, current)
-    if current != entry.postimage:
+    if _mismatch(current, entry.postimage):
         return False
-    restore(entry.preimage)
+    return _restore_if_unchanged(entry.preimage, entry.postimage)
+
+
+def _restore_if_unchanged(
+    preimage: FileSnapshot, expected: Optional[bytes]
+) -> bool:
+    """Restore ``preimage`` only while the path still holds ``expected``."""
+    try:
+        with _arm(preimage.path, expected):
+            restore(preimage)
+    except ConcurrentModification:
+        return False
     return True
 
 
 def _undo_append(entry: WriteRecord, current: Optional[bytes]) -> bool:
-    """Remove only Boxa's own appended line, preserving concurrent edits."""
+    """Remove only Boxa's own appended line, preserving concurrent edits.
+
+    The rewrite (or the removal of a file the append created) is conditional on
+    exactly the ``current`` bytes the removal was computed from, so an edit made
+    by Git or the user meanwhile is left in place and reported.
+    """
     if current is None:
         return True
     try:
@@ -365,12 +404,14 @@ def _undo_append(entry: WriteRecord, current: Optional[bytes]) -> bool:
         return True
     remainder = "".join(lines)
     if not remainder and not entry.preimage.existed:
-        try:
-            os.unlink(entry.path)
-        except FileNotFoundError:
-            pass
-        return True
-    atomic_text(entry.path, remainder)
+        return _restore_if_unchanged(
+            FileSnapshot(path=entry.path, existed=False), current
+        )
+    try:
+        with _arm(entry.path, current):
+            atomic_text(entry.path, remainder)
+    except ConcurrentModification:
+        return False
     return True
 
 

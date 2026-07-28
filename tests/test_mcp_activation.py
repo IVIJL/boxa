@@ -19,7 +19,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-from mcp import activation, broker, cli as mcp_cli, lifecycle, protocol, trusted  # noqa: E402
+from mcp import activation, broker, casfile, cli as mcp_cli, lifecycle, protocol, trusted  # noqa: E402
 from mcp.catalog import add_entry, update_entry  # noqa: E402
 
 
@@ -2086,6 +2086,25 @@ class ActivationTest(unittest.TestCase):
 
         with open(exclude_path, "rb") as fh:
             self.assertEqual(fh.read(), b"build/\nsecrets.env\n")
+
+    def test_rollback_conflict_does_not_mask_the_original_failure(self):
+        """P2: an unrestored path is named, the batch failure still surfaces."""
+        path = os.path.join(self.tmp.name, "rendered.json")
+        with open(path, "wb") as fh:
+            fh.write(b"before\n")
+        original = OSError("forced render-state write failure")
+
+        with casfile.transaction() as txn:
+            casfile.swap(path, b"before\n", "after\n")
+            with open(path, "wb") as fh:
+                fh.write(b"foreign\n")
+            with self.assertRaises(activation.ActivationError) as caught:
+                activation._compensate(txn, "render", original)
+
+        self.assertIn(path, str(caught.exception))
+        self.assertIs(caught.exception.__cause__, original)
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), b"foreign\n")
 
 
 if __name__ == "__main__":
