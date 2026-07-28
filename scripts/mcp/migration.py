@@ -396,6 +396,8 @@ def migrate_legacy() -> dict[str, Any]:
         for project in activation._claude_render_projects(activations, state):
             paths.append(activation.claude_config_path(project))
             paths.append(activation.claude_settings_path(project))
+            if not activation._project_directory_exists(project):
+                continue
             git_paths = activation._claude_git_paths(project)
             if git_paths is not None:
                 _relative, exclude, _claude = git_paths

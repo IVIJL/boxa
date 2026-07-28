@@ -46,28 +46,54 @@ migrate_enable_all_project_mcp_servers() {
             : > "$marker"
             exit 0
         fi
-        if [ ! -r "$TARGET/settings.json" ] \
-           || ! jq -e . "$TARGET/settings.json" >/dev/null 2>&1; then
-            exit 2
-        fi
+        local attempts_left=3 source="" tmp=""
+        while [ "$attempts_left" -gt 0 ]; do
+            attempts_left=$((attempts_left - 1))
+            source=$(mktemp "$TARGET/settings.json.source.XXXXXX") || exit 3
+            trap '[ -z "${source:-}" ] || rm -f "$source"; [ -z "${tmp:-}" ] || rm -f "$tmp"' EXIT
+            tmp=$(mktemp "$TARGET/settings.json.XXXXXX") || exit 3
+            if ! cp -- "$TARGET/settings.json" "$source" \
+               || ! jq -e . "$source" >/dev/null 2>&1; then
+                exit 2
+            fi
 
-        if jq -e 'type == "object" and has("enableAllProjectMcpServers")' \
-            "$TARGET/settings.json" >/dev/null; then
-            local tmp
-            tmp=$(mktemp "$TARGET/settings.json.XXXXXX")
-            trap 'rm -f "$tmp"' EXIT
-            if ! jq 'del(.enableAllProjectMcpServers)' \
-                "$TARGET/settings.json" > "$tmp"; then
+            if ! jq -e \
+                'type == "object" and has("enableAllProjectMcpServers")' \
+                "$source" >/dev/null; then
+                rm -f "$source" "$tmp"
+                source=""
+                tmp=""
+                trap - EXIT
+                : > "$marker"
+                exit 0
+            fi
+            if ! jq 'del(.enableAllProjectMcpServers)' "$source" > "$tmp"; then
                 exit 3
             fi
+            # Claude does not share this lock, so a small revalidate-to-rename
+            # race remains. Rechecking here narrows it as far as possible.
+            if ! cmp -s "$source" "$TARGET/settings.json"; then
+                rm -f "$source" "$tmp"
+                source=""
+                tmp=""
+                trap - EXIT
+                continue
+            fi
             mv "$tmp" "$TARGET/settings.json"
+            rm -f "$source"
+            source=""
+            tmp=""
             trap - EXIT
-        fi
-        : > "$marker"
+            : > "$marker"
+            exit 0
+        done
+        exit 4
     ) 9>"$migration_dir/enable-all-project-mcp-servers.lock" || status=$?
 
     if [ "$status" -eq 2 ]; then
         WARNINGS+=("Claude settings migration skipped — $TARGET/settings.json is unreadable or invalid JSON")
+    elif [ "$status" -eq 4 ]; then
+        WARNINGS+=("Claude settings migration deferred — concurrent Claude settings update detected; it will retry on next start (the final revalidate/rename window cannot be locked against Claude)")
     elif [ "$status" -ne 0 ]; then
         WARNINGS+=("Claude settings migration failed — could not retire enableAllProjectMcpServers")
     fi

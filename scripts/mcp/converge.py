@@ -135,6 +135,22 @@ def _read_bytes(path: str) -> bytes | None:
         ) from exc
 
 
+def _rollback_written_files(
+    written_files: list[tuple[activation._FileSnapshot, bytes | None]],
+) -> tuple[list[str], list[str]]:
+    rollback_errors: list[str] = []
+    concurrent_paths: list[str] = []
+    for preimage, postimage in reversed(written_files):
+        if _read_bytes(preimage.path) != postimage:
+            concurrent_paths.append(preimage.path)
+            continue
+        try:
+            activation._restore_file(preimage)
+        except OSError as exc:
+            rollback_errors.append(f"{preimage.path}: {exc}")
+    return rollback_errors, concurrent_paths
+
+
 def _read_snapshot_bytes(path: str | None) -> bytes:
     resolved_path = path or trusted.runtime_snapshot_path()
     try:
@@ -273,6 +289,7 @@ def converge(
     if not os.path.isdir(resolved):
         return _skipped("Project directory does not exist", resolved)
 
+    render_concurrent_paths: set[str] = set()
     for _attempt in range(MAX_CONVERGE_ATTEMPTS):
         try:
             snapshot_raw, snapshot = _read_runtime_snapshot(snapshot_path)
@@ -426,6 +443,11 @@ def converge(
 
             if mcp_changed:
                 preimage = activation._snapshot_file(mcp_path)
+                if (
+                    preimage.data if preimage.existed else None
+                ) != mcp_preimage:
+                    render_concurrent_paths.add(mcp_path)
+                    continue
                 activation._atomic_text(mcp_path, rendered)
                 postimage = _read_bytes(mcp_path)
                 if postimage != (
@@ -440,6 +462,29 @@ def converge(
                 ) = settings_plan
                 if settings_rendered != settings_existing:
                     preimage = activation._snapshot_file(settings_path)
+                    if (
+                        preimage.data if preimage.existed else None
+                    ) != settings_preimage:
+                        render_concurrent_paths.add(settings_path)
+                        rollback_errors, rollback_concurrent = (
+                            _rollback_written_files(written_files)
+                        )
+                        if rollback_errors:
+                            return _skipped(
+                                "concurrent write to the rendered file was "
+                                "detected and rollback was incomplete: "
+                                + "; ".join(rollback_errors),
+                                resolved,
+                            )
+                        if rollback_concurrent:
+                            return _skipped(
+                                "concurrent write to the rendered file was "
+                                "detected after convergence writes for "
+                                + ", ".join(reversed(rollback_concurrent))
+                                + "; the next convergence will repair it",
+                                resolved,
+                            )
+                        continue
                     activation._atomic_text(
                         settings_path, settings_rendered
                     )
@@ -476,18 +521,9 @@ def converge(
                     written_files.append((preimage, postimage))
 
             if _read_snapshot_bytes(snapshot_path) != snapshot_raw:
-                rollback_errors: list[str] = []
-                concurrent_paths: list[str] = []
-                for preimage, postimage in reversed(written_files):
-                    if _read_bytes(preimage.path) != postimage:
-                        concurrent_paths.append(preimage.path)
-                        continue
-                    try:
-                        activation._restore_file(preimage)
-                    except OSError as exc:
-                        rollback_errors.append(
-                            f"{preimage.path}: {exc}"
-                        )
+                rollback_errors, concurrent_paths = (
+                    _rollback_written_files(written_files)
+                )
                 if rollback_errors:
                     return _skipped(
                         "MCP runtime snapshot changed after convergence "
@@ -523,6 +559,13 @@ def converge(
             )
         ]
 
+    if render_concurrent_paths:
+        return _skipped(
+            "concurrent write to the rendered file was detected for "
+            + ", ".join(sorted(render_concurrent_paths))
+            + "; the next convergence will repair it",
+            resolved,
+        )
     return _skipped(
         "MCP runtime snapshot kept changing during convergence; "
         "the next convergence will retry",

@@ -666,6 +666,77 @@ class ConvergeTest(unittest.TestCase):
             self.assertEqual(fh.read(), concurrent)
         self.assertFalse(os.path.exists(converge.state_path()))
 
+    def test_render_change_at_write_preimage_is_not_clobbered(self):
+        self._write_snapshot(self._desired_records())
+        mcp_path = activation.claude_config_path(self.project)
+        original_snapshot = activation._snapshot_file
+        concurrent = []
+
+        def change_mcp_before_snapshot(path):
+            if path == mcp_path:
+                content = (
+                    b'{"mcpServers":{"host":{"command":"fresh-'
+                    + str(len(concurrent)).encode()
+                    + b'"}}}\n'
+                )
+                concurrent.append(content)
+                with open(path, "wb") as fh:
+                    fh.write(content)
+            return original_snapshot(path)
+
+        with mock.patch.object(
+            activation,
+            "_snapshot_file",
+            side_effect=change_mcp_before_snapshot,
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("concurrent write to the rendered file", result.reason)
+        self.assertEqual(len(concurrent), converge.MAX_CONVERGE_ATTEMPTS)
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), concurrent[-1])
+        self.assertFalse(os.path.exists(converge.state_path()))
+
+    def test_settings_change_at_write_rolls_back_mcp_write(self):
+        self._write_snapshot(self._desired_records())
+        mcp_path = activation.claude_config_path(self.project)
+        settings_path = activation.claude_settings_path(self.project)
+        original_mcp = b'{"manual":"mcp"}\n'
+        with open(mcp_path, "wb") as fh:
+            fh.write(original_mcp)
+        original_snapshot = activation._snapshot_file
+        concurrent = []
+
+        def change_settings_before_snapshot(path):
+            if path == settings_path:
+                content = (
+                    b'{"manual":"settings-'
+                    + str(len(concurrent)).encode()
+                    + b'"}\n'
+                )
+                concurrent.append(content)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as fh:
+                    fh.write(content)
+            return original_snapshot(path)
+
+        with mock.patch.object(
+            activation,
+            "_snapshot_file",
+            side_effect=change_settings_before_snapshot,
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("concurrent write to the rendered file", result.reason)
+        self.assertEqual(len(concurrent), converge.MAX_CONVERGE_ATTEMPTS)
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), original_mcp)
+        with open(settings_path, "rb") as fh:
+            self.assertEqual(fh.read(), concurrent[-1])
+        self.assertFalse(os.path.exists(converge.state_path()))
+
     def test_foreign_servers_and_top_level_keys_survive_and_are_not_seeded(self):
         self._write_snapshot(self._desired_records())
         foreign = {"command": "foreign", "args": ["--keep"], "x": {"y": 1}}

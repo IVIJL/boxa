@@ -229,6 +229,30 @@ class MigrationTest(unittest.TestCase):
         self.assertFalse(second["changed"])
         self.assertEqual(first["definitions"], second["definitions"])
 
+    def test_missing_previously_rendered_project_does_not_block_migration(self):
+        missing = os.path.realpath(os.path.join(self.tmp.name, "missing"))
+        self._write_project(self.project, {"echo": _server(["/bin/echo"])})
+        self._write_claude({self.project: {"mcpServers": {"boxa-echo": {
+            "command": "boxa-mcp-run",
+            "args": ["--project", self.project, "echo"],
+        }}}})
+        state_path = activation.render_state_path()
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as fh:
+            json.dump({"projects": {missing: ["boxa-stale"]}}, fh)
+
+        result = migration.migrate_legacy()
+
+        self.assertEqual(result["status"], "complete")
+        record = next(iter(
+            activation.load_activations()["projects"][self.project].values()
+        ))
+        self.assertEqual(record["consumers"], ["claude"])
+        with open(
+            activation.claude_config_path(self.project), encoding="utf-8"
+        ) as fh:
+            self.assertIn("boxa-echo", json.load(fh)["mcpServers"])
+
     def test_crash_after_partial_publication_resumes_from_prepared_manifest(self):
         self._write_project(self.project, {"echo": _server(["/bin/echo"])})
         self._write_claude({self.project: {"mcpServers": {"boxa-echo": {
