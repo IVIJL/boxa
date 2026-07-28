@@ -1374,6 +1374,84 @@ class ConvergeTest(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(stderr.getvalue(), "")
 
+    def test_pristine_install_without_snapshot_is_not_applicable(self):
+        # docker-run mounts the runtime directory even when the host has never
+        # published a snapshot; that is nothing to converge, not a problem.
+        self.assertFalse(os.path.exists(self.snapshot))
+        with mock.patch.object(
+            activation,
+            "_atomic_text",
+            side_effect=AssertionError("pristine convergence wrote a file"),
+        ):
+            result = converge.converge(self.project)[0]
+        self.assertEqual(result.status, "not-applicable")
+        self.assertIn("no MCP runtime snapshot has been published", result.reason)
+        self.assertFalse(os.path.exists(converge.state_path()))
+
+    def test_pristine_cli_is_silent_and_returns_zero(self):
+        for quiet in (True, False):
+            with self.subTest(quiet=quiet):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                argv = ["converge", "--project", self.project]
+                if quiet:
+                    argv.append("--quiet")
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    rc = cli.main(argv)
+                self.assertEqual(rc, 0)
+                self.assertEqual(stderr.getvalue(), "")
+                if quiet:
+                    self.assertEqual(stdout.getvalue(), "")
+                else:
+                    self.assertIn(
+                        "no MCP runtime snapshot has been published",
+                        stdout.getvalue(),
+                    )
+
+    def test_missing_snapshot_after_publication_stays_an_operational_skip(self):
+        self._write_snapshot(self._desired_records())
+        converge.converge(self.project)
+        os.unlink(self.snapshot)
+
+        with self.subTest(evidence="convergence state"):
+            result = converge.converge(self.project)[0]
+            self.assertEqual(result.status, "skipped")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = cli.main([
+                    "converge", "--project", self.project, "--quiet"
+                ])
+            self.assertEqual(rc, 3)
+            self.assertIn("MCP convergence skipped:", stderr.getvalue())
+
+        # Even with the local state gone, the boxa-managed render left in the
+        # Project is evidence a snapshot was published before.
+        with self.subTest(evidence="managed render"):
+            self._remove_converge_state()
+            self.assertIn("boxa-echo", self._mcp_data()["mcpServers"])
+            result = converge.converge(self.project)[0]
+            self.assertEqual(result.status, "skipped")
+
+    def test_pristine_but_unusable_snapshot_stays_an_operational_skip(self):
+        # A published-but-broken snapshot must never be mistaken for a pristine
+        # installation, even before anything was ever converged.
+        for name, payload in (("empty", b""), ("non-json", b"{not json")):
+            with self.subTest(name=name):
+                self._remove_converge_state()
+                with open(self.snapshot, "wb") as fh:
+                    fh.write(payload)
+                with mock.patch.object(
+                    activation,
+                    "_atomic_text",
+                    side_effect=AssertionError("broken snapshot caused a write"),
+                ):
+                    result = converge.converge(self.project)[0]
+                self.assertEqual(result.status, "skipped")
+                self.assertIn("snapshot", result.reason)
+
 
 if __name__ == "__main__":
     unittest.main()

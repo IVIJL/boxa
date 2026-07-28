@@ -198,6 +198,54 @@ def _read_snapshot_bytes(path: str | None) -> bytes:
         ) from exc
 
 
+def _has_managed_render(project: str) -> bool:
+    """True when the Project's Claude config still holds a boxa render."""
+    try:
+        _raw, _existing, data = _read_mcp_document(project)
+    except activation.ActivationError:
+        # An unreadable render is drift the next convergence must repair, so
+        # treat it as evidence rather than as a pristine installation.
+        return True
+    block = data.get("mcpServers")
+    if not isinstance(block, dict):
+        return False
+    return any(
+        is_managed_or_legacy(name)
+        and isinstance(definition, dict)
+        and definition.get("command") == "boxa-mcp-run"
+        for name, definition in block.items()
+    )
+
+
+def _snapshot_never_published(path: str | None, project: str) -> bool:
+    """True when no runtime state has ever reached this Container.
+
+    A pristine installation mounts the runtime directory but the host has not
+    published a snapshot yet, so there is genuinely nothing to converge — that
+    must stay silent instead of being reported as an operational skip on every
+    interactive shell. The distinction from "expected but gone" is evidence of
+    an earlier publication: a snapshot file that exists at all (empty, corrupt,
+    or unreadable), recorded convergence state for this Project, or a
+    boxa-managed render left behind in the Project's Claude config. Any of
+    those keeps the missing snapshot an operational skip.
+    """
+    resolved = path or trusted.runtime_snapshot_path()
+    try:
+        os.lstat(resolved)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    else:
+        return False
+    state, _existing = _load_state()
+    if _state_names(state, "projects", project) or _state_names(
+        state, "seeded", project
+    ):
+        return False
+    return not _has_managed_render(project)
+
+
 def mutation_marker_path(snapshot_path: str | None = None) -> str:
     """The host mutation window as published beside the runtime snapshot."""
     resolved = snapshot_path or trusted.runtime_snapshot_path()
@@ -390,6 +438,12 @@ def converge(
             snapshot_raw, snapshot = _read_runtime_snapshot(snapshot_path)
             definitions = _desired_definitions(snapshot, resolved)
         except (trusted.TrustedAuthorizationError, OSError) as exc:
+            if _snapshot_never_published(snapshot_path, resolved):
+                return _not_applicable(
+                    "no MCP runtime snapshot has been published for this "
+                    "Container",
+                    resolved,
+                )
             return _skipped(str(exc), resolved)
 
         try:

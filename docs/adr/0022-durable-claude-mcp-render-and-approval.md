@@ -192,7 +192,13 @@ never left half-converged. A pre-image whose bytes changed under convergence is
 left alone rather than clobbered, and the skip names it.
 
 A benign not-applicable convergence result, such as no identifiable Container
-Project or a missing Project directory, exits zero. An operational skip such
+Project, a missing Project directory, or a pristine installation where the
+runtime directory is mounted but the host has never published a snapshot,
+exits zero. A snapshot that once existed is different: after any evidence of an
+earlier publication — a snapshot file that is present but empty, corrupt or
+unreadable, recorded convergence state for the Project, or a boxa-managed
+render left in the Project — a missing or unusable snapshot stays an
+operational skip. An operational skip such
 as invalid input, absent tracked-file consent, or a concurrent-write race
 exits `3` and remains visible as a stderr warning under `--quiet`. Hard
 failures exit `1`, usage errors exit `2`, and successful convergence,
