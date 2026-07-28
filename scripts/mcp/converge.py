@@ -420,15 +420,18 @@ def converge(
                     resolved,
                 )
 
-            write_paths = [mcp_path, settings_path, state_path()]
-            if exclude_plan is not None:
-                write_paths.append(exclude_plan[0])
-            preimages = [
-                activation._snapshot_file(path) for path in write_paths
-            ]
+            written_files: list[
+                tuple[activation._FileSnapshot, bytes | None]
+            ] = []
 
             if mcp_changed:
+                preimage = activation._snapshot_file(mcp_path)
                 activation._atomic_text(mcp_path, rendered)
+                postimage = _read_bytes(mcp_path)
+                if postimage != (
+                    preimage.data if preimage.existed else None
+                ):
+                    written_files.append((preimage, postimage))
             if settings_plan is not None:
                 (
                     settings_path,
@@ -436,19 +439,49 @@ def converge(
                     settings_rendered,
                 ) = settings_plan
                 if settings_rendered != settings_existing:
+                    preimage = activation._snapshot_file(settings_path)
                     activation._atomic_text(
                         settings_path, settings_rendered
                     )
+                    postimage = _read_bytes(settings_path)
+                    if postimage != (
+                        preimage.data if preimage.existed else None
+                    ):
+                        written_files.append((preimage, postimage))
             if state_changed:
-                activation._atomic_text(state_path(), state_rendered)
-                os.chmod(state_path(), stat.S_IRUSR | stat.S_IWUSR)
+                convergence_state_path = state_path()
+                preimage = activation._snapshot_file(
+                    convergence_state_path
+                )
+                activation._atomic_text(
+                    convergence_state_path, state_rendered
+                )
+                os.chmod(
+                    convergence_state_path,
+                    stat.S_IRUSR | stat.S_IWUSR,
+                )
+                postimage = _read_bytes(convergence_state_path)
+                if postimage != (
+                    preimage.data if preimage.existed else None
+                ):
+                    written_files.append((preimage, postimage))
             if exclude_plan is not None:
                 exclude_path, relative = exclude_plan
+                preimage = activation._snapshot_file(exclude_path)
                 activation._ensure_local_exclude(exclude_path, relative)
+                postimage = _read_bytes(exclude_path)
+                if postimage != (
+                    preimage.data if preimage.existed else None
+                ):
+                    written_files.append((preimage, postimage))
 
             if _read_snapshot_bytes(snapshot_path) != snapshot_raw:
                 rollback_errors: list[str] = []
-                for preimage in reversed(preimages):
+                concurrent_paths: list[str] = []
+                for preimage, postimage in reversed(written_files):
+                    if _read_bytes(preimage.path) != postimage:
+                        concurrent_paths.append(preimage.path)
+                        continue
                     try:
                         activation._restore_file(preimage)
                     except OSError as exc:
@@ -460,6 +493,14 @@ def converge(
                         "MCP runtime snapshot changed after convergence "
                         "writes and rollback was incomplete: "
                         + "; ".join(rollback_errors),
+                        resolved,
+                    )
+                if concurrent_paths:
+                    return _skipped(
+                        "concurrent write to the rendered file was detected "
+                        "after convergence writes for "
+                        + ", ".join(reversed(concurrent_paths))
+                        + "; the next convergence will repair it",
                         resolved,
                     )
                 continue

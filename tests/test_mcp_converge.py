@@ -539,6 +539,104 @@ class ConvergeTest(unittest.TestCase):
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), content)
 
+    def test_concurrent_render_edit_after_writes_survives_rollback(self):
+        self._write_snapshot(self._desired_records())
+        mcp_path = activation.claude_config_path(self.project)
+        settings_path = activation.claude_settings_path(self.project)
+        state_path = converge.state_path()
+        preimages = {
+            mcp_path: b'{"manual":"mcp"}\n',
+            settings_path: b'{"manual":"settings"}\n',
+            state_path: b'{"manual":"state"}\n',
+        }
+        concurrent = b'{"mcpServers":{"host":{"command":"fresh"}}}\n'
+        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        for path, content in preimages.items():
+            with open(path, "wb") as fh:
+                fh.write(content)
+        with open(self.snapshot, "rb") as fh:
+            snapshot_raw = fh.read()
+        reads = 0
+
+        def edit_render_before_stale_snapshot(_path):
+            nonlocal reads
+            reads += 1
+            if reads % 3:
+                return snapshot_raw
+            with open(mcp_path, "wb") as fh:
+                fh.write(concurrent)
+            return snapshot_raw + b"\n"
+
+        with mock.patch.object(
+            converge,
+            "_read_snapshot_bytes",
+            side_effect=edit_render_before_stale_snapshot,
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("concurrent write to the rendered file", result.reason)
+        self.assertIn("after convergence writes", result.reason)
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), concurrent)
+        for path in (settings_path, state_path):
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), preimages[path])
+
+    def test_unwritten_exclude_is_not_restored_after_snapshot_change(self):
+        self._init_git()
+        self._write_snapshot(self._desired_records(), tracked_mcp_json={})
+        exclude_path = self._git(
+            "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
+        )
+        with open(exclude_path, "a", encoding="utf-8") as fh:
+            fh.write("/.mcp.json\n")
+        concurrent = b"# concurrent edit\n/.mcp.json\n"
+        concurrent_mtime_ns = 1_700_000_000_000_000_000
+        with open(self.snapshot, "rb") as fh:
+            snapshot_raw = fh.read()
+        reads = 0
+        restored_paths = []
+        original_restore = activation._restore_file
+
+        def edit_exclude_before_stale_snapshot(_path):
+            nonlocal reads
+            reads += 1
+            if reads != 3:
+                return snapshot_raw
+            with open(exclude_path, "wb") as fh:
+                fh.write(concurrent)
+            os.utime(
+                exclude_path,
+                ns=(concurrent_mtime_ns, concurrent_mtime_ns),
+            )
+            return snapshot_raw + b"\n"
+
+        def record_restore(preimage):
+            restored_paths.append(preimage.path)
+            original_restore(preimage)
+
+        with (
+            mock.patch.object(
+                converge,
+                "_read_snapshot_bytes",
+                side_effect=edit_exclude_before_stale_snapshot,
+            ),
+            mock.patch.object(
+                activation,
+                "_restore_file",
+                side_effect=record_restore,
+            ),
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        self.assertNotIn(exclude_path, restored_paths)
+        with open(exclude_path, "rb") as fh:
+            self.assertEqual(fh.read(), concurrent)
+        self.assertEqual(os.stat(exclude_path).st_mtime_ns, concurrent_mtime_ns)
+
     def test_render_change_before_commit_is_left_untouched_and_skipped(self):
         self._write_snapshot(self._desired_records())
         mcp_path = activation.claude_config_path(self.project)
