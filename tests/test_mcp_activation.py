@@ -943,6 +943,29 @@ class ActivationTest(unittest.TestCase):
         self.assertIn("dubious ownership", str(refused.exception))
         self.assertFalse(os.path.exists(activation.activation_path()))
 
+        def localized_non_repo(*_args, **kwargs):
+            env = kwargs.get("env", {})
+            if (
+                env.get("LC_ALL") == "C"
+                and env.get("LC_MESSAGES") == "C"
+                and env.get("LANGUAGE") == ""
+            ):
+                detail = "fatal: not a git repository (or any parent directories)"
+            else:
+                detail = "fatal: není gitový repozitář"
+            return subprocess.CompletedProcess(
+                [], 128, stdout="", stderr=detail
+            )
+
+        with mock.patch.object(
+            activation.subprocess, "run", side_effect=localized_non_repo
+        ) as git_run:
+            self.assertIsNone(activation._claude_git_paths(self.project))
+        git_env = git_run.call_args.kwargs["env"]
+        self.assertEqual(git_env["LC_ALL"], "C")
+        self.assertEqual(git_env["LC_MESSAGES"], "C")
+        self.assertEqual(git_env["LANGUAGE"], "")
+
         non_repo = subprocess.CompletedProcess(
             [],
             128,
@@ -1196,6 +1219,71 @@ class ActivationTest(unittest.TestCase):
         self.assertIn("global", retired["mcpServers"])
         project = retired["projects"][self.project]
         self.assertEqual(project["mcpServers"], {"manual": {"command": "keep"}})
+        self.assertEqual(project["disabledMcpServers"], ["manual"])
+
+    def test_legacy_retirement_preserves_foreign_prefixed_server(self):
+        legacy = activation.render_target_path()
+        with open(legacy, "w", encoding="utf-8") as fh:
+            json.dump({
+                "projects": {
+                    self.project: {
+                        "mcpServers": {
+                            "boxa-foreign": {"command": "my-own-thing"},
+                            "boxa-owned": {"command": "old"},
+                        },
+                        "disabledMcpServers": [
+                            "boxa-foreign",
+                            "boxa-owned",
+                            "manual",
+                        ],
+                    }
+                },
+            }, fh)
+
+        activation._retire_old_claude_render({
+            "projects": {self.project: ["boxa-owned"]}
+        })
+
+        with open(legacy, encoding="utf-8") as fh:
+            project = json.load(fh)["projects"][self.project]
+        self.assertEqual(
+            project["mcpServers"],
+            {"boxa-foreign": {"command": "my-own-thing"}},
+        )
+        self.assertEqual(
+            project["disabledMcpServers"], ["boxa-foreign", "manual"]
+        )
+
+    def test_legacy_retirement_removes_unrecorded_wrapper_entry(self):
+        legacy = activation.render_target_path()
+        with open(legacy, "w", encoding="utf-8") as fh:
+            json.dump({
+                "projects": {
+                    self.project: {
+                        "mcpServers": {
+                            "boxa-stale": {
+                                "command": "boxa-mcp-run",
+                                "args": ["echo"],
+                            },
+                            "devbox-stale": {
+                                "command": "devbox-mcp-run",
+                                "args": ["echo"],
+                            },
+                        },
+                        "disabledMcpServers": [
+                            "boxa-stale",
+                            "devbox-stale",
+                            "manual",
+                        ],
+                    }
+                },
+            }, fh)
+
+        activation._retire_old_claude_render({"projects": {}})
+
+        with open(legacy, encoding="utf-8") as fh:
+            project = json.load(fh)["projects"][self.project]
+        self.assertEqual(project["mcpServers"], {})
         self.assertEqual(project["disabledMcpServers"], ["manual"])
 
     def test_non_git_project_renders_mcp_json(self):

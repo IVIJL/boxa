@@ -24,7 +24,12 @@ from .catalog import (
 )
 from .providers.claude import render_target_path
 from .profile import config_root
-from .render import is_managed_or_legacy, rendered_name
+from .render import (
+    LEGACY_MANAGED_PREFIX,
+    WRAPPER_COMMAND,
+    is_managed_or_legacy,
+    rendered_name,
+)
 from .readiness import (
     ProjectProbe,
     ReadinessError,
@@ -41,10 +46,19 @@ _FILE_MODE = 0o600
 _RUNTIME_MODE = 0o644
 _CODEX_BEGIN = "# >>> boxa managed MCP servers >>>"
 _CODEX_END = "# <<< boxa managed MCP servers <<<"
+_LEGACY_WRAPPER_COMMAND = "devbox-mcp-run"
 
 
 class ActivationError(RuntimeError):
     pass
+
+
+def _git_env() -> dict[str, str]:
+    # Git failure classification relies on message text; translated diagnostics
+    # would misclassify a valid non-Git Project as an inspection failure.
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "LC_MESSAGES": "C", "LANGUAGE": ""})
+    return env
 
 
 def _root() -> str:
@@ -212,7 +226,7 @@ def _restore_file(snapshot: _FileSnapshot) -> None:
 def _git_output(project: str, *args: str) -> str:
     proc = subprocess.run(
         ["git", "-C", project, *args], stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, check=False,
+        stderr=subprocess.PIPE, text=True, check=False, env=_git_env(),
     )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()
@@ -265,6 +279,7 @@ def _codex_is_tracked(project: str, relative: str) -> bool:
             stderr=subprocess.PIPE,
             text=True,
             check=False,
+            env=_git_env(),
         )
     except OSError as exc:
         raise ActivationError(
@@ -288,6 +303,7 @@ def _claude_git_paths(project: str) -> Optional[tuple[str, str, str]]:
         top_proc = subprocess.run(
             ["git", "-C", project, "rev-parse", "--show-toplevel"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            env=_git_env(),
         )
     except OSError as exc:
         raise ActivationError(
@@ -327,6 +343,7 @@ def _claude_git_paths(project: str) -> Optional[tuple[str, str, str]]:
                 "--git-path", "info/exclude",
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            env=_git_env(),
         )
     except OSError as exc:
         raise ActivationError(
@@ -1251,8 +1268,19 @@ def _retire_old_claude_render(
         block = record.get("mcpServers")
         if isinstance(block, dict):
             remove = {
-                name for name in block
-                if name in owned or is_managed_or_legacy(name)
+                name for name, definition in block.items()
+                if name in owned or (
+                    is_managed_or_legacy(name)
+                    and isinstance(definition, dict)
+                    and (
+                        definition.get("command") == WRAPPER_COMMAND
+                        or (
+                            name.startswith(LEGACY_MANAGED_PREFIX)
+                            and definition.get("command")
+                            == _LEGACY_WRAPPER_COMMAND
+                        )
+                    )
+                )
             }
             for name in remove:
                 del block[name]
@@ -1264,7 +1292,7 @@ def _retire_old_claude_render(
                 name for name in disabled
                 if not (
                     isinstance(name, str)
-                    and (name in owned or is_managed_or_legacy(name))
+                    and name in owned
                 )
             ]
             if retained != disabled:
