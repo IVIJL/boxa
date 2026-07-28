@@ -1,6 +1,6 @@
 ---
 name: boxa
-description: Boxa dev environment guide — invoke when the user mentions the boxa CLI, boxa Containers, dev URLs (*.test, *.sslip.io), Allow-for windows, the Allowlist, Agent-browser session lifecycle, ports, mkcert HTTPS, Container identity, or anything about why network/host behaviour differs from a plain shell.
+description: Boxa dev environment guide — invoke when the user mentions the boxa CLI, boxa Containers, MCP catalog or MCP activation, trusted MCP execution, dev URLs (*.test, *.sslip.io), Allow-for windows, the Allowlist, Agent-browser session lifecycle, ports, mkcert HTTPS, Container identity, or anything about why network/host behaviour differs from a plain shell.
 user-invocable: false
 ---
 
@@ -92,6 +92,47 @@ boxa port <port> [project]      # print the dev URL for a single port
 
 mkcert provisions HTTPS for `*.test` and `*.sslip.io` dev URLs (ADR 0008). HTTPS degrades gracefully if mkcert is unavailable — plain HTTP still works.
 
+### MCP catalog and Project activation
+
+Treat these as separate states:
+
+1. `boxa mcp add NAME -- COMMAND...` records a durable user-wide **MCP catalog** definition. `NAME` is only Boxa's label; Boxa later executes `COMMAND...`. Adding neither installs the command nor activates the server.
+2. `boxa mcp install NAME --project PATH` materializes a runtime when needed. Skip it for commands already provided by the Container image.
+3. `boxa mcp readiness NAME --project PATH` checks a running Project without activating anything.
+4. `boxa mcp activate NAME --project PATH --for claude|codex|claude,codex` exposes the entry only in that Project and only to the selected consumers.
+
+Catalog definitions, installed runtimes, and execution modes survive Container and host restarts. Catalog membership is never global activation. For another Project, reuse the existing catalog entry and add a separate activation.
+
+Run all `boxa mcp ...` commands on the host. When operating inside a Container, inspect local prerequisites if useful, then give the user the exact host commands.
+
+#### Delegate from Claude to trusted Codex
+
+Use this host flow when Claude should call Codex directly as an MCP server:
+
+```sh
+cd /path/to/my-project
+boxa up
+boxa mcp add codex-delegate -- codex mcp-server
+boxa mcp mode codex-delegate agent-trusted
+boxa mcp readiness codex-delegate --project "$PWD"
+boxa mcp activate codex-delegate --project "$PWD" --for claude
+boxa mcp status --project "$PWD"
+```
+
+Do not invent a path or API key for `codex-delegate`: the label does not resolve software. The Container image already provides `codex`; the argv after `--` selects its `mcp-server` mode. Readiness checks the mounted `node` user's existing `codex login`, including ChatGPT subscription login.
+
+`agent-trusted` is a host-confirmed grant for the stable catalog identity. It gives the server the same `node`-user repository, mounted private-state, SSH, and Docker access as the agent that launches it, while excluding ambient bearer tokens and Boxa MCP-store secrets. Review the command/access preview before confirming. Boxa refuses Codex self-activation; select Claude only.
+
+To enable the prepared server in another Project, do not add or trust it again:
+
+```sh
+cd /path/to/other-project
+boxa up
+boxa mcp activate codex-delegate --project "$PWD" --for claude
+```
+
+Use `boxa mcp catalog`, `readiness`, `status`, and `doctor` to explain each state. `boxa mcp --help` is the complete user-facing workflow; when working in the Boxa repository, consult `docs/mcp.md` for design detail.
+
 ## Agent-browser
 
 Boxa-specific integration glue only. For the upstream CLI surface (navigation, screenshots, network inspection, the two-gate model in detail), defer to the upstream `agent-browser` skill (installed alongside this one). For architecture, see ADR 0010.
@@ -111,6 +152,8 @@ Three boxa-specific facts:
 - ADR 0009 — Allow-for window
 - ADR 0010 — Agent-browser host broker and proxy
 - ADR 0011 — Boxa-aware agent context (this skill's design)
+- ADR 0021 — Project-selected MCP catalog and agent-trusted execution
+- `docs/mcp.md` — complete MCP catalog, readiness, activation and trust guide
 - `boxa --help` (on host) for the full CLI surface
 
 ## Common failures
@@ -123,3 +166,5 @@ Short decision tree for the most-frequent symptoms.
 - **`ERR_TUNNEL_CONNECTION_FAILED` in Host agent Chrome** for an external host → the **Agent-browser proxy** denied it in **default mode**. Either add the host to the **Agent-browser allowlist** (`~/.config/boxa/agent-browser-allowed-domains.conf`) or open an **Agent-browser network window** with `boxa agent-browser allow-for <min> <project>`. Since the deny-visibility slice shipped, the in-container `agent-browser` wrapper also re-navigates Chrome to an inline `data:` URL that renders the same denial reason directly in the window, so you can read the blocked host and the recovery commands without digging through the proxy log.
 - **Certificate warnings on a `*.test` or `*.sslip.io` URL** → mkcert root CA is not trusted in the current Chrome profile. Check ADR 0008 for graceful-degradation behaviour; the user may need to re-run `boxa dns-install`.
 - **Stale agent-browser CLI behaviour** inside a Container (e.g., `connect 9222` errors after a host Chrome restart) → the auto-connect wrapper reconnects on Chrome restart since `f9e30fa`. If symptoms persist, ask the user to `boxa agent-browser stop <project> && boxa agent-browser start <project>`.
+- **MCP catalog entry exists but the agent cannot see it** → catalog membership never activates a server. Start the target Project, check `boxa mcp readiness <entry> --project <path>`, then explicitly `activate` it for the intended consumer.
+- **`codex-delegate` cannot be found as a binary** → it is only the catalog label. The executable comes from the command after `--` (`codex mcp-server`); verify the Project is running and use `boxa mcp readiness codex-delegate --project <path>`.

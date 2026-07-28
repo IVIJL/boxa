@@ -72,6 +72,7 @@ execution identity are separate states. Catalog membership exposes nothing.
 Subcommands:
   migrate     Migrate legacy profiles into catalog + explicit activations.
   catalog     List prepared MCP catalog definitions (never activates them).
+  readiness   Check whether one entry can run in a running Project.
   activate    Activate one ready catalog entry for a running Project.
   deactivate  Remove a Project activation without killing a live server.
   mode        Change a catalog entry's execution identity (host-only).
@@ -86,6 +87,38 @@ Subcommands:
   remove      Destroy one catalog identity and cascade its activations.
   reload      Re-stage changed MCP secrets into running Container(s) without a
               stop/start (host-initiated momentary root exec; no restart).
+
+Mental model and common flow:
+  1. 'add' records a durable user-wide catalog definition; it does not install
+     the command named after '--' and does not expose the server to any agent.
+  2. 'install' prepares runtimes that need materialization. Direct commands
+     already present in the Container (for example 'codex') need no install.
+  3. 'readiness' verifies the entry against one running Project.
+  4. 'activate' exposes it only to selected consumers in that Project.
+  Catalog definitions and execution mode survive Container and host restarts.
+  To reuse a prepared entry elsewhere, start that Project and activate it there.
+
+Trusted Codex delegation to Claude (run on the host):
+  cd /path/to/my-project
+  boxa up
+  boxa mcp add codex-delegate -- codex mcp-server
+  boxa mcp mode codex-delegate agent-trusted
+  boxa mcp readiness codex-delegate --project "$PWD"
+  boxa mcp activate codex-delegate --project "$PWD" --for claude
+
+  'codex-delegate' is only the catalog name; 'codex mcp-server' after '--' is
+  the command Boxa will launch. Boxa does not install Codex here. The Boxa
+  Container image provides it, and readiness also checks the mounted node
+  user's existing 'codex login' (including ChatGPT subscription login). No API
+  key is required for that login. Agent trust grants the server the same
+  node-user repository/private-state access as the launching agent, so review
+  the preview before confirming. Add and grant trust once; Codex
+  self-activation is refused.
+
+  In another Project the definition and trust grant are reused; only activate:
+  cd /path/to/other-project
+  boxa up
+  boxa mcp activate codex-delegate --project "$PWD" --for claude
 
 Activation:
   boxa mcp activate <entry> [--project <p>] --for claude|codex|claude,codex
@@ -138,7 +171,9 @@ Install (materialize) path:
 Add (record a new server) path:
   boxa mcp add <name> [--json] -- <command spec...>
       Add a service-isolated catalog definition. This never activates, starts,
-      or renders the server. The returned opaque ID survives rename/updates.
+      installs, or renders the server. <name> labels the catalog entry; only
+      the command spec after '--' is executed. The returned opaque ID survives
+      rename/updates.
 
 Execution mode:
   boxa mcp mode <entry> service-isolated|agent-trusted [--yes] [--json]
