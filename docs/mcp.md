@@ -102,6 +102,11 @@ not update `.mcp.json` while declining its approval companion, or vice versa.
 An already in-sync tracked file does not block repair of the other file.
 When convergence writes either untracked file in a Git Project, it adds the
 repository-root-relative path to `.git/info/exclude`.
+A Project with no `.git` entry at or above it is a supported non-Git Project
+and converges normally. If Git metadata exists but Git cannot use it — for
+example a linked worktree or submodule whose gitdir is outside the Project
+bind mount — the tracked state is unknown, so convergence skips with exit 3
+and writes nothing instead of assuming the files are untracked.
 Convergence revalidates the snapshot and rendered files immediately before
 writing. A newly published snapshot is replanned; a rendered-file change
 without a snapshot change is reported as a concurrent host write and left for

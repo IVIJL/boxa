@@ -1305,6 +1305,7 @@ def _catalog_render_state(
     entry: dict[str, Any],
     consumer: str,
     claude_status: Optional[object] = None,
+    claude_status_unknown: bool = False,
 ) -> tuple[str, bool, bool]:
     """Return (state, tracked, requires_consent) for one derived consumer record.
 
@@ -1332,7 +1333,7 @@ def _catalog_render_state(
                 or getattr(claude_status, "settings_tracked", False)
             )
         )
-        requires_consent = bool(
+        requires_consent = claude_status_unknown or bool(
             claude_status is not None
             and getattr(claude_status, "requires_consent", False)
         )
@@ -1357,15 +1358,26 @@ def _catalog_render_state(
         value = data.get("mcp_servers", {}).get(name)
     except (OSError, ValueError, AttributeError):
         value = None
-    tracked = False
+    from .activation import git_metadata_path
+
     try:
         relative = os.path.relpath(path, project)
-        tracked = subprocess.run(
+        returncode = subprocess.run(
             ["git", "-C", project, "ls-files", "--error-unmatch", "--", relative],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-        ).returncode == 0
+        ).returncode
     except OSError:
-        pass
+        returncode = None
+    if returncode == 0:
+        tracked = True
+    elif returncode == 1:
+        tracked = False
+    else:
+        # Only a definitive "not tracked" answer may unlock an automatic
+        # rewrite. An inspection failure with Git metadata present (unusable
+        # gitdir, damaged repository) stays consent-gated; a Project with no
+        # Git metadata at all is genuinely untracked.
+        tracked = git_metadata_path(project) is not None
     ok = isinstance(value, dict) and value.get("command") == WRAPPER_COMMAND and value.get("args") == expected_args
     # Codex has no in-sync exemption: a tracked config always needs consent.
     return ("rendered" if ok else "drift"), tracked, tracked
@@ -1385,6 +1397,7 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
     rows: list[dict[str, Any]] = []
     local_probe = probe if probe is not None else ProjectProbe()
     claude_status = None
+    claude_status_unknown = False
     if any(
         "claude" in record.get("consumers", [])
         for record in records.values()
@@ -1397,7 +1410,8 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
                 catalog=catalog,
             )
         except (OSError, activation.ActivationError):
-            pass
+            # Unknown tracked state must not read as "untracked, safe to fix".
+            claude_status_unknown = True
     for entry_id, entry in sorted(catalog["entries"].items(), key=lambda item: (item[1]["name"].casefold(), item[0])):
         record = records.get(entry_id)
         try:
@@ -1421,6 +1435,7 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
                 entry,
                 consumer,
                 claude_status,
+                claude_status_unknown=claude_status_unknown,
             )
             renders[consumer] = state
             consent_required[consumer] = needs_consent

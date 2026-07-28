@@ -413,6 +413,66 @@ class ConvergeTest(unittest.TestCase):
         with open(mcp_path, "rb") as fh:
             self.assertEqual(fh.read(), original)
 
+    def test_unusable_worktree_gitdir_skips_convergence_and_writes_nothing(self):
+        # A linked worktree/submodule whose gitdir is unreachable from the
+        # Container makes Git report "not a git repository"; the tracked state
+        # is unknown, so convergence must skip instead of rewriting files.
+        mcp_path = activation.claude_config_path(self.project)
+        original = b'{"theme":"maybe-tracked"}\n'
+        with open(mcp_path, "wb") as fh:
+            fh.write(original)
+        gitdir = os.path.join(self.tmp.name, "elsewhere", "worktrees", "project")
+        with open(os.path.join(self.project, ".git"), "w", encoding="utf-8") as fh:
+            fh.write(f"gitdir: {gitdir}\n")
+        self._write_snapshot(self._desired_records())
+
+        with mock.patch.object(
+            activation,
+            "_atomic_text",
+            side_effect=AssertionError("skipped convergence wrote a file"),
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("Git metadata", result.reason)
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), original)
+        self.assertFalse(
+            os.path.exists(activation.claude_settings_path(self.project))
+        )
+        self.assertFalse(os.path.exists(converge.state_path()))
+
+    def test_unusable_worktree_gitdir_skip_exits_three(self):
+        gitdir = os.path.join(self.tmp.name, "elsewhere", "worktrees", "project")
+        with open(os.path.join(self.project, ".git"), "w", encoding="utf-8") as fh:
+            fh.write(f"gitdir: {gitdir}\n")
+        self._write_snapshot(self._desired_records())
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            rc = cli.main([
+                "converge", "--project", self.project, "--quiet",
+            ])
+
+        self.assertEqual(rc, 3)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("MCP convergence skipped:", stderr.getvalue())
+
+    def test_project_without_any_git_metadata_still_converges(self):
+        self._write_snapshot(self._desired_records())
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        self.assertEqual(result.added, ["boxa-echo"])
+        self.assertFalse(
+            os.path.exists(os.path.join(self.project, ".git"))
+        )
+
     def test_tracked_mcp_change_with_snapshot_consent_converges(self):
         self._init_git()
         mcp_path = activation.claude_config_path(self.project)

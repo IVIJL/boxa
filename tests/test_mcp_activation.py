@@ -1137,6 +1137,57 @@ class ActivationTest(unittest.TestCase):
             ):
                 activation._claude_git_paths(self.project)
 
+    def test_unusable_git_metadata_is_not_a_non_repository(self):
+        # Linked worktree / submodule pointing at an unreachable gitdir.
+        with open(os.path.join(self.project, ".git"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "gitdir: "
+                + os.path.join(self.tmp.name, "gone", "worktrees", "project")
+                + "\n"
+            )
+        with self.assertRaisesRegex(
+            activation.ActivationError,
+            "cannot determine whether .* is inside a Git repository",
+        ) as refused:
+            activation._claude_git_paths(self.project)
+        self.assertIn("Git metadata", str(refused.exception))
+        self.assertFalse(
+            os.path.exists(activation.claude_config_path(self.project))
+        )
+
+        with self.assertRaises(activation.ActivationError):
+            activation.claude_tracked_state(self.project)
+
+        with self.assertRaises(activation.ActivationError):
+            activation.activate(
+                "echo", self.project, ["claude"], ReadyProbe(self.project)
+            )
+        self.assertFalse(
+            os.path.exists(activation.claude_config_path(self.project))
+        )
+        self.assertFalse(os.path.exists(activation.activation_path()))
+
+    def test_unusable_git_metadata_above_project_is_refused(self):
+        nested = activation.canonical_project(
+            os.path.join(self.project, "sub")
+        )
+        os.makedirs(nested)
+        with open(os.path.join(self.project, ".git"), "w", encoding="utf-8") as fh:
+            fh.write("gitdir: " + os.path.join(self.tmp.name, "gone") + "\n")
+        with self.assertRaisesRegex(
+            activation.ActivationError, "Git metadata"
+        ):
+            activation._claude_git_paths(nested)
+
+    def test_project_without_git_metadata_stays_a_clean_non_repository(self):
+        self.assertIsNone(activation.git_metadata_path(self.project))
+        self.assertIsNone(activation._claude_git_paths(self.project))
+        self.assertFalse(activation.claude_tracked_state(self.project))
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+        self.assertIn("boxa-echo", self._claude_data()["mcpServers"])
+
     def test_codex_tracked_check_raises_on_git_inspection_failure(self):
         failed = subprocess.CompletedProcess(
             [], 128, stdout="", stderr="fatal: damaged repository metadata"
@@ -1410,6 +1461,57 @@ class ActivationTest(unittest.TestCase):
 
         self.assertFalse(row["trackedMcpJson"])
         self.assertFalse(row["renderRequiresConsent"]["claude"])
+
+    def test_unusable_git_metadata_keeps_render_drift_consent_gated(self):
+        self._init_git()
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+        data = self._claude_data()
+        del data["mcpServers"]["boxa-echo"]
+        with open(
+            activation.claude_config_path(self.project), "w", encoding="utf-8"
+        ) as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        shutil.rmtree(os.path.join(self.project, ".git"))
+        with open(os.path.join(self.project, ".git"), "w", encoding="utf-8") as fh:
+            fh.write("gitdir: " + os.path.join(self.tmp.name, "gone") + "\n")
+
+        probe = mock.Mock()
+        probe.find_running.return_value = "boxa-project"
+        probe.command_path.return_value = "/bin/cat"
+        status = lifecycle.catalog_project_status(self.project, probe)
+        row = next(
+            item for item in status["entries"]
+            if item["id"] == self.entry["id"]
+        )
+
+        self.assertTrue(row["renderRequiresConsent"]["claude"])
+        finding = next(
+            item for item in lifecycle._catalog_doctor_findings(probe)
+            if item.code == "catalog-claude-render-drift"
+        )
+        self.assertFalse(finding.fixable)
+
+    def test_codex_render_state_treats_unusable_git_metadata_as_tracked(self):
+        with open(os.path.join(self.project, ".git"), "w", encoding="utf-8") as fh:
+            fh.write("gitdir: " + os.path.join(self.tmp.name, "gone") + "\n")
+
+        _state, tracked, consent = lifecycle._catalog_render_state(
+            self.project, self.entry["id"], self.entry, "codex"
+        )
+
+        self.assertTrue(tracked)
+        self.assertTrue(consent)
+
+        os.unlink(os.path.join(self.project, ".git"))
+        _state, tracked, consent = lifecycle._catalog_render_state(
+            self.project, self.entry["id"], self.entry, "codex"
+        )
+
+        self.assertFalse(tracked)
+        self.assertFalse(consent)
 
     def test_claude_render_status_is_empty_for_missing_project(self):
         missing = os.path.join(self.tmp.name, "missing")

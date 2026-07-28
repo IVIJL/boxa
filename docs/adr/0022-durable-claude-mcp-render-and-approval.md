@@ -138,6 +138,16 @@ file in a Git Project, including through approval-decision mirroring, it adds
 the repository-root-relative path to `.git/info/exclude` and never changes
 the shared `.gitignore`.
 
+Only a definitive Git answer may unlock an automatic write. Git message
+classification runs under a neutral locale, and a Project with no `.git` entry
+at or above it (up to the mount boundary) is a genuinely non-Git Project whose
+derived files are simply untracked. When Git metadata does exist but Git
+refuses to use it — typically a linked worktree or submodule whose gitdir lies
+outside the Project bind mount, which reports the same "not a git repository"
+as a plain directory — the tracked state is unknown. That is an inspection
+failure: the lifecycle refuses and convergence skips (exit 3, nothing written)
+rather than treating the files as safely untracked.
+
 Status and doctor report the two facts separately. Whether a derived Claude
 Project file is tracked is a repository fact, shown in the status payload and as
 the CLI `:tracked` marker whenever `.mcp.json` or `settings.local.json` is

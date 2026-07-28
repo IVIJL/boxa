@@ -61,6 +61,32 @@ def _git_env() -> dict[str, str]:
     return env
 
 
+def git_metadata_path(project: str) -> Optional[str]:
+    """Return the nearest ``.git`` entry at or above the Project, if any.
+
+    A linked worktree or a submodule keeps its real repository elsewhere and
+    only leaves a ``.git`` *file* pointing at that gitdir. When the gitdir sits
+    outside the Project bind mount, Git in the Container reports the very same
+    "not a git repository" as a directory with no Git metadata at all — but the
+    former is an inspection failure (the tracked state is unknown) while only
+    the latter is a genuinely non-Git Project. The walk stops at the mount
+    boundary because anything above it is not part of the Project mount.
+    """
+    current = project
+    while True:
+        try:
+            candidate = os.path.join(current, ".git")
+            if os.path.lexists(candidate):
+                return candidate
+            at_boundary = os.path.ismount(current)
+        except OSError:
+            return None
+        parent = os.path.dirname(current)
+        if at_boundary or not parent or parent == current:
+            return None
+        current = parent
+
+
 def _root() -> str:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = xdg if xdg else os.path.join(os.path.expanduser("~"), ".config")
@@ -333,7 +359,18 @@ def _claude_git_paths(
             or "this operation must be run in a work tree" in detail.casefold()
         )
         if non_repository:
-            return None
+            metadata = git_metadata_path(project)
+            if metadata is None:
+                return None
+            # Git metadata exists but Git refuses to use it (typically a linked
+            # worktree or submodule whose gitdir is outside the Project mount).
+            # The tracked state is unknown, so callers must skip rather than
+            # treat the derived files as safely untracked.
+            raise ActivationError(
+                f"cannot determine whether {path} is inside a Git repository: "
+                f"Git metadata {metadata} exists but Git cannot use it"
+                + (f" ({detail})" if detail else "")
+            )
         raise ActivationError(
             f"cannot determine whether {path} is inside a Git repository"
             + (f": {detail}" if detail else "")
