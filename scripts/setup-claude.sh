@@ -28,6 +28,51 @@ seed_defaults() {
     done
 }
 
+# Every-start until completed once. Retire Boxa's old global Project MCP
+# approval without overwriting any unrelated host settings. The durable marker
+# lets a user deliberately restore the setting after this upgrade.
+migrate_enable_all_project_mcp_servers() {
+    local migration_dir="$TARGET/.boxa-migrations"
+    local marker="$migration_dir/enable-all-project-mcp-servers"
+    local status=0
+    [ ! -e "$marker" ] || return 0
+
+    mkdir -p "$migration_dir"
+    (
+        flock 9 || exit 3
+        [ ! -e "$marker" ] || exit 0
+
+        if [ ! -e "$TARGET/settings.json" ]; then
+            : > "$marker"
+            exit 0
+        fi
+        if [ ! -r "$TARGET/settings.json" ] \
+           || ! jq -e . "$TARGET/settings.json" >/dev/null 2>&1; then
+            exit 2
+        fi
+
+        if jq -e 'type == "object" and has("enableAllProjectMcpServers")' \
+            "$TARGET/settings.json" >/dev/null; then
+            local tmp
+            tmp=$(mktemp "$TARGET/settings.json.XXXXXX")
+            trap 'rm -f "$tmp"' EXIT
+            if ! jq 'del(.enableAllProjectMcpServers)' \
+                "$TARGET/settings.json" > "$tmp"; then
+                exit 3
+            fi
+            mv "$tmp" "$TARGET/settings.json"
+            trap - EXIT
+        fi
+        : > "$marker"
+    ) 9>"$migration_dir/enable-all-project-mcp-servers.lock" || status=$?
+
+    if [ "$status" -eq 2 ]; then
+        WARNINGS+=("Claude settings migration skipped — $TARGET/settings.json is unreadable or invalid JSON")
+    elif [ "$status" -ne 0 ]; then
+        WARNINGS+=("Claude settings migration failed — could not retire enableAllProjectMcpServers")
+    fi
+}
+
 # Every-start. Backwards-compat alias /workspace/<name> -> host project path
 # (ADR 0004). /workspace is created and chown'd to node:node in the Dockerfile,
 # so node can write here without sudo.
@@ -165,6 +210,7 @@ print_summary() {
 
 main() {
     seed_defaults
+    migrate_enable_all_project_mcp_servers
     make_workspace_symlink     # before pretrust (logical order, not strict dep)
     pretrust_workspace_paths
     ensure_npm_global_path     # must precede bootstrap_codex (shared parent dir)

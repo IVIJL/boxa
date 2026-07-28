@@ -264,6 +264,19 @@ def converge(
         data.pop("mcpServers", None)
     rendered = activation._json_document(data)
     mcp_changed = bool(added or removed or repaired)
+    tracked_mcp_json = snapshot.get("trackedMcpJson", {})
+    if (
+        mcp_changed
+        and activation._codex_is_tracked(resolved, ".mcp.json")
+        and tracked_mcp_json.get(resolved) is not True
+    ):
+        return _skipped(
+            "tracked Claude MCP config "
+            f"{activation.claude_config_path(resolved)} requires durable consent; "
+            "authorize it with "
+            "boxa mcp activate ... --allow-tracked-mcp-json",
+            resolved,
+        )
 
     settings_exists, disabled_names = _settings_status(resolved)
     disabled = disabled_names & desired
@@ -275,7 +288,10 @@ def converge(
         planning_state, "seeded", resolved, protected_seeded
     )
     settings_plan = activation._claude_settings_plan(
-        resolved, sorted(desired), planning_state
+        resolved,
+        sorted(desired),
+        planning_state,
+        retire=previously_seeded - desired,
     )
     approval_changed = settings_plan is not None
     seeded: list[str] = []

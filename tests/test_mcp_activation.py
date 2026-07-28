@@ -439,14 +439,25 @@ class ActivationTest(unittest.TestCase):
 
     def test_deactivate_retires_seed_and_reactivation_seeds_again(self):
         activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+        path = activation.claude_settings_path(self.project)
+        settings = self._claude_settings_data()
+        settings["enabledMcpjsonServers"].append("user-enabled")
+        settings["unrelated"] = {"keep": True}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, indent=2)
+            fh.write("\n")
+
         activation.deactivate("echo", self.project)
         with open(activation.render_state_path(), encoding="utf-8") as fh:
             state = json.load(fh)
         self.assertNotIn(self.project, state["seeded"])
-
-        path = activation.claude_settings_path(self.project)
         settings = self._claude_settings_data()
-        settings["enabledMcpjsonServers"].remove("boxa-echo")
+        self.assertEqual(settings["enabledMcpjsonServers"], ["user-enabled"])
+        self.assertEqual(settings["unrelated"], {"keep": True})
+        self.assertNotIn(
+            "boxa-echo", settings.get("disabledMcpjsonServers", [])
+        )
+
         settings["disabledMcpjsonServers"] = ["manual", "boxa-echo"]
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(settings, fh, indent=2)
@@ -455,11 +466,63 @@ class ActivationTest(unittest.TestCase):
         activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
 
         settings = self._claude_settings_data()
-        self.assertEqual(settings["enabledMcpjsonServers"], ["boxa-echo"])
+        self.assertEqual(
+            settings["enabledMcpjsonServers"], ["user-enabled", "boxa-echo"]
+        )
         self.assertEqual(settings["disabledMcpjsonServers"], ["manual"])
+        self.assertEqual(settings["unrelated"], {"keep": True})
         with open(activation.render_state_path(), encoding="utf-8") as fh:
             state = json.load(fh)
         self.assertEqual(state["seeded"][self.project], ["boxa-echo"])
+
+    def test_recorded_approval_wins_when_boxa_seed_is_withdrawn(self):
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+        self._write_claude_decisions(enabled=["boxa-echo"])
+
+        activation.deactivate("echo", self.project)
+
+        settings = self._claude_settings_data()
+        self.assertIn("boxa-echo", settings["enabledMcpjsonServers"])
+        self.assertNotIn(
+            "boxa-echo", settings.get("disabledMcpjsonServers", [])
+        )
+
+    def test_recorded_rejection_survives_seed_withdrawal_as_rejection(self):
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+        self._write_claude_decisions(disabled=["boxa-echo"])
+
+        activation.deactivate("echo", self.project)
+
+        settings = self._claude_settings_data()
+        self.assertNotIn(
+            "boxa-echo", settings.get("enabledMcpjsonServers", [])
+        )
+        self.assertEqual(settings["disabledMcpjsonServers"], ["boxa-echo"])
+
+    def test_activation_store_rejects_malformed_tracked_mcp_json_consent(self):
+        os.makedirs(os.path.dirname(activation.activation_path()), exist_ok=True)
+        malformed = (
+            [],
+            {self.project: False},
+            {os.path.join(self.project, "..", "project"): True},
+            {1: True},
+        )
+        for tracked_mcp_json in malformed:
+            with self.subTest(tracked_mcp_json=tracked_mcp_json):
+                with open(activation.activation_path(), "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "version": activation.ACTIVATION_VERSION,
+                            "projects": {},
+                            "acknowledgements": {},
+                            "trackedMcpJson": tracked_mcp_json,
+                        },
+                        fh,
+                    )
+                with self.assertRaisesRegex(
+                    activation.ActivationError, r"tracked \.mcp\.json consent"
+                ):
+                    activation.load_activations()
 
     def test_malformed_claude_project_approval_refuses_activation(self):
         path = activation.claude_settings_path(self.project)
@@ -621,6 +684,22 @@ class ActivationTest(unittest.TestCase):
             allow_tracked_mcp_json=True,
         )
         self.assertIn("boxa-echo", self._claude_data()["mcpServers"])
+        self.assertTrue(
+            activation.load_activations()["trackedMcpJson"][self.project]
+        )
+        with open(activation.runtime_path(), encoding="utf-8") as fh:
+            self.assertTrue(json.load(fh)["trackedMcpJson"][self.project])
+
+        activation.deactivate(
+            "echo",
+            self.project,
+            allow_tracked_mcp_json=True,
+        )
+        self.assertNotIn(
+            self.project, activation.load_activations()["trackedMcpJson"]
+        )
+        with open(activation.runtime_path(), encoding="utf-8") as fh:
+            self.assertNotIn(self.project, json.load(fh)["trackedMcpJson"])
 
     def test_identical_tracked_mcp_rerender_is_noop_without_consent(self):
         self._init_git()

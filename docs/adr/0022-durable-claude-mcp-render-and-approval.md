@@ -85,6 +85,11 @@ Seeding happens **once per name**. A name already seeded is never seeded
 again, so a user who disables the server through Claude Code's own controls
 stays disabled across every later render. This mirrors the one-time
 default-disable decision the legacy profile writer already records.
+When a rendered name is retired, Boxa also withdraws the approval that its
+seed delivered. Only names recorded in Boxa's previous seeded set are
+withdrawn; unrelated approvals remain untouched. A recorded Claude Code user
+decision is applied after withdrawal, so an explicit approval or rejection
+still wins.
 
 ### Foreign servers must be approved by the user, once
 
@@ -115,6 +120,15 @@ say only what `boxa mcp deactivate` removed. An activated MCP server is
 therefore not lost until the user deactivates or disables it; anything else
 that removes it is repaired at the next Container or shell start.
 
+Automatic convergence does not broaden the consent to modify repository
+bytes. An activation that writes a tracked `.mcp.json` with
+`--allow-tracked-mcp-json` records durable consent for that canonical Project
+in the host activation store and publishes it in the secret-free runtime
+snapshot. Convergence refuses a changed tracked `.mcp.json` unless that
+consent is present. It may still repair approval or convergence state when
+the tracked file is already byte-identical, because those repairs do not
+modify the tracked repository file.
+
 ## Migration
 
 Boxa-written `boxa-*` entries in `~/.claude/.claude.json` are removed when the
@@ -122,6 +136,14 @@ new render target is established, in the same operation, so the two renderers
 never coexist. Non-Boxa entries in that file, including servers the user or
 another tool added, are left untouched. Existing activations are preserved and
 re-rendered to the new target; the user does not re-activate anything.
+
+Earlier Boxa defaults seeded `enableAllProjectMcpServers` in the shared
+`~/.claude/settings.json`. Container setup performs a concurrency-safe,
+one-shot upgrade migration that removes only that top-level key and preserves
+all other settings. A durable marker is written even when the key or file is
+absent, so a user who deliberately restores the setting after migration keeps
+that choice. Unreadable or invalid JSON is left untouched and reported for a
+later retry.
 
 ## Consequences
 

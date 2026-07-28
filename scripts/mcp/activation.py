@@ -73,7 +73,12 @@ def canonical_project(path: str) -> str:
 
 
 def empty_activations() -> dict[str, Any]:
-    return {"version": ACTIVATION_VERSION, "projects": {}, "acknowledgements": {}}
+    return {
+        "version": ACTIVATION_VERSION,
+        "projects": {},
+        "acknowledgements": {},
+        "trackedMcpJson": {},
+    }
 
 
 def load_activations(path: Optional[str] = None) -> dict[str, Any]:
@@ -112,6 +117,17 @@ def load_activations(path: Optional[str] = None) -> dict[str, Any]:
         if any(not isinstance(entry_id, str) or value is not True for entry_id, value in records.items()):
             raise ActivationError("malformed MCP activation acknowledgement")
     data.setdefault("acknowledgements", acknowledgements)
+    tracked_mcp_json = data.get("trackedMcpJson", {})
+    if not isinstance(tracked_mcp_json, dict):
+        raise ActivationError("malformed MCP tracked .mcp.json consent")
+    if any(
+        not isinstance(project, str)
+        or canonical_project(project) != project
+        or value is not True
+        for project, value in tracked_mcp_json.items()
+    ):
+        raise ActivationError("malformed MCP tracked .mcp.json consent")
+    data.setdefault("trackedMcpJson", tracked_mcp_json)
     return data
 
 
@@ -435,6 +451,21 @@ def _commit_activation_render(
         state,
         allow_tracked=allow_tracked_mcp_json,
     )
+    tracked_mcp_json = data.setdefault("trackedMcpJson", {})
+    for claude_project in _claude_render_projects(data, state):
+        (
+            _path,
+            _exclude,
+            _relative,
+            tracked,
+            _existing,
+            _rendered,
+            names,
+        ) = _claude_render_plan(data, claude_project, catalog, state)
+        if not tracked or not names:
+            tracked_mcp_json.pop(claude_project, None)
+        elif allow_tracked_mcp_json:
+            tracked_mcp_json[claude_project] = True
     if render_codex:
         _preflight_codex_lifecycle(
             catalog,
@@ -506,6 +537,7 @@ def refresh_runtime(activations: Optional[dict[str, Any]] = None) -> None:
         "catalogVersion": catalog["version"],
         "entries": catalog["entries"],
         "projects": activations["projects"],
+        "trackedMcpJson": activations.get("trackedMcpJson", {}),
     }
     path = runtime_path()
     runtime_dir = os.path.dirname(path)
@@ -666,6 +698,8 @@ def _claude_settings_plan(
     project: str,
     rendered_names: list[str],
     state: dict[str, Any],
+    *,
+    retire: Optional[set[str]] = None,
 ) -> Optional[tuple[str, str, str]]:
     to_seed = set(rendered_names) - _claude_seeded_names(state, project)
     approved, rejected = _observed_claude_decisions(project)
@@ -700,7 +734,10 @@ def _claude_settings_plan(
             f"Claude Project settings disabledMcpjsonServers is not a list of strings: {path}"
         )
 
-    new_enabled = list(enabled)
+    new_enabled = [
+        name for name in enabled
+        if name not in (retire or set())
+    ]
     new_disabled = list(disabled)
     for name in sorted(to_seed):
         if name not in new_enabled:
@@ -871,7 +908,8 @@ def _preflight_claude_lifecycle(
         ) = _claude_render_plan(activations, project, catalog, state)
         if tracked and rendered != existing and not allow_tracked:
             refusals.append(path)
-        _claude_settings_plan(project, names, state)
+        retire = _claude_seeded_names(state, project) - set(names)
+        _claude_settings_plan(project, names, state, retire=retire)
     if refusals:
         raise ActivationError(
             "tracked Claude MCP config requires --allow-tracked-mcp-json for: "
@@ -896,7 +934,13 @@ def render_claude_activations(
     ]
     settings_plans = {
         os.path.dirname(path): _claude_settings_plan(
-            os.path.dirname(path), names, state
+            os.path.dirname(path),
+            names,
+            state,
+            retire=(
+                _claude_seeded_names(state, os.path.dirname(path))
+                - set(names)
+            ),
         )
         for (
             path, _exclude_path, _relative, _tracked, _existing, _rendered, names,

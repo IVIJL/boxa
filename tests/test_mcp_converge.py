@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -76,7 +77,9 @@ class ConvergeTest(unittest.TestCase):
             record["enabled"] = enabled
         return record
 
-    def _write_snapshot(self, records=None, projects=None):
+    def _write_snapshot(
+        self, records=None, projects=None, tracked_mcp_json=None
+    ):
         if projects is None:
             projects = {self.project: records or {}}
         data = {
@@ -85,6 +88,8 @@ class ConvergeTest(unittest.TestCase):
             "entries": self.entries,
             "projects": projects,
         }
+        if tracked_mcp_json is not None:
+            data["trackedMcpJson"] = tracked_mcp_json
         with open(self.snapshot, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
         return data
@@ -116,6 +121,20 @@ class ConvergeTest(unittest.TestCase):
             os.unlink(converge.state_path())
         except FileNotFoundError:
             pass
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", "-C", self.project, *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+
+    def _init_git(self):
+        self._git("init", "-q")
+        self._git("config", "user.email", "boxa-tests@example.invalid")
+        self._git("config", "user.name", "Boxa Tests")
 
     def test_deleted_render_is_restored_from_snapshot_without_host_store(self):
         self._write_snapshot(self._desired_records())
@@ -225,6 +244,102 @@ class ConvergeTest(unittest.TestCase):
             set(self._mcp_data()["mcpServers"]), {"boxa-other"}
         )
 
+    def test_snapshot_deactivation_withdraws_only_boxa_seeded_approval(self):
+        self._write_snapshot(self._desired_records())
+        converge.converge(self.project)
+        settings_path = activation.claude_settings_path(self.project)
+        settings = self._settings_data()
+        settings["enabledMcpjsonServers"].append("user-enabled")
+        settings["unrelated"] = {"keep": True}
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, indent=2)
+            fh.write("\n")
+        self._write_snapshot({})
+
+        result = converge.converge(self.project)[0]
+
+        self.assertTrue(result.approval_changed)
+        settings = self._settings_data()
+        self.assertEqual(settings["enabledMcpjsonServers"], ["user-enabled"])
+        self.assertEqual(settings["unrelated"], {"keep": True})
+        self.assertNotIn(
+            "boxa-echo", settings.get("disabledMcpjsonServers", [])
+        )
+
+    def test_tracked_mcp_change_without_snapshot_consent_skips_all_writes(self):
+        self._init_git()
+        mcp_path = activation.claude_config_path(self.project)
+        settings_path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings_path))
+        with open(mcp_path, "w", encoding="utf-8") as fh:
+            fh.write('{"theme":"tracked"}\n')
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            fh.write('{"enabledMcpjsonServers":["user-enabled"]}\n')
+        self._git("add", ".mcp.json")
+        self._git("commit", "-qm", "tracked mcp config")
+        exclude_path = self._git(
+            "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
+        )
+        paths = (mcp_path, settings_path, exclude_path)
+        before = {}
+        for path in paths:
+            with open(path, "rb") as fh:
+                before[path] = fh.read()
+        self._write_snapshot(self._desired_records())
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn(mcp_path, result.reason)
+        self.assertIn("--allow-tracked-mcp-json", result.reason)
+        self.assertFalse(os.path.exists(converge.state_path()))
+        for path in paths:
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), before[path])
+
+    def test_tracked_mcp_change_with_snapshot_consent_converges(self):
+        self._init_git()
+        mcp_path = activation.claude_config_path(self.project)
+        with open(mcp_path, "w", encoding="utf-8") as fh:
+            fh.write('{"theme":"tracked"}\n')
+        self._git("add", ".mcp.json")
+        self._git("commit", "-qm", "tracked mcp config")
+        self._write_snapshot(
+            self._desired_records(),
+            tracked_mcp_json={self.project: True},
+        )
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        self.assertIn("boxa-echo", self._mcp_data()["mcpServers"])
+
+    def test_in_sync_tracked_mcp_allows_approval_repair_without_consent(self):
+        self._write_snapshot(self._desired_records())
+        converge.converge(self.project)
+        self._init_git()
+        self._git("add", "-f", ".mcp.json")
+        self._git("commit", "-qm", "track rendered mcp config")
+        settings_path = activation.claude_settings_path(self.project)
+        os.unlink(settings_path)
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        self.assertEqual(result.seeded, ["boxa-echo"])
+        self.assertEqual(
+            self._settings_data()["enabledMcpjsonServers"], ["boxa-echo"]
+        )
+
+    def test_untracked_mcp_change_needs_no_snapshot_consent(self):
+        self._init_git()
+        self._write_snapshot(self._desired_records(), tracked_mcp_json={})
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        self.assertIn("boxa-echo", self._mcp_data()["mcpServers"])
+
     def test_foreign_servers_and_top_level_keys_survive_and_are_not_seeded(self):
         self._write_snapshot(self._desired_records())
         foreign = {"command": "foreign", "args": ["--keep"], "x": {"y": 1}}
@@ -262,6 +377,9 @@ class ConvergeTest(unittest.TestCase):
             ).encode(),
             "malformed-maps": json.dumps(
                 {**valid, "projects": []}
+            ).encode(),
+            "malformed-tracked-consent": json.dumps(
+                {**valid, "trackedMcpJson": {self.project: "yes"}}
             ).encode(),
         }
 

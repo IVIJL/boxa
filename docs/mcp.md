@@ -34,12 +34,12 @@ connected; reload or restart the affected agent.
 
 ## Persistence and Project identity
 
-The catalog, activations, acknowledgements, and secrets are host-owned state
-under the user's Boxa configuration. They survive host restarts, `boxa down`,
-and Container recreation. Installed npm runtime lives in the persistent
-npm-global prefix; Docker images live in the Project's persistent rootless
-Docker state. Agent config and the Container runtime snapshot are derived and
-can be restored with `boxa mcp doctor --fix`.
+The catalog, activations, tracked-render consents, acknowledgements, and
+secrets are host-owned state under the user's Boxa configuration. They survive
+host restarts, `boxa down`, and Container recreation. Installed npm runtime
+lives in the persistent npm-global prefix; Docker images live in the Project's
+persistent rootless Docker state. Agent config and the Container runtime
+snapshot are derived and can be restored with `boxa mcp doctor --fix`.
 
 An activation is keyed by the canonical absolute host path. Moving a directory
 or creating a new clone produces another Project key and intentionally does not
@@ -59,10 +59,12 @@ without that authorization.
 
 For Claude Code, activation also seeds the rendered server name once into
 `.claude/settings.local.json`. Boxa preserves unrelated Project settings and
-does not seed that name again after the user disables it; deactivation retires
-the seed so a later reactivation delivers approval again. Decisions Claude Code
-records for Project servers, including foreign ones, are mirrored there as
-approval or rejection; unanswered servers remain unanswered.
+does not seed that name again after the user disables it. Deactivation
+withdraws the approval delivered by that seed and retires the seed so a later
+reactivation delivers approval again. User-created approvals and unrelated
+settings remain untouched. Decisions Claude Code records for Project servers,
+including foreign ones, are mirrored there as approval or rejection and win
+over withdrawal; unanswered servers remain unanswered.
 
 Deactivation, removal, or a runtime-affecting update re-renders selected
 consumers atomically. Restart/reload an already-running Claude or Codex session
@@ -83,6 +85,11 @@ Claude in the snapshot. A missing, empty, malformed, or unreadable snapshot is
 a reported no-op and never means that all entries should be removed. When the
 render, approval, and local convergence state already match, no file is
 rewritten.
+
+If `.mcp.json` is tracked and its rendered bytes need to change, convergence
+refuses all writes for that Project unless a host activation previously
+recorded durable consent through `--allow-tracked-mcp-json`. An already
+in-sync tracked `.mcp.json` does not block approval-state repair.
 
 ## Execution identity
 
@@ -157,6 +164,11 @@ enter the catalog with no activations. Existing Project definitions retain only
 the original Project and consumers where a Boxa render actually existed.
 Legacy source files remain recoverable, and migration never infers
 `agent-trusted`.
+
+Container setup also removes the old Boxa-seeded
+`enableAllProjectMcpServers` setting once without replacing unrelated Claude
+settings. A durable migration marker ensures a later deliberate user choice is
+not removed again.
 
 ## Diagnosis
 
