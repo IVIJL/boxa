@@ -5,8 +5,11 @@ Boxa renders derived state into files it does not own alone: a Project's
 too, ``.git/info/exclude`` by Git and by the user. Boxa's mutation lock only
 serializes Boxa processes, so a plan built from a pre-image can be stale by the
 time it is written. Every render write therefore goes through :func:`swap`,
-which re-reads the file immediately before the atomic replace and raises
-:class:`ConcurrentModification` instead of clobbering a foreign edit.
+which arms a CONDITIONAL REPLACE: the file is re-read inside the atomic writer,
+after the temporary file is complete and immediately before ``os.replace``, and
+:class:`ConcurrentModification` is raised instead of clobbering a foreign edit.
+The only window left is the replace syscall itself — an edit landing while the
+temporary file is being written is caught, not overwritten.
 
 The same journal that makes the check possible also makes compensation exact:
 :func:`transaction` records what Boxa actually wrote (pre-image + post-image)
@@ -148,12 +151,68 @@ def restore(entry: FileSnapshot) -> None:
             pass
 
 
+def _mismatch(current: Optional[bytes], expected: Optional[bytes]) -> bool:
+    """Whether ``current`` differs from the expected pre-image.
+
+    Existence is part of the value: a missing file (``None``) is never the
+    expected empty file (``b""``) and vice versa, so a concurrent create or
+    delete of an empty file is reported instead of being silently accepted.
+    """
+    return current != expected
+
+
+# -- conditional replace ------------------------------------------------------
+#
+# ``swap`` arms the expected pre-image for one path; the atomic writers check it
+# as the LAST thing before ``os.replace``. Arming (rather than an extra writer
+# argument) keeps the injected writer signature ``(path, text)``, so a writer
+# built on :func:`atomic_text` / :func:`atomic_json` — which is what every render
+# write is — inherits the check without threading it through by hand.
+
+
+@dataclass
+class _Armed:
+    path: str
+    expected: Optional[bytes]
+    checked: bool = False
+
+
+_ARMED: list[_Armed] = []
+
+
+@contextmanager
+def _arm(path: str, expected: Optional[bytes]) -> Iterator[_Armed]:
+    entry = _Armed(path=os.path.abspath(path), expected=expected)
+    _ARMED.append(entry)
+    try:
+        yield entry
+    finally:
+        _ARMED.pop()
+
+
+def _verify_armed(path: str) -> None:
+    """Refuse an armed replace whose target no longer holds its pre-image.
+
+    Called from inside the atomic writers with the temporary file already
+    written and fsynced, so the re-read reflects the file as it is at the very
+    moment of the replace. Unarmed paths (Boxa-private stores) pass through.
+    """
+    target = os.path.abspath(path)
+    for entry in reversed(_ARMED):
+        if entry.path == target:
+            if _mismatch(read_bytes(path), entry.expected):
+                raise ConcurrentModification(path)
+            entry.checked = True
+            return
+
+
 def atomic_text(path: str, text: str) -> None:
     """Replace ``path`` with ``text`` atomically, keeping its current mode.
 
-    Low-level writer: it performs no compare-and-swap. Render writes must call
-    :func:`swap`; only Boxa-private stores serialized by the mutation lock may
-    use this directly (they still journal through :func:`record`).
+    Low-level writer: it starts no compare-and-swap of its own, but it HONOURS
+    one armed by :func:`swap` (see :func:`_verify_armed`). Render writes must go
+    through :func:`swap`; only Boxa-private stores serialized by the mutation
+    lock may call this directly (they still journal through :func:`record`).
     """
     os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
     tmp = f"{path}.tmp-{os.getpid()}"
@@ -168,6 +227,9 @@ def atomic_text(path: str, text: str) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, mode)
+        # Last act before the replace: honour an armed pre-image, so an edit
+        # that landed while this temporary file was written is refused here.
+        _verify_armed(path)
         os.replace(tmp, path)
     finally:
         try:
@@ -188,6 +250,9 @@ def atomic_json(path: str, data: dict[str, Any], mode: int) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, mode)
+        # Last act before the replace: honour an armed pre-image, so an edit
+        # that landed while this temporary file was written is refused here.
+        _verify_armed(path)
         os.replace(tmp, path)
     finally:
         try:
@@ -312,14 +377,22 @@ def _undo_append(entry: WriteRecord, current: Optional[bytes]) -> bool:
 # -- compare-and-swap writes --------------------------------------------------
 
 
-def _mismatch(current: Optional[bytes], expected: Optional[bytes]) -> bool:
-    """Whether ``current`` differs from the expected pre-image.
+def concurrent_conflict(exc: BaseException) -> Optional[ConcurrentModification]:
+    """The CAS refusal behind ``exc``, if any — following translated errors.
 
-    Existence is part of the value: a missing file (``None``) is never the
-    expected empty file (``b""``) and vice versa, so a concurrent create or
-    delete of an empty file is reported instead of being silently accepted.
+    A caller that translates :class:`ConcurrentModification` into its own public
+    error type (``RenderWriteError``) chains the original as ``__cause__``. Batch
+    compensation still has to recognize the refusal to report it as "nothing was
+    written", so it asks here instead of matching the type directly.
     """
-    return current != expected
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ConcurrentModification):
+            return current
+        seen.add(id(current))
+        current = current.__cause__
+    return None
 
 
 def swap(
@@ -333,15 +406,27 @@ def swap(
 
     ``expected`` is the exact pre-image the new content was derived from, or
     ``None`` for "must not exist" — which is NOT the same as ``b""``, the
-    pre-image of an existing empty file. The check happens immediately before the
-    atomic replace; on mismatch nothing is written and
-    :class:`ConcurrentModification` is raised. The write is journalled into the
-    innermost :func:`transaction`, if any.
+    pre-image of an existing empty file. The pre-image is checked twice: once up
+    front, so a doomed write never even creates a temporary file, and once inside
+    the atomic writer immediately before ``os.replace`` — so an edit landing
+    while the temporary file is written is refused too. On mismatch nothing is
+    written and :class:`ConcurrentModification` is raised. The write is
+    journalled into the innermost :func:`transaction`, if any.
+
+    ``writer`` must perform its replace through :func:`atomic_text` or
+    :func:`atomic_json`; that is what makes the check conditional on the
+    pre-image. A writer that replaces the path by itself is a programming error
+    and is reported as such.
     """
     preimage = snapshot(path)
     if _mismatch(preimage.image, expected):
         raise ConcurrentModification(path)
-    (writer or atomic_text)(path, text)
+    with _arm(path, expected) as armed:
+        (writer or atomic_text)(path, text)
+    if not armed.checked:
+        raise WriteError(
+            f"render writer for {path} bypassed the compare-and-swap replace"
+        )
     postimage = read_bytes(path)
     if postimage == preimage.image:
         return None

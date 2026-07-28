@@ -128,16 +128,25 @@ repaired `.mcp.json` and an unrepaired `.claude/settings.local.json`.
 
 Every write Boxa makes to a rendered or shared file — on the host and inside a
 Container alike — goes through one compare-and-swap primitive. The file is
-re-read immediately before the atomic replace and compared with the exact
-pre-image the rendered content was derived from — including whether the file
-existed at all, so deleting it or creating it empty counts as a change. If
-Claude Code, Git, or you changed it in between, Boxa writes nothing and says so:
+re-read at the last possible moment — after Boxa's temporary file is written and
+flushed to disk, immediately before the replace — and compared with the exact
+pre-image the rendered content was derived from, including whether the file
+existed at all, so deleting it or creating it empty counts as a change. An edit
+that lands while Boxa is preparing the new content is therefore refused, not
+overwritten. If Claude Code, Git, or you changed it in between, Boxa writes
+nothing and says so:
 
 * convergence reports a skip ("concurrent write to the rendered file was
   detected") after a bounded number of retries and repairs it on the next run;
 * a host command (`activate`, `deactivate`, `doctor --fix`, `migrate`) aborts
   the whole batch, takes back everything it had already written, and names the
-  path that changed — re-run the command to render from fresh bytes.
+  path that changed — re-run the command to render from fresh bytes;
+* `boxa mcp render` refuses with `<path> changed on disk while Boxa was
+  rendering it; nothing was written — re-run the command` and exits non-zero.
+
+What remains is the rename itself: the filesystem has no compare-and-swap
+rename, so an edit written in the same instant as Boxa's replace can still be
+lost. Everything before that instant is covered.
 
 Rollback is equally careful: it restores a file only while its bytes are still
 the ones Boxa wrote, so an edit made after Boxa's write is reported instead of

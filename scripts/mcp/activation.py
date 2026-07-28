@@ -226,9 +226,12 @@ def _compensate(
             f"{label} failed and rollback was incomplete: "
             + "; ".join(problems)
         ) from exc
-    if isinstance(exc, casfile.ConcurrentModification):
+    # The refusal may arrive translated into a writer's public error type, so
+    # follow the cause chain rather than matching the type directly.
+    conflict = casfile.concurrent_conflict(exc)
+    if conflict is not None:
         raise ActivationError(
-            f"{label} refused: {exc.path} changed on disk while Boxa was "
+            f"{label} refused: {conflict.path} changed on disk while Boxa was "
             "rendering it; nothing was written — re-run the command"
         ) from exc
     raise exc
@@ -1241,7 +1244,16 @@ def mirror_claude_decisions(project: str) -> bool:
             f"{path}; grant consent by activating in that Project with "
             "--allow-tracked-mcp-json"
         )
-    _swap_text(path, existing, rendered)
+    # This entry point writes outside a compensating batch, so translate the CAS
+    # refusal into its declared error type rather than leaking it to the caller.
+    try:
+        _swap_text(path, existing, rendered)
+    except casfile.ConcurrentModification as exc:
+        raise ActivationError(
+            f"Claude decision mirroring refused: {exc.path} changed on disk "
+            "while Boxa was rendering it; nothing was written — re-run the "
+            "command"
+        ) from exc
     if git_paths is not None and not tracked:
         _ensure_local_exclude(exclude_path, relative)
     return True

@@ -48,34 +48,43 @@ class RenderWriteError(RuntimeError):
 def _swap_write(path: str, expected: Optional[str], text: str) -> None:
     """Compare-and-swap a config the agent also owns (ADR 0022).
 
-    Raises ``casfile.ConcurrentModification`` — never clobbers — when the file
-    changed since the bytes this render was derived from. ``expected`` is
-    ``None`` when the render was planned from a MISSING file, which never
-    matches an empty file created meanwhile.
+    Never clobbers: when the file changed since the bytes this render was
+    derived from, nothing is written and the refusal is reported as this
+    module's public :class:`RenderWriteError`, so the ``render-write-*`` CLI
+    path prints an actionable message instead of an unhandled traceback. The
+    original ``casfile.ConcurrentModification`` stays chained, so batch
+    compensation can still recognize the refusal (``casfile.concurrent_conflict``).
+    ``expected`` is ``None`` when the render was planned from a MISSING file,
+    which never matches an empty file created meanwhile.
     """
-    casfile.swap(
-        path,
-        casfile.preimage(expected),
-        text,
-        writer=lambda target, payload: _atomic_write(target, payload),
-    )
+    try:
+        casfile.swap(
+            path,
+            casfile.preimage(expected),
+            text,
+            writer=lambda target, payload: _atomic_write(target, payload),
+        )
+    except casfile.ConcurrentModification as exc:
+        raise RenderWriteError(
+            f"{exc.path} changed on disk while Boxa was rendering it; "
+            "nothing was written — re-run the command"
+        ) from exc
 
 
 def _atomic_write(path: str, text: str) -> None:
     """Write ``text`` to ``path`` atomically (temp file + replace).
 
     The agent config is non-secret (wrapper calls + env NAMES only), so default
-    permissions are fine — unlike the secret store, which forces 0600.
+    permissions are fine — unlike the secret store, which forces 0600. The
+    replace goes through ``casfile.atomic_text`` so a compare-and-swap armed by
+    :func:`_swap_write` is honoured immediately before it.
     """
     parent = os.path.dirname(path) or "."
     os.makedirs(parent, exist_ok=True)
     # Journalled so a failed migration/lifecycle batch takes the legacy render
     # write back exactly (ADR 0022).
     with casfile.record(path):
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
+        casfile.atomic_text(path, text)
 
 
 # -- Claude Code (JSON) -------------------------------------------------------

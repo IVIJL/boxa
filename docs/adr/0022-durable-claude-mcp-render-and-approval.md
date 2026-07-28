@@ -219,13 +219,27 @@ and every render, migration and rollback write goes through it:
   file, so a file deleted concurrently is not recreated from a stale empty
   pre-image and an empty file created concurrently is not overwritten by a plan
   derived from a missing one. Planning may treat a missing file as empty
-  content; the pre-image handed to the primitive may not. The primitive re-reads
-  the file immediately before the atomic replace; on mismatch it writes nothing and
-  raises one distinct *concurrent modification* condition. It never retries by
+  content; the pre-image handed to the primitive may not. The replace is
+  **conditional**: the primitive re-reads the file inside the atomic writer,
+  after the temporary file is complete and fsynced and immediately before
+  `os.replace`, so an edit landing while that temporary file is written is
+  refused too. On mismatch it writes nothing and raises one distinct *concurrent
+  modification* condition. The only window left is the `os.replace` call itself:
+  the filesystem offers no compare-and-swap rename, so an edit that lands in
+  that instant is still lost — a race no user-space writer can close without
+  locking foreign writers Boxa does not control. Deletes (`remove`) check just
+  before `unlink` and carry the same residual window. Because the check lives in
+  the writer, every render writer must replace through that writer; one that
+  replaces a path by itself is reported as a write error rather than silently
+  losing the guarantee. It never retries by
   itself: convergence retries from a newer snapshot up to its fixed bound and
   then reports a skip, while a host lifecycle command aborts the whole batch
   and names the path, because a host batch is a user-visible transaction, not a
-  background repair.
+  background repair. The condition never reaches the user as a raw internal
+  exception: each entry point translates it into its own declared error type
+  (`RenderWriteError`, `ActivationError`, `MigrationError`, a convergence skip)
+  while chaining the original, so batch compensation still recognizes a refusal
+  through the cause chain and reports "nothing was written".
 * **Journalled compensation.** Writes inside a batch record what Boxa actually
   wrote (pre-image and post-image). Rollback walks that journal newest-first
   and restores a path only while its current bytes are still Boxa's own

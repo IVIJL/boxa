@@ -380,9 +380,12 @@ def _compensate(
             f"{label} failed and rollback was incomplete: "
             + "; ".join(problems)
         ) from exc
-    if isinstance(exc, casfile.ConcurrentModification):
+    # The refusal may arrive translated into a writer's public error type, so
+    # follow the cause chain rather than matching the type directly.
+    conflict = casfile.concurrent_conflict(exc)
+    if conflict is not None:
         raise MigrationError(
-            f"{label} refused: {exc.path} changed on disk while Boxa was "
+            f"{label} refused: {conflict.path} changed on disk while Boxa was "
             "rendering it; nothing was written — re-run the command"
         ) from exc
     raise exc

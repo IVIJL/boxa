@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -193,6 +194,90 @@ class CasFileTest(unittest.TestCase):
     def test_preimage_keeps_absence_distinct_from_empty_text(self):
         self.assertIsNone(casfile.preimage(None))
         self.assertEqual(casfile.preimage(""), b"")
+
+    def _edit_while_the_temp_file_is_written(self, data: bytes):
+        """Land a foreign edit inside the writer's own write window.
+
+        The writer has already created and fsynced its temporary file; the edit
+        arrives in the instant before ``os.replace``. A call-site-only check
+        cannot see it, which is exactly the window under test.
+        """
+        real_fsync = os.fsync
+        landed: list[bool] = []
+
+        def fsync(fd):
+            result = real_fsync(fd)
+            if not landed:
+                landed.append(True)
+                self._write(data)
+            return result
+
+        return mock.patch.object(casfile.os, "fsync", fsync)
+
+    def test_swap_refuses_an_edit_landing_while_the_temp_file_is_written(self):
+        self._write(b"before\n")
+
+        with self._edit_while_the_temp_file_is_written(b"foreign\n"):
+            with self.assertRaises(casfile.ConcurrentModification) as caught:
+                casfile.swap(self.path, b"before\n", "after\n")
+
+        self.assertEqual(caught.exception.path, self.path)
+        self.assertEqual(self._read(), b"foreign\n")
+        # Nothing written and no temp residue left behind.
+        self.assertEqual(os.listdir(self.tmp.name), ["file.json"])
+
+    def test_swap_refuses_a_delete_landing_while_the_temp_file_is_written(self):
+        self._write(b"before\n")
+        real_fsync = os.fsync
+        landed: list[bool] = []
+
+        def fsync(fd):
+            result = real_fsync(fd)
+            if not landed:
+                landed.append(True)
+                os.unlink(self.path)
+            return result
+
+        with mock.patch.object(casfile.os, "fsync", fsync):
+            with self.assertRaises(casfile.ConcurrentModification):
+                casfile.swap(self.path, b"before\n", "after\n")
+
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_swap_json_refuses_an_edit_landing_in_the_same_window(self):
+        self._write(b'{"a":1}\n')
+
+        with self._edit_while_the_temp_file_is_written(b'{"foreign":true}\n'):
+            with self.assertRaises(casfile.ConcurrentModification):
+                casfile.swap_json(self.path, b'{"a":1}\n', {"a": 2}, 0o600)
+
+        self.assertEqual(self._read(), b'{"foreign":true}\n')
+
+    def test_swap_still_writes_when_nothing_lands_in_the_window(self):
+        self._write(b"before\n")
+
+        with self._edit_while_the_temp_file_is_written(b"before\n"):
+            casfile.swap(self.path, b"before\n", "after\n")
+
+        self.assertEqual(self._read(), b"after\n")
+
+    def test_swap_reports_a_writer_that_bypasses_the_conditional_replace(self):
+        self._write(b"before\n")
+
+        def rogue(path, text):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        with self.assertRaises(casfile.WriteError):
+            casfile.swap(self.path, b"before\n", "after\n", writer=rogue)
+
+    def test_concurrent_conflict_follows_a_translated_error(self):
+        original = casfile.ConcurrentModification(self.path)
+        translated = RuntimeError("refused")
+        translated.__cause__ = original
+
+        self.assertIs(casfile.concurrent_conflict(translated), original)
+        self.assertIsNone(casfile.concurrent_conflict(RuntimeError("other")))
 
     def test_record_journals_a_bespoke_write(self):
         self._write(b"before\n")

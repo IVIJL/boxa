@@ -22,12 +22,15 @@ Covers the issue-07 real-render acceptance criteria:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
@@ -38,7 +41,9 @@ from mcp.render import (  # noqa: E402
     PlannedEntry,
     build_render_plan,
 )
+from mcp import casfile, writer  # noqa: E402
 from mcp.writer import (  # noqa: E402
+    RenderWriteError,
     write_claude,
     write_codex,
     write_plan,
@@ -466,6 +471,116 @@ class WritePlanTest(WriterEnv):
             self._codex_plan([_entry("context7")]),
         )
         self.assertEqual(sorted(written), ["claude-code", "codex"])
+
+
+class ConcurrentEditRefusalTest(WriterEnv):
+    """A foreign edit during the write window is refused as RenderWriteError.
+
+    The refusal must arrive as this module's PUBLIC error type: the
+    ``render-write-*`` CLI path catches only ``RenderWriteError``, so a raw
+    ``casfile.ConcurrentModification`` would surface as a traceback.
+    """
+
+    def _land_edit_during_the_write(self, target: str, data: str):
+        original = writer._atomic_write  # noqa: SLF001
+        landed: list[bool] = []
+
+        def edit_then_write(path, text):
+            if path == target and not landed:
+                landed.append(True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(data)
+            return original(path, text)
+
+        return mock.patch.object(
+            writer, "_atomic_write", side_effect=edit_then_write
+        )
+
+    def test_claude_write_reports_a_concurrent_edit_as_render_write_error(self):
+        with open(self.claude_path, "w", encoding="utf-8") as fh:
+            fh.write('{"mcpServers": {}}\n')
+
+        with self._land_edit_during_the_write(
+            self.claude_path, '{"foreign": true}\n'
+        ):
+            with self.assertRaises(RenderWriteError) as caught:
+                write_claude(self._claude_plan([_entry("context7")]))
+
+        self.assertIn(self.claude_path, str(caught.exception))
+        self.assertIn("nothing was written", str(caught.exception))
+        self.assertIsInstance(
+            caught.exception.__cause__, casfile.ConcurrentModification
+        )
+        with open(self.claude_path, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), '{"foreign": true}\n')
+
+    @unittest.skipUnless(_HAS_TOML, "no TOML parser available")
+    def test_codex_write_reports_a_concurrent_edit_as_render_write_error(self):
+        with open(self.codex_path, "w", encoding="utf-8") as fh:
+            fh.write("[manual]\nkeep = true\n")
+
+        with self._land_edit_during_the_write(
+            self.codex_path, "[foreign]\nlanded = true\n"
+        ):
+            with self.assertRaises(RenderWriteError):
+                write_codex(self._codex_plan([_entry("context7")]))
+
+        self.assertEqual(self._read_codex(), "[foreign]\nlanded = true\n")
+
+
+class ConcurrentEditCliRefusalTest(unittest.TestCase):
+    """`boxa mcp render` prints an actionable refusal, never a traceback."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = self._tmp.name
+        self._saved = {}
+        for var in ("HOME", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR"):
+            self._saved[var] = os.environ.get(var)
+        os.environ["HOME"] = self.home
+        os.environ["XDG_CONFIG_HOME"] = os.path.join(self.home, ".config")
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
+    def tearDown(self) -> None:
+        for var, val in self._saved.items():
+            if val is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = val
+        self._tmp.cleanup()
+
+    def test_render_write_reports_the_refusal_and_exits_one(self) -> None:
+        from mcp import cli
+
+        target = build_render_plan().claude.config_path
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write('{"mcpServers": {}}\n')
+
+        original = writer._atomic_write  # noqa: SLF001
+        landed: list[bool] = []
+
+        def edit_then_write(path, text):
+            if path == target and not landed:
+                landed.append(True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write('{"foreign": true}\n')
+            return original(path, text)
+
+        err = io.StringIO()
+        with mock.patch.object(
+            writer, "_atomic_write", side_effect=edit_then_write
+        ), contextlib.redirect_stderr(err), contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            code = cli.main(["render-write-text"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("changed on disk", err.getvalue())
+        self.assertIn("re-run the command", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        with open(target, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), '{"foreign": true}\n')
 
 
 class DryRunIsWriteFreeTest(unittest.TestCase):
