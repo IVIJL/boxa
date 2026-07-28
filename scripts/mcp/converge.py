@@ -258,11 +258,11 @@ def converge(
             del block[name]
             removed.append(name)
 
-    if block:
-        data["mcpServers"] = block
-    else:
-        data.pop("mcpServers", None)
-    rendered = activation._json_document(data)
+    rendered = activation._render_mcp_json(
+        existing,
+        definitions,
+        set(removed),
+    ) or activation._json_document({})
     mcp_changed = bool(added or removed or repaired)
     tracked_mcp_json = snapshot.get("trackedMcpJson", {})
     if (

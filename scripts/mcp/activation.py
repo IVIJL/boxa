@@ -633,6 +633,301 @@ def _json_document(data: dict[str, Any]) -> str:
     return json.dumps(data, indent=2) + "\n"
 
 
+@dataclass(frozen=True)
+class _JsonMember:
+    key: str
+    leading_start: int
+    key_start: int
+    key_end: int
+    value_start: int
+    value_end: int
+    comma_after: Optional[int]
+
+
+@dataclass(frozen=True)
+class _JsonObject:
+    start: int
+    close: int
+    members: tuple[_JsonMember, ...]
+
+
+_JSON_DECODER = json.JSONDecoder()
+_JSON_WHITESPACE = " \t\r\n"
+
+
+def _skip_json_whitespace(text: str, position: int) -> int:
+    while position < len(text) and text[position] in _JSON_WHITESPACE:
+        position += 1
+    return position
+
+
+def _scan_json_object(text: str, start: int) -> _JsonObject:
+    """Locate object members without changing their original representation."""
+    if start >= len(text) or text[start] != "{":
+        raise ValueError("JSON value is not an object")
+    members: list[_JsonMember] = []
+    position = start + 1
+    while True:
+        leading_start = position
+        position = _skip_json_whitespace(text, position)
+        if position >= len(text):
+            raise ValueError("unterminated JSON object")
+        if text[position] == "}":
+            return _JsonObject(start, position, tuple(members))
+
+        key_start = position
+        key, key_end = _JSON_DECODER.raw_decode(text, position)
+        if not isinstance(key, str):
+            raise ValueError("JSON object member name is not a string")
+        position = _skip_json_whitespace(text, key_end)
+        if position >= len(text) or text[position] != ":":
+            raise ValueError("JSON object member has no colon")
+        value_start = _skip_json_whitespace(text, position + 1)
+        _value, value_end = _JSON_DECODER.raw_decode(text, value_start)
+        position = _skip_json_whitespace(text, value_end)
+        comma_after: Optional[int] = None
+        if position < len(text) and text[position] == ",":
+            comma_after = position
+            position += 1
+        elif position >= len(text) or text[position] != "}":
+            raise ValueError("JSON object member has no separator")
+        members.append(
+            _JsonMember(
+                key,
+                leading_start,
+                key_start,
+                key_end,
+                value_start,
+                value_end,
+                comma_after,
+            )
+        )
+
+
+def _line_indent(text: str, position: int) -> str:
+    line_start = max(
+        text.rfind("\n", 0, position),
+        text.rfind("\r", 0, position),
+    ) + 1
+    line = text[line_start:position]
+    length = 0
+    while length < len(line) and line[length] in " \t":
+        length += 1
+    return line[:length]
+
+
+def _member_indent(text: str, member: _JsonMember) -> str:
+    return _line_indent(text, member.key_start)
+
+
+def _object_member_style(
+    text: str,
+    scanned: _JsonObject,
+) -> tuple[str, str, str, _JsonMember]:
+    """Return separator, colon spacing, member indent, and a value exemplar."""
+    exemplar = scanned.members[-1]
+    if len(scanned.members) > 1:
+        previous = scanned.members[-2]
+        separator = text[previous.value_end:exemplar.key_start]
+    else:
+        separator = "," + text[scanned.start + 1:exemplar.key_start]
+    colon = text[exemplar.key_end:exemplar.value_start]
+    return separator, colon, _member_indent(text, exemplar), exemplar
+
+
+def _indent_unit(text: str, scanned: _JsonObject, member_indent: str) -> str:
+    parent_indent = _line_indent(text, scanned.start)
+    if (
+        member_indent.startswith(parent_indent)
+        and len(member_indent) > len(parent_indent)
+    ):
+        return member_indent[len(parent_indent):]
+    return "  "
+
+
+def _render_json_value(
+    value: Any,
+    text: str,
+    scanned: _JsonObject,
+    exemplar: _JsonMember,
+    member_indent: str,
+) -> str:
+    original_value = text[exemplar.value_start:exemplar.value_end]
+    if "\n" not in original_value and "\r" not in original_value:
+        return json.dumps(value, separators=(",", ":"))
+    unit = _indent_unit(text, scanned, member_indent)
+    rendered = json.dumps(value, indent=unit)
+    return rendered.replace("\n", "\n" + member_indent)
+
+
+def _delete_json_member(text: str, object_start: int, index: int) -> str:
+    scanned = _scan_json_object(text, object_start)
+    member = scanned.members[index]
+    if len(scanned.members) == 1:
+        return text[:scanned.start + 1] + text[scanned.close:]
+    if index == 0:
+        if member.comma_after is None:
+            raise ValueError("first JSON member has no following comma")
+        return text[:member.leading_start] + text[member.comma_after + 1:]
+    previous = scanned.members[index - 1]
+    return text[:previous.value_end] + text[member.value_end:]
+
+
+def _append_json_member(
+    text: str,
+    object_start: int,
+    key: str,
+    value: Any,
+) -> str:
+    scanned = _scan_json_object(text, object_start)
+    if scanned.members:
+        separator, colon, member_indent, exemplar = _object_member_style(
+            text, scanned
+        )
+        rendered = _render_json_value(
+            value, text, scanned, exemplar, member_indent
+        )
+        addition = separator + json.dumps(key) + colon + rendered
+        insertion = scanned.members[-1].value_end
+        return text[:insertion] + addition + text[insertion:]
+
+    # Empty objects have no neighbour to copy. Preserve existing inner
+    # whitespace when it already establishes a multiline style; otherwise use
+    # the documented two-space fallback.
+    inner = text[scanned.start + 1:scanned.close]
+    parent_indent = _line_indent(text, scanned.start)
+    if "\n" in inner or "\r" in inner:
+        leading = inner + "  "
+        member_indent = parent_indent + "  "
+        newline = (
+            "\r\n" if "\r\n" in inner
+            else "\r" if "\r" in inner
+            else "\n"
+        )
+        closing = newline + parent_indent
+    else:
+        leading = "\n" + parent_indent + "  "
+        member_indent = parent_indent + "  "
+        closing = "\n" + parent_indent
+    rendered = json.dumps(value, indent=2).replace("\n", "\n" + member_indent)
+    addition = leading + json.dumps(key) + ": " + rendered + closing
+    return text[:scanned.start + 1] + addition + text[scanned.close:]
+
+
+def _fallback_mcp_document(
+    original: str,
+    upserts: dict[str, dict[str, Any]],
+    deletes: set[str],
+) -> str:
+    data = json.loads(original) if original else {}
+    block = data.get("mcpServers")
+    if not isinstance(block, dict):
+        block = {}
+    for name in deletes:
+        block.pop(name, None)
+    block.update(upserts)
+    if block:
+        data["mcpServers"] = block
+    else:
+        data.pop("mcpServers", None)
+    return _json_document(data) if data else ""
+
+
+def _render_mcp_json(
+    original: str,
+    upserts: dict[str, dict[str, Any]],
+    deletes: set[str],
+) -> str:
+    """Patch only Boxa-owned ``mcpServers`` members in an existing document."""
+    if not original:
+        return _fallback_mcp_document(original, upserts, deletes)
+
+    parsed = json.loads(original)
+    block = parsed.get("mcpServers")
+    current = block if isinstance(block, dict) else {}
+    effective_deletes = {name for name in deletes if name in current}
+    changed_upserts = {
+        name: value
+        for name, value in upserts.items()
+        if current.get(name) != value
+    }
+    if not effective_deletes and not changed_upserts:
+        return original
+
+    intended = json.loads(json.dumps(parsed))
+    intended_block = intended.get("mcpServers")
+    if not isinstance(intended_block, dict):
+        intended_block = {}
+    for name in effective_deletes:
+        intended_block.pop(name, None)
+    intended_block.update(upserts)
+    if intended_block:
+        intended["mcpServers"] = intended_block
+    else:
+        intended.pop("mcpServers", None)
+
+    try:
+        text = original
+        root = _scan_json_object(text, _skip_json_whitespace(text, 0))
+        top_members = [
+            member for member in root.members if member.key == "mcpServers"
+        ]
+        if len(top_members) > 1:
+            raise ValueError("duplicate top-level mcpServers members")
+        if not top_members:
+            text = _append_json_member(
+                text, root.start, "mcpServers", intended_block
+            )
+        elif not intended_block:
+            index = root.members.index(top_members[0])
+            text = _delete_json_member(text, root.start, index)
+            if not intended:
+                return ""
+        else:
+            top = top_members[0]
+            nested = _scan_json_object(text, top.value_start)
+            keys = [member.key for member in nested.members]
+            if len(keys) != len(set(keys)):
+                raise ValueError("duplicate mcpServers members")
+            for name in effective_deletes:
+                nested = _scan_json_object(text, top.value_start)
+                index = next(
+                    index for index, member in enumerate(nested.members)
+                    if member.key == name
+                )
+                text = _delete_json_member(text, top.value_start, index)
+            for name, value in upserts.items():
+                root = _scan_json_object(text, _skip_json_whitespace(text, 0))
+                top = next(
+                    member for member in root.members
+                    if member.key == "mcpServers"
+                )
+                nested = _scan_json_object(text, top.value_start)
+                member = next(
+                    (item for item in nested.members if item.key == name),
+                    None,
+                )
+                if member is None:
+                    text = _append_json_member(
+                        text, nested.start, name, value
+                    )
+                elif json.loads(text[member.value_start:member.value_end]) != value:
+                    indent = _member_indent(text, member)
+                    rendered = _render_json_value(
+                        value, text, nested, member, indent
+                    )
+                    text = (
+                        text[:member.value_start]
+                        + rendered
+                        + text[member.value_end:]
+                    )
+        if json.loads(text) != intended:
+            raise ValueError("positional MCP render produced wrong JSON")
+        return text
+    except (StopIteration, TypeError, ValueError):
+        return _fallback_mcp_document(original, upserts, deletes)
+
+
 def claude_server_definition(
     entry_id: str,
     project: str,
@@ -815,16 +1110,14 @@ def _claude_render_plan(
     if block is not None and not isinstance(block, dict):
         raise ActivationError(f"Claude MCP config mcpServers is not an object: {path}")
     changed_block = bool(owned or definitions)
-    if changed_block:
-        if block is None:
-            block = {}
-            data["mcpServers"] = block
-        for name in owned | set(definitions):
-            block.pop(name, None)
-        block.update(definitions)
-        if not block:
-            data.pop("mcpServers", None)
-    rendered = _json_document(data) if data else ""
+    rendered = (
+        _render_mcp_json(
+            existing,
+            definitions,
+            owned - set(definitions),
+        )
+        if changed_block else existing
+    )
 
     git_paths = _claude_git_paths(project)
     tracked = False

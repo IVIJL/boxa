@@ -1445,7 +1445,13 @@ def _catalog_doctor_findings(probe: Optional[object] = None) -> list[Finding]:
                 tracked_label = "Codex config" if consumer == "codex" else ".mcp.json"
                 findings.append(Finding(SEVERITY_WARN, code, f"{consumer} render drift for activated MCP {row['name']!r} in Project {project}." + (f" The {tracked_label} is tracked." if tracked else ""), repair, not tracked))
 
-    expected = {"version": 1, "catalogVersion": catalog["version"], "entries": catalog["entries"], "projects": activations.get("projects", {})}
+    expected = {
+        "version": 1,
+        "catalogVersion": catalog["version"],
+        "entries": catalog["entries"],
+        "projects": activations.get("projects", {}),
+        "trackedMcpJson": activations.get("trackedMcpJson", {}),
+    }
     try:
         with open(runtime_path(), encoding="utf-8") as fh:
             actual = json.load(fh)

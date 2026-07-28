@@ -705,6 +705,17 @@ class ActivationTest(unittest.TestCase):
         self._init_git()
         activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
         path = activation.claude_config_path(self.project)
+        definition = activation.claude_server_definition(
+            self.entry["id"], self.project, self.entry
+        )
+        original = (
+            '{"label":"caf\\u00e9","mcpServers":{"foreign":'
+            '{"command":"keep","ratio":1.0},"boxa-echo":'
+            f'{json.dumps(definition, separators=(",", ":"))}'
+            '},"numeric":1e3}\t'
+        )
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(original)
         self._git("add", "-f", ".mcp.json")
         self._git("commit", "-qm", "track rendered mcp config")
         before = os.stat(path).st_mtime_ns
@@ -712,6 +723,32 @@ class ActivationTest(unittest.TestCase):
         activation.render_claude_activations(allow_tracked=False)
 
         self.assertEqual(os.stat(path).st_mtime_ns, before)
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), original)
+
+    def test_runtime_doctor_accepts_tracked_mcp_json_and_fix_clears_drift(self):
+        activations = activation.empty_activations()
+        activations["trackedMcpJson"][self.project] = True
+        activation.save_activation_store(activations)
+        activation.refresh_runtime()
+
+        findings = lifecycle._catalog_doctor_findings()
+        self.assertNotIn(
+            "catalog-runtime-drift", {finding.code for finding in findings}
+        )
+
+        with open(activation.runtime_path(), "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
+        findings = lifecycle._catalog_doctor_findings()
+        self.assertIn(
+            "catalog-runtime-drift", {finding.code for finding in findings}
+        )
+        fixed = lifecycle.apply_doctor_fixes(
+            lifecycle.DoctorReport(False, findings)
+        )
+        self.assertNotIn(
+            "catalog-runtime-drift", {finding.code for finding in fixed.remaining}
+        )
 
     def test_tracked_mcp_drift_is_reported_and_not_doctor_fixable(self):
         self._init_git()
@@ -795,6 +832,59 @@ class ActivationTest(unittest.TestCase):
                 "mcpServers": {"manual": {"command": "manual"}},
             },
         )
+
+    def test_claude_render_preserves_unmanaged_mcp_json_bytes(self):
+        path = activation.claude_config_path(self.project)
+        original = (
+            '{"label":"caf\\u00e9","mcpServers":{'
+            '"foreign":{"command":"keep","ratio":1.0},'
+            '"boxa-echo":{"command":"old"},'
+            '"boxa-stale":{"command":"old"}},'
+            '"numeric":1e3}\t'
+        )
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        activations = activation.empty_activations()
+        activations["projects"][self.project] = {
+            self.entry["id"]: {
+                "catalogId": self.entry["id"],
+                "consumers": ["claude"],
+            },
+            self.inactive["id"]: {
+                "catalogId": self.inactive["id"],
+                "consumers": ["claude"],
+            },
+        }
+        state = {
+            "projects": {
+                self.project: ["boxa-echo", "boxa-stale"],
+            }
+        }
+
+        plan = activation._claude_render_plan(
+            activations, self.project, activation.load_catalog(), state
+        )
+
+        echo = json.dumps(
+            activation.claude_server_definition(
+                self.entry["id"], self.project, self.entry
+            ),
+            separators=(",", ":"),
+        )
+        inactive = json.dumps(
+            activation.claude_server_definition(
+                self.inactive["id"], self.project, self.inactive
+            ),
+            separators=(",", ":"),
+        )
+        expected = (
+            '{"label":"caf\\u00e9","mcpServers":{'
+            f'"foreign":{{"command":"keep","ratio":1.0}},'
+            f'"boxa-echo":{echo},"boxa-inactive":{inactive}'
+            '},"numeric":1e3}\t'
+        )
+        self.assertEqual(plan[5], expected)
+        self.assertEqual(json.loads(plan[5])["numeric"], 1000)
 
     def test_existing_activation_store_renders_new_target_and_retires_old(self):
         record = {

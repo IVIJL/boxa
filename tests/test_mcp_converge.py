@@ -228,6 +228,70 @@ class ConvergeTest(unittest.TestCase):
             data["mcpServers"]["boxa-echo"]["args"][-1], "echo"
         )
 
+    def test_converge_preserves_unmanaged_mcp_json_bytes(self):
+        records = {
+            self.entry["id"]: self._record(self.entry),
+            self.other["id"]: self._record(self.other),
+        }
+        self._write_snapshot(records)
+        original = (
+            '{\n'
+            '\t"label": "caf\\u00e9",\n'
+            '\t"mcpServers": {\n'
+            '\t\t"foreign": {"command":"keep","ratio":1.0},\n'
+            '\t\t"boxa-echo": {"command":"old"},\n'
+            '\t\t"boxa-stale": {"command":"old"}\n'
+            '\t},\n'
+            '\t"numeric": 1e3\n'
+            '}\t'
+        )
+        mcp_path = activation.claude_config_path(self.project)
+        with open(mcp_path, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        os.makedirs(os.path.dirname(converge.state_path()), exist_ok=True)
+        with open(converge.state_path(), "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "version": 1,
+                    "projects": {
+                        self.project: ["boxa-echo", "boxa-stale"],
+                    },
+                    "seeded": {},
+                },
+                fh,
+            )
+
+        result = converge.converge(self.project)[0]
+
+        echo = json.dumps(
+            activation.claude_server_definition(
+                self.entry["id"], self.project, self.entry
+            ),
+            separators=(",", ":"),
+        )
+        other = json.dumps(
+            activation.claude_server_definition(
+                self.other["id"], self.project, self.other
+            ),
+            separators=(",", ":"),
+        )
+        expected = (
+            '{\n'
+            '\t"label": "caf\\u00e9",\n'
+            '\t"mcpServers": {\n'
+            '\t\t"foreign": {"command":"keep","ratio":1.0},\n'
+            f'\t\t"boxa-echo": {echo},\n'
+            f'\t\t"boxa-other": {other}\n'
+            '\t},\n'
+            '\t"numeric": 1e3\n'
+            '}\t'
+        )
+        with open(mcp_path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), expected)
+        self.assertEqual(result.added, ["boxa-other"])
+        self.assertEqual(result.repaired, ["boxa-echo"])
+        self.assertEqual(result.removed, ["boxa-stale"])
+
     def test_snapshot_deactivation_removes_only_the_deactivated_entry(self):
         records = {
             self.entry["id"]: self._record(self.entry),
