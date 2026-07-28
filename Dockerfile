@@ -186,8 +186,11 @@ RUN --mount=type=cache,target=/home/node/.cargo/registry,uid=1000 \
 RUN mkdir -p /home/node/.local/bin && \
     curl -sS https://starship.rs/install.sh | sh -s -- --yes --bin-dir /home/node/.local/bin
 
-# Atuin shell history
-RUN curl --proto '=https' --tlsv1.2 -LsSf https://setup.atuin.sh | sh && \
+# Atuin shell history — use the release installer directly; setup.atuin.sh opens
+# /dev/tty, which does not exist during a build and kills the shell (exit 2).
+# Shell init is handled by our own dotfiles, so the wrapper adds nothing here.
+RUN curl --proto '=https' --tlsv1.2 -LsSf \
+        https://github.com/atuinsh/atuin/releases/latest/download/atuin-installer.sh | sh && \
     mkdir -p /home/node/.local/share/atuin
 
 # UV Python package manager
