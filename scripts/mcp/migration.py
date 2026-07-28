@@ -30,6 +30,12 @@ from .writer import _atomic_write, _strip_boxa_tables
 MIGRATION_VERSION = 1
 _NAMESPACE = uuid.UUID("eaf81ab8-f607-4ed0-a47a-e3898950acc9")
 
+# ADR 0022 retires ~/.claude/.claude.json as a render target. That upgrade is
+# independent of the ADR 0021 legacy-profile migration, so it carries its own
+# durable marker: an install whose legacy manifest is already `complete` (or
+# that never had legacy profiles at all) must still receive it exactly once.
+CLAUDE_RENDER_TARGET = "project-mcp-json"
+
 
 class MigrationError(RuntimeError):
     pass
@@ -37,6 +43,10 @@ class MigrationError(RuntimeError):
 
 def migration_path() -> str:
     return os.path.join(config_root(), "migration-v1.json")
+
+
+def render_target_marker_path() -> str:
+    return os.path.join(config_root(), "claude-render-target.json")
 
 
 @dataclass
@@ -221,21 +231,56 @@ def _load_manifest() -> Optional[dict[str, Any]]:
     return value
 
 
-def _remove_legacy_claude_entries() -> None:
+def _load_legacy_claude_config() -> Optional[dict[str, Any]]:
     path = render_target_path()
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        return
+        return None
+    except (OSError, ValueError) as exc:
+        raise MigrationError(f"cannot inspect rendered Claude config: {exc}") from exc
     if not isinstance(data, dict):
         raise MigrationError(f"Claude config is not an object: {path}")
+    return data
+
+
+def _has_legacy_claude_entries() -> bool:
+    """True when the retired render target still holds Boxa-written entries."""
+    data = _load_legacy_claude_config()
+    if data is None:
+        return False
+    block = data.get("mcpServers")
+    if isinstance(block, dict) and any(is_managed_or_legacy(name) for name in block):
+        return True
+    projects = data.get("projects")
+    if isinstance(projects, dict):
+        for record in projects.values():
+            if not isinstance(record, dict):
+                continue
+            servers = record.get("mcpServers")
+            if isinstance(servers, dict) and any(
+                is_managed_or_legacy(name) for name in servers
+            ):
+                return True
+    return False
+
+
+def _remove_legacy_claude_entries() -> None:
+    path = render_target_path()
+    data = _load_legacy_claude_config()
+    if data is None:
+        return
+    changed = False
     block = data.get("mcpServers")
     if isinstance(block, dict):
-        data["mcpServers"] = {
+        retained = {
             name: value for name, value in block.items()
             if not is_managed_or_legacy(name)
         }
+        if retained != block:
+            data["mcpServers"] = retained
+            changed = True
     projects = data.get("projects")
     if isinstance(projects, dict):
         for record in projects.values():
@@ -244,13 +289,21 @@ def _remove_legacy_claude_entries() -> None:
             servers = record.get("mcpServers")
             if isinstance(servers, dict):
                 removed = {name for name in servers if is_managed_or_legacy(name)}
-                record["mcpServers"] = {
-                    name: value for name, value in servers.items() if name not in removed
-                }
+                if removed:
+                    record["mcpServers"] = {
+                        name: value for name, value in servers.items() if name not in removed
+                    }
+                    changed = True
                 disabled = record.get("disabledMcpServers")
                 if isinstance(disabled, list):
-                    record["disabledMcpServers"] = [name for name in disabled if name not in removed]
-    activation._atomic_json(path, data, 0o600)
+                    retained_disabled = [name for name in disabled if name not in removed]
+                    if retained_disabled != disabled:
+                        record["disabledMcpServers"] = retained_disabled
+                        changed = True
+    # Claude Code owns this file. Rewriting it when nothing was removed would
+    # reformat foreign content for no reason, so only write on a real removal.
+    if changed:
+        activation._atomic_json(path, data, 0o600)
 
 
 def _remove_legacy_global_codex_entries() -> None:
@@ -265,15 +318,152 @@ def _remove_legacy_global_codex_entries() -> None:
         _atomic_write(path, stripped)
 
 
+def _render_target_retired() -> bool:
+    path = render_target_marker_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            value = json.load(fh)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as exc:
+        raise MigrationError(
+            f"cannot read Claude render-target marker {path}: {exc}"
+        ) from exc
+    return isinstance(value, dict) and value.get("target") == CLAUDE_RENDER_TARGET
+
+
+def _write_render_target_marker() -> None:
+    activation._atomic_json(
+        render_target_marker_path(),
+        {"version": MIGRATION_VERSION, "target": CLAUDE_RENDER_TARGET},
+        0o600,
+    )
+
+
+def _batch_consent(
+    activations: dict[str, Any],
+    claude_projects: list[str],
+    allow_tracked_mcp_json: bool,
+) -> frozenset[str]:
+    """Durable per-Project consent plus this one batch's flag (ADR 0022)."""
+    durable_consented = {
+        consented_project
+        for consented_project, allowed
+        in activations.get("trackedMcpJson", {}).items()
+        if allowed is True
+    }
+    return frozenset(
+        durable_consented
+        | (set(claude_projects) if allow_tracked_mcp_json else set())
+    )
+
+
+def _claude_transaction_paths(claude_projects: list[str]) -> list[str]:
+    paths: list[str] = []
+    for project in claude_projects:
+        paths.append(activation.claude_config_path(project))
+        paths.append(activation.claude_settings_path(project))
+        if not activation._project_directory_exists(project):
+            continue
+        git_paths = activation._claude_git_paths(project)
+        if git_paths is not None:
+            _relative, exclude, _claude = git_paths
+            paths.append(exclude)
+    return paths
+
+
+def _preflight_claude_batch(
+    catalog: dict[str, Any],
+    activations: dict[str, Any],
+    state: dict[str, Any],
+    consented: frozenset[str],
+    claude_projects: list[str],
+) -> None:
+    try:
+        activation._preflight_claude_lifecycle(
+            catalog,
+            activations,
+            state,
+            consented=consented,
+            projects=claude_projects,
+        )
+    except activation.ActivationError as exc:
+        raise MigrationError(
+            f"{exc}, or re-run 'boxa mcp migrate "
+            "--allow-tracked-mcp-json' to authorize this migration batch"
+        ) from exc
+
+
+def _upgrade_claude_render_target(*, allow_tracked_mcp_json: bool = False) -> bool:
+    """Retire ~/.claude/.claude.json on an install that already migrated.
+
+    ADR 0022 arrived after the legacy migration shipped, so a manifest that is
+    already ``complete`` — or an install that never had legacy profiles — would
+    otherwise keep its entries in the retired file while convergence renders the
+    same servers into ``.mcp.json``. Idempotent: a durable marker records the
+    retirement, and the work itself is a plain re-render.
+    """
+    if _render_target_retired():
+        return False
+    catalog = load_catalog()
+    activations = activation.load_activations()
+    state = activation._load_render_state()
+    claude_projects = activation._claude_render_projects(activations, state)
+    if not claude_projects and not _has_legacy_claude_entries():
+        # Nothing was ever rendered anywhere; leave no marker so a later
+        # install that does render is still upgraded exactly once.
+        return False
+    consented = _batch_consent(activations, claude_projects, allow_tracked_mcp_json)
+    _preflight_claude_batch(
+        catalog, activations, state, consented, claude_projects
+    )
+    paths = [
+        render_target_path(),
+        activation.render_state_path(),
+        activation.runtime_path(),
+        render_target_marker_path(),
+        *_claude_transaction_paths(claude_projects),
+    ]
+    snapshots = [activation._snapshot_file(path) for path in dict.fromkeys(paths)]
+    try:
+        _remove_legacy_claude_entries()
+        activation.render_claude_activations(activations, consented=consented)
+        # The render records the seeded approval set, so publish the runtime
+        # snapshot only after it: convergence must not read a snapshot that
+        # still omits a name Boxa has already seeded.
+        activation.refresh_runtime(activations)
+        _write_render_target_marker()
+    except Exception:
+        errors: list[str] = []
+        for snapshot in reversed(snapshots):
+            try:
+                activation._restore_file(snapshot)
+            except OSError as exc:
+                errors.append(f"{snapshot.path}: {exc}")
+        if errors:
+            raise MigrationError(
+                "Claude render-target retirement failed and rollback was "
+                "incomplete: " + "; ".join(errors)
+            )
+        raise
+    return True
+
+
 def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
     """Migrate once, atomically; legacy source files remain recoverable."""
     with mutation_lock():
         prior_manifest = _load_manifest()
         if prior_manifest is not None and prior_manifest.get("status") == "complete":
+            # The legacy migration is done, but the ADR 0022 render-target
+            # retirement may still be pending on this upgraded install.
             result = dict(prior_manifest)
-            result["changed"] = False
+            result["changed"] = _upgrade_claude_render_target(
+                allow_tracked_mcp_json=allow_tracked_mcp_json
+            )
             return result
 
+        # The inventory reads the retired file to learn which legacy servers
+        # were actually rendered, so it must run before any retirement.
         legacy = _inventory()
         if not legacy and prior_manifest is None:
             return {
@@ -281,7 +471,9 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
                 "status": "not-needed",
                 "legacyRetained": True,
                 "definitions": [],
-                "changed": False,
+                "changed": _upgrade_claude_render_target(
+                    allow_tracked_mcp_json=allow_tracked_mcp_json
+                ),
             }
         catalog = load_catalog()
         activations = activation.load_activations()
@@ -386,6 +578,7 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
         paths = [
             activation.catalog_path(), activation.activation_path(), activation.runtime_path(),
             render_target_path(), activation.render_state_path(), migration_path(),
+            render_target_marker_path(),
             codex_global_config_path(),
             *secret_updates,
         ]
@@ -394,43 +587,18 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
             paths.extend((exclude, codex))
         state = activation._load_render_state()
         claude_projects = activation._claude_render_projects(activations, state)
-        for project in claude_projects:
-            paths.append(activation.claude_config_path(project))
-            paths.append(activation.claude_settings_path(project))
-            if not activation._project_directory_exists(project):
-                continue
-            git_paths = activation._claude_git_paths(project)
-            if git_paths is not None:
-                _relative, exclude, _claude = git_paths
-                paths.append(exclude)
+        paths.extend(_claude_transaction_paths(claude_projects))
         # Migration is a lifecycle write like any other: it may not touch a
         # tracked .mcp.json or .claude/settings.local.json without consent.
         # It has no single explicitly mutated Project, so — as for a
         # catalog-wide mutation (ADR 0022) — its flag authorizes this batch
         # only and records no new durable Project consent.
-        durable_consented = {
-            consented_project
-            for consented_project, allowed
-            in activations.get("trackedMcpJson", {}).items()
-            if allowed is True
-        }
-        consented = frozenset(
-            durable_consented
-            | (set(claude_projects) if allow_tracked_mcp_json else set())
+        consented = _batch_consent(
+            activations, claude_projects, allow_tracked_mcp_json
         )
-        try:
-            activation._preflight_claude_lifecycle(
-                catalog,
-                activations,
-                state,
-                consented=consented,
-                projects=claude_projects,
-            )
-        except activation.ActivationError as exc:
-            raise MigrationError(
-                f"{exc}, or re-run 'boxa mcp migrate "
-                "--allow-tracked-mcp-json' to authorize this migration batch"
-            ) from exc
+        _preflight_claude_batch(
+            catalog, activations, state, consented, claude_projects
+        )
         snapshots = [activation._snapshot_file(path) for path in dict.fromkeys(paths)]
         try:
             # A crash can bypass compensating rollback. Publish the secret-free
@@ -440,7 +608,7 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
             save_catalog(catalog)
             for path, store in secret_updates.items():
                 save_secrets(path, store)
-            activation.save_activations(activations)
+            activation.save_activation_store(activations)
             _remove_legacy_claude_entries()
             _remove_legacy_global_codex_entries()
             activation.render_claude_activations(
@@ -448,6 +616,13 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
             )
             for project in sorted(codex_projects):
                 activation._render_codex_activation(activations, project, allow_tracked=True)
+            # The Claude render is what records the seeded approval set, so the
+            # runtime snapshot is published only after it. Publishing earlier
+            # would ship a snapshot without `seededApprovals`, and convergence
+            # would then treat an already-seeded name as new and re-enable a
+            # server the user had removed from the Project approval settings.
+            activation.refresh_runtime(activations)
+            _write_render_target_marker()
             manifest["status"] = "complete"
             activation._atomic_json(migration_path(), manifest, 0o600)
         except Exception:

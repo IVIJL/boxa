@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -1344,6 +1345,71 @@ class ActivationTest(unittest.TestCase):
             "catalog-claude-render-drift",
             {item.code for item in fixed.remaining},
         )
+
+    def test_in_sync_tracked_file_is_still_reported_as_tracked(self):
+        # Tracked is a repository fact; fixability is the narrower consent
+        # question. A byte-identical tracked companion must show up in status
+        # JSON and the CLI marker while leaving 'doctor --fix' available.
+        self._init_git()
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+        self._git("add", "-f", ".claude/settings.local.json")
+        self._git("commit", "-qm", "track in-sync Claude Project settings")
+        data = self._claude_data()
+        del data["mcpServers"]["boxa-echo"]
+        with open(
+            activation.claude_config_path(self.project),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+
+        probe = mock.Mock()
+        probe.find_running.return_value = "boxa-project"
+        probe.command_path.return_value = "/bin/cat"
+        status = lifecycle.catalog_project_status(self.project, probe)
+        row = next(
+            item for item in status["entries"]
+            if item["id"] == self.entry["id"]
+        )
+
+        self.assertTrue(row["trackedMcpJson"])
+        self.assertFalse(row["renderRequiresConsent"]["claude"])
+        stdout = io.StringIO()
+        with mock.patch.object(mcp_cli.sys, "stdout", stdout):
+            self.assertEqual(
+                mcp_cli.main([
+                    "catalog-effective-list-text", "--project", self.project,
+                ]),
+                0,
+            )
+        self.assertIn("claude:drift:tracked", stdout.getvalue())
+        finding = next(
+            item for item in lifecycle._catalog_doctor_findings(probe)
+            if item.code == "catalog-claude-render-drift"
+        )
+        self.assertTrue(finding.fixable)
+        self.assertNotIn("--allow-tracked-mcp-json", finding.repair)
+
+    def test_untracked_claude_project_files_are_reported_untracked(self):
+        self._init_git()
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+
+        probe = mock.Mock()
+        probe.find_running.return_value = "boxa-project"
+        probe.command_path.return_value = "/bin/cat"
+        status = lifecycle.catalog_project_status(self.project, probe)
+        row = next(
+            item for item in status["entries"]
+            if item["id"] == self.entry["id"]
+        )
+
+        self.assertFalse(row["trackedMcpJson"])
+        self.assertFalse(row["renderRequiresConsent"]["claude"])
 
     def test_claude_render_status_is_empty_for_missing_project(self):
         missing = os.path.join(self.tmp.name, "missing")

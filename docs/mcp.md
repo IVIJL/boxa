@@ -210,6 +210,16 @@ otherwise use `boxa mcp migrate --allow-tracked-mcp-json`, which authorizes
 that one batch and — like any catalog-wide mutation — records no new durable
 per-Project consent.
 
+Retiring `~/.claude/.claude.json` as a render target is a separate upgrade with
+its own durable marker, so an install whose legacy migration is already
+complete — or that never had legacy profiles at all — still receives it exactly
+once. `boxa mcp migrate` removes the Boxa-written entries from that file,
+re-renders the existing activations into each Project's `.mcp.json`, and
+republishes the runtime snapshot, leaving foreign entries and foreign
+formatting untouched. It obeys the same tracked-file rule and the same
+`--allow-tracked-mcp-json` batch consent as the legacy migration, and is a
+no-op once the marker exists.
+
 Container setup also removes the old Boxa-seeded
 `enableAllProjectMcpServers` setting once without replacing unrelated Claude
 settings. A durable migration marker ensures a later deliberate user choice is

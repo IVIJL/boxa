@@ -398,6 +398,135 @@ class MigrationTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "complete")
 
+    def _runtime_snapshot(self):
+        with open(activation.runtime_path(), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def _legacy_claude_render(self, name="echo"):
+        """Recreate the pre-ADR-0022 rendered state in the retired file."""
+        os.unlink(migration.render_target_marker_path())
+        os.unlink(activation.claude_config_path(self.project))
+        self._write_claude({self.project: {"mcpServers": {f"boxa-{name}": {
+            "command": "boxa-mcp-run",
+            "args": ["--project", self.project, name],
+        }}}})
+
+    def test_completed_manifest_still_retires_the_claude_render_target(self):
+        self._write_claude(self._legacy_claude_project(self.project))
+        self.assertTrue(migration.migrate_legacy()["changed"])
+        self._legacy_claude_render()
+
+        result = migration.migrate_legacy()
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["status"], "complete")
+        with open(activation.render_target_path(), encoding="utf-8") as fh:
+            claude = json.load(fh)
+        self.assertEqual(
+            claude["projects"][self.project]["mcpServers"], {}
+        )
+        with open(
+            activation.claude_config_path(self.project), encoding="utf-8"
+        ) as fh:
+            self.assertIn("boxa-echo", json.load(fh)["mcpServers"])
+        # Idempotent: the durable marker keeps the upgrade one-shot.
+        self.assertFalse(migration.migrate_legacy()["changed"])
+
+    def test_render_target_retirement_runs_without_any_legacy_profile(self):
+        # No legacy profile ever existed, so migration is "not-needed" — but
+        # the ADR 0021 catalog render still lives in the retired file.
+        self._write_claude({self.project: {"mcpServers": {"boxa-echo": {
+            "command": "boxa-mcp-run",
+            "args": ["--project", self.project, "echo"],
+        }}}})
+
+        result = migration.migrate_legacy()
+
+        self.assertEqual(result["status"], "not-needed")
+        self.assertTrue(result["changed"])
+        with open(activation.render_target_path(), encoding="utf-8") as fh:
+            self.assertEqual(
+                json.load(fh)["projects"][self.project]["mcpServers"], {}
+            )
+        self.assertFalse(migration.migrate_legacy()["changed"])
+
+    def test_retirement_leaves_a_pristine_install_untouched(self):
+        result = migration.migrate_legacy()
+
+        self.assertEqual(result["status"], "not-needed")
+        self.assertFalse(result["changed"])
+        self.assertFalse(
+            os.path.exists(migration.render_target_marker_path())
+        )
+        self.assertFalse(os.path.exists(activation.runtime_path()))
+
+    def test_retirement_refuses_tracked_mcp_json_without_consent(self):
+        self._write_claude(self._legacy_claude_project(self.project))
+        self._init_git(self.project)
+        migration.migrate_legacy(allow_tracked_mcp_json=True)
+        self._legacy_claude_render()
+        tracked = self._track(
+            self.project, ".mcp.json", '{"mcpServers":{}}\n'
+        )
+        paths = [
+            tracked,
+            activation.render_target_path(),
+            activation.render_state_path(),
+            activation.runtime_path(),
+        ]
+        before = self._state(paths)
+
+        with self.assertRaises(migration.MigrationError) as ctx:
+            migration.migrate_legacy()
+
+        self.assertIn(tracked, str(ctx.exception))
+        self.assertIn("--allow-tracked-mcp-json", str(ctx.exception))
+        self.assertEqual(self._state(paths), before)
+        self.assertFalse(
+            os.path.exists(migration.render_target_marker_path())
+        )
+
+    def test_migration_publishes_seeded_approvals_in_runtime_state(self):
+        self._write_claude(self._legacy_claude_project(self.project))
+
+        migration.migrate_legacy()
+
+        self.assertEqual(
+            self._runtime_snapshot()["seededApprovals"],
+            {self.project: ["boxa-echo"]},
+        )
+
+    def test_retirement_publishes_seeded_approvals_in_runtime_state(self):
+        self._write_claude(self._legacy_claude_project(self.project))
+        migration.migrate_legacy()
+        self._legacy_claude_render()
+        # Drop the published seeds the way a pre-ADR-0022 snapshot would.
+        snapshot = self._runtime_snapshot()
+        snapshot.pop("seededApprovals")
+        with open(activation.runtime_path(), "w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh)
+
+        migration.migrate_legacy()
+
+        self.assertEqual(
+            self._runtime_snapshot()["seededApprovals"],
+            {self.project: ["boxa-echo"]},
+        )
+
+    def test_retirement_does_not_reformat_a_foreign_claude_config(self):
+        self._write_claude(self._legacy_claude_project(self.project))
+        migration.migrate_legacy()
+        os.unlink(migration.render_target_marker_path())
+        path = activation.render_target_path()
+        foreign = '{"projects": {}, "mcpServers": {"manual":  {"command": "x"}}}'
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(foreign)
+
+        migration.migrate_legacy()
+
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), foreign)
+
     def test_crash_after_partial_publication_resumes_from_prepared_manifest(self):
         self._write_project(self.project, {"echo": _server(["/bin/echo"])})
         self._write_claude({self.project: {"mcpServers": {"boxa-echo": {

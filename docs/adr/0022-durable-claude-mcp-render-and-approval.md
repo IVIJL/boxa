@@ -138,6 +138,13 @@ file in a Git Project, including through approval-decision mirroring, it adds
 the repository-root-relative path to `.git/info/exclude` and never changes
 the shared `.gitignore`.
 
+Status and doctor report the two facts separately. Whether a derived Claude
+Project file is tracked is a repository fact, shown in the status payload and as
+the CLI `:tracked` marker whenever `.mcp.json` or `settings.local.json` is
+tracked. Whether a repair needs consent is the narrower question the preflight
+answers, and a tracked file that is already byte-identical needs none. Doctor
+fixability follows consent, never the bare tracked fact.
+
 Convergence uses the same tracked classification and durable consent. A
 changed tracked file without consent refuses all writes for that Project, so
 the render and approval files cannot be half-applied. A byte-identical tracked
@@ -201,6 +208,17 @@ new render target is established, in the same operation, so the two renderers
 never coexist. Non-Boxa entries in that file, including servers the user or
 another tool added, are left untouched. Existing activations are preserved and
 re-rendered to the new target; the user does not re-activate anything.
+
+Retiring that render target is a distinct upgrade from the legacy-profile
+migration and therefore carries its own durable marker rather than riding on the
+legacy manifest's `complete` status. An install that already migrated, or that
+never had legacy profiles, still receives the retirement exactly once: the
+Boxa-written entries are removed, the existing activations are re-rendered into
+each Project's `.mcp.json`, and the runtime snapshot is republished afterwards so
+the seeded approval set it carries is the one the re-render just recorded. The
+retirement writes the retired file only when it actually removes something, so
+foreign entries keep their bytes. It is idempotent and compensated as one set
+like every other lifecycle write.
 
 Migration is a lifecycle write like any other and gets no exemption from the
 tracked-file rule. It runs the same preflight over every Project it would

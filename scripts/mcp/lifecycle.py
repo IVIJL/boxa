@@ -1305,8 +1305,14 @@ def _catalog_render_state(
     entry: dict[str, Any],
     consumer: str,
     claude_status: Optional[object] = None,
-) -> tuple[str, bool]:
-    """Return (state, tracked) for one derived consumer record, secret-free."""
+) -> tuple[str, bool, bool]:
+    """Return (state, tracked, requires_consent) for one derived consumer record.
+
+    ``tracked`` is the repository fact reported by status/doctor JSON and the
+    CLI ``:tracked`` marker. ``requires_consent`` is the narrower fixability
+    question: a tracked companion file that is already byte-identical does not
+    block ``doctor --fix`` (ADR 0022), so the two must not be collapsed.
+    """
     from .activation import claude_config_path, codex_config_path
 
     name = rendered_name(str(entry["name"]))
@@ -1320,6 +1326,13 @@ def _catalog_render_state(
         except (OSError, ValueError, AttributeError):
             value = None
         tracked = bool(
+            claude_status is not None
+            and (
+                getattr(claude_status, "mcp_json_tracked", False)
+                or getattr(claude_status, "settings_tracked", False)
+            )
+        )
+        requires_consent = bool(
             claude_status is not None
             and getattr(claude_status, "requires_consent", False)
         )
@@ -1335,7 +1348,7 @@ def _catalog_render_state(
             and value.get("args") == expected_args
             and not approval_drift
         )
-        return ("rendered" if ok else "drift"), tracked
+        return ("rendered" if ok else "drift"), tracked, requires_consent
 
     path = codex_config_path(project)
     try:
@@ -1354,7 +1367,8 @@ def _catalog_render_state(
     except OSError:
         pass
     ok = isinstance(value, dict) and value.get("command") == WRAPPER_COMMAND and value.get("args") == expected_args
-    return ("rendered" if ok else "drift"), tracked
+    # Codex has no in-sync exemption: a tracked config always needs consent.
+    return ("rendered" if ok else "drift"), tracked, tracked
 
 
 def catalog_project_status(project: str, probe: Optional[object] = None) -> dict[str, Any]:
@@ -1399,8 +1413,9 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
         renders = {}
         tracked_codex = False
         tracked_claude = False
+        consent_required: dict[str, bool] = {}
         for consumer in consumers:
-            state, is_tracked = _catalog_render_state(
+            state, is_tracked, needs_consent = _catalog_render_state(
                 key,
                 entry_id,
                 entry,
@@ -1408,6 +1423,7 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
                 claude_status,
             )
             renders[consumer] = state
+            consent_required[consumer] = needs_consent
             if consumer == "codex":
                 tracked_codex = tracked_codex or is_tracked
             elif consumer == "claude":
@@ -1427,6 +1443,9 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
             "degradedSecretIsolationAcknowledged": activations.get("acknowledgements", {}).get(key, {}).get(entry_id) is True,
             "trackedCodexConfig": tracked_codex,
             "trackedMcpJson": tracked_claude,
+            # Tracked is the repository fact; consent is the fixability
+            # question, and an in-sync tracked file needs none (ADR 0022).
+            "renderRequiresConsent": consent_required,
         })
     return {"projectKey": key, "entries": rows}
 
@@ -1498,9 +1517,11 @@ def _catalog_doctor_findings(probe: Optional[object] = None) -> list[Finding]:
             for consumer, render_state in row["renders"].items():
                 if render_state == "rendered":
                     continue
-                tracked = (
-                    row["trackedCodexConfig"] if consumer == "codex"
-                    else row["trackedMcpJson"]
+                # Fixability follows consent, not the bare tracked fact: a
+                # tracked companion file that is already byte-identical must
+                # not block 'doctor --fix'.
+                needs_consent = bool(
+                    row.get("renderRequiresConsent", {}).get(consumer)
                 )
                 code = f"catalog-{consumer}-render-drift"
                 flag = (
@@ -1510,10 +1531,10 @@ def _catalog_doctor_findings(probe: Optional[object] = None) -> list[Finding]:
                 )
                 repair = (
                     f"Re-run activation with {flag} after reviewing the repository change."
-                    if tracked else "boxa mcp doctor --fix"
+                    if needs_consent else "boxa mcp doctor --fix"
                 )
                 tracked_label = "Codex config" if consumer == "codex" else ".mcp.json"
-                findings.append(Finding(SEVERITY_WARN, code, f"{consumer} render drift for activated MCP {row['name']!r} in Project {project}." + (f" The {tracked_label} is tracked." if tracked else ""), repair, not tracked, project))
+                findings.append(Finding(SEVERITY_WARN, code, f"{consumer} render drift for activated MCP {row['name']!r} in Project {project}." + (f" The {tracked_label} is tracked." if needs_consent else ""), repair, not needs_consent, project))
 
     from .activation import runtime_payload
     expected = runtime_payload(activations, catalog)
