@@ -214,6 +214,10 @@ def claude_config_path(project: str) -> str:
     return os.path.join(project, ".mcp.json")
 
 
+def claude_settings_path(project: str) -> str:
+    return os.path.join(project, ".claude", "settings.local.json")
+
+
 def _codex_git_paths(project: str) -> tuple[str, str, str]:
     top = os.path.realpath(_git_output(project, "rev-parse", "--show-toplevel"))
     config = codex_config_path(project)
@@ -445,7 +449,10 @@ def _commit_activation_render(
         render_state_path(),
     )
     for claude_project in _claude_render_projects(data, state):
-        paths += (claude_config_path(claude_project),)
+        paths += (
+            claude_config_path(claude_project),
+            claude_settings_path(claude_project),
+        )
         git_paths = _claude_git_paths(claude_project)
         if git_paths is not None:
             _relative, exclude_path, _claude_path = git_paths
@@ -586,11 +593,71 @@ def _claude_render_projects(
     activations: dict[str, Any], state: dict[str, Any]
 ) -> list[str]:
     old = state.get("projects") if isinstance(state.get("projects"), dict) else {}
-    return sorted(set(activations["projects"]) | set(old))
+    seeded = state.get("seeded") if isinstance(state.get("seeded"), dict) else {}
+    return sorted(set(activations["projects"]) | set(old) | set(seeded))
 
 
 def _json_document(data: dict[str, Any]) -> str:
     return json.dumps(data, indent=2) + "\n"
+
+
+def _claude_seeded_names(state: dict[str, Any], project: str) -> set[str]:
+    seeded = state.get("seeded") if isinstance(state.get("seeded"), dict) else {}
+    names = seeded.get(project, [])
+    if not isinstance(names, list):
+        return set()
+    return {name for name in names if isinstance(name, str)}
+
+
+def _claude_settings_plan(
+    project: str,
+    rendered_names: list[str],
+    state: dict[str, Any],
+) -> Optional[tuple[str, str, str]]:
+    to_seed = set(rendered_names) - _claude_seeded_names(state, project)
+    if not to_seed:
+        return None
+
+    path = claude_settings_path(project)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            existing = fh.read()
+        data = json.loads(existing)
+    except FileNotFoundError:
+        existing = ""
+        data = {}
+    except (OSError, ValueError) as exc:
+        raise ActivationError(f"cannot read Claude Project settings {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ActivationError(f"Claude Project settings is not an object: {path}")
+
+    enabled = data.get("enabledMcpjsonServers", [])
+    if not (
+        isinstance(enabled, list)
+        and all(isinstance(name, str) for name in enabled)
+    ):
+        raise ActivationError(
+            f"Claude Project settings enabledMcpjsonServers is not a list of strings: {path}"
+        )
+    disabled = data.get("disabledMcpjsonServers", [])
+    if not (
+        isinstance(disabled, list)
+        and all(isinstance(name, str) for name in disabled)
+    ):
+        raise ActivationError(
+            f"Claude Project settings disabledMcpjsonServers is not a list of strings: {path}"
+        )
+
+    new_enabled = list(enabled)
+    for name in sorted(to_seed):
+        if name not in new_enabled:
+            new_enabled.append(name)
+    data["enabledMcpjsonServers"] = new_enabled
+    if "disabledMcpjsonServers" in data:
+        data["disabledMcpjsonServers"] = [
+            name for name in disabled if name not in to_seed
+        ]
+    return path, existing, _json_document(data)
 
 
 def _claude_render_plan(
@@ -731,10 +798,11 @@ def _preflight_claude_lifecycle(
     refusals: list[str] = []
     for project in _claude_render_projects(activations, state):
         (
-            path, _exclude, _relative, tracked, existing, rendered, _names,
+            path, _exclude, _relative, tracked, existing, rendered, names,
         ) = _claude_render_plan(activations, project, catalog, state)
         if tracked and rendered != existing and not allow_tracked:
             refusals.append(path)
+        _claude_settings_plan(project, names, state)
     if refusals:
         raise ActivationError(
             "tracked Claude MCP config requires --allow-tracked-mcp-json for: "
@@ -757,8 +825,17 @@ def render_claude_activations(
         _claude_render_plan(activations, project, catalog, state)
         for project in _claude_render_projects(activations, state)
     ]
+    settings_plans = {
+        os.path.dirname(path): _claude_settings_plan(
+            os.path.dirname(path), names, state
+        )
+        for (
+            path, _exclude_path, _relative, _tracked, _existing, _rendered, names,
+        ) in plans
+    }
     _retire_old_claude_render(state)
     new_state: dict[str, list[str]] = {}
+    new_seeded: dict[str, list[str]] = {}
     for (
         path, exclude_path, relative, tracked, existing, rendered, names,
     ) in plans:
@@ -780,7 +857,17 @@ def render_claude_activations(
         if names:
             project = os.path.dirname(path)
             new_state[project] = names
-    _atomic_json(render_state_path(), {"projects": new_state}, 0o600)
+            new_seeded[project] = names
+            settings_plan = settings_plans[project]
+            if settings_plan is not None:
+                settings_path, settings_existing, settings_rendered = settings_plan
+                if settings_rendered != settings_existing:
+                    _atomic_text(settings_path, settings_rendered)
+    _atomic_json(
+        render_state_path(),
+        {"projects": new_state, "seeded": new_seeded},
+        0o600,
+    )
 
 
 def activate(
@@ -1015,7 +1102,7 @@ def _catalog_transaction_paths(
         _relative, exclude_path, codex_path = _codex_git_paths(project)
         paths.extend((codex_path, exclude_path))
     for project in claude_projects:
-        paths.append(claude_config_path(project))
+        paths.extend((claude_config_path(project), claude_settings_path(project)))
         git_paths = _claude_git_paths(project)
         if git_paths is not None:
             _relative, exclude_path, _claude_path = git_paths

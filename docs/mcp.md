@@ -57,6 +57,11 @@ For Git Projects it adds either otherwise-untracked render target to
 `--allow-tracked-codex-config`. Doctor will not edit either tracked file
 without that authorization.
 
+For Claude Code, activation also seeds the rendered server name once into
+`.claude/settings.local.json`. Boxa preserves unrelated Project settings and
+does not seed that name again after the user disables it; deactivation retires
+the seed so a later reactivation delivers approval again.
+
 Deactivation, removal, or a runtime-affecting update re-renders selected
 consumers atomically. Restart/reload an already-running Claude or Codex session
 to drop an old connection or pick up a changed definition.

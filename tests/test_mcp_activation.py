@@ -69,6 +69,7 @@ class ActivationTest(unittest.TestCase):
             os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".claude.json"),
             activation.render_state_path(),
             activation.claude_config_path(self.project),
+            activation.claude_settings_path(self.project),
         )
 
     def _file_states(self):
@@ -103,6 +104,13 @@ class ActivationTest(unittest.TestCase):
     def _claude_data(self, project=None):
         with open(
             activation.claude_config_path(project or self.project),
+            encoding="utf-8",
+        ) as fh:
+            return json.load(fh)
+
+    def _claude_settings_data(self, project=None):
+        with open(
+            activation.claude_settings_path(project or self.project),
             encoding="utf-8",
         ) as fh:
             return json.load(fh)
@@ -183,6 +191,127 @@ class ActivationTest(unittest.TestCase):
         self.assertEqual(managed["args"][0:4], ["--catalog-id", self.entry["id"], "--consumer", "claude"])
         legacy = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".claude.json")
         self.assertFalse(os.path.exists(legacy))
+
+    def test_claude_activation_seeds_project_approval(self):
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+
+        settings = self._claude_settings_data()
+        self.assertEqual(settings["enabledMcpjsonServers"], ["boxa-echo"])
+        self.assertNotIn("enableAllProjectMcpServers", settings)
+
+    def test_claude_approval_seed_preserves_unrelated_settings(self):
+        path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(path))
+        original = {
+            "permissions": {
+                "allow": ["Bash(git status:*)"],
+                "deny": ["Read(./.env)"],
+            },
+            "hooks": {"Stop": [{"command": "notify"}]},
+            "userSetting": {"nested": True},
+            "enabledMcpjsonServers": ["manual"],
+            "disabledMcpjsonServers": ["manual-disabled", "boxa-echo"],
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(original, fh, indent=2)
+            fh.write("\n")
+
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+
+        settings = self._claude_settings_data()
+        self.assertEqual(settings["permissions"], original["permissions"])
+        self.assertEqual(settings["hooks"], original["hooks"])
+        self.assertEqual(settings["userSetting"], original["userSetting"])
+        self.assertEqual(settings["enabledMcpjsonServers"], ["manual", "boxa-echo"])
+        self.assertEqual(settings["disabledMcpjsonServers"], ["manual-disabled"])
+
+    def test_claude_approval_is_seeded_only_once(self):
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+        path = activation.claude_settings_path(self.project)
+        settings = self._claude_settings_data()
+        settings["enabledMcpjsonServers"].remove("boxa-echo")
+        settings["disabledMcpjsonServers"] = ["manual", "boxa-echo"]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, indent=2)
+            fh.write("\n")
+        before = os.stat(path).st_mtime_ns
+
+        activation.render_claude_activations()
+
+        self.assertEqual(os.stat(path).st_mtime_ns, before)
+        self.assertEqual(
+            self._claude_settings_data()["disabledMcpjsonServers"],
+            ["manual", "boxa-echo"],
+        )
+        self.assertNotIn(
+            "boxa-echo",
+            self._claude_settings_data()["enabledMcpjsonServers"],
+        )
+
+    def test_claude_approval_does_not_seed_foreign_shaped_server(self):
+        path = activation.claude_config_path(self.project)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "mcpServers": {
+                    "boxa-foreign": {"command": "foreign"},
+                },
+            }, fh)
+
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+
+        self.assertIn("boxa-foreign", self._claude_data()["mcpServers"])
+        self.assertEqual(
+            self._claude_settings_data()["enabledMcpjsonServers"],
+            ["boxa-echo"],
+        )
+
+    def test_deactivate_retires_seed_and_reactivation_seeds_again(self):
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+        activation.deactivate("echo", self.project)
+        with open(activation.render_state_path(), encoding="utf-8") as fh:
+            state = json.load(fh)
+        self.assertNotIn(self.project, state["seeded"])
+
+        path = activation.claude_settings_path(self.project)
+        settings = self._claude_settings_data()
+        settings["enabledMcpjsonServers"].remove("boxa-echo")
+        settings["disabledMcpjsonServers"] = ["manual", "boxa-echo"]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, indent=2)
+            fh.write("\n")
+
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+
+        settings = self._claude_settings_data()
+        self.assertEqual(settings["enabledMcpjsonServers"], ["boxa-echo"])
+        self.assertEqual(settings["disabledMcpjsonServers"], ["manual"])
+        with open(activation.render_state_path(), encoding="utf-8") as fh:
+            state = json.load(fh)
+        self.assertEqual(state["seeded"][self.project], ["boxa-echo"])
+
+    def test_malformed_claude_project_approval_refuses_activation(self):
+        path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"enabledMcpjsonServers": "boxa-echo"}, fh)
+        before = self._file_states()
+
+        with self.assertRaisesRegex(
+            activation.ActivationError, "enabledMcpjsonServers.*list of strings"
+        ):
+            activation.activate(
+                "echo", self.project, ["claude"], ReadyProbe(self.project)
+            )
+
+        self.assertEqual(self._file_states(), before)
+
+    def test_shipped_claude_settings_do_not_enable_all_project_servers(self):
+        with open(
+            os.path.join(ROOT, "config", "claude", "settings.json"),
+            encoding="utf-8",
+        ) as fh:
+            settings = json.load(fh)
+        self.assertNotIn("enableAllProjectMcpServers", settings)
 
     def test_codex_activation_renders_project_config_and_local_exclude(self):
         self._init_git()
@@ -571,6 +700,15 @@ class ActivationTest(unittest.TestCase):
         with open(activation.render_state_path(), "wb") as fh:
             fh.write(b'{"projects":{},"sentinel":true}\n')
         os.chmod(activation.render_state_path(), 0o620)
+        settings = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings))
+        with open(settings, "wb") as fh:
+            fh.write(
+                b'{"enabledMcpjsonServers":["manual"],'
+                b'"disabledMcpjsonServers":["boxa-echo"],'
+                b'"permissions":{"allow":["Bash(git status:*)"]}}\n'
+            )
+        os.chmod(settings, 0o640)
         before = self._file_states()
         real_atomic = activation._atomic_json
 
