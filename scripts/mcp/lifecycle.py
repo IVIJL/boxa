@@ -1232,6 +1232,30 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
     # derived state. Repairing them is safe, but a tracked consumer config is
     # an explicit repository mutation and therefore never enters this branch.
     catalog_codes = {f.code for f in report.findings if f.fixable}
+    # These repairs rewrite the very Project files and runtime snapshot an
+    # in-Container convergence reads, so take the same host mutation lock every
+    # other lifecycle write takes. That also publishes the mutation window
+    # convergence observes, so a repair cannot be half-observed (ADR 0022).
+    from .catalog import mutation_lock
+    with mutation_lock():
+        _apply_catalog_doctor_fixes(
+            report, result, render_failures, catalog_codes
+        )
+    # Re-run doctor to capture what remains after the fixes, so the user sees the
+    # honest post-fix state (e.g. a still-missing env var, or a wrapper we could
+    # not relink). A render write that hard-failed is surfaced on top of the
+    # fresh report so it is never lost.
+    after = run_doctor()
+    result.remaining = render_failures + list(after.findings)
+    return result
+
+
+def _apply_catalog_doctor_fixes(
+    report: DoctorReport,
+    result: FixResult,
+    render_failures: list[Finding],
+    catalog_codes: set[str],
+) -> None:
     if "catalog-runtime-drift" in catalog_codes:
         try:
             from .activation import refresh_runtime
@@ -1273,13 +1297,6 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
             result.actions.append("restored untracked Codex activation renders")
         except (OSError, ValueError, RuntimeError) as exc:
             render_failures.append(Finding(SEVERITY_ERROR, "catalog-render-fix-failed", f"Codex render repair failed: {exc}", "Inspect the Codex config and re-run 'boxa mcp doctor --fix'."))
-    # Re-run doctor to capture what remains after the fixes, so the user sees the
-    # honest post-fix state (e.g. a still-missing env var, or a wrapper we could
-    # not relink). A render write that hard-failed is surfaced on top of the
-    # fresh report so it is never lost.
-    after = run_doctor()
-    result.remaining = render_failures + list(after.findings)
-    return result
 
 
 def _catalog_render_state(

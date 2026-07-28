@@ -196,10 +196,14 @@ Catalog update:
       config is changed only with its explicit opt-in flag.
 
 Migration:
-  boxa mcp migrate [--json]
+  boxa mcp migrate [--allow-tracked-mcp-json] [--json]
       Copy legacy definitions into the catalog once. Former global definitions
       get no activation; Project definitions retain only originally rendered
       consumers. Migration never infers agent trust and retains source files.
+      Like every other lifecycle path it refuses the whole batch when any
+      Project would need tracked '.mcp.json' or '.claude/settings.local.json'
+      bytes changed; --allow-tracked-mcp-json authorizes this batch only and
+      records no durable per-Project consent.
 
 Reload (re-stage secrets into a running Container) path:
   boxa mcp reload [--global | --project <p>] [--json]
@@ -507,18 +511,20 @@ cmd_import_apply() {
 
 cmd_migrate() {
     local json=false
+    local -a mig_args=()
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --json) json=true ;;
+            --allow-tracked-mcp-json) mig_args+=("$1") ;;
             -h|--help) _usage; return 0 ;;
             *) echo "Unknown argument for 'mcp migrate': $1" >&2; return 2 ;;
         esac
         shift
     done
     if [ "$json" = true ]; then
-        _run_py migrate-json
+        _run_py migrate-json "${mig_args[@]}"
     else
-        _run_py migrate-text
+        _run_py migrate-text "${mig_args[@]}"
     fi
 }
 

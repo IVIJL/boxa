@@ -2554,11 +2554,19 @@ def main(argv: list[str]) -> int:
     if command == "project-targets-text":
         return _cmd_project_targets(rest, as_json=False)
     if command in ("migrate-json", "migrate-text"):
-        if rest:
-            sys.stderr.write("mcp.cli: migrate takes no arguments\n")
+        allow_tracked_mcp_json = False
+        for arg in rest:
+            if arg == "--allow-tracked-mcp-json":
+                allow_tracked_mcp_json = True
+                continue
+            sys.stderr.write(
+                "mcp.cli: migrate takes only --allow-tracked-mcp-json\n"
+            )
             return 2
         try:
-            result = migrate_legacy()
+            result = migrate_legacy(
+                allow_tracked_mcp_json=allow_tracked_mcp_json
+            )
         except (MigrationError, ActivationError, CatalogError, OSError, ValueError) as exc:
             sys.stderr.write(f"mcp.cli: {exc}\n")
             return 2

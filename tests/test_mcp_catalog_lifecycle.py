@@ -190,6 +190,44 @@ class CatalogLifecycleTest(unittest.TestCase):
             set(runtime["projects"]), set(self.projects)
         )
 
+    def test_claude_render_batch_failure_leaves_no_half_written_project(self):
+        """A standalone render batch compensates its own partial writes."""
+        for project in self.projects:
+            self._activate(project, ["claude"])
+        paths = [
+            activation.claude_config_path(project)
+            for project in self.projects
+        ]
+        paths.append(activation.render_state_path())
+        for path in paths[:2]:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            del data["mcpServers"]["boxa-echo"]
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+                fh.write("\n")
+        before = {}
+        for path in paths:
+            with open(path, "rb") as fh:
+                before[path] = fh.read()
+        original_atomic = activation._atomic_text
+        second = activation.claude_config_path(self.projects[1])
+
+        def fail_on_second_project(path, text):
+            if path == second:
+                raise OSError(30, "Read-only file system")
+            return original_atomic(path, text)
+
+        with mock.patch.object(
+            activation, "_atomic_text", side_effect=fail_on_second_project
+        ):
+            with self.assertRaises(OSError):
+                activation.render_claude_activations()
+
+        for path in paths:
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), before[path])
+
     def test_doctor_repairs_only_fixable_claude_projects(self):
         for project in self.projects:
             subprocess.run(

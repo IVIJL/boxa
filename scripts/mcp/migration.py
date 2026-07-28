@@ -265,7 +265,7 @@ def _remove_legacy_global_codex_entries() -> None:
         _atomic_write(path, stripped)
 
 
-def migrate_legacy() -> dict[str, Any]:
+def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
     """Migrate once, atomically; legacy source files remain recoverable."""
     with mutation_lock():
         prior_manifest = _load_manifest()
@@ -393,7 +393,8 @@ def migrate_legacy() -> dict[str, Any]:
             _relative, exclude, codex = activation._codex_git_paths(project)
             paths.extend((exclude, codex))
         state = activation._load_render_state()
-        for project in activation._claude_render_projects(activations, state):
+        claude_projects = activation._claude_render_projects(activations, state)
+        for project in claude_projects:
             paths.append(activation.claude_config_path(project))
             paths.append(activation.claude_settings_path(project))
             if not activation._project_directory_exists(project):
@@ -402,6 +403,34 @@ def migrate_legacy() -> dict[str, Any]:
             if git_paths is not None:
                 _relative, exclude, _claude = git_paths
                 paths.append(exclude)
+        # Migration is a lifecycle write like any other: it may not touch a
+        # tracked .mcp.json or .claude/settings.local.json without consent.
+        # It has no single explicitly mutated Project, so — as for a
+        # catalog-wide mutation (ADR 0022) — its flag authorizes this batch
+        # only and records no new durable Project consent.
+        durable_consented = {
+            consented_project
+            for consented_project, allowed
+            in activations.get("trackedMcpJson", {}).items()
+            if allowed is True
+        }
+        consented = frozenset(
+            durable_consented
+            | (set(claude_projects) if allow_tracked_mcp_json else set())
+        )
+        try:
+            activation._preflight_claude_lifecycle(
+                catalog,
+                activations,
+                state,
+                consented=consented,
+                projects=claude_projects,
+            )
+        except activation.ActivationError as exc:
+            raise MigrationError(
+                f"{exc}, or re-run 'boxa mcp migrate "
+                "--allow-tracked-mcp-json' to authorize this migration batch"
+            ) from exc
         snapshots = [activation._snapshot_file(path) for path in dict.fromkeys(paths)]
         try:
             # A crash can bypass compensating rollback. Publish the secret-free
@@ -415,10 +444,7 @@ def migrate_legacy() -> dict[str, Any]:
             _remove_legacy_claude_entries()
             _remove_legacy_global_codex_entries()
             activation.render_claude_activations(
-                activations,
-                consented=frozenset(
-                    activation._claude_render_projects(activations, state)
-                ),
+                activations, consented=consented
             )
             for project in sorted(codex_projects):
                 activation._render_codex_activation(activations, project, allow_tracked=True)

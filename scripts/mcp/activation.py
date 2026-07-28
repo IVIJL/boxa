@@ -1536,6 +1536,25 @@ def _preflight_claude_lifecycle(
         )
 
 
+def _claude_render_transaction_paths(render_projects: Iterable[str]) -> list[str]:
+    """Every file one Claude render batch can write, for exact compensation."""
+    paths = [render_state_path(), render_target_path()]
+    for project in render_projects:
+        paths.append(claude_config_path(project))
+        settings_path = claude_settings_path(project)
+        paths.append(settings_path)
+        if not _project_directory_exists(project):
+            continue
+        for git_paths in (
+            _claude_git_paths(project),
+            _claude_git_paths(project, path=settings_path),
+        ):
+            if git_paths is not None:
+                _relative, exclude_path, _path = git_paths
+                paths.append(exclude_path)
+    return list(dict.fromkeys(paths))
+
+
 def render_claude_activations(
     activations: Optional[dict[str, Any]] = None,
     *,
@@ -1589,7 +1608,48 @@ def render_claude_activations(
             settings_git_paths,
             settings_tracked,
         )
-    scoped = projects is not None
+    # The batch writes several unrelated files that cannot share a rename
+    # transaction, so take exact pre-images and compensate on any failure.
+    # Callers that already wrap this in a wider transaction simply restore the
+    # same bytes twice; a caller that does not (doctor --fix, migration
+    # replans) is no longer left with a half-written render.
+    snapshots = [
+        _snapshot_file(path)
+        for path in _claude_render_transaction_paths(render_projects)
+    ]
+    try:
+        _render_claude_batch(
+            activations,
+            state,
+            plans,
+            settings_plans,
+            scoped=projects is not None,
+            render_projects=render_projects,
+        )
+    except Exception:
+        rollback_errors: list[str] = []
+        for snapshot in reversed(snapshots):
+            try:
+                _restore_file(snapshot)
+            except OSError as exc:
+                rollback_errors.append(f"{snapshot.path}: {exc}")
+        if rollback_errors:
+            raise ActivationError(
+                "Claude render failed and rollback was incomplete: "
+                + "; ".join(rollback_errors)
+            )
+        raise
+
+
+def _render_claude_batch(
+    activations: dict[str, Any],
+    state: dict[str, Any],
+    plans: list[tuple[str, tuple[Any, ...]]],
+    settings_plans: dict[str, Any],
+    *,
+    scoped: bool,
+    render_projects: list[str],
+) -> None:
     _retire_old_claude_render(
         state, set(render_projects) if scoped else None
     )

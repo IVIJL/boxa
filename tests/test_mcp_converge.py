@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -17,7 +18,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-from mcp import activation, cli, converge, trusted  # noqa: E402
+from mcp import activation, catalog, cli, converge, trusted  # noqa: E402
 from mcp.catalog import CATALOG_VERSION, add_entry, update_entry  # noqa: E402
 
 
@@ -883,6 +884,169 @@ class ConvergeTest(unittest.TestCase):
         with open(settings_path, "rb") as fh:
             self.assertEqual(fh.read(), concurrent[-1])
         self.assertFalse(os.path.exists(converge.state_path()))
+
+    def test_settings_write_failure_rolls_back_the_mcp_json_write(self):
+        self._write_snapshot(self._desired_records())
+        mcp_path = activation.claude_config_path(self.project)
+        settings_path = activation.claude_settings_path(self.project)
+        original_mcp = b'{"manual":"mcp"}\n'
+        with open(mcp_path, "wb") as fh:
+            fh.write(original_mcp)
+        original_atomic = activation._atomic_text
+
+        def fail_on_settings(path, text):
+            if path == settings_path:
+                raise OSError(13, "Permission denied")
+            return original_atomic(path, text)
+
+        with mock.patch.object(
+            activation, "_atomic_text", side_effect=fail_on_settings
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("Permission denied", result.reason)
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), original_mcp)
+        self.assertFalse(os.path.exists(settings_path))
+        self.assertFalse(os.path.exists(converge.state_path()))
+
+    def test_converge_state_write_failure_rolls_back_project_files(self):
+        self._write_snapshot(self._desired_records())
+        mcp_path = activation.claude_config_path(self.project)
+        settings_path = activation.claude_settings_path(self.project)
+        original_mcp = b'{"manual":"mcp"}\n'
+        original_settings = b'{"manual":"settings"}\n'
+        with open(mcp_path, "wb") as fh:
+            fh.write(original_mcp)
+        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+        with open(settings_path, "wb") as fh:
+            fh.write(original_settings)
+        original_atomic = activation._atomic_text
+
+        def fail_on_state(path, text):
+            if path == converge.state_path():
+                raise OSError(28, "No space left on device")
+            return original_atomic(path, text)
+
+        with mock.patch.object(
+            activation, "_atomic_text", side_effect=fail_on_state
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("No space left on device", result.reason)
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), original_mcp)
+        with open(settings_path, "rb") as fh:
+            self.assertEqual(fh.read(), original_settings)
+
+    def test_exclude_write_failure_rolls_back_project_files(self):
+        self._init_git()
+        self._write_snapshot(self._desired_records(), tracked_mcp_json={})
+        mcp_path = activation.claude_config_path(self.project)
+        original_mcp = b'{"manual":"mcp"}\n'
+        with open(mcp_path, "wb") as fh:
+            fh.write(original_mcp)
+
+        with mock.patch.object(
+            activation,
+            "_ensure_local_exclude",
+            side_effect=OSError(30, "Read-only file system"),
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("Read-only file system", result.reason)
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), original_mcp)
+        self.assertFalse(
+            os.path.exists(activation.claude_settings_path(self.project))
+        )
+        self.assertFalse(os.path.exists(converge.state_path()))
+
+    def _hold_mutation_window(self):
+        """Act as the host holding its published mutation window."""
+        path = converge.mutation_marker_path(self.snapshot)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+
+    def test_published_host_mutation_window_defers_convergence(self):
+        self._write_snapshot(self._desired_records())
+        self._hold_mutation_window()
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("host MCP mutation is in progress", result.reason)
+        self.assertFalse(
+            os.path.exists(activation.claude_config_path(self.project))
+        )
+        self.assertFalse(os.path.exists(converge.state_path()))
+
+    def test_withdrawn_mutation_window_lets_convergence_proceed(self):
+        self._write_snapshot(self._desired_records())
+        fd = self._hold_mutation_window()
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        self.assertEqual(result.added, ["boxa-echo"])
+
+    def test_host_mutation_opened_after_writes_rolls_back_and_defers(self):
+        """The publication race: host wrote the Project file, snapshot pending.
+
+        Convergence planned from the old snapshot and would restore the old
+        render, so the still-open host window must undo those writes.
+        """
+        self._write_snapshot(self._desired_records())
+        mcp_path = activation.claude_config_path(self.project)
+        original_mcp = b'{"manual":"mcp"}\n'
+        with open(mcp_path, "wb") as fh:
+            fh.write(original_mcp)
+        original_atomic = activation._atomic_text
+        opened = []
+
+        def open_window_after_first_write(path, text):
+            result = original_atomic(path, text)
+            if not opened:
+                opened.append(self._hold_mutation_window())
+            return result
+
+        with mock.patch.object(
+            activation,
+            "_atomic_text",
+            side_effect=open_window_after_first_write,
+        ):
+            result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("host MCP mutation is in progress", result.reason)
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), original_mcp)
+        self.assertFalse(os.path.exists(converge.state_path()))
+
+    def test_host_mutation_lock_publishes_the_window_it_holds(self):
+        marker = os.path.join(
+            os.path.dirname(activation.runtime_path()),
+            catalog.MUTATION_MARKER_NAME,
+        )
+        with catalog.mutation_lock():
+            self.assertTrue(
+                converge._mutation_in_progress(
+                    os.path.join(os.path.dirname(marker), "runtime.json")
+                )
+            )
+            mode = stat.S_IMODE(os.stat(marker).st_mode)
+        self.assertEqual(mode, 0o644)
+        self.assertFalse(
+            converge._mutation_in_progress(
+                os.path.join(os.path.dirname(marker), "runtime.json")
+            )
+        )
 
     def test_foreign_servers_and_top_level_keys_survive_and_are_not_seeded(self):
         self._write_snapshot(self._desired_records())

@@ -107,6 +107,18 @@ writing. A newly published snapshot is replanned; a rendered-file change
 without a snapshot change is reported as a concurrent host write and left for
 the next convergence.
 
+A host lifecycle command publishes its mutation window in the runtime
+directory for the whole transaction — from before its first write until after
+it republishes the snapshot. Convergence observes that window before planning
+and again after writing, and defers ("a host MCP mutation is in progress")
+rather than restoring a render the host has just replaced but not yet
+published. Observation is read-only; the Container never takes the host
+mutation lock, and a Container can never delay a host mutation.
+
+All convergence writes are compensated as one set: any later failure, race, or
+deferral restores the exact pre-images, so a Project is never left with a
+repaired `.mcp.json` and an unrepaired `.claude/settings.local.json`.
+
 The convergence command exits `0` after convergence, an in-sync check, or a
 benign nothing-to-do result such as no Container Project. It exits `3` when an
 operational condition prevented repair and prints the skip reason as a warning
@@ -188,6 +200,15 @@ enter the catalog with no activations. Existing Project definitions retain only
 the original Project and consumers where a Boxa render actually existed.
 Legacy source files remain recoverable, and migration never infers
 `agent-trusted`.
+
+Migration re-renders the migrated activations and therefore obeys the same
+tracked-file rule as every other lifecycle path. It preflights every affected
+Project and refuses the whole migration, naming each offending path, when a
+tracked `.mcp.json` or `.claude/settings.local.json` would change without
+consent. Consent already recorded durably for a Project authorizes it;
+otherwise use `boxa mcp migrate --allow-tracked-mcp-json`, which authorizes
+that one batch and — like any catalog-wide mutation — records no new durable
+per-Project consent.
 
 Container setup also removes the old Boxa-seeded
 `enableAllProjectMcpServers` setting once without replacing unrelated Claude

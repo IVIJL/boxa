@@ -12,6 +12,7 @@ import json
 import os
 import stat
 import threading
+import time
 import uuid
 import re
 from contextlib import contextmanager
@@ -37,6 +38,11 @@ DEGRADED_SECRET_ISOLATION = "degraded-secret-isolation"
 # by the in-Container broker. The catalog FILE itself is host-only 0600.
 _DIR_MODE = 0o755
 _FILE_MODE = 0o600
+# The mutation window marker is published, not gated: Containers read it.
+MUTATION_MARKER_NAME = "mutation-in-progress"
+_MARKER_FILE_MODE = 0o644
+_MARKER_ATTEMPTS = 100
+_MARKER_RETRY_SECONDS = 0.01
 _PROCESS_MUTATION_LOCK = threading.RLock()
 _MUTATION_LOCAL = threading.local()
 
@@ -55,6 +61,58 @@ def mutation_lock_path() -> str:
     return os.path.join(os.path.dirname(catalog_path()), ".mutation.lock")
 
 
+def mutation_marker_path() -> str:
+    """Container-visible publication of the host mutation window (ADR 0022).
+
+    The lock itself lives in the gated host store and must stay unreachable
+    from a Container. Its *window* is published as a read-only file in the
+    already-mounted runtime directory: the host holds an exclusive advisory
+    lock on it for the whole transaction, so an in-Container convergence can
+    observe — never take — a host mutation whose runtime snapshot is not yet
+    republished. The lock is held by an open file description, so a crashed
+    host releases it automatically and the window can never go stale.
+    """
+    return os.path.join(
+        os.path.dirname(catalog_path()), "runtime", MUTATION_MARKER_NAME
+    )
+
+
+def _publish_mutation_window() -> Optional[int]:
+    path = mutation_marker_path()
+    try:
+        os.makedirs(os.path.dirname(path), mode=_DIR_MODE, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, _MARKER_FILE_MODE)
+    except OSError:
+        return None
+    try:
+        os.chmod(path, _MARKER_FILE_MODE)
+    except OSError:
+        pass
+    for _attempt in range(_MARKER_ATTEMPTS):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Only read-only observers can hold this, and only for the
+            # duration of one probe. Never block a host mutation on them.
+            time.sleep(_MARKER_RETRY_SECONDS)
+            continue
+        except OSError:
+            break
+        return fd
+    os.close(fd)
+    return None
+
+
+def _withdraw_mutation_window(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+
+
 @contextmanager
 def mutation_lock():
     """Serialize catalog/activation read-modify-write transactions."""
@@ -70,13 +128,16 @@ def mutation_lock():
         path = mutation_lock_path()
         os.makedirs(os.path.dirname(path), mode=_DIR_MODE, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, _FILE_MODE)
+        marker_fd: Optional[int] = None
         try:
             os.chmod(path, _FILE_MODE)
             fcntl.flock(fd, fcntl.LOCK_EX)
+            marker_fd = _publish_mutation_window()
             _MUTATION_LOCAL.depth = 1
             yield
         finally:
             _MUTATION_LOCAL.depth = 0
+            _withdraw_mutation_window(marker_fd)
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 

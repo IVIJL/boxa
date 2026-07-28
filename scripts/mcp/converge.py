@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import stat
@@ -9,12 +10,29 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import activation, trusted
+from .catalog import MUTATION_MARKER_NAME
 from .render import is_managed_or_legacy, rendered_name
 
 
 IDENTITY_PATH = "/etc/boxa/identity.json"
 STATE_VERSION = 1
 MAX_CONVERGE_ATTEMPTS = 3
+
+
+class _ConcurrentRender(Exception):
+    """A rendered file changed between planning and the commit write."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self.path = path
+
+
+class _SnapshotChanged(Exception):
+    """The runtime snapshot was republished during the commit."""
+
+
+class _HostMutationInProgress(Exception):
+    """The host holds its mutation window; its publication is still pending."""
 
 
 @dataclass
@@ -180,6 +198,43 @@ def _read_snapshot_bytes(path: str | None) -> bytes:
         ) from exc
 
 
+def mutation_marker_path(snapshot_path: str | None = None) -> str:
+    """The host mutation window as published beside the runtime snapshot."""
+    resolved = snapshot_path or trusted.runtime_snapshot_path()
+    return os.path.join(os.path.dirname(resolved), MUTATION_MARKER_NAME)
+
+
+def _mutation_in_progress(snapshot_path: str | None) -> bool:
+    """Observe the host mutation lock the Container may never take.
+
+    The Container must not reach the gated host store, so the host publishes
+    its mutation window as a shared-lock probe on a read-only file inside the
+    already-published runtime directory. A host mutation that has written a
+    Project file but not yet republished the snapshot is therefore visible
+    here, which is what closes the post-check publication race. Probing is
+    fail-open: an environment without working advisory locks degrades to the
+    snapshot comparison alone rather than refusing to converge.
+    """
+    try:
+        fd = os.open(mutation_marker_path(snapshot_path), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    else:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        os.close(fd)
+
+
 def _read_runtime_snapshot(
     path: str | None,
 ) -> tuple[bytes, dict[str, Any]]:
@@ -269,6 +324,16 @@ def _exclude_after_change_plan(
     return exclude_path, relative
 
 
+def _abort_reason(exc: Exception) -> str:
+    if isinstance(exc, _SnapshotChanged):
+        return "MCP runtime snapshot changed after convergence writes"
+    if isinstance(exc, _HostMutationInProgress):
+        return "a host MCP mutation was in progress during convergence writes"
+    if isinstance(exc, _ConcurrentRender):
+        return "concurrent write to the rendered file was detected"
+    return f"convergence write failed: {exc}"
+
+
 def _skipped(reason: str, project: str | None = None) -> list[ConvergeResult]:
     return [
         ConvergeResult(
@@ -314,7 +379,13 @@ def converge(
         return _not_applicable("Project directory does not exist", resolved)
 
     render_concurrent_paths: set[str] = set()
+    host_mutation_pending = False
     for _attempt in range(MAX_CONVERGE_ATTEMPTS):
+        # Planning from a snapshot the host is about to replace only wastes an
+        # attempt, so defer before reading it as well as after writing.
+        if _mutation_in_progress(snapshot_path):
+            host_mutation_pending = True
+            continue
         try:
             snapshot_raw, snapshot = _read_runtime_snapshot(snapshot_path)
             definitions = _desired_definitions(snapshot, resolved)
@@ -493,108 +564,114 @@ def converge(
                     resolved,
                 )
 
+            # Every write below is compensated as one set: any later failure,
+            # concurrent edit, snapshot republication or host mutation window
+            # restores the accumulated pre-images, so the Project is never
+            # left half-converged.
             written_files: list[
                 tuple[activation._FileSnapshot, bytes | None]
             ] = []
-
-            if mcp_changed:
-                preimage = activation._snapshot_file(mcp_path)
-                if (
-                    preimage.data if preimage.existed else None
-                ) != mcp_preimage:
-                    render_concurrent_paths.add(mcp_path)
-                    continue
-                activation._atomic_text(mcp_path, rendered)
-                postimage = _read_bytes(mcp_path)
-                if postimage != (
-                    preimage.data if preimage.existed else None
-                ):
-                    written_files.append((preimage, postimage))
-            if settings_plan is not None:
-                (
-                    settings_path,
-                    settings_existing,
-                    settings_rendered,
-                ) = settings_plan
-                if settings_rendered != settings_existing:
-                    preimage = activation._snapshot_file(settings_path)
+            try:
+                if mcp_changed:
+                    preimage = activation._snapshot_file(mcp_path)
                     if (
                         preimage.data if preimage.existed else None
-                    ) != settings_preimage:
-                        render_concurrent_paths.add(settings_path)
-                        rollback_errors, rollback_concurrent = (
-                            _rollback_written_files(written_files)
-                        )
-                        if rollback_errors:
-                            return _skipped(
-                                "concurrent write to the rendered file was "
-                                "detected and rollback was incomplete: "
-                                + "; ".join(rollback_errors),
-                                resolved,
-                            )
-                        if rollback_concurrent:
-                            return _skipped(
-                                "concurrent write to the rendered file was "
-                                "detected after convergence writes for "
-                                + ", ".join(reversed(rollback_concurrent))
-                                + "; the next convergence will repair it",
-                                resolved,
-                            )
-                        continue
-                    activation._atomic_text(
-                        settings_path, settings_rendered
-                    )
-                    postimage = _read_bytes(settings_path)
+                    ) != mcp_preimage:
+                        raise _ConcurrentRender(mcp_path)
+                    activation._atomic_text(mcp_path, rendered)
+                    postimage = _read_bytes(mcp_path)
                     if postimage != (
                         preimage.data if preimage.existed else None
                     ):
                         written_files.append((preimage, postimage))
-            if state_changed:
-                convergence_state_path = state_path()
-                preimage = activation._snapshot_file(
-                    convergence_state_path
-                )
-                activation._atomic_text(
-                    convergence_state_path, state_rendered
-                )
-                os.chmod(
-                    convergence_state_path,
-                    stat.S_IRUSR | stat.S_IWUSR,
-                )
-                postimage = _read_bytes(convergence_state_path)
-                if postimage != (
-                    preimage.data if preimage.existed else None
-                ):
-                    written_files.append((preimage, postimage))
-            for exclude_plan in exclude_plans:
-                exclude_path, relative = exclude_plan
-                preimage = activation._snapshot_file(exclude_path)
-                activation._ensure_local_exclude(exclude_path, relative)
-                postimage = _read_bytes(exclude_path)
-                if postimage != (
-                    preimage.data if preimage.existed else None
-                ):
-                    written_files.append((preimage, postimage))
+                if settings_plan is not None:
+                    (
+                        settings_path,
+                        settings_existing,
+                        settings_rendered,
+                    ) = settings_plan
+                    if settings_rendered != settings_existing:
+                        preimage = activation._snapshot_file(settings_path)
+                        if (
+                            preimage.data if preimage.existed else None
+                        ) != settings_preimage:
+                            raise _ConcurrentRender(settings_path)
+                        activation._atomic_text(
+                            settings_path, settings_rendered
+                        )
+                        postimage = _read_bytes(settings_path)
+                        if postimage != (
+                            preimage.data if preimage.existed else None
+                        ):
+                            written_files.append((preimage, postimage))
+                if state_changed:
+                    convergence_state_path = state_path()
+                    preimage = activation._snapshot_file(
+                        convergence_state_path
+                    )
+                    activation._atomic_text(
+                        convergence_state_path, state_rendered
+                    )
+                    os.chmod(
+                        convergence_state_path,
+                        stat.S_IRUSR | stat.S_IWUSR,
+                    )
+                    postimage = _read_bytes(convergence_state_path)
+                    if postimage != (
+                        preimage.data if preimage.existed else None
+                    ):
+                        written_files.append((preimage, postimage))
+                for exclude_plan in exclude_plans:
+                    exclude_path, relative = exclude_plan
+                    preimage = activation._snapshot_file(exclude_path)
+                    activation._ensure_local_exclude(exclude_path, relative)
+                    postimage = _read_bytes(exclude_path)
+                    if postimage != (
+                        preimage.data if preimage.existed else None
+                    ):
+                        written_files.append((preimage, postimage))
 
-            if _read_snapshot_bytes(snapshot_path) != snapshot_raw:
-                rollback_errors, concurrent_paths = (
+                # A host mutation that already wrote the Project files but has
+                # not yet republished the snapshot is invisible to the snapshot
+                # comparison alone, so observe its published window first.
+                if _mutation_in_progress(snapshot_path):
+                    raise _HostMutationInProgress()
+                if _read_snapshot_bytes(snapshot_path) != snapshot_raw:
+                    raise _SnapshotChanged()
+            except (
+                _ConcurrentRender,
+                _SnapshotChanged,
+                _HostMutationInProgress,
+                activation.ActivationError,
+                trusted.TrustedAuthorizationError,
+                OSError,
+            ) as exc:
+                if isinstance(exc, _ConcurrentRender):
+                    render_concurrent_paths.add(exc.path)
+                rollback_errors, rollback_concurrent = (
                     _rollback_written_files(written_files)
                 )
                 if rollback_errors:
                     return _skipped(
-                        "MCP runtime snapshot changed after convergence "
-                        "writes and rollback was incomplete: "
+                        _abort_reason(exc)
+                        + " and rollback was incomplete: "
                         + "; ".join(rollback_errors),
                         resolved,
                     )
-                if concurrent_paths:
+                if rollback_concurrent:
                     return _skipped(
                         "concurrent write to the rendered file was detected "
                         "after convergence writes for "
-                        + ", ".join(reversed(concurrent_paths))
+                        + ", ".join(reversed(rollback_concurrent))
                         + "; the next convergence will repair it",
                         resolved,
                     )
+                if isinstance(exc, _HostMutationInProgress):
+                    host_mutation_pending = True
+                elif not isinstance(
+                    exc, (_ConcurrentRender, _SnapshotChanged)
+                ):
+                    return _skipped(str(exc), resolved)
                 continue
         except (
             activation.ActivationError,
@@ -620,6 +697,12 @@ def converge(
             "concurrent write to the rendered file was detected for "
             + ", ".join(sorted(render_concurrent_paths))
             + "; the next convergence will repair it",
+            resolved,
+        )
+    if host_mutation_pending:
+        return _skipped(
+            "a host MCP mutation is in progress; the next convergence will "
+            "apply its published result",
             resolved,
         )
     return _skipped(

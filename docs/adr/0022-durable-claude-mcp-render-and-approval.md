@@ -157,6 +157,33 @@ and skips when a rendered file changed while the snapshot did not. It checks
 the snapshot again after writing so a concurrently published host mutation is
 replanned before convergence returns.
 
+Comparing snapshots alone cannot close the whole window: a host mutation that
+has already written the Project files but has not yet republished the snapshot
+is invisible to it, so convergence could plan from the old snapshot, restore
+the old render, and still pass its post-check. The host therefore **publishes
+its mutation window**, without publishing the lock itself. It holds an
+exclusive advisory lock, for the entire transaction, on a read-only marker file
+inside the runtime directory Containers already mount. Convergence probes that
+lock — shared, non-blocking, released immediately — before planning and again
+after writing, and defers when the window is open. Because the window opens
+before the first host write and closes only after the snapshot is republished,
+every interleaving is caught by either the probe or the snapshot comparison.
+The lock lives in an open file description, so a crashed host releases it and
+the window can never go stale. The Container only ever reads; it still cannot
+reach the gated host store, and a probe the host cannot immediately take is
+bounded and then ignored, so a Container can never stall a host mutation.
+
+Residual risk: the probe is deliberately fail-open. On a filesystem without
+working advisory locks the window is unobservable and convergence degrades to
+the snapshot comparison alone, which is the pre-existing behaviour.
+
+Every convergence write — `.mcp.json`, `settings.local.json`, the
+Container-local convergence state, and the repository-local exclude entries —
+is compensated as one set. Any failure after the first successful write,
+operational or racing, restores the accumulated pre-images, so a Project is
+never left half-converged. A pre-image whose bytes changed under convergence is
+left alone rather than clobbered, and the skip names it.
+
 A benign not-applicable convergence result, such as no identifiable Container
 Project or a missing Project directory, exits zero. An operational skip such
 as invalid input, absent tracked-file consent, or a concurrent-write race
@@ -174,6 +201,16 @@ new render target is established, in the same operation, so the two renderers
 never coexist. Non-Boxa entries in that file, including servers the user or
 another tool added, are left untouched. Existing activations are preserved and
 re-rendered to the new target; the user does not re-activate anything.
+
+Migration is a lifecycle write like any other and gets no exemption from the
+tracked-file rule. It runs the same preflight over every Project it would
+re-render, and refuses the whole batch — naming every offending path — when a
+tracked `.mcp.json` or `.claude/settings.local.json` would change without
+consent. Durable per-Project consent already recorded in the activation store
+authorizes those Projects. Migration has no single explicitly mutated Project,
+so, exactly like a catalog-wide mutation, its `--allow-tracked-mcp-json`
+authorizes only that one batch and records no new durable consent. A Project
+whose directory has vanished still does not block migration.
 
 Earlier Boxa defaults seeded `enableAllProjectMcpServers` in the shared
 `~/.claude/settings.json`. Container setup performs a concurrency-safe,

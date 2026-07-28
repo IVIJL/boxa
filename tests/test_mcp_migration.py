@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -252,6 +253,150 @@ class MigrationTest(unittest.TestCase):
             activation.claude_config_path(self.project), encoding="utf-8"
         ) as fh:
             self.assertIn("boxa-echo", json.load(fh)["mcpServers"])
+
+    def _git(self, project, *args):
+        return subprocess.run(
+            ["git", "-C", project, *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "LC_ALL": "C"},
+        ).stdout.strip()
+
+    def _init_git(self, project):
+        self._git(project, "init", "-q")
+        self._git(project, "config", "user.email", "boxa@example.invalid")
+        self._git(project, "config", "user.name", "Boxa Tests")
+
+    def _track(self, project, relative, content):
+        path = os.path.join(project, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        self._git(project, "add", "-f", "--", relative)
+        self._git(project, "commit", "-q", "-m", "track")
+        return path
+
+    def _legacy_claude_project(self, project, name="echo"):
+        self._write_project(project, {name: _server(["/bin/echo", name])})
+        return {project: {"mcpServers": {f"boxa-{name}": {
+            "command": "boxa-mcp-run",
+            "args": ["--project", project, name],
+        }}}}
+
+    def test_tracked_mcp_json_refuses_whole_migration_without_consent(self):
+        other = os.path.realpath(os.path.join(self.tmp.name, "other"))
+        os.makedirs(other)
+        rendered = self._legacy_claude_project(self.project)
+        rendered.update(self._legacy_claude_project(other, "sibling"))
+        self._write_claude(rendered)
+        self._init_git(self.project)
+        tracked = self._track(
+            self.project, ".mcp.json", '{"mcpServers":{}}\n'
+        )
+        paths = [
+            catalog_path(), activation.activation_path(),
+            activation.runtime_path(), activation.render_target_path(),
+            activation.render_state_path(), migration.migration_path(),
+            tracked,
+            activation.claude_config_path(other),
+        ]
+        before = self._state(paths)
+
+        with self.assertRaises(migration.MigrationError) as ctx:
+            migration.migrate_legacy()
+
+        self.assertIn(tracked, str(ctx.exception))
+        self.assertIn("--allow-tracked-mcp-json", str(ctx.exception))
+        # Whole-batch semantics: the untracked sibling Project is not written
+        # either, and no legacy state was consumed.
+        self.assertEqual(self._state(paths), before)
+
+    def test_tracked_settings_local_json_refuses_migration_without_consent(self):
+        self._write_claude(self._legacy_claude_project(self.project))
+        self._init_git(self.project)
+        tracked = self._track(
+            self.project,
+            os.path.join(".claude", "settings.local.json"),
+            '{"enabledMcpjsonServers":[]}\n',
+        )
+
+        with self.assertRaises(migration.MigrationError) as ctx:
+            migration.migrate_legacy()
+
+        self.assertIn(tracked, str(ctx.exception))
+        self.assertFalse(os.path.exists(catalog_path()))
+
+    def test_migration_flag_authorizes_batch_without_durable_consent(self):
+        self._write_claude(self._legacy_claude_project(self.project))
+        self._init_git(self.project)
+        tracked = self._track(
+            self.project, ".mcp.json", '{"mcpServers":{}}\n'
+        )
+
+        result = migration.migrate_legacy(allow_tracked_mcp_json=True)
+
+        self.assertEqual(result["status"], "complete")
+        with open(tracked, encoding="utf-8") as fh:
+            self.assertIn("boxa-echo", json.load(fh)["mcpServers"])
+        # A catalog-wide batch flag never records new durable Project consent.
+        self.assertEqual(
+            activation.load_activations().get("trackedMcpJson", {}), {}
+        )
+
+    def test_durable_project_consent_authorizes_migration(self):
+        self._write_claude(self._legacy_claude_project(self.project))
+        self._init_git(self.project)
+        tracked = self._track(
+            self.project, ".mcp.json", '{"mcpServers":{}}\n'
+        )
+        store = activation.empty_activations()
+        store["trackedMcpJson"][self.project] = True
+        activation.save_activation_store(store)
+
+        result = migration.migrate_legacy()
+
+        self.assertEqual(result["status"], "complete")
+        with open(tracked, encoding="utf-8") as fh:
+            self.assertIn("boxa-echo", json.load(fh)["mcpServers"])
+
+    def test_byte_identical_tracked_render_does_not_need_migration_consent(self):
+        self._write_claude(self._legacy_claude_project(self.project))
+        self._init_git(self.project)
+        # Render once with consent, then commit exactly those bytes. A repeat
+        # migration over the tracked-but-identical file must not refuse.
+        migration.migrate_legacy(allow_tracked_mcp_json=True)
+        with open(
+            activation.claude_config_path(self.project), encoding="utf-8"
+        ) as fh:
+            rendered_bytes = fh.read()
+        self._track(self.project, ".mcp.json", rendered_bytes)
+        with open(migration.migration_path(), encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        manifest["status"] = "prepared"
+        with open(migration.migration_path(), "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+
+        result = migration.migrate_legacy()
+
+        self.assertEqual(result["status"], "complete")
+        with open(
+            activation.claude_config_path(self.project), encoding="utf-8"
+        ) as fh:
+            self.assertEqual(fh.read(), rendered_bytes)
+
+    def test_vanished_project_still_does_not_block_migration_consent(self):
+        missing = os.path.realpath(os.path.join(self.tmp.name, "missing"))
+        self._write_claude(self._legacy_claude_project(self.project))
+        state_path = activation.render_state_path()
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as fh:
+            json.dump({"projects": {missing: ["boxa-stale"]}}, fh)
+
+        result = migration.migrate_legacy()
+
+        self.assertEqual(result["status"], "complete")
 
     def test_crash_after_partial_publication_resumes_from_prepared_manifest(self):
         self._write_project(self.project, {"echo": _server(["/bin/echo"])})
