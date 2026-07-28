@@ -105,6 +105,7 @@ class CatalogLifecycleTest(unittest.TestCase):
         for project in self.projects:
             _relative, exclude_path, codex_path = activation._codex_git_paths(project)
             paths.extend((codex_path, exclude_path))
+            paths.append(activation.claude_config_path(project))
             paths.append(project_secrets_path(project))
         return paths
 
@@ -123,13 +124,13 @@ class CatalogLifecycleTest(unittest.TestCase):
         self.assertEqual(activation.load_activations(), before_activations)
         bomb.find_running.assert_not_called()
         with open(
-            activation.render_target_path(),
+            activation.claude_config_path(self.projects[0]),
             encoding="utf-8",
         ) as fh:
             claude = json.load(fh)
         self.assertIn(
             "boxa-renamed",
-            claude["projects"][self.projects[0]]["mcpServers"],
+            claude["mcpServers"],
         )
         with open(activation.codex_config_path(self.projects[1]), encoding="utf-8") as fh:
             codex = fh.read()
@@ -251,10 +252,10 @@ class CatalogLifecycleTest(unittest.TestCase):
         store_server_secrets(secret_path, "echo", {"TOKEN": "destroyed"})
         self._activate(self.projects[0], ["claude"])
         self._activate(self.projects[1], ["codex"])
-        claude_path = activation.render_target_path()
+        claude_path = activation.claude_config_path(self.projects[0])
         with open(claude_path, encoding="utf-8") as fh:
             claude = json.load(fh)
-        claude["projects"][self.projects[0]]["mcpServers"]["manual"] = {
+        claude["mcpServers"]["manual"] = {
             "command": "keep"
         }
         with open(claude_path, "w", encoding="utf-8") as fh:
@@ -274,7 +275,7 @@ class CatalogLifecycleTest(unittest.TestCase):
         with open(claude_path, encoding="utf-8") as fh:
             claude = json.load(fh)
         self.assertEqual(
-            claude["projects"][self.projects[0]]["mcpServers"]["manual"],
+            claude["mcpServers"]["manual"],
             {"command": "keep"},
         )
         with open(codex_path, encoding="utf-8") as fh:
@@ -384,7 +385,7 @@ class CatalogLifecycleTest(unittest.TestCase):
         release_render = threading.Event()
         failures = []
 
-        def pause_then_fail(_activations):
+        def pause_then_fail(_activations, **_kwargs):
             render_entered.set()
             if not release_render.wait(timeout=5):
                 raise AssertionError("test did not release paused late render")

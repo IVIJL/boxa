@@ -68,6 +68,7 @@ class ActivationTest(unittest.TestCase):
             activation.runtime_path(),
             os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".claude.json"),
             activation.render_state_path(),
+            activation.claude_config_path(self.project),
         )
 
     def _file_states(self):
@@ -98,6 +99,13 @@ class ActivationTest(unittest.TestCase):
     def _codex_text(self, project=None):
         with open(activation.codex_config_path(project or self.project), encoding="utf-8") as fh:
             return fh.read()
+
+    def _claude_data(self, project=None):
+        with open(
+            activation.claude_config_path(project or self.project),
+            encoding="utf-8",
+        ) as fh:
+            return json.load(fh)
 
     def test_activate_records_identity_project_and_consumer_only(self):
         result = activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
@@ -159,21 +167,22 @@ class ActivationTest(unittest.TestCase):
         )
 
     def test_render_is_project_only_and_preserves_manual_configuration(self):
-        config = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".claude.json")
+        config = activation.claude_config_path(self.project)
         with open(config, "w", encoding="utf-8") as fh:
-            json.dump({"theme": "dark", "mcpServers": {"manual-global": {"command": "x"}}, "projects": {self.project: {"mcpServers": {"manual": {"command": "y"}}, "disabledMcpServers": ["manual", "boxa-echo"]}}}, fh)
+            json.dump({
+                "theme": "dark",
+                "mcpServers": {"manual": {"command": "y"}},
+            }, fh)
         activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
-        with open(config, encoding="utf-8") as fh:
-            rendered = json.load(fh)
+        rendered = self._claude_data()
         self.assertEqual(rendered["theme"], "dark")
-        self.assertIn("manual-global", rendered["mcpServers"])
-        block = rendered["projects"][self.project]["mcpServers"]
+        block = rendered["mcpServers"]
         self.assertIn("manual", block)
         managed = block["boxa-echo"]
         self.assertEqual(managed["command"], "boxa-mcp-run")
         self.assertEqual(managed["args"][0:4], ["--catalog-id", self.entry["id"], "--consumer", "claude"])
-        self.assertEqual(rendered["projects"][self.project]["disabledMcpServers"], ["manual"])
-        self.assertNotIn("boxa-echo", rendered.get("mcpServers", {}))
+        legacy = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".claude.json")
+        self.assertFalse(os.path.exists(legacy))
 
     def test_codex_activation_renders_project_config_and_local_exclude(self):
         self._init_git()
@@ -215,10 +224,9 @@ class ActivationTest(unittest.TestCase):
 
     def test_consumer_selection_renders_only_selected_consumers(self):
         self._init_git()
-        claude = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".claude.json")
+        claude = activation.claude_config_path(self.project)
         activation.activate("echo", self.project, ["codex"], ReadyProbe(self.project))
-        with open(claude, encoding="utf-8") as fh:
-            self.assertNotIn("boxa-echo", json.dumps(json.load(fh)))
+        self.assertFalse(os.path.exists(claude))
         activation.activate(
             "echo", self.project, ["claude", "codex"], ReadyProbe(self.project)
         )
@@ -235,10 +243,11 @@ class ActivationTest(unittest.TestCase):
                 [
                     "echo", "--project", self.project, "--for", "claude,codex",
                     "--allow-tracked-codex-config",
+                    "--allow-tracked-mcp-json",
                 ],
                 "activate",
             ),
-            ("echo", self.project, ["claude", "codex"], True, False),
+            ("echo", self.project, ["claude", "codex"], True, True, False),
         )
 
     def test_tracked_codex_config_requires_explicit_opt_in(self):
@@ -261,6 +270,194 @@ class ActivationTest(unittest.TestCase):
         )
         self.assertIn(activation._CODEX_BEGIN, self._codex_text())
         self.assertTrue(self._git("status", "--short", "--", ".codex/config.toml"))
+
+    def test_untracked_mcp_json_uses_local_exclude_not_gitignore(self):
+        self._init_git()
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+
+        exclude = self._git(
+            "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
+        )
+        with open(exclude, encoding="utf-8") as fh:
+            self.assertIn("/.mcp.json", fh.read().splitlines())
+        self.assertFalse(os.path.exists(os.path.join(self.project, ".gitignore")))
+
+    def test_nested_project_mcp_exclude_is_repo_relative(self):
+        repo = activation.canonical_project(os.path.join(self.tmp.name, "repo"))
+        nested = activation.canonical_project(os.path.join(repo, "nested"))
+        os.makedirs(nested)
+        self._git("init", "-q", cwd=repo)
+
+        activation.activate("echo", nested, ["claude"], ReadyProbe(nested))
+
+        exclude = self._git(
+            "rev-parse", "--path-format=absolute", "--git-path", "info/exclude",
+            cwd=repo,
+        )
+        with open(exclude, encoding="utf-8") as fh:
+            self.assertIn("/nested/.mcp.json", fh.read().splitlines())
+
+    def test_tracked_mcp_json_requires_explicit_opt_in(self):
+        self._init_git()
+        path = activation.claude_config_path(self.project)
+        original = '{"theme":"tracked"}\n'
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        self._git("add", ".mcp.json")
+        self._git("commit", "-qm", "tracked mcp config")
+
+        before = self._file_states()
+        with self.assertRaisesRegex(
+            activation.ActivationError, "allow-tracked-mcp-json"
+        ):
+            activation.activate(
+                "echo", self.project, ["claude"], ReadyProbe(self.project),
+                allow_tracked_mcp_json=False,
+            )
+        self.assertEqual(self._file_states(), before)
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project),
+            allow_tracked_mcp_json=True,
+        )
+        self.assertIn("boxa-echo", self._claude_data()["mcpServers"])
+
+    def test_identical_tracked_mcp_rerender_is_noop_without_consent(self):
+        self._init_git()
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+        path = activation.claude_config_path(self.project)
+        self._git("add", "-f", ".mcp.json")
+        self._git("commit", "-qm", "track rendered mcp config")
+        before = os.stat(path).st_mtime_ns
+
+        activation.render_claude_activations(allow_tracked=False)
+
+        self.assertEqual(os.stat(path).st_mtime_ns, before)
+
+    def test_tracked_mcp_drift_is_reported_and_not_doctor_fixable(self):
+        self._init_git()
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+        path = activation.claude_config_path(self.project)
+        self._git("add", "-f", ".mcp.json")
+        self._git("commit", "-qm", "track rendered mcp config")
+        data = self._claude_data()
+        del data["mcpServers"]["boxa-echo"]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+
+        probe = mock.Mock()
+        probe.find_running.return_value = "boxa-project"
+        probe.command_path.return_value = "/bin/cat"
+        status = lifecycle.catalog_project_status(self.project, probe)
+        row = next(item for item in status["entries"] if item["id"] == self.entry["id"])
+        self.assertTrue(row["trackedMcpJson"])
+        self.assertFalse(row["trackedCodexConfig"])
+        findings = lifecycle._catalog_doctor_findings(probe)
+        finding = next(
+            item for item in findings
+            if item.code == "catalog-claude-render-drift"
+        )
+        self.assertFalse(finding.fixable)
+        self.assertIn("--allow-tracked-mcp-json", finding.repair)
+        before = os.stat(path).st_mtime_ns
+        lifecycle.apply_doctor_fixes(
+            lifecycle.DoctorReport(False, findings)
+        )
+        self.assertEqual(os.stat(path).st_mtime_ns, before)
+
+    def test_multi_project_claude_preflight_refuses_all_before_write(self):
+        self._init_git()
+        other = activation.canonical_project(os.path.join(self.tmp.name, "other"))
+        os.makedirs(other)
+        self._git("init", "-q", cwd=other)
+        self._git("config", "user.email", "boxa-tests@example.invalid", cwd=other)
+        self._git("config", "user.name", "Boxa Tests", cwd=other)
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+        activation.activate("echo", other, ["claude"], ReadyProbe(other))
+        tracked = activation.claude_config_path(other)
+        self._git("add", "-f", ".mcp.json", cwd=other)
+        self._git("commit", "-qm", "track mcp config", cwd=other)
+        paths = [
+            activation.claude_config_path(self.project),
+            tracked,
+            activation.catalog_path(),
+            activation.render_state_path(),
+        ]
+        before = {}
+        for path in paths:
+            with open(path, "rb") as fh:
+                before[path] = fh.read()
+
+        with self.assertRaisesRegex(
+            activation.ActivationError, "allow-tracked-mcp-json"
+        ) as refused:
+            update_entry(self.entry["id"], name="renamed")
+
+        self.assertIn(tracked, str(refused.exception))
+        for path in paths:
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), before[path])
+
+    def test_deactivate_preserves_unrelated_mcp_json_content(self):
+        path = activation.claude_config_path(self.project)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "theme": "keep",
+                "mcpServers": {"manual": {"command": "manual"}},
+            }, fh)
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+        activation.deactivate("echo", self.project)
+
+        self.assertEqual(
+            self._claude_data(),
+            {
+                "theme": "keep",
+                "mcpServers": {"manual": {"command": "manual"}},
+            },
+        )
+
+    def test_existing_activation_store_renders_new_target_and_retires_old(self):
+        record = {
+            "catalogId": self.entry["id"],
+            "consumers": ["claude"],
+            "enabled": True,
+        }
+        data = activation.empty_activations()
+        data["projects"][self.project] = {self.entry["id"]: record}
+        activation.save_activation_store(data)
+        os.makedirs(os.path.dirname(activation.render_state_path()), exist_ok=True)
+        with open(activation.render_state_path(), "w", encoding="utf-8") as fh:
+            json.dump({"projects": {self.project: ["boxa-echo"]}}, fh)
+        legacy = activation.render_target_path()
+        with open(legacy, "w", encoding="utf-8") as fh:
+            json.dump({
+                "theme": "keep",
+                "mcpServers": {"global": {"command": "keep"}},
+                "projects": {
+                    self.project: {
+                        "mcpServers": {
+                            "boxa-echo": {"command": "old"},
+                            "manual": {"command": "keep"},
+                        },
+                        "disabledMcpServers": ["boxa-echo", "manual"],
+                    }
+                },
+            }, fh)
+
+        activation.render_claude_activations()
+
+        self.assertIn("boxa-echo", self._claude_data()["mcpServers"])
+        with open(legacy, encoding="utf-8") as fh:
+            retired = json.load(fh)
+        self.assertEqual(retired["theme"], "keep")
+        self.assertIn("global", retired["mcpServers"])
+        project = retired["projects"][self.project]
+        self.assertEqual(project["mcpServers"], {"manual": {"command": "keep"}})
+        self.assertEqual(project["disabledMcpServers"], ["manual"])
+
+    def test_non_git_project_renders_mcp_json(self):
+        activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
+        self.assertIn("boxa-echo", self._claude_data()["mcpServers"])
 
     def test_malformed_managed_region_refuses_without_partial_state(self):
         self._init_git()
@@ -300,10 +497,7 @@ class ActivationTest(unittest.TestCase):
         self.assertFalse(any(row["activated"] for row in activation.effective_catalog(other)))
         result = activation.deactivate("echo", self.project)
         self.assertTrue(result.changed)
-        config = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".claude.json")
-        with open(config, encoding="utf-8") as fh:
-            rendered = json.load(fh)
-        self.assertNotIn("boxa-echo", rendered["projects"][self.project]["mcpServers"])
+        self.assertFalse(os.path.exists(activation.claude_config_path(self.project)))
 
     def test_broker_authorizes_activation_and_rejects_absent_wrong_disabled_deleted_consumer(self):
         activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))

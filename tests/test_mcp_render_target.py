@@ -59,9 +59,11 @@ class _HomeEnv(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = self._tmp.name
         self._saved = {
-            k: os.environ.get(k) for k in ("HOME", "CLAUDE_CONFIG_DIR")
+            k: os.environ.get(k)
+            for k in ("HOME", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR")
         }
         os.environ["HOME"] = self.home
+        os.environ["XDG_CONFIG_HOME"] = os.path.join(self.home, "xdg")
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
 
     def tearDown(self) -> None:

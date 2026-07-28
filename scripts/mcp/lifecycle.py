@@ -1226,8 +1226,8 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
             )
 
     # Catalog activation renders and the secret-free runtime snapshot are
-    # derived state.  Repairing them is safe, but a tracked Codex config is an
-    # explicit repository mutation and therefore never enters this branch.
+    # derived state. Repairing them is safe, but a tracked consumer config is
+    # an explicit repository mutation and therefore never enters this branch.
     catalog_codes = {f.code for f in report.findings if f.fixable}
     if "catalog-runtime-drift" in catalog_codes:
         try:
@@ -1239,7 +1239,7 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
     if "catalog-claude-render-drift" in catalog_codes:
         try:
             from .activation import render_claude_activations
-            render_claude_activations()
+            render_claude_activations(allow_tracked=False)
             result.actions.append("restored Claude Code activation renders")
         except (OSError, ValueError, RuntimeError) as exc:
             render_failures.append(Finding(SEVERITY_ERROR, "catalog-render-fix-failed", f"Claude render repair failed: {exc}", "Inspect the Claude config and re-run 'boxa mcp doctor --fix'."))
@@ -1264,20 +1264,29 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
 
 def _catalog_render_state(project: str, entry_id: str, entry: dict[str, Any], consumer: str) -> tuple[str, bool]:
     """Return (state, tracked) for one derived consumer record, secret-free."""
-    from .activation import codex_config_path
-    from .providers.claude import render_target_path
+    from .activation import claude_config_path, codex_config_path
 
     name = rendered_name(str(entry["name"]))
     expected_args = ["--catalog-id", entry_id, "--consumer", consumer, "--project", project, entry["name"]]
     if consumer == "claude":
+        path = claude_config_path(project)
         try:
-            with open(render_target_path(), encoding="utf-8") as fh:
+            with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
-            value = data.get("projects", {}).get(project, {}).get("mcpServers", {}).get(name)
+            value = data.get("mcpServers", {}).get(name)
         except (OSError, ValueError, AttributeError):
-            return "drift", False
+            value = None
+        tracked = False
+        try:
+            relative = os.path.relpath(path, project)
+            tracked = subprocess.run(
+                ["git", "-C", project, "ls-files", "--error-unmatch", "--", relative],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            ).returncode == 0
+        except OSError:
+            pass
         ok = isinstance(value, dict) and value.get("command") == WRAPPER_COMMAND and value.get("args") == expected_args
-        return ("rendered" if ok else "drift"), False
+        return ("rendered" if ok else "drift"), tracked
 
     path = codex_config_path(project)
     try:
@@ -1324,11 +1333,15 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
             readiness = {"state": "target-stopped", "container": "", "checks": [], "message": str(exc)}
         consumers = list(record.get("consumers", [])) if isinstance(record, dict) else []
         renders = {}
-        tracked = False
+        tracked_codex = False
+        tracked_claude = False
         for consumer in consumers:
             state, is_tracked = _catalog_render_state(key, entry_id, entry, consumer)
             renders[consumer] = state
-            tracked = tracked or is_tracked
+            if consumer == "codex":
+                tracked_codex = tracked_codex or is_tracked
+            elif consumer == "claude":
+                tracked_claude = tracked_claude or is_tracked
         rows.append({
             "id": entry_id,
             "name": entry["name"],
@@ -1342,7 +1355,8 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
             "executionUser": "node" if entry["executionMode"] == "agent-trusted" else "boxa-mcp",
             "isolationStatus": degradation_status(entry) or "isolated",
             "degradedSecretIsolationAcknowledged": activations.get("acknowledgements", {}).get(key, {}).get(entry_id) is True,
-            "trackedCodexConfig": tracked,
+            "trackedCodexConfig": tracked_codex,
+            "trackedMcpJson": tracked_claude,
         })
     return {"projectKey": key, "entries": rows}
 
@@ -1414,10 +1428,22 @@ def _catalog_doctor_findings(probe: Optional[object] = None) -> list[Finding]:
             for consumer, render_state in row["renders"].items():
                 if render_state == "rendered":
                     continue
-                tracked = consumer == "codex" and row["trackedCodexConfig"]
+                tracked = (
+                    row["trackedCodexConfig"] if consumer == "codex"
+                    else row["trackedMcpJson"]
+                )
                 code = f"catalog-{consumer}-render-drift"
-                repair = ("Re-run activation with --allow-tracked-codex-config after reviewing the repository change." if tracked else "boxa mcp doctor --fix")
-                findings.append(Finding(SEVERITY_WARN, code, f"{consumer} render drift for activated MCP {row['name']!r} in Project {project}." + (" The Codex config is tracked." if tracked else ""), repair, not tracked))
+                flag = (
+                    "--allow-tracked-codex-config"
+                    if consumer == "codex"
+                    else "--allow-tracked-mcp-json"
+                )
+                repair = (
+                    f"Re-run activation with {flag} after reviewing the repository change."
+                    if tracked else "boxa mcp doctor --fix"
+                )
+                tracked_label = "Codex config" if consumer == "codex" else ".mcp.json"
+                findings.append(Finding(SEVERITY_WARN, code, f"{consumer} render drift for activated MCP {row['name']!r} in Project {project}." + (f" The {tracked_label} is tracked." if tracked else ""), repair, not tracked))
 
     expected = {"version": 1, "catalogVersion": catalog["version"], "entries": catalog["entries"], "projects": activations.get("projects", {})}
     try:

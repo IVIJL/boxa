@@ -123,14 +123,16 @@ Trusted Codex delegation to Claude (run on the host):
 Activation:
   boxa mcp activate <entry> [--project <p>] --for claude|codex|claude,codex
       [--allow-tracked-codex-config]
+      [--allow-tracked-mcp-json]
       [--accept-degraded-secret-isolation] [--json]
-      Render only the selected Project consumers. Codex writes the managed
-      region in <Project>/.codex/config.toml and locally excludes an untracked
-      config. A tracked Codex config requires the explicit opt-in flag.
+      Render only the selected Project consumers. Claude writes
+      <Project>/.mcp.json; Codex writes the managed region in
+      <Project>/.codex/config.toml. Untracked configs are locally excluded.
+      A tracked consumer config requires its corresponding explicit opt-in.
   boxa mcp deactivate <entry> [--project <p>]
-      [--allow-tracked-codex-config] [--json]
+      [--allow-tracked-codex-config] [--allow-tracked-mcp-json] [--json]
       Remove this Project activation and its selected managed consumer entries.
-      A tracked Codex config is changed only with the explicit opt-in flag.
+      A tracked consumer config is changed only with its explicit opt-in flag.
 
 Status and doctor:
   boxa mcp list|status [--project <p>] [--json]
@@ -140,9 +142,9 @@ Status and doctor:
       Diagnose stopped targets, missing prerequisites, stale references,
       forbidden agent-trusted secrets, render/runtime drift, and degraded
       Docker isolation. --fix may repair only Boxa-owned directories/wrapper,
-      the secret-free runtime snapshot, Claude renders, and untracked Codex
-      renders. It never installs, starts, activates, grants trust, accepts a
-      degradation, or modifies a tracked Codex config without authorization.
+      the secret-free runtime snapshot, and untracked Claude/Codex renders.
+      It never installs, starts, activates, grants trust, accepts a degradation,
+      or modifies a tracked .mcp.json or Codex config without authorization.
 
 Definition import (write) path:
   boxa mcp import --apply [scope]             Import selected definitions.
@@ -183,13 +185,15 @@ Execution mode:
 
 Catalog update:
   boxa mcp update <entry> [--name <new-name>] [--description <text>]
-      [--allow-tracked-codex-config] [--json] [-- <command spec...>]
+      [--allow-tracked-codex-config] [--allow-tracked-mcp-json]
+      [--json] [-- <command spec...>]
       Rename/cosmetic changes preserve stable identity and trust. Runtime
       changes preflight every activated Project, then atomically switch the
       catalog, broker runtime snapshot, and all selected consumer configs.
-  boxa mcp remove <entry> [--allow-tracked-codex-config] [--json]
-      Cascade every activation and managed consumer entry. A tracked Codex
-      config is changed only with the explicit opt-in flag.
+  boxa mcp remove <entry> [--allow-tracked-codex-config]
+      [--allow-tracked-mcp-json] [--json]
+      Cascade every activation and managed consumer entry. A tracked consumer
+      config is changed only with its explicit opt-in flag.
 
 Migration:
   boxa mcp migrate [--json]
@@ -1212,7 +1216,8 @@ cmd_disable() {
 }
 
 cmd_remove() {
-    local json=false no_render=false allow_tracked=false
+    local json=false no_render=false
+    local allow_tracked_codex=false allow_tracked_mcp=false
     local -a raw=()
     local a
     for a in "$@"; do
@@ -1220,7 +1225,8 @@ cmd_remove() {
             -h|--help) _usage; return 0 ;;
             --json) json=true ;;
             --no-render) no_render=true ;;
-            --allow-tracked-codex-config) allow_tracked=true ;;
+            --allow-tracked-codex-config) allow_tracked_codex=true ;;
+            --allow-tracked-mcp-json) allow_tracked_mcp=true ;;
             *) raw+=("$a") ;;
         esac
     done
@@ -1234,7 +1240,8 @@ cmd_remove() {
             return 2
         fi
         local -a catalog_args=("${raw[0]}")
-        [ "$allow_tracked" = false ] || catalog_args+=(--allow-tracked-codex-config)
+        [ "$allow_tracked_codex" = false ] || catalog_args+=(--allow-tracked-codex-config)
+        [ "$allow_tracked_mcp" = false ] || catalog_args+=(--allow-tracked-mcp-json)
         if [ "$json" = true ]; then
             _run_py catalog-remove-json "${catalog_args[@]}"
         else
@@ -1242,8 +1249,8 @@ cmd_remove() {
         fi
         return $?
     fi
-    if [ "$allow_tracked" = true ]; then
-        echo "--allow-tracked-codex-config applies only to catalog removal." >&2
+    if [ "$allow_tracked_codex" = true ] || [ "$allow_tracked_mcp" = true ]; then
+        echo "Tracked-config consent flags apply only to catalog removal." >&2
         return 2
     fi
     local out rc
@@ -2097,7 +2104,8 @@ cmd_readiness() {
 cmd_activation() {
     local action="$1"
     shift
-    local json=false project="" consumer="" token="" allow_tracked=false accept_degraded=false
+    local json=false project="" consumer="" token="" accept_degraded=false
+    local allow_tracked_codex=false allow_tracked_mcp=false
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --json) json=true ;;
@@ -2113,7 +2121,8 @@ cmd_activation() {
                 consumer="$1"
                 ;;
             --for=*) consumer="${1#--for=}" ;;
-            --allow-tracked-codex-config) allow_tracked=true ;;
+            --allow-tracked-codex-config) allow_tracked_codex=true ;;
+            --allow-tracked-mcp-json) allow_tracked_mcp=true ;;
             --accept-degraded-secret-isolation) accept_degraded=true ;;
             -h|--help) _usage; return 0 ;;
             -*) echo "Unknown flag for 'mcp $action': $1" >&2; return 2 ;;
@@ -2150,7 +2159,8 @@ cmd_activation() {
             fi
         fi
         args+=(--for "$consumer")
-        [ "$allow_tracked" = false ] || args+=(--allow-tracked-codex-config)
+        [ "$allow_tracked_codex" = false ] || args+=(--allow-tracked-codex-config)
+        [ "$allow_tracked_mcp" = false ] || args+=(--allow-tracked-mcp-json)
         if [ "$accept_degraded" = true ]; then
             args+=(--accept-degraded-secret-isolation)
         elif [ -t 0 ] && [ -t 1 ] \
@@ -2191,8 +2201,9 @@ cmd_activation() {
         echo "'mcp deactivate' does not accept activation flags." >&2
         return 2
     fi
-    if [ "$action" = "deactivate" ] && [ "$allow_tracked" = true ]; then
-        args+=(--allow-tracked-codex-config)
+    if [ "$action" = "deactivate" ]; then
+        [ "$allow_tracked_codex" = false ] || args+=(--allow-tracked-codex-config)
+        [ "$allow_tracked_mcp" = false ] || args+=(--allow-tracked-mcp-json)
     fi
     if [ "$json" = true ]; then
         _run_py "${action}-json" "${args[@]}"

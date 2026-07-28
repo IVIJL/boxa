@@ -470,6 +470,7 @@ def update_entry(
     *,
     probe: Optional[object] = None,
     allow_tracked_codex_config: bool = False,
+    allow_tracked_mcp_json: bool = False,
     **changes: Any,
 ) -> dict[str, Any]:
     """Transactionally update a definition while preserving identity/mode."""
@@ -480,6 +481,7 @@ def update_entry(
         changes,
         probe=probe,
         allow_tracked_codex_config=allow_tracked_codex_config,
+        allow_tracked_mcp_json=allow_tracked_mcp_json,
     ).entry
 
 
@@ -488,13 +490,16 @@ def remove_entry(
     *,
     activation_count: int = 0,
     allow_tracked_codex_config: bool = False,
+    allow_tracked_mcp_json: bool = False,
 ) -> dict[str, Any]:
     if activation_count:
         raise CatalogError("cannot remove a catalog entry while activations exist")
     from .activation import remove_catalog_entry
 
     return remove_catalog_entry(
-        token, allow_tracked_codex_config=allow_tracked_codex_config
+        token,
+        allow_tracked_codex_config=allow_tracked_codex_config,
+        allow_tracked_mcp_json=allow_tracked_mcp_json,
     ).entry
 
 

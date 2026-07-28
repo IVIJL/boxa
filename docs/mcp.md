@@ -48,13 +48,14 @@ activation.
 
 ## Consumers
 
-Claude Code is rendered through Boxa's host-owned Project record. Codex only
-supports Project-scoped MCP through a trusted repository's
-`.codex/config.toml`, so Boxa writes a delimited managed region there while the
-host activation remains authoritative. It preserves all non-Boxa content and
-adds an otherwise untracked file to `.git/info/exclude`, never `.gitignore`.
-A tracked Codex config requires `--allow-tracked-codex-config`; doctor will not
-edit it without that authorization.
+Claude Code is rendered into the Project's `.mcp.json`; Codex uses the
+Project's `.codex/config.toml` with a delimited managed region. The host
+activation remains authoritative, and Boxa preserves all non-Boxa content.
+For Git Projects it adds either otherwise-untracked render target to
+`.git/info/exclude`, never `.gitignore`. A tracked `.mcp.json` requires
+`--allow-tracked-mcp-json`; a tracked Codex config requires
+`--allow-tracked-codex-config`. Doctor will not edit either tracked file
+without that authorization.
 
 Deactivation, removal, or a runtime-affecting update re-renders selected
 consumers atomically. Restart/reload an already-running Claude or Codex session
@@ -151,6 +152,6 @@ the Docker degradation. Output contains no secret values.
 
 `doctor --fix` is deliberately narrow: it may create Boxa-owned directories,
 repair the launcher link, refresh the secret-free runtime snapshot, and restore
-derived Claude or untracked Codex renders. It never installs, starts a Boxa,
-activates, grants trust, accepts degraded isolation, or edits a tracked Codex
-config without explicit authorization.
+derived untracked Claude or Codex renders. It never installs, starts a Boxa,
+activates, grants trust, accepts degraded isolation, or edits a tracked
+`.mcp.json` or Codex config without explicit authorization.

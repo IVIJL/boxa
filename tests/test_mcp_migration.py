@@ -124,7 +124,12 @@ class MigrationTest(unittest.TestCase):
         self.assertNotIn("boxa-global", claude["mcpServers"])
         self.assertIn("manual-global", claude["mcpServers"])
         self.assertIn("manual", claude["projects"][self.project]["mcpServers"])
-        self.assertIn("boxa-active", claude["projects"][self.project]["mcpServers"])
+        self.assertNotIn("boxa-active", claude["projects"][self.project]["mcpServers"])
+        with open(
+            activation.claude_config_path(self.project), encoding="utf-8"
+        ) as fh:
+            project_render = json.load(fh)
+        self.assertIn("boxa-active", project_render["mcpServers"])
         self.assertTrue(result["legacyRetained"])
         self.assertNotIn("secret", json.dumps(result).lower())
 
@@ -211,6 +216,7 @@ class MigrationTest(unittest.TestCase):
         }}}})
         paths = [catalog_path(), activation.activation_path(), activation.runtime_path(),
                  activation.render_target_path(), activation.render_state_path(),
+                 activation.claude_config_path(self.project),
                  migration.migration_path(), secret_path]
         before = self._state(paths)
         with mock.patch.object(activation, "render_claude_activations", side_effect=OSError("injected")):

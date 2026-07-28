@@ -142,10 +142,11 @@ class CatalogOperatingPathIntegrationTest(unittest.TestCase):
         self.assertTrue(all(row["activation"] == "inactive" for row in lifecycle.catalog_project_status(self.other, self.probe)["entries"]))
 
         # Doctor repairs derived drift only and never creates cross-Project state.
-        with open(activation.render_target_path(), encoding="utf-8") as fh:
+        claude_path = activation.claude_config_path(self.project)
+        with open(claude_path, encoding="utf-8") as fh:
             claude = json.load(fh)
-        del claude["projects"][self.project]["mcpServers"]["boxa-codex-delegate"]
-        with open(activation.render_target_path(), "w", encoding="utf-8") as fh:
+        del claude["mcpServers"]["boxa-codex-delegate"]
+        with open(claude_path, "w", encoding="utf-8") as fh:
             json.dump(claude, fh)
         report = lifecycle.DoctorReport(False, lifecycle._catalog_doctor_findings(self.probe))
         self.assertIn("catalog-claude-render-drift", {finding.code for finding in report.findings})

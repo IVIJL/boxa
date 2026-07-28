@@ -1727,8 +1727,12 @@ def _cmd_catalog_add(argv: list[str], as_json: bool) -> int:
 
 
 def _cmd_catalog_remove(argv: list[str], as_json: bool) -> int:
-    allow_tracked = "--allow-tracked-codex-config" in argv
-    argv = [arg for arg in argv if arg != "--allow-tracked-codex-config"]
+    allow_tracked_codex = "--allow-tracked-codex-config" in argv
+    allow_tracked_mcp = "--allow-tracked-mcp-json" in argv
+    argv = [
+        arg for arg in argv
+        if arg not in {"--allow-tracked-codex-config", "--allow-tracked-mcp-json"}
+    ]
     parsed = _parse_catalog_mutation(argv, "catalog remove")
     if parsed is None:
         return 2
@@ -1738,7 +1742,9 @@ def _cmd_catalog_remove(argv: list[str], as_json: bool) -> int:
         return 2
     try:
         result = remove_catalog_entry(
-            token, allow_tracked_codex_config=allow_tracked
+            token,
+            allow_tracked_codex_config=allow_tracked_codex,
+            allow_tracked_mcp_json=allow_tracked_mcp,
         )
     except (CatalogError, ActivationError) as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
@@ -1779,18 +1785,24 @@ def _cmd_catalog_update(argv: list[str], as_json: bool) -> int:
     else:
         options, spec = rest, []
     changes: dict[str, object] = {}
-    allow_tracked = False
+    allow_tracked_codex = False
+    allow_tracked_mcp = False
     i = 0
     while i < len(options):
         option = options[i]
         if option == "--allow-tracked-codex-config":
-            allow_tracked = True
+            allow_tracked_codex = True
+            i += 1
+            continue
+        if option == "--allow-tracked-mcp-json":
+            allow_tracked_mcp = True
             i += 1
             continue
         if option not in {"--name", "--description"} or i + 1 >= len(options):
             sys.stderr.write(
                 "mcp.cli: catalog update accepts --name <name>, "
-                "--description <text>, --allow-tracked-codex-config, and an "
+                "--description <text>, --allow-tracked-codex-config, "
+                "--allow-tracked-mcp-json, and an "
                 "optional command spec after '--'\n"
             )
             return 2
@@ -1809,7 +1821,8 @@ def _cmd_catalog_update(argv: list[str], as_json: bool) -> int:
         result = update_catalog_entry(
             token,
             changes,
-            allow_tracked_codex_config=allow_tracked,
+            allow_tracked_codex_config=allow_tracked_codex,
+            allow_tracked_mcp_json=allow_tracked_mcp,
         )
     except (CatalogError, ActivationError) as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
@@ -1839,11 +1852,14 @@ def _cmd_catalog_update(argv: list[str], as_json: bool) -> int:
     return 0
 
 
-def _parse_activation(argv: list[str], command: str) -> Optional[tuple[str, str, list[str], bool, bool]]:
+def _parse_activation(
+    argv: list[str], command: str
+) -> Optional[tuple[str, str, list[str], bool, bool, bool]]:
     token: Optional[str] = None
     project: Optional[str] = None
     consumers: list[str] = []
     allow_tracked_codex_config = False
+    allow_tracked_mcp_json = False
     accept_degraded = False
     i = 0
     while i < len(argv):
@@ -1862,6 +1878,8 @@ def _parse_activation(argv: list[str], command: str) -> Optional[tuple[str, str,
             consumers.extend(value for value in argv[i].split(",") if value)
         elif arg == "--allow-tracked-codex-config":
             allow_tracked_codex_config = True
+        elif arg == "--allow-tracked-mcp-json":
+            allow_tracked_mcp_json = True
         elif arg == "--accept-degraded-secret-isolation":
             accept_degraded = True
         elif arg.startswith("-"):
@@ -1876,21 +1894,25 @@ def _parse_activation(argv: list[str], command: str) -> Optional[tuple[str, str,
     if not token or not project:
         sys.stderr.write(f"mcp.cli: {command} requires <entry> --project <absolute-path>\n")
         return None
-    return token, project, consumers, allow_tracked_codex_config, accept_degraded
+    return (
+        token, project, consumers, allow_tracked_codex_config,
+        allow_tracked_mcp_json, accept_degraded,
+    )
 
 
 def _cmd_activate(argv: list[str], as_json: bool) -> int:
     parsed = _parse_activation(argv, "activate")
     if parsed is None:
         return 2
-    token, project, consumers, allow_tracked, accept_degraded = parsed
+    token, project, consumers, allow_tracked_codex, allow_tracked_mcp, accept_degraded = parsed
     if not consumers:
         sys.stderr.write("mcp.cli: non-interactive activation requires --for claude, codex, or both\n")
         return 2
     try:
         result = activate_catalog(
             token, project, consumers,
-            allow_tracked_codex_config=allow_tracked,
+            allow_tracked_codex_config=allow_tracked_codex,
+            allow_tracked_mcp_json=allow_tracked_mcp,
             accept_degraded_secret_isolation=accept_degraded,
         )
     except ActivationError as exc:
@@ -1910,8 +1932,8 @@ def _cmd_activation_degradation(argv: list[str], as_json: bool) -> int:
     parsed = _parse_activation(argv, "activation-degradation")
     if parsed is None:
         return 2
-    token, _project, consumers, allow_tracked, accept_degraded = parsed
-    if consumers or allow_tracked or accept_degraded:
+    token, _project, consumers, allow_tracked_codex, allow_tracked_mcp, accept_degraded = parsed
+    if consumers or allow_tracked_codex or allow_tracked_mcp or accept_degraded:
         sys.stderr.write("mcp.cli: activation-degradation accepts only entry and Project\n")
         return 2
     try:
@@ -1930,8 +1952,8 @@ def _cmd_readiness(argv: list[str], as_json: bool) -> int:
     parsed = _parse_activation(argv, "readiness")
     if parsed is None:
         return 2
-    token, project, consumers, allow_tracked, accept_degraded = parsed
-    if consumers or allow_tracked or accept_degraded:
+    token, project, consumers, allow_tracked_codex, allow_tracked_mcp, accept_degraded = parsed
+    if consumers or allow_tracked_codex or allow_tracked_mcp or accept_degraded:
         sys.stderr.write("mcp.cli: readiness does not accept activation flags\n")
         return 2
     try:
@@ -1957,8 +1979,8 @@ def _cmd_catalog_install(argv: list[str], as_json: bool) -> int:
     parsed = _parse_activation(argv, "install")
     if parsed is None:
         return 2
-    token, project, consumers, allow_tracked, accept_degraded = parsed
-    if consumers or allow_tracked or accept_degraded:
+    token, project, consumers, allow_tracked_codex, allow_tracked_mcp, accept_degraded = parsed
+    if consumers or allow_tracked_codex or allow_tracked_mcp or accept_degraded:
         sys.stderr.write("mcp.cli: install does not accept activation flags\n")
         return 2
     try:
@@ -1985,7 +2007,7 @@ def _cmd_deactivate(argv: list[str], as_json: bool) -> int:
     parsed = _parse_activation(argv, "deactivate")
     if parsed is None:
         return 2
-    token, project, consumers, allow_tracked, accept_degraded = parsed
+    token, project, consumers, allow_tracked_codex, allow_tracked_mcp, accept_degraded = parsed
     if accept_degraded:
         sys.stderr.write("mcp.cli: deactivate does not accept degradation acknowledgement\n")
         return 2
@@ -1996,7 +2018,8 @@ def _cmd_deactivate(argv: list[str], as_json: bool) -> int:
         result = deactivate_catalog(
             token,
             project,
-            allow_tracked_codex_config=allow_tracked,
+            allow_tracked_codex_config=allow_tracked_codex,
+            allow_tracked_mcp_json=allow_tracked_mcp,
         )
     except (ActivationError, CatalogError) as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
@@ -2046,7 +2069,18 @@ def _cmd_catalog_effective_list(argv: list[str], as_json: bool) -> int:
                 e["readiness"]["state"],
                 e["activation"],
                 ",".join(e["consumers"]) or "-",
-                ",".join(f"{consumer}:{state}" for consumer, state in e["renders"].items()) or "-",
+                ",".join(
+                    f"{consumer}:{state}"
+                    + (
+                        ":tracked"
+                        if (
+                            (consumer == "codex" and e["trackedCodexConfig"])
+                            or (consumer == "claude" and e["trackedMcpJson"])
+                        )
+                        else ""
+                    )
+                    for consumer, state in e["renders"].items()
+                ) or "-",
                 f"{e['executionMode']} / {e['executionUser']}",
                 e["isolationStatus"],
             )
