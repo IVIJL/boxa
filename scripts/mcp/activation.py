@@ -462,18 +462,19 @@ def _codex_render_plan(
     activations: dict[str, Any],
     project: str,
     catalog: dict[str, Any],
-) -> tuple[str, str, str, bool, str, str, str]:
+) -> tuple[str, str, str, bool, Optional[str], str, str]:
     relative, exclude_path, path = _codex_git_paths(project)
     tracked = _codex_is_tracked(project, relative)
     records = activations["projects"].get(project, {})
+    existing: Optional[str]
     try:
         with open(path, encoding="utf-8", newline="") as fh:
             existing = fh.read()
     except FileNotFoundError:
-        existing = ""
+        existing = None
     except (OSError, UnicodeError) as exc:
         raise ActivationError(f"cannot read Codex config {path}: {exc}") from exc
-    prefix, suffix = _split_codex_region(existing, path)
+    prefix, suffix = _split_codex_region(_plan_text(existing), path)
     region = _codex_region(project, records, catalog)
     if region:
         rendered = prefix + ("\n" if prefix else "") + region + suffix
@@ -494,11 +495,11 @@ def _render_codex_activation(
     (
         relative, exclude_path, path, tracked, existing, rendered, region,
     ) = _codex_render_plan(activations, project, catalog or load_catalog())
-    if tracked and rendered != existing and not allow_tracked:
+    if tracked and rendered != _plan_text(existing) and not allow_tracked:
         raise ActivationError(
             f"tracked Codex config {path} requires --allow-tracked-codex-config"
         )
-    if rendered != existing:
+    if rendered != _plan_text(existing):
         if not rendered and not os.path.exists(path):
             return
         _swap_text(path, existing, rendered)
@@ -511,16 +512,27 @@ def _atomic_text(path: str, text: str) -> None:
     casfile.atomic_text(path, text)
 
 
-def _swap_text(path: str, expected: str, text: str) -> None:
+def _plan_text(preimage: Optional[str]) -> str:
+    """Render-plan view of a possibly absent file: absence reads as empty text.
+
+    Planning and change detection treat "no file" and "empty file" alike (both
+    render the same content). The compare-and-swap must NOT: it keeps the
+    ``None`` pre-image, so a concurrent create/delete is caught.
+    """
+    return "" if preimage is None else preimage
+
+
+def _swap_text(path: str, expected: Optional[str], text: str) -> None:
     """Replace a rendered file only while it still holds its planned pre-image.
 
-    ``expected`` is the text the render plan was derived from. A foreign edit
-    (Claude Code, the user) that landed since raises
+    ``expected`` is the text the render plan was derived from, or ``None`` when
+    the plan was derived from a MISSING file (distinct from an empty one). A
+    foreign edit (Claude Code, the user) that landed since raises
     ``casfile.ConcurrentModification`` instead of being clobbered.
     """
     casfile.swap(
         path,
-        expected.encode("utf-8"),
+        casfile.preimage(expected),
         text,
         writer=lambda target, payload: _atomic_text(target, payload),
     )
@@ -1126,13 +1138,16 @@ def _claude_settings_plan(
     *,
     retire: Optional[set[str]] = None,
     existing_document: Optional[tuple[bool, str]] = None,
-) -> Optional[tuple[str, str, str]]:
+) -> Optional[tuple[str, Optional[str], str]]:
     approved, rejected = _observed_claude_decisions(project)
 
     path = claude_settings_path(project)
+    # ``existing`` is the CAS pre-image: ``None`` means the file was absent,
+    # which must not collapse into the empty document.
+    existing: Optional[str]
     if existing_document is not None and not existing_document[0]:
         exists = False
-        existing = existing_document[1]
+        existing = None
         data = {}
     else:
         try:
@@ -1145,7 +1160,7 @@ def _claude_settings_plan(
             data = json.loads(existing)
         except FileNotFoundError:
             exists = False
-            existing = ""
+            existing = None
             data = {}
         except (OSError, ValueError) as exc:
             raise ActivationError(
@@ -1220,7 +1235,7 @@ def mirror_claude_decisions(project: str) -> bool:
     consented = (
         load_activations().get("trackedMcpJson", {}).get(project) is True
     )
-    if tracked and rendered != existing and not consented:
+    if tracked and rendered != _plan_text(existing) and not consented:
         raise ActivationError(
             "tracked Claude Project file refused for: "
             f"{path}; grant consent by activating in that Project with "
@@ -1237,16 +1252,17 @@ def _claude_render_plan(
     project: str,
     catalog: dict[str, Any],
     state: dict[str, Any],
-) -> tuple[str, Optional[str], Optional[str], bool, str, str, list[str]]:
+) -> tuple[str, Optional[str], Optional[str], bool, Optional[str], str, list[str]]:
     path = claude_config_path(project)
     if not _project_directory_exists(project):
         return path, None, None, False, "", "", []
+    existing: Optional[str]
     try:
         with open(path, encoding="utf-8") as fh:
             existing = fh.read()
         data = json.loads(existing)
     except FileNotFoundError:
-        existing = ""
+        existing = None
         data = {}
     except (OSError, ValueError) as exc:
         raise ActivationError(f"cannot read Claude MCP config {path}: {exc}") from exc
@@ -1278,11 +1294,11 @@ def _claude_render_plan(
     changed_block = bool(owned or definitions)
     rendered = (
         _render_mcp_json(
-            existing,
+            _plan_text(existing),
             definitions,
             owned - set(definitions),
         )
-        if changed_block else existing
+        if changed_block else _plan_text(existing)
     )
 
     git_paths = _claude_git_paths(project)
@@ -1358,7 +1374,7 @@ def claude_render_status(
     if settings_plan is not None:
         settings_path, settings_existing, settings_rendered = settings_plan
         existing_enabled, existing_disabled = (
-            _claude_settings_memberships(settings_existing)
+            _claude_settings_memberships(_plan_text(settings_existing))
         )
         rendered_enabled, rendered_disabled = (
             _claude_settings_memberships(settings_rendered)
@@ -1366,7 +1382,7 @@ def claude_render_status(
         settings_changed_names = (
             existing_enabled ^ rendered_enabled
         ) | (existing_disabled ^ rendered_disabled)
-    mcp_json_changes = rendered != existing
+    mcp_json_changes = rendered != _plan_text(existing)
     settings_changes = settings_plan is not None
     requires_consent = (
         mcp_json_changes and mcp_json_tracked
@@ -1604,13 +1620,14 @@ def _render_claude_batch(
                 new_state.pop(project, None)
                 new_seeded.pop(project, None)
             continue
-        if rendered != existing:
+        if rendered != _plan_text(existing):
             if rendered:
                 _swap_text(path, existing, rendered)
             else:
                 # Reached only when a non-empty pre-image renders away, so the
-                # pre-image is exact: an emptied file is a concurrent edit.
-                casfile.remove(path, existing.encode("utf-8"))
+                # pre-image is exact: an emptied or deleted file is a concurrent
+                # edit and ``remove`` refuses it.
+                casfile.remove(path, casfile.preimage(existing))
         if (
             exclude_path is not None
             and relative is not None
@@ -1629,7 +1646,7 @@ def _render_claude_batch(
         )
         if settings_plan is not None:
             settings_path, settings_existing, settings_rendered = settings_plan
-            if settings_rendered != settings_existing:
+            if settings_rendered != _plan_text(settings_existing):
                 _swap_text(
                     settings_path, settings_existing, settings_rendered
                 )
@@ -1875,7 +1892,7 @@ def _preflight_codex_lifecycle(
             rendered,
             _region,
         ) = _codex_render_plan(activations, project, catalog)
-        if tracked and rendered != existing and not allow_tracked:
+        if tracked and rendered != _plan_text(existing) and not allow_tracked:
             refusals.append(path)
     if refusals:
         raise ActivationError(

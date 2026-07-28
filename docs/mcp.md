@@ -129,8 +129,9 @@ repaired `.mcp.json` and an unrepaired `.claude/settings.local.json`.
 Every write Boxa makes to a rendered or shared file — on the host and inside a
 Container alike — goes through one compare-and-swap primitive. The file is
 re-read immediately before the atomic replace and compared with the exact
-pre-image the rendered content was derived from. If Claude Code, Git, or you
-changed it in between, Boxa writes nothing and says so:
+pre-image the rendered content was derived from — including whether the file
+existed at all, so deleting it or creating it empty counts as a change. If
+Claude Code, Git, or you changed it in between, Boxa writes nothing and says so:
 
 * convergence reports a skip ("concurrent write to the rendered file was
   detected") after a bounded number of retries and repairs it on the next run;
@@ -140,9 +141,10 @@ changed it in between, Boxa writes nothing and says so:
 
 Rollback is equally careful: it restores a file only while its bytes are still
 the ones Boxa wrote, so an edit made after Boxa's write is reported instead of
-being erased. `.git/info/exclude` is only ever appended to, and a rollback
-removes just Boxa's own ignore line, leaving concurrent Git or user edits
-untouched.
+being erased. `.git/info/exclude` is only ever appended to — a single atomic
+append, so a Git or user edit that lands while Boxa is writing survives — and a
+rollback removes just Boxa's own ignore line, leaving concurrent Git or user
+edits untouched.
 
 The convergence command exits `0` after convergence, an in-sync check, or a
 benign nothing-to-do result such as no Container Project. It exits `3` when an

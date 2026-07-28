@@ -15,8 +15,16 @@ still equal Boxa's own post-image. A concurrent edit made *after* Boxa's write
 is reported, never overwritten.
 
 ``.git/info/exclude`` is append-oriented and shared with Git, so it is written
-with :func:`append_rule`, whose compensation removes only Boxa's own appended
+with :func:`append_rule`, which appends through ``O_APPEND`` — no read-modify-
+write window at all — and whose compensation removes only Boxa's own appended
 line and leaves every concurrent edit in place.
+
+An expected pre-image is existence-aware: ``None`` means "the file did not
+exist" and never compares equal to ``b""``, the pre-image of an existing empty
+file. Callers must therefore encode a missing file as ``None`` (see
+:func:`preimage`), so a file deleted concurrently is not recreated from a stale
+empty pre-image, and an empty file created concurrently is not overwritten by a
+render planned from a missing one.
 
 Callers decide what a :class:`ConcurrentModification` means — a bounded retry
 (convergence) or an aborted batch reported as skipped/failed (host renders).
@@ -81,6 +89,16 @@ def read_bytes(path: str) -> Optional[bytes]:
         return None
     except OSError as exc:
         raise WriteError(f"cannot read {path}: {exc}") from exc
+
+
+def preimage(text: Optional[str]) -> Optional[bytes]:
+    """Encode a text pre-image, keeping "the file was absent" distinct.
+
+    ``None`` in, ``None`` out: a caller that read a missing file as empty text
+    must pass ``None``, never ``""`` — otherwise the two states collapse and the
+    compare-and-swap stops catching a concurrent create/delete.
+    """
+    return None if text is None else text.encode("utf-8")
 
 
 def snapshot(path: str) -> FileSnapshot:
@@ -295,9 +313,13 @@ def _undo_append(entry: WriteRecord, current: Optional[bytes]) -> bool:
 
 
 def _mismatch(current: Optional[bytes], expected: Optional[bytes]) -> bool:
-    if expected is None:
-        return current is not None
-    return (current if current is not None else b"") != expected
+    """Whether ``current`` differs from the expected pre-image.
+
+    Existence is part of the value: a missing file (``None``) is never the
+    expected empty file (``b""``) and vice versa, so a concurrent create or
+    delete of an empty file is reported instead of being silently accepted.
+    """
+    return current != expected
 
 
 def swap(
@@ -310,7 +332,8 @@ def swap(
     """Replace ``path`` only while its bytes still equal ``expected``.
 
     ``expected`` is the exact pre-image the new content was derived from, or
-    ``None`` for "must not exist". The check happens immediately before the
+    ``None`` for "must not exist" — which is NOT the same as ``b""``, the
+    pre-image of an existing empty file. The check happens immediately before the
     atomic replace; on mismatch nothing is written and
     :class:`ConcurrentModification` is raised. The write is journalled into the
     innermost :func:`transaction`, if any.
@@ -341,7 +364,12 @@ def swap_json(
 
 
 def remove(path: str, expected: Optional[bytes]) -> Optional[WriteRecord]:
-    """Delete ``path`` only while its bytes still equal ``expected``."""
+    """Delete ``path`` only while its bytes still equal ``expected``.
+
+    ``expected=None`` means "already gone"; an ``expected`` of ``b""`` demands
+    an existing empty file, so a concurrent delete raises rather than passing
+    for the plan's pre-image.
+    """
     preimage = snapshot(path)
     if _mismatch(preimage.image, expected):
         raise ConcurrentModification(path)
@@ -358,16 +386,39 @@ def append_rule(path: str, rule: str) -> Optional[WriteRecord]:
     """Append ``rule`` once to an append-oriented shared file.
 
     Used for ``.git/info/exclude``: the file belongs to Git and the user, so
-    Boxa never rewrites it wholesale. Compensation (see :func:`undo`) removes
-    only this line and keeps any edit made meanwhile.
+    Boxa never rewrites it wholesale. The rule is written with a single
+    ``O_APPEND`` write — the kernel makes that atomic for a regular file, so a
+    concurrent edit landing between the read and the write is appended to, never
+    replaced, and the file keeps its inode and mode. Compensation (see
+    :func:`undo`) removes only this line and keeps any edit made meanwhile.
     """
-    preimage = snapshot(path)
-    existing = preimage.data.decode("utf-8", "replace") if preimage.existed else ""
-    if rule in existing.splitlines():
+    before = snapshot(path)
+    if rule in before.data.decode("utf-8", "replace").splitlines():
         return None
-    separator = "" if not existing or existing.endswith("\n") else "\n"
-    atomic_text(path, existing + separator + rule + "\n")
-    postimage = read_bytes(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, mode=0o755, exist_ok=True)
+    try:
+        # O_RDWR (not O_WRONLY) so the trailing byte can be re-read through the
+        # very descriptor the append goes to; O_APPEND still forces every write
+        # to the current end of file.
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    except OSError as exc:
+        raise WriteError(f"cannot append to {path}: {exc}") from exc
+    try:
+        # Re-read the final byte through the same descriptor, so the newline
+        # separator reflects the file as it is now rather than as snapshotted.
+        size = os.fstat(fd).st_size
+        tail = os.pread(fd, 1, size - 1) if size else b"\n"
+        payload = ("" if tail == b"\n" else "\n") + rule + "\n"
+        os.write(fd, payload.encode("utf-8"))
+        os.fsync(fd)
+    except OSError as exc:
+        raise WriteError(f"cannot append to {path}: {exc}") from exc
+    finally:
+        os.close(fd)
+    # No post-image: an append is compensated line-level (see ``_undo_append``),
+    # never by restoring a whole-file image that would drop concurrent edits.
     return _journal(
-        WriteRecord(preimage=preimage, postimage=postimage, appended=rule)
+        WriteRecord(preimage=before, postimage=None, appended=rule)
     )

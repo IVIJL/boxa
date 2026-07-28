@@ -67,24 +67,33 @@ def _empty_state() -> dict[str, Any]:
     return {"version": STATE_VERSION, "projects": {}, "seeded": {}}
 
 
-def _load_state() -> tuple[dict[str, Any], str]:
+def _load_state() -> tuple[dict[str, Any], bytes | None]:
+    """Convergence state plus its exact pre-image (``None`` = no file yet).
+
+    The pre-image stays bytes-or-``None`` so the commit's compare-and-swap can
+    tell "state file absent" from "state file emptied by someone else".
+    """
     path = state_path()
     try:
-        with open(path, encoding="utf-8") as fh:
-            existing = fh.read()
+        raw = casfile.read_bytes(path)
+    except casfile.WriteError:
+        # Unreadable: no usable pre-image, so any commit swap must refuse.
+        return _empty_state(), b""
+    if raw is None:
+        return _empty_state(), None
+    try:
+        existing = raw.decode("utf-8")
         data = json.loads(existing)
-    except FileNotFoundError:
-        return _empty_state(), ""
-    except (OSError, UnicodeError, ValueError):
-        return _empty_state(), ""
+    except (UnicodeError, ValueError):
+        return _empty_state(), raw
     if (
         not isinstance(data, dict)
         or data.get("version") != STATE_VERSION
         or not isinstance(data.get("projects"), dict)
         or not isinstance(data.get("seeded"), dict)
     ):
-        return _empty_state(), existing
-    return data, existing
+        return _empty_state(), raw
+    return data, raw
 
 
 def _project_from_identity() -> str | None:
@@ -440,7 +449,7 @@ def converge(
             return _skipped(str(exc), resolved)
 
         try:
-            state, state_existing = _load_state()
+            state, state_raw = _load_state()
             desired = set(definitions)
             previously_owned = _state_names(state, "projects", resolved)
             snapshot_seeded = _snapshot_project_value(
@@ -576,7 +585,7 @@ def converge(
             _set_project_names(state, "projects", resolved, desired)
             _set_project_names(state, "seeded", resolved, desired)
             state_rendered = activation._json_document(state)
-            state_changed = state_rendered != state_existing
+            state_changed = state_rendered.encode("utf-8") != state_raw
             changed = mcp_changed or approval_changed or state_changed
             exclude_plans = [
                 plan
@@ -626,7 +635,7 @@ def converge(
                             settings_existing,
                             settings_rendered,
                         ) = settings_plan
-                        if settings_rendered != settings_existing:
+                        if settings_rendered != (settings_existing or ""):
                             _swap(
                                 settings_path,
                                 settings_preimage,
@@ -636,7 +645,7 @@ def converge(
                         convergence_state_path = state_path()
                         _swap(
                             convergence_state_path,
-                            state_existing.encode("utf-8"),
+                            state_raw,
                             state_rendered,
                         )
                         os.chmod(

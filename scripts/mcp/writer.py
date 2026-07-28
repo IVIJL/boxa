@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Optional
 
 from . import casfile
 from .providers import codex as codex_provider
@@ -45,15 +45,17 @@ class RenderWriteError(RuntimeError):
     """A render write failure with an actionable message."""
 
 
-def _swap_write(path: str, expected: str, text: str) -> None:
+def _swap_write(path: str, expected: Optional[str], text: str) -> None:
     """Compare-and-swap a config the agent also owns (ADR 0022).
 
     Raises ``casfile.ConcurrentModification`` — never clobbers — when the file
-    changed since the bytes this render was derived from.
+    changed since the bytes this render was derived from. ``expected`` is
+    ``None`` when the render was planned from a MISSING file, which never
+    matches an empty file created meanwhile.
     """
     casfile.swap(
         path,
-        expected.encode("utf-8"),
+        casfile.preimage(expected),
         text,
         writer=lambda target, payload: _atomic_write(target, payload),
     )
@@ -280,7 +282,8 @@ def write_claude(plan: AgentPlan) -> None:
     """
     path = plan.config_path
     data: dict[str, Any]
-    existing = ""
+    # ``None`` = planned from a missing file (see ``_swap_write``).
+    existing: Optional[str] = None
     if os.path.isfile(path):
         try:
             with open(path, "r", encoding="utf-8") as fh:
@@ -509,7 +512,8 @@ def write_codex(plan: AgentPlan) -> None:
         )
 
     path = plan.config_path
-    existing = ""
+    # ``None`` = planned from a missing file (see ``_swap_write``).
+    existing: Optional[str] = None
     if os.path.isfile(path):
         try:
             with open(path, "r", encoding="utf-8") as fh:
@@ -519,7 +523,7 @@ def write_codex(plan: AgentPlan) -> None:
                 f"cannot read Codex config to render into: {path}: {exc}"
             ) from exc
 
-    stripped = _strip_boxa_tables(existing)
+    stripped = _strip_boxa_tables(existing or "")
 
     # ``build_codex_plan`` already excludes project-scoped servers (no scoped
     # Codex target), so ``plan.planned`` is global-only. Defense-in-depth: filter

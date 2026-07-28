@@ -129,6 +129,71 @@ class CasFileTest(unittest.TestCase):
 
         self.assertFalse(os.path.exists(self.path))
 
+    def test_append_keeps_an_edit_landing_after_the_snapshot(self):
+        """Git may rewrite info/exclude between the read and Boxa's append."""
+        self._write(b"build/\n")
+        real_snapshot = casfile.snapshot
+
+        def snapshot_then_foreign_edit(path: str):
+            captured = real_snapshot(path)
+            if path == self.path:
+                with open(self.path, "ab") as fh:
+                    fh.write(b"secrets.env\n")
+            return captured
+
+        casfile.snapshot = snapshot_then_foreign_edit
+        self.addCleanup(setattr, casfile, "snapshot", real_snapshot)
+
+        casfile.append_rule(self.path, "/.mcp.json")
+
+        self.assertEqual(
+            self._read(), b"build/\nsecrets.env\n/.mcp.json\n"
+        )
+
+    def test_append_terminates_a_line_the_foreign_edit_left_open(self):
+        self._write(b"build/")
+
+        casfile.append_rule(self.path, "/.mcp.json")
+
+        self.assertEqual(self._read(), b"build/\n/.mcp.json\n")
+
+    def test_swap_does_not_recreate_a_file_deleted_concurrently(self):
+        """An empty pre-image is an EMPTY FILE, never a missing one."""
+        self._write(b"")
+        os.unlink(self.path)
+
+        with self.assertRaises(casfile.ConcurrentModification):
+            casfile.swap(self.path, b"", "rendered\n")
+
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_swap_writes_against_a_genuinely_empty_file(self):
+        self._write(b"")
+
+        casfile.swap(self.path, b"", "rendered\n")
+
+        self.assertEqual(self._read(), b"rendered\n")
+
+    def test_swap_does_not_overwrite_an_empty_file_created_concurrently(self):
+        """A missing pre-image is ``None``; an empty file is a foreign create."""
+        self._write(b"")
+
+        with self.assertRaises(casfile.ConcurrentModification):
+            casfile.swap(self.path, None, "rendered\n")
+
+        self.assertEqual(self._read(), b"")
+
+    def test_remove_refuses_a_file_deleted_concurrently(self):
+        self._write(b"")
+        os.unlink(self.path)
+
+        with self.assertRaises(casfile.ConcurrentModification):
+            casfile.remove(self.path, b"")
+
+    def test_preimage_keeps_absence_distinct_from_empty_text(self):
+        self.assertIsNone(casfile.preimage(None))
+        self.assertEqual(casfile.preimage(""), b"")
+
     def test_record_journals_a_bespoke_write(self):
         self._write(b"before\n")
 

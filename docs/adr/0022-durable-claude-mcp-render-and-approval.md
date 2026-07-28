@@ -214,8 +214,13 @@ Boxa therefore has exactly one write primitive for these files (`mcp.casfile`),
 and every render, migration and rollback write goes through it:
 
 * **Compare-and-swap.** A write states the exact pre-image its content was
-  derived from — bytes, or "must not exist". The primitive re-reads the file
-  immediately before the atomic replace; on mismatch it writes nothing and
+  derived from — bytes, or "must not exist". Existence is part of that value:
+  "must not exist" is a distinct sentinel that never compares equal to an empty
+  file, so a file deleted concurrently is not recreated from a stale empty
+  pre-image and an empty file created concurrently is not overwritten by a plan
+  derived from a missing one. Planning may treat a missing file as empty
+  content; the pre-image handed to the primitive may not. The primitive re-reads
+  the file immediately before the atomic replace; on mismatch it writes nothing and
   raises one distinct *concurrent modification* condition. It never retries by
   itself: convergence retries from a newer snapshot up to its fixed bound and
   then reports a skip, while a host lifecycle command aborts the whole batch
@@ -231,6 +236,9 @@ and every render, migration and rollback write goes through it:
   forget to snapshot a file it writes.
 * **Append-oriented shared files.** `.git/info/exclude` belongs to Git and the
   user, so Boxa appends its rule once and never rewrites the file wholesale.
+  The rule is written as a single `O_APPEND` write — atomic for a regular file,
+  so there is no read-modify-write window in which a Git or user edit could be
+  replaced by Boxa's snapshot, and the file keeps its inode and mode.
   Compensation removes only Boxa's own appended line and leaves any concurrent
   edit in place, rather than restoring a whole-file snapshot.
 
