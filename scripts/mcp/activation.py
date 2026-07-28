@@ -601,6 +601,22 @@ def _json_document(data: dict[str, Any]) -> str:
     return json.dumps(data, indent=2) + "\n"
 
 
+def claude_server_definition(
+    entry_id: str,
+    project: str,
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the single Claude render shape shared by host and Container."""
+    return {
+        "type": "stdio",
+        "command": "boxa-mcp-run",
+        "args": [
+            "--catalog-id", entry_id, "--consumer", "claude",
+            "--project", project, entry["name"],
+        ],
+    }
+
+
 def _claude_seeded_names(state: dict[str, Any], project: str) -> set[str]:
     seeded = state.get("seeded") if isinstance(state.get("seeded"), dict) else {}
     names = seeded.get(project, [])
@@ -756,14 +772,7 @@ def _claude_render_plan(
         if not isinstance(entry, dict):
             continue
         name = rendered_name(entry["name"])
-        definitions[name] = {
-            "type": "stdio",
-            "command": "boxa-mcp-run",
-            "args": [
-                "--catalog-id", entry_id, "--consumer", "claude",
-                "--project", project, entry["name"],
-            ],
-        }
+        definitions[name] = claude_server_definition(entry_id, project, entry)
 
     block = data.get("mcpServers")
     if block is not None and not isinstance(block, dict):

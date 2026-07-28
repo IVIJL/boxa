@@ -137,6 +137,16 @@ repair_claude_bin() {
     echo "Claude symlink -> $latest"
 }
 
+# Every-start. The runtime snapshot is node-readable; convergence never needs
+# the gated host MCP store and a stale render must not block Container setup.
+converge_mcp_state() {
+    # Pre-convergence images lack the wrapper; that is a rebuild, not a fault.
+    command -v boxa-mcp-converge >/dev/null 2>&1 || return 0
+    if ! boxa-mcp-converge --quiet; then
+        WARNINGS+=("MCP convergence failed — run 'boxa-mcp-converge' inside the Container")
+    fi
+}
+
 print_summary() {
     if [ "$seeded" -gt 0 ]; then
         echo "Claude Code config seeded ($seeded file(s))"
@@ -161,6 +171,7 @@ main() {
     bootstrap_codex_cli
     bootstrap_agent_browser_cli
     repair_claude_bin
+    converge_mcp_state
     print_summary
 }
 

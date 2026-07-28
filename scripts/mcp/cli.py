@@ -64,6 +64,7 @@ from .catalog_import import (
 )
 from .candidate import Candidate
 from .classify import classify_candidate
+from .converge import converge as converge_runtime
 from .merge import MergedCandidate, merge_candidates
 from . import onboarding
 from .migration import MigrationError, migrate_legacy
@@ -2263,6 +2264,64 @@ def _cmd_project_targets(argv: list[str], as_json: bool) -> int:
     return 0
 
 
+def _cmd_converge(argv: list[str]) -> int:
+    project: Optional[str] = None
+    as_json = False
+    quiet = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--project":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: converge --project requires a value\n")
+                return 2
+            project = argv[i]
+        elif arg.startswith("--project="):
+            project = arg[len("--project="):]
+        elif arg == "--json":
+            as_json = True
+        elif arg == "--quiet":
+            quiet = True
+        else:
+            sys.stderr.write(f"mcp.cli: unknown converge argument {arg!r}\n")
+            return 2
+        i += 1
+
+    try:
+        results = converge_runtime(project)
+    except (ActivationError, OSError, ValueError) as exc:
+        sys.stderr.write(f"mcp.cli: convergence failed: {exc}\n")
+        return 1
+
+    visible = [
+        result for result in results
+        if not quiet or result.status == "converged"
+    ]
+    if not visible:
+        return 0
+    if as_json:
+        return _emit({"results": [result.to_dict() for result in visible]})
+    for result in visible:
+        if result.status == "skipped":
+            sys.stdout.write(f"MCP convergence skipped: {result.reason}.\n")
+            continue
+        if result.status == "in-sync":
+            sys.stdout.write(
+                f"MCP state is in sync for Project {result.project}.\n"
+            )
+            continue
+        changes = len(result.added) + len(result.removed) + len(result.repaired)
+        sys.stdout.write(
+            f"Converged MCP state for Project {result.project}: "
+            f"{changes} render change(s)"
+        )
+        if result.approval_changed:
+            sys.stdout.write(", approval updated")
+        sys.stdout.write(".\n")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         sys.stderr.write("mcp.cli: missing command\n")
@@ -2270,6 +2329,8 @@ def main(argv: list[str]) -> int:
     command = argv[0]
     rest = argv[1:]
 
+    if command == "converge":
+        return _cmd_converge(rest)
     if command == "import-json":
         scope = _parse_scope(rest)
         if scope is None:

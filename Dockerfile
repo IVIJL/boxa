@@ -366,6 +366,14 @@ RUN STAMP=$(date +%s) && \
 # Ensure npm-global bin is in PATH for all zsh sessions (survives chezmoi dotfiles)
 RUN echo 'export PATH="$PATH:/usr/local/share/npm-global/bin"' >> /etc/zsh/zshenv
 
+# Repair derived MCP state only for interactive shells inside a Boxa Container.
+# zshenv is intentionally avoided because it also runs for non-interactive zsh.
+RUN printf '%s\n' \
+    'if [[ -o interactive ]] && [[ -f /etc/boxa/identity.json ]] && [[ -d /run/boxa-mcp-runtime ]]; then' \
+    '  boxa-mcp-converge --quiet || true' \
+    'fi' \
+    >> /etc/zsh/zshrc
+
 # Ensure login shells that source /etc/profile also see global npm binaries.
 # /etc/profile resets PATH, so the earlier Docker ENV alone is not enough.
 RUN printf '%s\n' \
@@ -391,6 +399,7 @@ COPY lib/allow-for.sh /usr/local/share/boxa/lib/allow-for.sh
 # validates required env without logging values, and execs the MCP command.
 COPY scripts/mcp/ /usr/local/share/boxa/mcp/
 COPY scripts/mcp-run.sh /usr/local/bin/boxa-mcp-run
+COPY scripts/mcp-converge.sh /usr/local/bin/boxa-mcp-converge
 # Container MCP broker launcher (ADR 0014, issue 15). Runs the Python broker as
 # boxa-mcp (started from the entrypoint root phase before the node drop).
 COPY scripts/mcp-broker.sh /usr/local/bin/boxa-mcp-broker
@@ -459,6 +468,7 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/stop-agent-browser-host-allow \
     /usr/local/bin/agent-browser \
     /usr/local/bin/boxa-mcp-run \
+    /usr/local/bin/boxa-mcp-converge \
     /usr/local/bin/boxa-mcp-broker \
     /usr/local/bin/mcp-broker-namespace \
     /usr/local/bin/stage-mcp-secrets \

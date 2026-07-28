@@ -68,6 +68,22 @@ Deactivation, removal, or a runtime-affecting update re-renders selected
 consumers atomically. Restart/reload an already-running Claude or Codex session
 to drop an old connection or pick up a changed definition.
 
+## Container convergence
+
+At every Container start and interactive shell initialization, Boxa reads the
+node-readable, secret-free runtime snapshot and re-asserts the Project's
+`.mcp.json` entries and Claude approval state. Missing or hand-edited Boxa
+definitions are repaired, while foreign servers and unrelated settings remain
+untouched. Approval follows the same one-time seeding and recorded-decision
+rules as activation, so convergence does not re-enable a server the user
+disabled.
+
+Convergence removes only a Boxa-owned entry that is no longer activated for
+Claude in the snapshot. A missing, empty, malformed, or unreadable snapshot is
+a reported no-op and never means that all entries should be removed. When the
+render, approval, and local convergence state already match, no file is
+rewritten.
+
 ## Execution identity
 
 `service-isolated` is the default. The server runs as `boxa-mcp`, can read and
