@@ -254,7 +254,7 @@ def _codex_is_tracked(project: str, relative: str) -> bool:
         proc = subprocess.run(
             [
                 "git", "-C", project, "ls-files", "--error-unmatch", "--",
-                relative,
+                f":(top,literal){relative}",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -1193,7 +1193,7 @@ def _claude_render_plan(
     relative: Optional[str] = None
     if git_paths is not None:
         relative, exclude_path, _path = git_paths
-        tracked = _codex_is_tracked(project, ".mcp.json")
+        tracked = _codex_is_tracked(project, relative)
     return (
         path, exclude_path, relative, tracked, existing, rendered,
         sorted(definitions),

@@ -361,6 +361,30 @@ class ConvergeTest(unittest.TestCase):
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), before[path])
 
+    def test_nested_tracked_mcp_without_snapshot_consent_is_skipped(self):
+        repo = activation.canonical_project(os.path.join(self.tmp.name, "repo"))
+        os.makedirs(repo)
+        self.project = repo
+        self._init_git()
+        self.project = activation.canonical_project(os.path.join(repo, "sub"))
+        os.makedirs(self.project)
+        mcp_path = activation.claude_config_path(self.project)
+        original = b'{"theme":"tracked"}\n'
+        with open(mcp_path, "wb") as fh:
+            fh.write(original)
+        self._git("add", ".mcp.json")
+        self._write_snapshot(
+            self._desired_records(), tracked_mcp_json={}
+        )
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn(mcp_path, result.reason)
+        self.assertIn("--allow-tracked-mcp-json", result.reason)
+        with open(mcp_path, "rb") as fh:
+            self.assertEqual(fh.read(), original)
+
     def test_tracked_mcp_change_with_snapshot_consent_converges(self):
         self._init_git()
         mcp_path = activation.claude_config_path(self.project)
@@ -403,6 +427,26 @@ class ConvergeTest(unittest.TestCase):
 
         self.assertEqual(result.status, "converged")
         self.assertIn("boxa-echo", self._mcp_data()["mcpServers"])
+
+    def test_nested_untracked_mcp_exclude_is_repo_relative(self):
+        repo = activation.canonical_project(os.path.join(self.tmp.name, "repo"))
+        os.makedirs(repo)
+        self.project = repo
+        self._init_git()
+        self.project = activation.canonical_project(os.path.join(repo, "sub"))
+        os.makedirs(self.project)
+        self._write_snapshot(self._desired_records(), tracked_mcp_json={})
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        exclude_path = self._git(
+            "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
+        )
+        with open(exclude_path, encoding="utf-8") as fh:
+            patterns = fh.read().splitlines()
+        self.assertIn("/sub/.mcp.json", patterns)
+        self.assertNotIn("/.mcp.json", patterns)
 
     def test_git_tracked_inspection_failure_skips_without_writes(self):
         self._init_git()

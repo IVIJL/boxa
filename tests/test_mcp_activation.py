@@ -635,6 +635,28 @@ class ActivationTest(unittest.TestCase):
         self.assertIn(activation._CODEX_BEGIN, self._codex_text())
         self.assertTrue(self._git("status", "--short", "--", ".codex/config.toml"))
 
+    def test_nested_project_tracked_codex_config_requires_explicit_opt_in(self):
+        repo = activation.canonical_project(os.path.join(self.tmp.name, "repo"))
+        nested = activation.canonical_project(os.path.join(repo, "sub"))
+        path = activation.codex_config_path(nested)
+        os.makedirs(os.path.dirname(path))
+        self._git("init", "-q", cwd=repo)
+        original = 'model = "tracked"\n'
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        self._git("add", "sub/.codex/config.toml", cwd=repo)
+
+        with self.assertRaisesRegex(
+            activation.ActivationError, "allow-tracked-codex-config"
+        ):
+            activation.activate(
+                "echo", nested, ["codex"], ReadyProbe(nested),
+                allow_tracked_codex_config=False,
+            )
+
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), original)
+
     def test_untracked_mcp_json_uses_local_exclude_not_gitignore(self):
         self._init_git()
         activation.activate("echo", self.project, ["claude"], ReadyProbe(self.project))
@@ -660,6 +682,28 @@ class ActivationTest(unittest.TestCase):
         )
         with open(exclude, encoding="utf-8") as fh:
             self.assertIn("/nested/.mcp.json", fh.read().splitlines())
+
+    def test_nested_project_tracked_mcp_json_requires_explicit_opt_in(self):
+        repo = activation.canonical_project(os.path.join(self.tmp.name, "repo"))
+        nested = activation.canonical_project(os.path.join(repo, "sub"))
+        os.makedirs(nested)
+        self._git("init", "-q", cwd=repo)
+        path = activation.claude_config_path(nested)
+        original = '{"theme":"tracked"}\n'
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        self._git("add", "sub/.mcp.json", cwd=repo)
+
+        with self.assertRaisesRegex(
+            activation.ActivationError, "allow-tracked-mcp-json"
+        ):
+            activation.activate(
+                "echo", nested, ["claude"], ReadyProbe(nested),
+                allow_tracked_mcp_json=False,
+            )
+
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), original)
 
     def test_tracked_mcp_json_requires_explicit_opt_in(self):
         self._init_git()
