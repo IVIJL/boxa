@@ -51,13 +51,17 @@ activation.
 Claude Code is rendered into the Project's `.mcp.json`; Codex uses the
 Project's `.codex/config.toml` with a delimited managed region. The host
 activation remains authoritative, and Boxa preserves all non-Boxa content.
-For Git Projects it adds either otherwise-untracked render target to
-`.git/info/exclude`, never `.gitignore`. A tracked `.mcp.json` requires
-`--allow-tracked-mcp-json`; a tracked Codex config requires
-`--allow-tracked-codex-config`. Doctor will not edit either tracked file
-without that authorization. The `.mcp.json` flag grants and records durable
+For Git Projects it adds each otherwise-untracked render target to
+`.git/info/exclude`, never `.gitignore`. Tracked `.mcp.json` and
+`.claude/settings.local.json` writes share `--allow-tracked-mcp-json`: the
+decision means Boxa may write its derived Claude Project files in that tracked
+repository. A tracked Codex config requires
+`--allow-tracked-codex-config`. The Claude flag grants and records durable
 consent only for the Project explicitly targeted by that lifecycle command;
 it does not authorize another Project included in an incidental re-render.
+If any changed Claude Project file lacks consent, the complete multi-Project
+render batch is refused before the first write. An already byte-identical
+tracked file does not require consent.
 
 For Claude Code, activation also seeds the rendered server name once into
 `.claude/settings.local.json`. Boxa preserves unrelated Project settings and
@@ -88,14 +92,26 @@ a reported no-op and never means that all entries should be removed. When the
 render, approval, and local convergence state already match, no file is
 rewritten.
 
-If `.mcp.json` is tracked and its rendered bytes need to change, convergence
-refuses all writes for that Project unless a host activation previously
-recorded durable consent through `--allow-tracked-mcp-json`. An already
-in-sync tracked `.mcp.json` does not block approval-state repair.
+If `.mcp.json` or `.claude/settings.local.json` is tracked and its rendered
+bytes need to change, convergence refuses all writes for that Project unless
+a host activation previously recorded durable consent through
+`--allow-tracked-mcp-json`. This is a whole-Project refusal: convergence does
+not update `.mcp.json` while declining its approval companion, or vice versa.
+An already in-sync tracked file does not block repair of the other file.
+When convergence writes either untracked file in a Git Project, it adds the
+repository-root-relative path to `.git/info/exclude`.
 Convergence revalidates the snapshot and rendered files immediately before
 writing. A newly published snapshot is replanned; a rendered-file change
 without a snapshot change is reported as a concurrent host write and left for
 the next convergence.
+
+The convergence command exits `0` after convergence, an in-sync check, or a
+benign nothing-to-do result such as no Container Project. It exits `3` when an
+operational condition prevented repair and prints the skip reason as a warning
+on stderr even with `--quiet`; callers should surface that warning without
+aborting Container setup or interactive shell startup. Exit `1` is a hard
+failure and exit `2` is a usage error. JSON output retains the
+`{"results": [...]}` shape and returns the same status code.
 
 ## Execution identity
 

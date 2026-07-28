@@ -370,7 +370,7 @@ RUN echo 'export PATH="$PATH:/usr/local/share/npm-global/bin"' >> /etc/zsh/zshen
 # zshenv is intentionally avoided because it also runs for non-interactive zsh.
 RUN printf '%s\n' \
     'if [[ -o interactive ]] && [[ -f /etc/boxa/identity.json ]] && [[ -d /run/boxa-mcp-runtime ]]; then' \
-    '  boxa-mcp-converge --quiet || true' \
+    '  boxa-mcp-converge --quiet || { print -u2 -r -- "boxa: MCP convergence incomplete — run '\''boxa-mcp-converge'\'' for details"; true; }' \
     'fi' \
     >> /etc/zsh/zshrc
 

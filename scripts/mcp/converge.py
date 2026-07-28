@@ -249,24 +249,37 @@ def _set_project_names(
 
 
 def _exclude_after_change_plan(
-    project: str,
-    desired: set[str],
+    git_paths: tuple[str, str, str] | None,
+    tracked: bool,
 ) -> tuple[str, str] | None:
-    if not desired:
-        return None
-    git_paths = activation._claude_git_paths(project)
-    if git_paths is None:
+    if git_paths is None or tracked:
         return None
     relative, exclude_path, _path = git_paths
-    if not activation._codex_is_tracked(project, relative):
-        return exclude_path, relative
-    return None
+    return exclude_path, relative
 
 
 def _skipped(reason: str, project: str | None = None) -> list[ConvergeResult]:
     return [
         ConvergeResult(
             status="skipped",
+            reason=reason,
+            project=project,
+            added=[],
+            removed=[],
+            repaired=[],
+            seeded=[],
+            approval_changed=False,
+        )
+    ]
+
+
+def _not_applicable(
+    reason: str,
+    project: str | None = None,
+) -> list[ConvergeResult]:
+    return [
+        ConvergeResult(
+            status="not-applicable",
             reason=reason,
             project=project,
             added=[],
@@ -285,9 +298,9 @@ def converge(
 ) -> list[ConvergeResult]:
     resolved = _resolve_project(project)
     if resolved is None:
-        return _skipped("no Container Project could be determined")
+        return _not_applicable("no Container Project could be determined")
     if not os.path.isdir(resolved):
-        return _skipped("Project directory does not exist", resolved)
+        return _not_applicable("Project directory does not exist", resolved)
 
     render_concurrent_paths: set[str] = set()
     for _attempt in range(MAX_CONVERGE_ATTEMPTS):
@@ -337,27 +350,15 @@ def converge(
             ) or activation._json_document({})
             mcp_changed = bool(added or removed or repaired)
             tracked_mcp_json = snapshot.get("trackedMcpJson", {})
+            mcp_path = activation.claude_config_path(resolved)
             git_paths = (
-                activation._claude_git_paths(resolved)
-                if mcp_changed else None
+                activation._claude_git_paths(resolved, path=mcp_path)
+                if mcp_changed or desired else None
             )
             mcp_tracked = (
                 git_paths is not None
                 and activation._codex_is_tracked(resolved, git_paths[0])
             )
-            if (
-                mcp_changed
-                and mcp_tracked
-                and tracked_mcp_json.get(resolved) is not True
-            ):
-                return _skipped(
-                    "tracked Claude MCP config "
-                    f"{activation.claude_config_path(resolved)} requires "
-                    "durable consent; authorize it with "
-                    "boxa mcp activate ... --allow-tracked-mcp-json",
-                    resolved,
-                )
-
             (
                 settings_preimage,
                 settings_exists,
@@ -383,6 +384,35 @@ def converge(
                 existing_document=(settings_exists, settings_existing),
             )
             approval_changed = settings_plan is not None
+            settings_path = activation.claude_settings_path(resolved)
+            settings_git_paths = (
+                activation._claude_git_paths(
+                    resolved, path=settings_path
+                )
+                if approval_changed else None
+            )
+            settings_tracked = (
+                settings_git_paths is not None
+                and activation._codex_is_tracked(
+                    resolved, settings_git_paths[0]
+                )
+            )
+            tracked_refusals = []
+            if mcp_changed and mcp_tracked:
+                tracked_refusals.append(mcp_path)
+            if approval_changed and settings_tracked:
+                tracked_refusals.append(settings_path)
+            if (
+                tracked_refusals
+                and tracked_mcp_json.get(resolved) is not True
+            ):
+                return _skipped(
+                    "tracked Claude Project files "
+                    + ", ".join(tracked_refusals)
+                    + " require durable consent; authorize them with "
+                    "boxa mcp activate ... --allow-tracked-mcp-json",
+                    resolved,
+                )
             seeded: list[str] = []
             if settings_plan is not None:
                 (
@@ -413,17 +443,26 @@ def converge(
             state_rendered = activation._json_document(state)
             state_changed = state_rendered != state_existing
             changed = mcp_changed or approval_changed or state_changed
-            exclude_plan = (
-                _exclude_after_change_plan(resolved, desired)
-                if changed else None
-            )
+            exclude_plans = [
+                plan
+                for plan in (
+                    (
+                        _exclude_after_change_plan(
+                            git_paths, mcp_tracked
+                        )
+                        if changed and desired else None
+                    ),
+                    _exclude_after_change_plan(
+                        settings_git_paths, settings_tracked
+                    ),
+                )
+                if plan is not None
+            ]
 
             current_snapshot_raw = _read_snapshot_bytes(snapshot_path)
             if current_snapshot_raw != snapshot_raw:
                 continue
 
-            mcp_path = activation.claude_config_path(resolved)
-            settings_path = activation.claude_settings_path(resolved)
             concurrent_paths = []
             if _read_bytes(mcp_path) != mcp_preimage:
                 concurrent_paths.append(mcp_path)
@@ -510,7 +549,7 @@ def converge(
                     preimage.data if preimage.existed else None
                 ):
                     written_files.append((preimage, postimage))
-            if exclude_plan is not None:
+            for exclude_plan in exclude_plans:
                 exclude_path, relative = exclude_plan
                 preimage = activation._snapshot_file(exclude_path)
                 activation._ensure_local_exclude(exclude_path, relative)

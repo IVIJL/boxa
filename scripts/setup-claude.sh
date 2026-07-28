@@ -214,7 +214,7 @@ converge_mcp_state() {
     # Pre-convergence images lack the wrapper; that is a rebuild, not a fault.
     command -v boxa-mcp-converge >/dev/null 2>&1 || return 0
     if ! boxa-mcp-converge --quiet; then
-        WARNINGS+=("MCP convergence failed — run 'boxa-mcp-converge' inside the Container")
+        WARNINGS+=("MCP convergence incomplete — run 'boxa-mcp-converge' inside the Container for details")
     fi
 }
 

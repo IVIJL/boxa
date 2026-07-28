@@ -121,13 +121,27 @@ therefore not lost until the user deactivates or disables it; anything else
 that removes it is repaired at the next Container or shell start.
 
 Automatic convergence does not broaden the consent to modify repository
-bytes. An activation that writes a tracked `.mcp.json` with
-`--allow-tracked-mcp-json` records durable consent for that canonical Project
-in the host activation store and publishes it in the secret-free runtime
-snapshot. Convergence refuses a changed tracked `.mcp.json` unless that
-consent is present. It may still repair approval or convergence state when
-the tracked file is already byte-identical, because those repairs do not
-modify the tracked repository file.
+bytes. `.mcp.json` and `.claude/settings.local.json` are one pair of derived
+Claude Project files for this purpose. An activation that writes either
+tracked file with `--allow-tracked-mcp-json` records durable consent for that
+canonical Project in the host activation store and publishes it in the
+secret-free runtime snapshot. The flag is one user decision that Boxa may
+write its derived Claude files in that tracked repository; it is not a
+`.mcp.json`-only exception.
+
+Host rendering classifies both files before any lifecycle write. If either
+render would change tracked bytes without consent, the whole multi-Project
+batch is refused and the error names every offending path. A byte-identical
+tracked file does not block. Whenever Boxa actually writes either untracked
+file in a Git Project, including through approval-decision mirroring, it adds
+the repository-root-relative path to `.git/info/exclude` and never changes
+the shared `.gitignore`.
+
+Convergence uses the same tracked classification and durable consent. A
+changed tracked file without consent refuses all writes for that Project, so
+the render and approval files cannot be half-applied. A byte-identical tracked
+file may coexist with repair of the other file. Untracked files written by
+convergence receive the same repository-local exclude entries.
 
 Tracked-file consent is scoped to the Project explicitly mutated by the
 lifecycle command. Existing durable consent may authorize that Project during
@@ -141,6 +155,16 @@ immediately before writing, retries from a newer snapshot up to a fixed bound,
 and skips when a rendered file changed while the snapshot did not. It checks
 the snapshot again after writing so a concurrently published host mutation is
 replanned before convergence returns.
+
+A benign not-applicable convergence result, such as no identifiable Container
+Project or a missing Project directory, exits zero. An operational skip such
+as invalid input, absent tracked-file consent, or a concurrent-write race
+exits `3` and remains visible as a stderr warning under `--quiet`. Hard
+failures exit `1`, usage errors exit `2`, and successful convergence,
+in-sync state, and nothing-to-do results exit `0`. Container setup and
+interactive shell wiring surface nonzero convergence without letting it abort
+startup. JSON keeps the full results payload and follows the same exit-code
+contract.
 
 ## Migration
 
@@ -172,4 +196,6 @@ later retry.
 - Drift becomes self-correcting, so `boxa mcp doctor --fix` returns to being a
   diagnostic escape hatch rather than the only recovery path.
 - Boxa now writes one additional Project file, `.claude/settings.local.json`,
-  and must preserve any unrelated settings the user or Claude Code keeps there.
+  must preserve any unrelated settings the user or Claude Code keeps there,
+  and applies the same local-exclude and tracked-write consent policy used for
+  `.mcp.json`.

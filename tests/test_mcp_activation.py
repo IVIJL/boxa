@@ -306,6 +306,26 @@ class ActivationTest(unittest.TestCase):
         self.assertEqual(settings["enabledMcpjsonServers"], ["foreign"])
         self.assertNotIn("disabledMcpjsonServers", settings)
 
+    def test_mirrored_untracked_settings_use_local_exclude(self):
+        self._init_git()
+        self._write_claude_decisions(enabled=["foreign"])
+
+        self.assertTrue(activation.mirror_claude_decisions(self.project))
+
+        exclude = self._git(
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        )
+        with open(exclude, encoding="utf-8") as fh:
+            self.assertIn(
+                "/.claude/settings.local.json", fh.read().splitlines()
+            )
+        self.assertFalse(
+            os.path.exists(os.path.join(self.project, ".gitignore"))
+        )
+
     def test_render_mirrors_decisions_without_boxa_rendered_claude_names(self):
         data = activation.empty_activations()
         data["projects"][self.project] = {
@@ -492,10 +512,10 @@ class ActivationTest(unittest.TestCase):
         os.makedirs(other)
         real_git_paths = activation._claude_git_paths
 
-        def reject_git_for_vanished(project):
+        def reject_git_for_vanished(project, **kwargs):
             if project == self.project:
                 raise AssertionError("Git inspected for vanished Project")
-            return real_git_paths(project)
+            return real_git_paths(project, **kwargs)
 
         with mock.patch.object(
             activation,
@@ -722,7 +742,9 @@ class ActivationTest(unittest.TestCase):
             "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
         )
         with open(exclude, encoding="utf-8") as fh:
-            self.assertIn("/.mcp.json", fh.read().splitlines())
+            patterns = fh.read().splitlines()
+        self.assertIn("/.mcp.json", patterns)
+        self.assertIn("/.claude/settings.local.json", patterns)
         self.assertFalse(os.path.exists(os.path.join(self.project, ".gitignore")))
 
     def test_nested_project_mcp_exclude_is_repo_relative(self):
@@ -738,7 +760,135 @@ class ActivationTest(unittest.TestCase):
             cwd=repo,
         )
         with open(exclude, encoding="utf-8") as fh:
-            self.assertIn("/nested/.mcp.json", fh.read().splitlines())
+            patterns = fh.read().splitlines()
+        self.assertIn("/nested/.mcp.json", patterns)
+        self.assertIn(
+            "/nested/.claude/settings.local.json", patterns
+        )
+
+    def test_tracked_claude_settings_require_shared_consent(self):
+        self._init_git()
+        settings_path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings_path))
+        original = '{"enabledMcpjsonServers":[]}\n'
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        self._git("add", ".claude/settings.local.json")
+        self._git("commit", "-qm", "track Claude Project settings")
+
+        before = self._file_states()
+        with self.assertRaisesRegex(
+            activation.ActivationError,
+            "allow-tracked-mcp-json",
+        ) as refused:
+            activation.activate(
+                "echo",
+                self.project,
+                ["claude"],
+                ReadyProbe(self.project),
+            )
+
+        self.assertIn(settings_path, str(refused.exception))
+        self.assertEqual(self._file_states(), before)
+        self.assertFalse(
+            os.path.exists(activation.claude_config_path(self.project))
+        )
+
+        activation.activate(
+            "echo",
+            self.project,
+            ["claude"],
+            ReadyProbe(self.project),
+            allow_tracked_mcp_json=True,
+        )
+
+        self.assertEqual(
+            self._claude_settings_data()["enabledMcpjsonServers"],
+            ["boxa-echo"],
+        )
+        self.assertTrue(
+            activation.load_activations()["trackedMcpJson"][self.project]
+        )
+        with open(activation.runtime_path(), encoding="utf-8") as fh:
+            self.assertTrue(
+                json.load(fh)["trackedMcpJson"][self.project]
+            )
+
+    def test_in_sync_tracked_settings_retain_durable_consent(self):
+        self._init_git()
+        settings_path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings_path))
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            fh.write('{"enabledMcpjsonServers":[]}\n')
+        self._git("add", ".claude/settings.local.json")
+        self._git("commit", "-qm", "track Claude Project settings")
+        activation.activate(
+            "echo",
+            self.project,
+            ["claude"],
+            ReadyProbe(self.project),
+            allow_tracked_mcp_json=True,
+        )
+
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+
+        self.assertTrue(
+            activation.load_activations()["trackedMcpJson"][self.project]
+        )
+
+    def test_untracked_settings_drop_durable_consent(self):
+        self._init_git()
+        settings_path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings_path))
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            fh.write('{"enabledMcpjsonServers":[]}\n')
+        self._git("add", ".claude/settings.local.json")
+        self._git("commit", "-qm", "track Claude Project settings")
+        activation.activate(
+            "echo",
+            self.project,
+            ["claude"],
+            ReadyProbe(self.project),
+            allow_tracked_mcp_json=True,
+        )
+        self._git("rm", "--cached", "-q", ".claude/settings.local.json")
+
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+
+        self.assertNotIn(
+            self.project, activation.load_activations()["trackedMcpJson"]
+        )
+        with open(activation.runtime_path(), encoding="utf-8") as fh:
+            self.assertNotIn(
+                self.project, json.load(fh)["trackedMcpJson"]
+            )
+
+    def test_in_sync_tracked_claude_settings_do_not_require_consent(self):
+        self._init_git()
+        settings_path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings_path))
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"enabledMcpjsonServers": ["boxa-echo"]},
+                fh,
+                indent=2,
+            )
+            fh.write("\n")
+        self._git("add", ".claude/settings.local.json")
+        self._git("commit", "-qm", "track in-sync Claude settings")
+
+        activation.activate(
+            "echo", self.project, ["claude"], ReadyProbe(self.project)
+        )
+
+        self.assertIn("boxa-echo", self._claude_data()["mcpServers"])
+        self.assertNotIn(
+            self.project, activation.load_activations()["trackedMcpJson"]
+        )
 
     def test_nested_project_tracked_mcp_json_requires_explicit_opt_in(self):
         repo = activation.canonical_project(os.path.join(self.tmp.name, "repo"))

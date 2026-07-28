@@ -296,9 +296,13 @@ def _codex_is_tracked(project: str, relative: str) -> bool:
     )
 
 
-def _claude_git_paths(project: str) -> Optional[tuple[str, str, str]]:
+def _claude_git_paths(
+    project: str,
+    *,
+    path: Optional[str] = None,
+) -> Optional[tuple[str, str, str]]:
     """Resolve local Git paths, while keeping non-repository Projects valid."""
-    path = claude_config_path(project)
+    path = path or claude_config_path(project)
     try:
         top_proc = subprocess.run(
             ["git", "-C", project, "rev-parse", "--show-toplevel"],
@@ -532,6 +536,7 @@ def _commit_activation_render(
         consented=consented,
     )
     tracked_mcp_json = data.setdefault("trackedMcpJson", {})
+    settings_git_paths_by_project = {}
     for claude_project in _claude_render_projects(data, state):
         if not _project_directory_exists(claude_project):
             if not data["projects"].get(claude_project):
@@ -546,7 +551,29 @@ def _commit_activation_render(
             _rendered,
             names,
         ) = _claude_render_plan(data, claude_project, catalog, state)
-        if not tracked or not names:
+        retire = _claude_seeded_names(state, claude_project) - set(names)
+        settings_plan = _claude_settings_plan(
+            claude_project, names, state, retire=retire
+        )
+        settings_tracked = False
+        settings_path = claude_settings_path(claude_project)
+        if settings_plan is not None or (
+            names and os.path.exists(settings_path)
+        ):
+            settings_git_paths = _claude_git_paths(
+                claude_project, path=settings_path
+            )
+            if settings_plan is not None:
+                settings_git_paths_by_project[claude_project] = (
+                    settings_git_paths
+                )
+            settings_tracked = (
+                settings_git_paths is not None
+                and _codex_is_tracked(
+                    claude_project, settings_git_paths[0]
+                )
+            )
+        if not names or not (tracked or settings_tracked):
             tracked_mcp_json.pop(claude_project, None)
         elif allow_tracked_mcp_json and claude_project == project:
             tracked_mcp_json[claude_project] = True
@@ -571,7 +598,13 @@ def _commit_activation_render(
         if _project_directory_exists(claude_project):
             git_paths = _claude_git_paths(claude_project)
             if git_paths is not None:
-                _relative, exclude_path, _claude_path = git_paths
+                _relative, exclude_path, _path = git_paths
+                paths += (exclude_path,)
+            settings_git_paths = settings_git_paths_by_project.get(
+                claude_project
+            )
+            if settings_git_paths is not None:
+                _relative, exclude_path, _path = settings_git_paths
                 paths += (exclude_path,)
     if render_codex:
         _relative, exclude_path, codex_path = _codex_git_paths(project)
@@ -1155,11 +1188,28 @@ def _claude_settings_plan(
 
 def mirror_claude_decisions(project: str) -> bool:
     """Persist Claude Code's recorded decisions for one arbitrary Project."""
-    plan = _claude_settings_plan(canonical_project(project), [], {})
+    project = canonical_project(project)
+    plan = _claude_settings_plan(project, [], {})
     if plan is None:
         return False
-    path, _existing, rendered = plan
+    path, existing, rendered = plan
+    git_paths = _claude_git_paths(project, path=path)
+    tracked = False
+    if git_paths is not None:
+        relative, exclude_path, _path = git_paths
+        tracked = _codex_is_tracked(project, relative)
+    consented = (
+        load_activations().get("trackedMcpJson", {}).get(project) is True
+    )
+    if tracked and rendered != existing and not consented:
+        raise ActivationError(
+            "tracked Claude Project file refused for: "
+            f"{path}; grant consent by activating in that Project with "
+            "--allow-tracked-mcp-json"
+        )
     _atomic_text(path, rendered)
+    if git_paths is not None and not tracked:
+        _ensure_local_exclude(exclude_path, relative)
     return True
 
 
@@ -1325,10 +1375,29 @@ def _preflight_claude_lifecycle(
         if tracked and rendered != existing and project not in consented:
             refusals.append(path)
         retire = _claude_seeded_names(state, project) - set(names)
-        _claude_settings_plan(project, names, state, retire=retire)
+        settings_plan = _claude_settings_plan(
+            project, names, state, retire=retire
+        )
+        if settings_plan is not None:
+            settings_path, settings_existing, settings_rendered = (
+                settings_plan
+            )
+            settings_git_paths = _claude_git_paths(
+                project, path=settings_path
+            )
+            settings_tracked = (
+                settings_git_paths is not None
+                and _codex_is_tracked(project, settings_git_paths[0])
+            )
+            if (
+                settings_tracked
+                and settings_rendered != settings_existing
+                and project not in consented
+            ):
+                refusals.append(settings_path)
     if refusals:
         raise ActivationError(
-            "tracked Claude MCP config refused for: "
+            "tracked Claude Project files refused for: "
             + ", ".join(refusals)
             + "; grant consent by activating in that Project with "
             "--allow-tracked-mcp-json"
@@ -1359,8 +1428,14 @@ def render_claude_activations(
         )
         for project in render_projects
     ]
-    settings_plans = {
-        project: _claude_settings_plan(
+    settings_plans = {}
+    for project, (
+        _path, _exclude_path, _relative, _tracked, _existing, _rendered,
+        names,
+    ) in plans:
+        if not _project_directory_exists(project):
+            continue
+        settings_plan = _claude_settings_plan(
             project,
             names,
             state,
@@ -1369,12 +1444,19 @@ def render_claude_activations(
                 - set(names)
             ),
         )
-        for project, (
-            _path, _exclude_path, _relative, _tracked, _existing, _rendered,
-            names,
-        ) in plans
-        if _project_directory_exists(project)
-    }
+        settings_git_paths = (
+            _claude_git_paths(project, path=settings_plan[0])
+            if settings_plan is not None else None
+        )
+        settings_tracked = (
+            settings_git_paths is not None
+            and _codex_is_tracked(project, settings_git_paths[0])
+        )
+        settings_plans[project] = (
+            settings_plan,
+            settings_git_paths,
+            settings_tracked,
+        )
     scoped = projects is not None
     _retire_old_claude_render(
         state, set(render_projects) if scoped else None
@@ -1423,11 +1505,20 @@ def render_claude_activations(
         else:
             new_state.pop(project, None)
             new_seeded.pop(project, None)
-        settings_plan = settings_plans[project]
+        settings_plan, settings_git_paths, settings_tracked = (
+            settings_plans[project]
+        )
         if settings_plan is not None:
             settings_path, settings_existing, settings_rendered = settings_plan
             if settings_rendered != settings_existing:
                 _atomic_text(settings_path, settings_rendered)
+                if settings_git_paths is not None and not settings_tracked:
+                    settings_relative, settings_exclude, _path = (
+                        settings_git_paths
+                    )
+                    _ensure_local_exclude(
+                        settings_exclude, settings_relative
+                    )
     _atomic_json(
         render_state_path(),
         {"projects": new_state, "seeded": new_seeded},

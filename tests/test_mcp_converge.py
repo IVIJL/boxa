@@ -187,10 +187,6 @@ class ConvergeTest(unittest.TestCase):
             activation,
             "_atomic_text",
             side_effect=AssertionError("in-sync convergence wrote a file"),
-        ), mock.patch.object(
-            activation,
-            "_claude_git_paths",
-            side_effect=AssertionError("in-sync convergence invoked Git"),
         ):
             result = converge.converge(self.project)[0]
 
@@ -419,6 +415,70 @@ class ConvergeTest(unittest.TestCase):
             self._settings_data()["enabledMcpjsonServers"], ["boxa-echo"]
         )
 
+    def test_tracked_settings_change_without_consent_skips_all_writes(self):
+        self._init_git()
+        settings_path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings_path))
+        original = b'{"enabledMcpjsonServers":[]}\n'
+        with open(settings_path, "wb") as fh:
+            fh.write(original)
+        self._git("add", ".claude/settings.local.json")
+        self._git("commit", "-qm", "tracked Claude settings")
+        self._write_snapshot(self._desired_records(), tracked_mcp_json={})
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn(settings_path, result.reason)
+        self.assertIn("--allow-tracked-mcp-json", result.reason)
+        self.assertFalse(
+            os.path.exists(activation.claude_config_path(self.project))
+        )
+        self.assertFalse(os.path.exists(converge.state_path()))
+        with open(settings_path, "rb") as fh:
+            self.assertEqual(fh.read(), original)
+
+    def test_tracked_settings_change_with_snapshot_consent_converges(self):
+        self._init_git()
+        settings_path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings_path))
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            fh.write('{"enabledMcpjsonServers":[]}\n')
+        self._git("add", ".claude/settings.local.json")
+        self._git("commit", "-qm", "tracked Claude settings")
+        self._write_snapshot(
+            self._desired_records(),
+            tracked_mcp_json={self.project: True},
+        )
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        self.assertIn("boxa-echo", self._mcp_data()["mcpServers"])
+        self.assertEqual(
+            self._settings_data()["enabledMcpjsonServers"], ["boxa-echo"]
+        )
+
+    def test_in_sync_tracked_settings_do_not_block_mcp_repair(self):
+        self._init_git()
+        settings_path = activation.claude_settings_path(self.project)
+        os.makedirs(os.path.dirname(settings_path))
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"enabledMcpjsonServers": ["boxa-echo"]},
+                fh,
+                indent=2,
+            )
+            fh.write("\n")
+        self._git("add", ".claude/settings.local.json")
+        self._git("commit", "-qm", "tracked in-sync Claude settings")
+        self._write_snapshot(self._desired_records(), tracked_mcp_json={})
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        self.assertIn("boxa-echo", self._mcp_data()["mcpServers"])
+
     def test_untracked_mcp_change_needs_no_snapshot_consent(self):
         self._init_git()
         self._write_snapshot(self._desired_records(), tracked_mcp_json={})
@@ -446,7 +506,60 @@ class ConvergeTest(unittest.TestCase):
         with open(exclude_path, encoding="utf-8") as fh:
             patterns = fh.read().splitlines()
         self.assertIn("/sub/.mcp.json", patterns)
+        self.assertIn(
+            "/sub/.claude/settings.local.json", patterns
+        )
         self.assertNotIn("/.mcp.json", patterns)
+        self.assertNotIn("/.claude/settings.local.json", patterns)
+
+    def test_approval_repair_restores_missing_mcp_exclude(self):
+        self._init_git()
+        self._write_snapshot(self._desired_records(), tracked_mcp_json={})
+        converge.converge(self.project)
+        exclude_path = self._git(
+            "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
+        )
+        with open(exclude_path, encoding="utf-8") as fh:
+            patterns = fh.read().splitlines()
+        with open(exclude_path, "w", encoding="utf-8") as fh:
+            for pattern in patterns:
+                if pattern != "/.mcp.json":
+                    fh.write(pattern + "\n")
+        os.unlink(activation.claude_settings_path(self.project))
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        self.assertTrue(result.approval_changed)
+        with open(exclude_path, encoding="utf-8") as fh:
+            self.assertIn("/.mcp.json", fh.read().splitlines())
+
+    def test_last_server_removal_does_not_add_mcp_exclude(self):
+        self._init_git()
+        self._write_snapshot(self._desired_records(), tracked_mcp_json={})
+        converge.converge(self.project)
+        exclude_path = self._git(
+            "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
+        )
+        with open(exclude_path, encoding="utf-8") as fh:
+            patterns = fh.read().splitlines()
+        with open(exclude_path, "w", encoding="utf-8") as fh:
+            for pattern in patterns:
+                if pattern not in (
+                    "/.mcp.json",
+                    "/.claude/settings.local.json",
+                ):
+                    fh.write(pattern + "\n")
+        self._write_snapshot({}, tracked_mcp_json={})
+
+        result = converge.converge(self.project)[0]
+
+        self.assertEqual(result.status, "converged")
+        self.assertEqual(result.removed, ["boxa-echo"])
+        with open(exclude_path, encoding="utf-8") as fh:
+            patterns = fh.read().splitlines()
+        self.assertNotIn("/.mcp.json", patterns)
+        self.assertIn("/.claude/settings.local.json", patterns)
 
     def test_git_tracked_inspection_failure_skips_without_writes(self):
         self._init_git()
@@ -591,8 +704,11 @@ class ConvergeTest(unittest.TestCase):
             "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
         )
         with open(exclude_path, "a", encoding="utf-8") as fh:
-            fh.write("/.mcp.json\n")
-        concurrent = b"# concurrent edit\n/.mcp.json\n"
+            fh.write("/.mcp.json\n/.claude/settings.local.json\n")
+        concurrent = (
+            b"# concurrent edit\n/.mcp.json\n"
+            b"/.claude/settings.local.json\n"
+        )
         concurrent_mtime_ns = 1_700_000_000_000_000_000
         with open(self.snapshot, "rb") as fh:
             snapshot_raw = fh.read()
@@ -906,7 +1022,7 @@ class ConvergeTest(unittest.TestCase):
             ),
         ):
             result = converge.converge()[0]
-        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.status, "not-applicable")
         self.assertIn("no Container Project", result.reason)
 
     def test_state_is_private_and_cli_supports_json_quiet_and_project(self):
@@ -932,6 +1048,113 @@ class ConvergeTest(unittest.TestCase):
             ])
         self.assertEqual(rc, 0)
         self.assertEqual(stdout.getvalue(), "")
+
+    def test_cli_quiet_reports_converged_changes(self):
+        self._write_snapshot(self._desired_records())
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            rc = cli.main([
+                "converge", "--project", self.project, "--quiet"
+            ])
+
+        self.assertEqual(rc, 0)
+        self.assertIn(
+            f"Converged MCP state for Project {self.project}:",
+            stdout.getvalue(),
+        )
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_cli_operational_skip_returns_three_and_warns_on_stderr(self):
+        with open(self.snapshot, "w", encoding="utf-8") as fh:
+            fh.write("{malformed")
+
+        for quiet in (False, True):
+            with self.subTest(quiet=quiet):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                argv = ["converge", "--project", self.project]
+                if quiet:
+                    argv.append("--quiet")
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    rc = cli.main(argv)
+
+                self.assertEqual(rc, 3)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(
+                    "MCP convergence skipped:", stderr.getvalue()
+                )
+                self.assertIn("snapshot", stderr.getvalue())
+
+    def test_cli_json_includes_operational_skip_and_returns_three(self):
+        with open(self.snapshot, "w", encoding="utf-8") as fh:
+            fh.write("{malformed")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            rc = cli.main([
+                "converge",
+                "--project",
+                self.project,
+                "--json",
+                "--quiet",
+            ])
+
+        self.assertEqual(rc, 3)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["results"][0]["status"], "skipped")
+        self.assertIn(
+            payload["results"][0]["reason"], stderr.getvalue()
+        )
+
+    def test_cli_not_applicable_cases_return_zero_and_quiet_is_silent(self):
+        missing_project = os.path.join(self.tmp.name, "missing-project")
+        for argv in (
+            ["converge", "--project", missing_project],
+            ["converge", "--project", missing_project, "--quiet"],
+        ):
+            with self.subTest(argv=argv):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    rc = cli.main(argv)
+                self.assertEqual(rc, 0)
+                self.assertEqual(stderr.getvalue(), "")
+                if "--quiet" in argv:
+                    self.assertEqual(stdout.getvalue(), "")
+                else:
+                    self.assertIn(
+                        "MCP convergence skipped: "
+                        "Project directory does not exist.",
+                        stdout.getvalue(),
+                    )
+
+        missing_identity = os.path.join(self.tmp.name, "missing-identity")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(converge, "IDENTITY_PATH", missing_identity),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            rc = cli.main(["converge", "--quiet"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
 
 
 if __name__ == "__main__":

@@ -2294,16 +2294,26 @@ def _cmd_converge(argv: list[str]) -> int:
         sys.stderr.write(f"mcp.cli: convergence failed: {exc}\n")
         return 1
 
-    visible = [
-        result for result in results
-        if not quiet or result.status == "converged"
+    operational_skips = [
+        result for result in results if result.status == "skipped"
     ]
-    if not visible:
-        return 0
+    exit_code = 3 if operational_skips else 0
     if as_json:
-        return _emit({"results": [result.to_dict() for result in visible]})
-    for result in visible:
+        _emit({"results": [result.to_dict() for result in results]})
+        for result in operational_skips:
+            sys.stderr.write(
+                f"MCP convergence skipped: {result.reason}.\n"
+            )
+        return exit_code
+    for result in results:
         if result.status == "skipped":
+            sys.stderr.write(
+                f"MCP convergence skipped: {result.reason}.\n"
+            )
+            continue
+        if quiet and result.status != "converged":
+            continue
+        if result.status == "not-applicable":
             sys.stdout.write(f"MCP convergence skipped: {result.reason}.\n")
             continue
         if result.status == "in-sync":
@@ -2319,7 +2329,7 @@ def _cmd_converge(argv: list[str]) -> int:
         if result.approval_changed:
             sys.stdout.write(", approval updated")
         sys.stdout.write(".\n")
-    return 0
+    return exit_code
 
 
 def main(argv: list[str]) -> int:
