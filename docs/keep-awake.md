@@ -6,6 +6,13 @@ daemon from `keep-awake/` with the host's local Go toolchain, installs user
 autostart, and creates a port-17777 Host connection trusted by every present
 and future box.
 
+On WSL2, the scheduled task resolves the Windows vEthernet adapter when it
+starts. If the adapter is still absent after 60 seconds, keep-awake starts on
+loopback only and continues polling every 30 seconds. Once vEthernet appears,
+the wrapper stops the daemon instance it started and restarts it with both
+loopback and vEthernet listeners. `status` and `doctor` also require the task's
+PowerShell wrapper to exist; `boxa keep-awake enable` repairs a missing wrapper.
+
 ```bash
 boxa keep-awake enable
 boxa keep-awake status

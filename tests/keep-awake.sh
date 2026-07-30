@@ -230,9 +230,26 @@ assert_contains "Windows wrapper opts into the resolved non-loopback bind" \
     "'-listen-address', \$gateway, '-listen-unsafe'" "$(cat "$windows_wrapper")"
 assert_contains "Windows wrapper logs loopback-only fallback" \
     "starting with loopback-only binding" "$(cat "$windows_wrapper")"
+assert_contains "Windows wrapper keeps polling after loopback fallback" \
+    "Start-Sleep -Seconds 30" "$(cat "$windows_wrapper")"
+assert_contains "Windows wrapper tracks and stops its own fallback daemon" \
+    "Stop-Process -Id \$daemon.Id" "$(cat "$windows_wrapper")"
+assert_contains "Windows wrapper logs late adapter discovery" \
+    "WSL vEthernet adapter appeared" "$(cat "$windows_wrapper")"
+assert_contains "Windows wrapper logs dual-listener restart" \
+    "restarting with loopback and vEthernet listeners" "$(cat "$windows_wrapper")"
 assert_eq "Windows task does not bake in the current WSL gateway" "0" \
     "$(grep -c '172\.30\.96\.1' "$KEEP_AWAKE_TEST_LOG" || true)"
 assert_contains "Windows build targets Windows" "go GOOS=windows" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+rm -f "$windows_wrapper"
+broken_windows_status="$("$KEEP_AWAKE" status 2>&1)"
+assert_contains "Windows status rejects task with missing wrapper" \
+    "Autostart installed: no" "$broken_windows_status"
+assert_contains "Windows status gives wrapper repair hint" \
+    "Repair with: boxa keep-awake enable" "$broken_windows_status"
+assert_eq "Windows doctor probe rejects task with missing wrapper" missing \
+    "$("$KEEP_AWAKE" probe 2>/dev/null)"
+"$KEEP_AWAKE" enable >/dev/null
 "$KEEP_AWAKE" disable >/dev/null
 assert_eq "Windows disable deletes scheduled task" false "$(file_exists "$KEEP_AWAKE_TEST_TASK")"
 assert_eq "Windows disable removes runtime gateway wrapper" false "$(file_exists "$windows_wrapper")"

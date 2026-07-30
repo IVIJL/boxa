@@ -158,7 +158,12 @@ keep_awake::autostart_installed() {
                 && launchctl print "gui/$(id -u)/$KEEP_AWAKE_LAUNCH_LABEL" >/dev/null 2>&1
             ;;
         wsl2)
-            schtasks.exe /Query /TN "$KEEP_AWAKE_TASK_NAME" >/dev/null 2>&1
+            schtasks.exe /Query /TN "$KEEP_AWAKE_TASK_NAME" >/dev/null 2>&1 || return 1
+            if [ ! -f "$KEEP_AWAKE_WRAPPER" ]; then
+                printf 'keep-awake: Windows scheduled task exists, but its PowerShell wrapper is missing at %s. Repair with: boxa keep-awake enable\n' \
+                    "$KEEP_AWAKE_WRAPPER" >&2
+                return 1
+            fi
             ;;
     esac
 }
@@ -269,21 +274,39 @@ keep_awake::write_windows_wrapper() {
     if ! cat > "$KEEP_AWAKE_WRAPPER" <<EOF
 \$binary = '$binary_literal'
 \$logFile = '$log_literal'
-\$gateway = \$null
-for (\$attempt = 0; \$attempt -lt 30 -and -not \$gateway; \$attempt++) {
-    \$gateway = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+function Get-WslGateway {
+    Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { \$_.InterfaceAlias -like 'vEthernet (WSL*' -and \$_.IPAddress -notlike '169.254.*' } |
         Select-Object -First 1 -ExpandProperty IPAddress
+}
+\$gateway = \$null
+for (\$attempt = 0; \$attempt -lt 30 -and -not \$gateway; \$attempt++) {
+    \$gateway = Get-WslGateway
     if (-not \$gateway) { Start-Sleep -Seconds 2 }
 }
-\$arguments = @('-port', '$KEEP_AWAKE_PORT', '-log-file', \$logFile)
+\$arguments = @('-port', '$KEEP_AWAKE_PORT', '-log-file', ('"' + \$logFile + '"'))
 if (\$gateway) {
     \$arguments += @('-listen-address', \$gateway, '-listen-unsafe')
+    & \$binary @arguments
+    exit \$LASTEXITCODE
 } else {
     Add-Content -LiteralPath \$logFile -Value "\$(Get-Date -Format o) keep-awake: WSL vEthernet adapter unavailable after retries; starting with loopback-only binding."
 }
-& \$binary @arguments
-exit \$LASTEXITCODE
+\$daemon = Start-Process -FilePath \$binary -ArgumentList \$arguments -PassThru
+while (-not \$daemon.HasExited) {
+    Start-Sleep -Seconds 30
+    \$gateway = Get-WslGateway
+    if (-not \$gateway) { continue }
+
+    Add-Content -LiteralPath \$logFile -Value "\$(Get-Date -Format o) keep-awake: WSL vEthernet adapter appeared at \$gateway; stopping loopback-only daemon PID \$(\$daemon.Id)."
+    Stop-Process -Id \$daemon.Id -ErrorAction SilentlyContinue
+    \$daemon.WaitForExit()
+    Add-Content -LiteralPath \$logFile -Value "\$(Get-Date -Format o) keep-awake: restarting with loopback and vEthernet listeners."
+    \$arguments += @('-listen-address', \$gateway, '-listen-unsafe')
+    & \$binary @arguments
+    exit \$LASTEXITCODE
+}
+exit \$daemon.ExitCode
 EOF
     then
         return 1
