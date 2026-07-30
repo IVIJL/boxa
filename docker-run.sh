@@ -1662,18 +1662,38 @@ host_connection_cidr_is_valid() {
         && [ "$prefix" -le 32 ] 2>/dev/null
 }
 
+host_connection_relay_matches_process() {
+    local pid="${1:-}" host_ip="$2" host_port="$3" comm="" cmdline=""
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+    if [ -r "/proc/${pid}/comm" ] && [ -r "/proc/${pid}/cmdline" ]; then
+        comm="$(< "/proc/${pid}/comm")"
+        cmdline="$({ tr '\0' ' ' < "/proc/${pid}/cmdline"; } 2>/dev/null || true)"
+    else
+        comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+        cmdline="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+        comm="${comm#"${comm%%[![:space:]]*}"}"
+    fi
+
+    [ "${comm##*/}" = socat ] \
+        && [[ "$cmdline" == *"TCP-LISTEN:${host_port},bind=${host_ip},"* ]]
+}
+
 host_connection_relay_is_alive() {
-    local pid="${1:-}" host_ip="$2" host_port="$3" cmdline
+    local pid="${1:-}" host_ip="$2" host_port="$3"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
-    [ -r "/proc/${pid}/cmdline" ] || return 1
-    cmdline="$({ tr '\0' ' ' < "/proc/${pid}/cmdline"; } 2>/dev/null || true)"
-    [[ "$cmdline" == *"TCP-LISTEN:${host_port},bind=${host_ip},"* ]]
+    host_connection_relay_matches_process "$pid" "$host_ip" "$host_port"
 }
 
 terminate_connection_process_group() {
-    local pid="${1:-}" attempt
+    local pid="${1:-}" host_ip="$2" host_port="$3" attempt
     [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    if ! host_connection_relay_matches_process "$pid" "$host_ip" "$host_port"; then
+        echo "Not stopping Host connection relay PID ${pid}: process identity does not match ${host_ip}:${host_port}." >&2
+        return 0
+    fi
 
     if kill -TERM -- "-$pid" 2>/dev/null; then
         for attempt in 1 2 3 4 5 6 7 8 9 10; do
@@ -1687,10 +1707,21 @@ terminate_connection_process_group() {
     else
         # Compatibility with state created without setsid: socat's forked
         # connection handlers are direct children while the listener lives.
-        if command -v pkill >/dev/null 2>&1; then
-            pkill -TERM -P "$pid" 2>/dev/null || true
+        if kill -STOP "$pid" 2>/dev/null; then
+            if command -v pkill >/dev/null 2>&1; then
+                pkill -TERM -P "$pid" 2>/dev/null || true
+            fi
+            kill -TERM "$pid" 2>/dev/null || true
+            kill -CONT "$pid" 2>/dev/null || true
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+                : "$attempt"
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.01
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
         fi
-        kill -TERM "$pid" 2>/dev/null || true
     fi
     wait "$pid" 2>/dev/null || true
 }
@@ -1906,7 +1937,7 @@ stop_host_connection_host_side() {
     [ -f "$state_file" ] || return 0
     IFS=$'\t' read -r host_ip relay_pid subnet ufw_owned < "$state_file"
 
-    terminate_connection_process_group "$relay_pid"
+    terminate_connection_process_group "$relay_pid" "$host_ip" "$host_port"
 
     if [ "$ufw_owned" = true ] && [ -n "$subnet" ]; then
         if ! host_connection_ipv4_is_valid "$host_ip" \
@@ -1986,7 +2017,7 @@ start_host_connection_host_side() {
             sleep 0.02
         done
         if [ "$relay_ready" = false ]; then
-            terminate_connection_process_group "$relay_pid"
+            terminate_connection_process_group "$relay_pid" "$host_ip" "$host_port"
             rm -f "$state_file" "${state_file}.tmp" "$relay_log"
             echo "Host connection relay ${host_ip}:${host_port} did not become ready; cleaned up the failed relay and firewall state." >&2
             return 1
@@ -1996,7 +2027,7 @@ start_host_connection_host_side() {
     if host_connection_ufw_active; then
         desired_subnet="$(host_connection_bridge_subnet)"
         if ! host_connection_cidr_is_valid "$desired_subnet"; then
-            terminate_connection_process_group "$relay_pid"
+            terminate_connection_process_group "$relay_pid" "$host_ip" "$host_port"
             echo "Could not determine the devproxy bridge subnet for Host connection ${host_ip}:${host_port}." >&2
             return 1
         fi
@@ -2011,7 +2042,7 @@ start_host_connection_host_side() {
         ufw_output="$(LC_ALL=C sudo ufw allow proto tcp from "$desired_subnet" \
             to "$host_ip" port "$host_port" 2>&1)" || ufw_rc=$?
         if [ "$ufw_rc" -ne 0 ]; then
-            terminate_connection_process_group "$relay_pid"
+            terminate_connection_process_group "$relay_pid" "$host_ip" "$host_port"
             echo "Could not create Host connection ufw slot for ${host_ip}:${host_port} from ${desired_subnet}." >&2
             return 1
         fi
@@ -2063,16 +2094,39 @@ stop_container_connection() {
 
     docker exec -u node \
         -e PID_FILE="$pid_file" \
+        -e LOCAL_PORT="$local_port" \
         "$source_container" bash -lc '
             set -euo pipefail
             if [ -f "$PID_FILE" ]; then
                 pid="$(cat "$PID_FILE")"
                 if [[ "$pid" =~ ^[0-9]+$ ]]; then
-                    if ! kill -TERM -- "-$pid" 2>/dev/null; then
-                        if command -v pkill >/dev/null 2>&1; then
-                            pkill -TERM -P "$pid" 2>/dev/null || true
+                    comm=""
+                    cmdline=""
+                    if [ -r "/proc/${pid}/comm" ] && [ -r "/proc/${pid}/cmdline" ]; then
+                        comm="$(< "/proc/${pid}/comm")"
+                        cmdline="$({ tr "\0" " " < "/proc/${pid}/cmdline"; } 2>/dev/null || true)"
+                    fi
+                    if [ "$comm" = socat ] \
+                        && [[ "$cmdline" == *"TCP-LISTEN:${LOCAL_PORT},bind=127.0.0.1,"* ]]; then
+                        if ! kill -TERM -- "-$pid" 2>/dev/null; then
+                            if kill -STOP "$pid" 2>/dev/null; then
+                                if command -v pkill >/dev/null 2>&1; then
+                                    pkill -TERM -P "$pid" 2>/dev/null || true
+                                fi
+                                kill -TERM "$pid" 2>/dev/null || true
+                                kill -CONT "$pid" 2>/dev/null || true
+                                for attempt in 1 2 3 4 5 6 7 8 9 10; do
+                                    : "$attempt"
+                                    kill -0 "$pid" 2>/dev/null || break
+                                    sleep 0.01
+                                done
+                                if kill -0 "$pid" 2>/dev/null; then
+                                    kill -KILL "$pid" 2>/dev/null || true
+                                fi
+                            fi
                         fi
-                        kill -TERM "$pid" 2>/dev/null || true
+                    elif kill -0 "$pid" 2>/dev/null; then
+                        echo "Not stopping container connection PID ${pid}: process identity does not match local port ${LOCAL_PORT}." >&2
                     fi
                 fi
                 rm -f "$PID_FILE"

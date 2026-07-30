@@ -38,6 +38,7 @@ export BOXA_CONNECT_TEST_START_ALLOW_FAIL_PORTS=""
 export BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_PORTS=""
 export BOXA_CONNECT_TEST_MISSING_PYTHON=false
 export BOXA_CONNECT_TEST_MISSING_IP=false
+export BOXA_CONNECT_TEST_MISSING_SETSID=false
 export BOXA_CONNECT_TEST_INTERFACE_IPS="127.0.0.1"
 export BOXA_CONNECT_TEST_EXEC_NODE_TEARDOWN=false
 : > "$BOXA_CONNECT_TEST_LOG"
@@ -61,6 +62,10 @@ command() {
     fi
     if [ "$BOXA_CONNECT_TEST_MISSING_IP" = true ] \
         && [ "${1:-}" = -v ] && [ "${2:-}" = ip ]; then
+        return 1
+    fi
+    if [ "$BOXA_CONNECT_TEST_MISSING_SETSID" = true ] \
+        && [ "${1:-}" = -v ] && [ "${2:-}" = setsid ]; then
         return 1
     fi
     builtin command "$@"
@@ -102,14 +107,16 @@ docker() {
         exec)
             local helper_port="${*: -1}"
             if [ "$BOXA_CONNECT_TEST_EXEC_NODE_TEARDOWN" = true ]; then
-                local exec_pid_file="" argument
+                local exec_local_port="" exec_pid_file="" argument
                 for argument in "$@"; do
                     case "$argument" in
+                        LOCAL_PORT=*) exec_local_port="${argument#LOCAL_PORT=}" ;;
                         PID_FILE=*) exec_pid_file="${argument#PID_FILE=}" ;;
                     esac
                 done
                 if [ -n "$exec_pid_file" ]; then
-                    PID_FILE="$exec_pid_file" bash -lc "${*: -1}"
+                    LOCAL_PORT="$exec_local_port" PID_FILE="$exec_pid_file" \
+                        bash -lc "${*: -1}"
                     return
                 fi
             fi
@@ -351,16 +358,26 @@ export HOST_CONNECTION_STATE_DIR="$_TMPROOT/home/.local/state/boxa/host-connecti
 source "$extracted"
 
 # The in-Container teardown executes through docker in production. Run that
-# exact embedded shell against a detached mock listener with a live child.
+# exact embedded shell against a detached socat listener with a live handler.
 container_forward_child_file="$_TMPROOT/mock-socat-child-container.pid"
-setsid bash -c "sleep 300 & printf '%s\n' \"\$!\" > \"\$1\"; wait" \
-    _ "$container_forward_child_file" &
+socat TCP-LISTEN:64999,bind=127.0.0.1,reuseaddr,fork EXEC:"sleep 300" \
+    >/dev/null 2>&1 &
 container_forward_pid=$!
+container_forward_client_pid=""
 for _attempt in $(seq 1 50); do
-    [ -s "$container_forward_child_file" ] && break
+    if (exec 3<>/dev/tcp/127.0.0.1/64999) 2>/dev/null; then
+        bash -c 'exec 3<>/dev/tcp/127.0.0.1/64999; sleep 300' &
+        container_forward_client_pid=$!
+        break
+    fi
     sleep 0.01
 done
-container_forward_child_pid="$(cat "$container_forward_child_file")"
+for _attempt in $(seq 1 50); do
+    container_forward_child_pid="$(pgrep -P "$container_forward_pid" | head -1)"
+    [ -n "$container_forward_child_pid" ] && break
+    sleep 0.01
+done
+printf '%s\n' "$container_forward_child_pid" > "$container_forward_child_file"
 BOXA_CONNECT_TEST_CONTAINER_PID_FILE="/tmp/boxa-connect-64999.pid"
 printf '%s\n' "$container_forward_pid" > "$BOXA_CONNECT_TEST_CONTAINER_PID_FILE"
 BOXA_CONNECT_TEST_EXEC_NODE_TEARDOWN=true
@@ -370,6 +387,39 @@ assert_eq "container forward teardown stops listener" "false" \
     "$(kill -0 "$container_forward_pid" 2>/dev/null && echo true || echo false)"
 assert_eq "container forward teardown stops listener child" "false" \
     "$(kill -0 "$container_forward_child_pid" 2>/dev/null && echo true || echo false)"
+kill "$container_forward_client_pid" 2>/dev/null || true
+
+# A reused PID must only lose its stale record; the unrelated process survives.
+sleep 300 &
+stale_container_pid=$!
+printf '%s\n' "$stale_container_pid" > "$BOXA_CONNECT_TEST_CONTAINER_PID_FILE"
+BOXA_CONNECT_TEST_EXEC_NODE_TEARDOWN=true
+stale_container_output="$(stop_container_connection boxa-source 64999 2>&1)"
+assert_eq "container teardown preserves mismatched PID" "true" \
+    "$(kill -0 "$stale_container_pid" 2>/dev/null && echo true || echo false)"
+assert_eq "container teardown removes mismatched PID file" "false" \
+    "$([ -f "$BOXA_CONNECT_TEST_CONTAINER_PID_FILE" ] && echo true || echo false)"
+assert_contains "container teardown reports mismatched PID" \
+    "process identity does not match local port 64999" "$stale_container_output"
+kill "$stale_container_pid" 2>/dev/null || true
+BOXA_CONNECT_TEST_EXEC_NODE_TEARDOWN=false
+
+# Host-side persisted state has the same PID-reuse protection without relying
+# on /proc-only process inspection, so the implementation remains macOS-safe.
+sleep 300 &
+stale_host_pid=$!
+stale_host_port=18985
+mkdir -p "$HOST_CONNECTION_STATE_DIR"
+printf '127.0.0.2\t%s\t\tfalse\n' "$stale_host_pid" \
+    > "$(host_connection_state_file "$stale_host_port")"
+stale_host_output="$(stop_host_connection_host_side "$stale_host_port" 2>&1)"
+assert_eq "host teardown preserves mismatched PID" "true" \
+    "$(kill -0 "$stale_host_pid" 2>/dev/null && echo true || echo false)"
+assert_eq "host teardown removes mismatched state" "false" \
+    "$([ -f "$(host_connection_state_file "$stale_host_port")" ] && echo true || echo false)"
+assert_contains "host teardown reports mismatched PID" \
+    "process identity does not match 127.0.0.2:${stale_host_port}" "$stale_host_output"
+kill "$stale_host_pid" 2>/dev/null || true
 
 # Behavioral platform detection: a VM-owned address rejects the host bind, so
 # no host relay state or ufw INPUT slot is created.
@@ -481,9 +531,26 @@ assert_eq "host-side teardown stops current relay" "false" \
     "$(kill -0 "$changed_relay_pid" 2>/dev/null && echo true || echo false)"
 assert_eq "host-side teardown stops current relay child" "false" \
     "$(kill -0 "$changed_relay_child_pid" 2>/dev/null && echo true || echo false)"
+
+# State produced before setsid support shares the caller process group. The
+# compatibility teardown freezes its listener before scanning direct children.
+fallback_child_file="$_TMPROOT/mock-socat-child-no-setsid.pid"
+BOXA_CONNECT_TEST_MISSING_SETSID=true
+BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$fallback_child_file" \
+    PATH="$relay_mock_bin:$PATH" \
+    start_host_connection_host_side 127.0.0.4 "$native_host_port"
+IFS=$'\t' read -r _fallback_ip fallback_relay_pid _fallback_subnet _fallback_owned \
+    < "$(host_connection_state_file "$native_host_port")"
+fallback_relay_child_pid="$(cat "$fallback_child_file")"
+stop_host_connection_host_side "$native_host_port"
+BOXA_CONNECT_TEST_MISSING_SETSID=false
+assert_eq "pre-setsid teardown stops listener" "false" \
+    "$(kill -0 "$fallback_relay_pid" 2>/dev/null && echo true || echo false)"
+assert_eq "pre-setsid teardown stops existing child" "false" \
+    "$(kill -0 "$fallback_relay_child_pid" 2>/dev/null && echo true || echo false)"
 kill "$native_service_pid" 2>/dev/null || true
 
-# A relay process that dies during startup must fail the add path and leave no
+# A relay process that never becomes ready must fail the add path and leave no
 # durable host-side state or ufw slot behind.
 failed_relay_port=18986
 failed_relay_bin="$_TMPROOT/failed-relay-bin"
@@ -492,7 +559,8 @@ printf '%s\n' \
     '#!/bin/bash' \
     'sleep 300 &' \
     "printf '%s\\n' \"\$!\" > \"\$BOXA_CONNECT_TEST_SOCAT_CHILD_FILE\"" \
-    'exit 1' \
+    "trap 'exit 0' TERM" \
+    'while true; do sleep 1; done' \
     > "$failed_relay_bin/socat"
 chmod +x "$failed_relay_bin/socat"
 failed_relay_child_file="$_TMPROOT/mock-socat-child-failed.pid"
