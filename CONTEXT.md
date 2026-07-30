@@ -136,6 +136,30 @@ and summarized into a human-readable `summary.md` (visited hosts,
 out-of-allowlist requests, downloads, suspicious flags).
 _Avoid_: chrome log, browser audit
 
+### Connections
+
+**Cross-boxa connection**:
+A managed TCP forward owned by a source **Container**, giving its
+processes and inner DinD containers a stable local address
+(`127.0.0.1:<local-port>`, from inner containers `10.0.2.2:<local-port>`)
+for a published service in another box. Persisted per source box and
+replayed on Container start; inspectable via `boxa connections`. See
+ADR 0019.
+_Avoid_: box link, box tunnel, port forward (ambiguous)
+
+**Host connection**:
+A **Cross-boxa connection** whose target is a service on the host
+instead of another box. Alongside the forward it carries a scoped
+firewall exception — a single-IP, single-port accept inside the
+**Container**, plus on native Docker an equally scoped host-side slot —
+that is re-established on every Container start and removed only by
+explicit removal or uninstall. The default local port mirrors the host
+port; fallbacks are chosen deterministically once, at creation time.
+Scope is one box by default, or every box for host services that any
+Container may signal. The exception is host-managed end to end: nothing
+inside the Container can create, widen, or remove it.
+_Avoid_: host-service, host relay, host hole, host forward
+
 ### MCP
 
 **MCP server**:
@@ -467,6 +491,18 @@ _Avoid_: boxa check, boxa repair, boxa heal
 - The **Agent-browser proxy** is the single network exit point for
   **Host agent Chrome**. Chrome cannot reach the internet by any other
   path; the `--proxy-server` flag is non-negotiable.
+- A **Cross-boxa connection** is owned by exactly one source **Container**.
+  A **Host connection** with all-boxes scope is the one exception: it is
+  applied to every **Container** at start.
+- A **Host connection**'s firewall exception lives exactly as long as its
+  persisted entry: re-established on every Container start, removed by
+  explicit removal and by uninstall. Like the **Allow-for window**, it can
+  only be granted from the host — never requested from inside the
+  **Container**.
+- The **Allowlist** and a **Host connection** are different gates: the
+  **Allowlist** admits domains via DNS resolution into the
+  **Allowed-domains ipset**; a **Host connection** admits exactly one
+  IP:port pair. Neither implies the other.
 - A **Project** has one effective **MCP profile** at a time, formed only from
   its explicit **MCP activations**. The user-wide **MCP catalog** contributes
   available definitions, never implicit selections.
