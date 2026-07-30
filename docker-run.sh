@@ -1667,6 +1667,27 @@ host_connection_relay_is_alive() {
     [[ "$cmdline" == *"TCP-LISTEN:${host_port},bind=${host_ip},"* ]]
 }
 
+host_connection_ip_is_host_owned() {
+    local host_ip="$1"
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "python3 is required to detect the Host connection relay platform." >&2
+        return 2
+    fi
+    python3 - "$host_ip" <<'PY'
+import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind((sys.argv[1], 0))
+except OSError:
+    raise SystemExit(1)
+finally:
+    sock.close()
+PY
+}
+
 host_connection_ufw_active() {
     command -v ufw >/dev/null 2>&1 || return 1
     LC_ALL=C sudo ufw status 2>/dev/null | grep -qi '^Status: active'
@@ -1855,14 +1876,25 @@ start_host_connection_host_side() {
     local state_file old_ip="" old_pid="" old_subnet="" old_ufw_owned=false
     local relay_pid="" relay_log desired_subnet="" state_subnet=""
     local ufw_output ufw_rc=0 ufw_owned=false
-    local relay_retry
+    local relay_retry ownership_rc=0
+
+    state_file="$(host_connection_state_file "$host_port")"
+    host_connection_ip_is_host_owned "$host_ip" || ownership_rc=$?
+    if [ "$ownership_rc" -gt 1 ]; then
+        return "$ownership_rc"
+    fi
+    if [ "$ownership_rc" -eq 1 ]; then
+        if [ -f "$state_file" ]; then
+            stop_host_connection_host_side "$host_port" || return 1
+        fi
+        return 0
+    fi
 
     if ! command -v socat >/dev/null 2>&1; then
         echo "host socat not found. Install it (Debian/Ubuntu: sudo apt-get install -y socat; Fedora/RHEL: sudo dnf install -y socat; Arch: sudo pacman -S socat; macOS: brew install socat). It is required for the Host connection relay on this platform." >&2
         return 1
     fi
 
-    state_file="$(host_connection_state_file "$host_port")"
     if [ -f "$state_file" ]; then
         IFS=$'\t' read -r old_ip old_pid old_subnet old_ufw_owned < "$state_file"
         if [ "$old_ip" = "$host_ip" ] \
@@ -1943,10 +1975,14 @@ start_host_connection() {
         return 1
     fi
 
-    docker exec -u root "$source_container" \
-        /usr/local/bin/start-host-connection-allow "$host_ip" "$host_port"
-    start_host_connection_host_side "$host_ip" "$host_port"
-    start_container_connection "$source_container" "$host_ip" "$host_port" "$local_port" "$alias"
+    if ! docker exec -u root "$source_container" \
+        /usr/local/bin/start-host-connection-allow "$host_ip" "$host_port"; then
+        echo "Could not create the container firewall slot for Host connection ${host_ip}:${host_port} in ${source_container}." >&2
+        return 1
+    fi
+    start_host_connection_host_side "$host_ip" "$host_port" || return 1
+    start_container_connection "$source_container" "$host_ip" "$host_port" \
+        "$local_port" "$alias" || return 1
 }
 
 stop_container_connection() {
@@ -1977,9 +2013,12 @@ stop_host_connection() {
         return 1
     fi
 
-    docker exec -u root "$source_container" \
-        /usr/local/bin/stop-host-connection-allow "$host_ip" "$host_port"
-    stop_container_connection "$source_container" "$local_port"
+    if ! docker exec -u root "$source_container" \
+        /usr/local/bin/stop-host-connection-allow "$host_ip" "$host_port"; then
+        echo "Could not remove the container firewall slot for Host connection ${host_ip}:${host_port} in ${source_container}." >&2
+        return 1
+    fi
+    stop_container_connection "$source_container" "$local_port" || return 1
 }
 
 remove_host_connection() {
@@ -2060,6 +2099,7 @@ start_boxa_connections() {
     local container="$1"
     local source_project="${container#boxa-}"
     local config_file global_config_file replay_file start_connection_fn
+    local replay_failed=false
     local -a start_connection_args
     config_file="$(connection_config_file "$source_project")"
     global_config_file="$(global_connection_config_file)"
@@ -2080,9 +2120,11 @@ start_boxa_connections() {
                 echo "Connection: ${alias} 10.0.2.2:${local_port} → ${target_container}:${target_port}"
             else
                 echo "Failed to start connection ${alias} for ${container}." >&2
+                replay_failed=true
             fi
         done < "$replay_file"
     done
+    [ "$replay_failed" = false ]
 }
 
 list_boxa_container_names() {
@@ -2179,9 +2221,16 @@ upsert_connection_record() {
     mkdir -p "$CONNECT_CONFIG_DIR"
     touch "$config_file"
 
+    if awk -F '\t' -v t="$target_container" -v p="$target_port" -v lp="$local_port" \
+        '$4 == lp && !($2 == t && $3 == p) { found=1 } END { exit found ? 0 : 1 }' \
+        "$config_file"; then
+        echo "Local port ${local_port} is already used by another persisted connection." >&2
+        return 1
+    fi
+
     tmp="${config_file}.tmp"
-    awk -F '\t' -v t="$target_container" -v p="$target_port" -v lp="$local_port" \
-        'BEGIN { OFS = FS } !($2 == t && $3 == p) && !($4 == lp)' "$config_file" > "$tmp"
+    awk -F '\t' -v t="$target_container" -v p="$target_port" \
+        'BEGIN { OFS = FS } !($2 == t && $3 == p)' "$config_file" > "$tmp"
     printf '%s\t%s\t%s\t%s\n' "$alias" "$target_container" "$target_port" "$local_port" >> "$tmp"
     mv "$tmp" "$config_file"
 }
@@ -2193,9 +2242,16 @@ upsert_global_connection_record() {
     mkdir -p "$CONNECT_CONFIG_DIR"
     touch "$config_file"
 
+    if awk -F '\t' -v t="$target_container" -v p="$target_port" -v lp="$local_port" \
+        '$4 == lp && !($2 == t && $3 == p) { found=1 } END { exit found ? 0 : 1 }' \
+        "$config_file"; then
+        echo "Local port ${local_port} is already used by another persisted connection." >&2
+        return 1
+    fi
+
     tmp="${config_file}.tmp"
-    awk -F '\t' -v t="$target_container" -v p="$target_port" -v lp="$local_port" \
-        'BEGIN { OFS = FS } !($2 == t && $3 == p) && !($4 == lp)' "$config_file" > "$tmp"
+    awk -F '\t' -v t="$target_container" -v p="$target_port" \
+        'BEGIN { OFS = FS } !($2 == t && $3 == p)' "$config_file" > "$tmp"
     printf '%s\t%s\t%s\t%s\n' "$alias" "$target_container" "$target_port" "$local_port" >> "$tmp"
     mv "$tmp" "$config_file"
 }
@@ -3955,7 +4011,8 @@ if [ "$MODE" = "connect" ]; then
                 local_port="$(allocate_connection_port "$SOURCE_PROJECT" "$target_container" "$host_port" "$config_file")"
             fi
             alias="${inner_name}.${target_project}.boxa"
-            upsert_connection_record "$SOURCE_PROJECT" "$alias" "$target_container" "$host_port" "$local_port"
+            upsert_connection_record "$SOURCE_PROJECT" "$alias" "$target_container" \
+                "$host_port" "$local_port" || exit 1
             start_container_connection "$SOURCE_CONTAINER" "$target_container" "$host_port" "$local_port" "$alias"
             printf '  %-32s 10.0.2.2:%s -> %s:%s\n' "${inner_name}.${target_project}.boxa" "$local_port" "$target_container" "$host_port"
         done <<< "$SELECTED_SERVICES"
@@ -4090,11 +4147,6 @@ if [ "$MODE" = "connect" ]; then
         echo "Target container is not running: $TARGET_CONTAINER" >&2
         exit 1
     fi
-    if [ "$TARGET_CONTAINER" = host ] && ! command -v socat >/dev/null 2>&1; then
-        echo "host socat not found. Install it (Debian/Ubuntu: sudo apt-get install -y socat; Fedora/RHEL: sudo dnf install -y socat; Arch: sudo pacman -S socat; macOS: brew install socat). It is required for the Host connection relay on this platform." >&2
-        exit 1
-    fi
-
     GLOBAL_CONFIG_FILE="$(global_connection_config_file)"
     if [ "$ALL_CONNECTIONS" = true ]; then
         if host_connection_target_is_persisted_per_box "$TARGET_PORT"; then
@@ -4136,7 +4188,8 @@ if [ "$MODE" = "connect" ]; then
 
     ALIAS="${CONNECTION_NAME:-${TARGET_PROJECT}-${TARGET_PORT}}"
     if [ "$ALL_CONNECTIONS" = true ]; then
-        upsert_global_connection_record "$ALIAS" "$TARGET_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT"
+        upsert_global_connection_record "$ALIAS" "$TARGET_CONTAINER" \
+            "$TARGET_PORT" "$LOCAL_PORT" || exit 1
         global_start_failed=false
         while IFS= read -r running_container; do
             [ -n "$running_container" ] || continue
@@ -4147,7 +4200,8 @@ if [ "$MODE" = "connect" ]; then
         done < <(list_boxa_container_names)
         [ "$global_start_failed" = false ] || exit 1
     else
-        upsert_connection_record "$SOURCE_PROJECT" "$ALIAS" "$TARGET_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT"
+        upsert_connection_record "$SOURCE_PROJECT" "$ALIAS" "$TARGET_CONTAINER" \
+            "$TARGET_PORT" "$LOCAL_PORT" || exit 1
     fi
 
     if [ "$ALL_CONNECTIONS" = true ]; then

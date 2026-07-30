@@ -20,6 +20,8 @@ export BOXA_CONNECT_TEST_RULE_MISSING_PORTS=""
 export BOXA_CONNECT_TEST_CONTAINERS="boxa-source"
 export BOXA_CONNECT_TEST_UFW_ACTIVE=false
 export BOXA_CONNECT_TEST_MISSING_SOCAT=false
+export BOXA_CONNECT_TEST_START_ALLOW_FAIL_PORTS=""
+export BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_PORTS=""
 : > "$BOXA_CONNECT_TEST_LOG"
 
 # Keep list_listening_ports_in_container's timeout path compatible with the
@@ -64,6 +66,19 @@ docker() {
             done <<< "${BOXA_CONNECT_TEST_CONTAINERS//,/$'\n'}"
             ;;
         exec)
+            local helper_port="${*: -1}"
+            case "$*" in
+                *'/usr/local/bin/start-host-connection-allow '*)
+                    case ",${BOXA_CONNECT_TEST_START_ALLOW_FAIL_PORTS}," in
+                        *",${helper_port},"*) return 1 ;;
+                    esac
+                    ;;
+                *'/usr/local/bin/stop-host-connection-allow '*)
+                    case ",${BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_PORTS}," in
+                        *",${helper_port},"*) return 1 ;;
+                    esac
+                    ;;
+            esac
             case "$*" in
                 *'getent ahostsv4 host.docker.internal'*)
                     printf '%s\n' "$BOXA_CONNECT_TEST_HOST_IP"
@@ -218,6 +233,17 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local label="$1" needle="$2" haystack="$3"
+    if [[ "$haystack" != *"$needle"* ]]; then
+        printf 'PASS  %s\n' "$label"
+    else
+        printf 'FAIL  %s\n      unexpected: %q\n      actual:     %q\n' \
+            "$label" "$needle" "$haystack"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
 count_log_matches() {
     local needle="$1"
     awk -v needle="$needle" 'index($0, needle) { count++ } END { print count + 0 }' \
@@ -295,6 +321,18 @@ native_host_port=18991
 socat TCP-LISTEN:"$native_host_port",bind=127.0.0.1,reuseaddr,fork \
     SYSTEM:"printf native-ok" >/dev/null 2>&1 &
 native_service_pid=$!
+native_service_ready=false
+for _attempt in $(seq 1 50); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/${native_host_port}") 2>/dev/null; then
+        native_service_ready=true
+        break
+    fi
+    sleep 0.02
+done
+if [ "$native_service_ready" = false ]; then
+    printf 'FAIL  native loopback service did not become ready\n'
+    exit 1
+fi
 start_host_connection_host_side 127.0.0.2 "$native_host_port"
 native_state_file="$(host_connection_state_file "$native_host_port")"
 IFS=$'\t' read -r native_ip native_relay_pid native_subnet native_ufw_owned \
@@ -328,13 +366,58 @@ assert_eq "host-side teardown stops current relay" "false" \
 kill "$native_service_pid" 2>/dev/null || true
 
 BOXA_CONNECT_TEST_MISSING_SOCAT=true
+desktop_without_socat_output="$(run_boxa connect host 18992 --from source 2>&1)"
+assert_contains "Docker Desktop add does not require host socat" \
+    "Connected: boxa-source -> host:18992" "$desktop_without_socat_output"
+run_boxa connect rm host 18992 --from source >/dev/null
+
+BOXA_CONNECT_TEST_HOST_IP="127.0.0.2"
 missing_socat_output="$(run_boxa connect host 18992 --from source 2>&1 || true)"
 assert_contains "missing host socat prints exact install hint" \
     "host socat not found. Install it (Debian/Ubuntu: sudo apt-get install -y socat; Fedora/RHEL: sudo dnf install -y socat; Arch: sudo pacman -S socat; macOS: brew install socat). It is required for the Host connection relay on this platform." \
     "$missing_socat_output"
-assert_eq "missing host socat does not persist failed add" "" \
+assert_eq "failed native add remains persisted for repair" \
+    $'host-18992\thost\t18992\t18992' \
     "$(awk -F '\t' '$2 == "host" && $3 == 18992 { print }' "$config_file")"
 BOXA_CONNECT_TEST_MISSING_SOCAT=false
+run_boxa connect rm host 18992 --from source >/dev/null
+
+# Start and replay surface missing durable support artifacts. The persisted
+# row remains the repair source of truth, and failed teardown keeps it intact.
+BOXA_CONNECT_TEST_HOST_IP="192.168.65.254"
+helper_failure_port=18993
+BOXA_CONNECT_TEST_START_ALLOW_FAIL_PORTS="$helper_failure_port"
+helper_failure_output="$(run_boxa connect host "$helper_failure_port" --from source 2>&1 || true)"
+assert_contains "add reports container firewall helper failure" \
+    "Could not create the container firewall slot" "$helper_failure_output"
+assert_not_contains "failed add does not report success" \
+    "Connected: boxa-source -> host:${helper_failure_port}" "$helper_failure_output"
+assert_eq "failed add keeps persisted row for repair" "$helper_failure_port" \
+    "$(awk -F '\t' -v p="$helper_failure_port" '$3 == p { print $4 }' "$config_file")"
+replay_failure_output="$(start_boxa_connections boxa-source 2>&1 || true)"
+assert_contains "replay reports helper failure" \
+    "Failed to start connection host-${helper_failure_port}" "$replay_failure_output"
+if start_boxa_connections boxa-source >/dev/null 2>&1; then
+    replay_failure_status=success
+else
+    replay_failure_status=failure
+fi
+assert_eq "replay propagates helper failure" failure "$replay_failure_status"
+BOXA_CONNECT_TEST_START_ALLOW_FAIL_PORTS=""
+
+BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_PORTS="$helper_failure_port"
+forward_teardowns_before="$(count_log_matches "PID_FILE=/tmp/boxa-connect-${helper_failure_port}.pid")"
+teardown_failure_output="$(run_boxa connect rm host "$helper_failure_port" --from source 2>&1 || true)"
+assert_contains "rm reports container firewall teardown failure" \
+    "Could not remove the container firewall slot" "$teardown_failure_output"
+assert_not_contains "failed rm does not report removal" \
+    "Removed Host connection" "$teardown_failure_output"
+assert_eq "failed rm retains persisted row" "$helper_failure_port" \
+    "$(awk -F '\t' -v p="$helper_failure_port" '$3 == p { print $4 }' "$config_file")"
+assert_eq "failed firewall teardown stops before forward teardown" "$forward_teardowns_before" \
+    "$(count_log_matches "PID_FILE=/tmp/boxa-connect-${helper_failure_port}.pid")"
+BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_PORTS=""
+run_boxa connect rm host "$helper_failure_port" --from source >/dev/null
 
 BOXA_CONNECT_TEST_HOST_IP="192.168.65.253"
 start_boxa_connections boxa-source >/dev/null
@@ -450,6 +533,12 @@ assert_eq "explicit local port skips selection scan" "$scan_calls_before" \
     "$(count_log_matches 'cat /proc/net/tcp /proc/net/tcp6')"
 assert_eq "explicit local port is persisted" "$explicit_port" \
     "$(awk -F '\t' -v p="$fallback_host_port" '$3 == p { print $4 }' "$config_file")"
+per_box_same_scope_collision_output="$(run_boxa connect host 18890 "$explicit_port" --from source 2>&1 || true)"
+assert_contains "per-box add rejects same-scope explicit local-port collision" \
+    "Local port ${explicit_port} is already used by another persisted connection." \
+    "$per_box_same_scope_collision_output"
+assert_eq "per-box collision preserves existing row" "$fallback_host_port" \
+    "$(awk -F '\t' -v p="$explicit_port" '$4 == p { print $3 }' "$config_file")"
 
 connect_help="$(run_boxa help connect)"
 assert_contains "help documents connect host" \
@@ -481,6 +570,12 @@ assert_eq "global add starts firewall slot in two running boxes" "2" \
     "$(count_log_matches "/usr/local/bin/start-host-connection-allow 192.168.65.254 ${global_host_port}")"
 assert_eq "global add starts forward in two running boxes" "2" \
     "$(count_log_matches "-e TARGET_PORT=${global_host_port} -e LOCAL_PORT=${global_host_port}")"
+global_same_scope_collision_output="$(run_boxa connect host 17785 "$global_host_port" --all 2>&1 || true)"
+assert_contains "global add rejects same-scope explicit local-port collision" \
+    "Local port ${global_host_port} is already used by another persisted connection." \
+    "$global_same_scope_collision_output"
+assert_eq "global collision preserves existing row" "$global_host_port" \
+    "$(awk -F '\t' -v p="$global_host_port" '$4 == p { print $3 }' "$global_config_file")"
 assert_eq "global and per-box files coexist" "$explicit_port" \
     "$(awk -F '\t' -v p="$fallback_host_port" '$3 == p { print $4 }' "$config_file")"
 
