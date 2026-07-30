@@ -273,6 +273,8 @@ The explicit form forwards one TCP port from the source boxa to a target.
 The reserved target `host` forwards a host service; --name sets its label.
 Host connections are per-box by default. --all deliberately widens trust to
 every present and future box; it cannot be combined with --from.
+On native Linux, each Host connection keeps a standing, narrowly scoped host
+firewall rule for exactly as long as the entry exists.
 Host auto-port order: host port -> 15000-15999 checksum slot -> slot+1 ->
 interactive prompt. An explicit local-port always wins. The selected port
 is persisted unchanged.
@@ -346,6 +348,7 @@ source "$BOXA_DIR/lib/brand.sh"
 IMAGE="$BRAND_IMAGE"
 TRAEFIK_CONFIG_DIR="$HOME/.config/$CLI_NAME/traefik/dynamic"
 CONNECT_CONFIG_DIR="$HOME/.config/$CLI_NAME/connect"
+HOST_CONNECTION_STATE_DIR="$HOME/.local/state/$CLI_NAME/host-connections"
 DNS_CONFIG_DIR="$HOME/.config/$CLI_NAME/dns"
 
 # Container names that belong to shared boxa infrastructure, not to any
@@ -1503,6 +1506,17 @@ host_connection_target_is_persisted_per_box() {
     return 1
 }
 
+host_connection_target_has_other_record() {
+    local host_port="$1" match_count=0 config_file
+
+    for config_file in "$CONNECT_CONFIG_DIR"/*.tsv; do
+        [ -f "$config_file" ] || continue
+        match_count=$((match_count + $(awk -F '\t' -v p="$host_port" \
+            '$2 == "host" && $3 == p { count++ } END { print count + 0 }' "$config_file")))
+    done
+    [ "$match_count" -gt 1 ]
+}
+
 select_global_host_connection_port() {
     local host_port="$1" global_config_file="$2"
     local running_containers listening_output checksum checksum_port next_port candidate entered container
@@ -1598,6 +1612,171 @@ resolve_host_connection_ip() {
     '
 }
 
+host_connection_state_file() {
+    local host_port="$1"
+    printf '%s/%s.state' "$HOST_CONNECTION_STATE_DIR" "$host_port"
+}
+
+host_connection_ipv4_is_valid() {
+    local ip="${1:-}" octet
+    local -a octets
+
+    [[ "$ip" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    IFS=. read -ra octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        [ "$octet" -ge 0 ] 2>/dev/null && [ "$octet" -le 255 ] 2>/dev/null || return 1
+        case "$octet" in
+            0) ;;
+            0*) return 1 ;;
+        esac
+    done
+}
+
+host_connection_cidr_is_valid() {
+    local cidr="${1:-}" prefix
+    case "$cidr" in */*) ;; *) return 1 ;; esac
+    prefix="${cidr#*/}"
+    host_connection_ipv4_is_valid "${cidr%/*}" || return 1
+    [[ "$prefix" =~ ^[0-9]+$ ]] \
+        && [ "$prefix" -ge 0 ] 2>/dev/null \
+        && [ "$prefix" -le 32 ] 2>/dev/null
+}
+
+host_connection_relay_is_alive() {
+    local pid="${1:-}" host_ip="$2" host_port="$3" cmdline
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ -r "/proc/${pid}/cmdline" ] || return 1
+    cmdline="$({ tr '\0' ' ' < "/proc/${pid}/cmdline"; } 2>/dev/null || true)"
+    [[ "$cmdline" == *"TCP-LISTEN:${host_port},bind=${host_ip},"* ]]
+}
+
+host_connection_ufw_active() {
+    command -v ufw >/dev/null 2>&1 || return 1
+    LC_ALL=C sudo ufw status 2>/dev/null | grep -qi '^Status: active'
+}
+
+host_connection_bridge_subnet() {
+    docker network inspect devproxy \
+        --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9].*\//) {print $i; exit}}'
+}
+
+stop_host_connection_host_side() {
+    local host_port="$1" state_file host_ip relay_pid subnet ufw_owned
+    local ufw_output ufw_rc=0
+
+    state_file="$(host_connection_state_file "$host_port")"
+    [ -f "$state_file" ] || return 0
+    IFS=$'\t' read -r host_ip relay_pid subnet ufw_owned < "$state_file"
+
+    if host_connection_relay_is_alive "$relay_pid" "$host_ip" "$host_port"; then
+        kill "$relay_pid" 2>/dev/null || true
+    fi
+
+    if [ "$ufw_owned" = true ] && [ -n "$subnet" ]; then
+        if ! host_connection_ipv4_is_valid "$host_ip" \
+            || ! host_connection_cidr_is_valid "$subnet"; then
+            echo "Refusing to remove malformed Host connection ufw state for ${host_ip}:${host_port} from ${subnet}." >&2
+            return 1
+        fi
+        if command -v ufw >/dev/null 2>&1; then
+            ufw_output="$(LC_ALL=C sudo ufw delete allow proto tcp from "$subnet" \
+                to "$host_ip" port "$host_port" 2>&1)" || ufw_rc=$?
+            if [ "$ufw_rc" -ne 0 ] \
+                && ! grep -qi 'Could not delete non-existent rule' <<< "$ufw_output"; then
+                echo "Could not remove Host connection ufw slot for ${host_ip}:${host_port} from ${subnet}." >&2
+                return 1
+            fi
+        fi
+    fi
+
+    rm -f "$state_file" "$HOST_CONNECTION_STATE_DIR/${host_port}.relay.log"
+}
+
+start_host_connection_host_side() {
+    local host_ip="$1" host_port="$2"
+    local state_file old_ip="" old_pid="" old_subnet="" old_ufw_owned=false
+    local relay_pid="" relay_log desired_subnet="" state_subnet=""
+    local ufw_output ufw_rc=0 ufw_owned=false
+    local relay_retry
+
+    if ! command -v socat >/dev/null 2>&1; then
+        echo "host socat not found. Install it (Debian/Ubuntu: sudo apt-get install -y socat; Fedora/RHEL: sudo dnf install -y socat; Arch: sudo pacman -S socat; macOS: brew install socat). It is required for the Host connection relay on this platform." >&2
+        return 1
+    fi
+
+    state_file="$(host_connection_state_file "$host_port")"
+    if [ -f "$state_file" ]; then
+        IFS=$'\t' read -r old_ip old_pid old_subnet old_ufw_owned < "$state_file"
+        if [ "$old_ip" = "$host_ip" ] \
+            && host_connection_relay_is_alive "$old_pid" "$old_ip" "$host_port"; then
+            relay_pid="$old_pid"
+            ufw_owned="$old_ufw_owned"
+        else
+            stop_host_connection_host_side "$host_port" || return 1
+            old_subnet=""
+            old_ufw_owned=false
+        fi
+    fi
+
+    if [ -z "$relay_pid" ]; then
+        mkdir -p "$HOST_CONNECTION_STATE_DIR"
+        relay_log="$HOST_CONNECTION_STATE_DIR/${host_port}.relay.log"
+        nohup socat "TCP-LISTEN:${host_port},bind=${host_ip},fork,reuseaddr" \
+            "TCP:127.0.0.1:${host_port}" > "$relay_log" 2>&1 &
+        relay_pid=$!
+        for relay_retry in 1 2 3 4 5 6 7 8 9 10; do
+            : "$relay_retry"
+            sleep 0.02
+            host_connection_relay_is_alive "$relay_pid" "$host_ip" "$host_port" || break
+        done
+        if [ "$relay_retry" -lt 10 ] \
+            || ! host_connection_relay_is_alive "$relay_pid" "$host_ip" "$host_port"; then
+            wait "$relay_pid" 2>/dev/null || true
+            rm -f "$relay_log"
+            return 0
+        fi
+    fi
+
+    if host_connection_ufw_active; then
+        desired_subnet="$(host_connection_bridge_subnet)"
+        if ! host_connection_cidr_is_valid "$desired_subnet"; then
+            kill "$relay_pid" 2>/dev/null || true
+            echo "Could not determine the devproxy bridge subnet for Host connection ${host_ip}:${host_port}." >&2
+            return 1
+        fi
+        if [ -n "$old_subnet" ] && [ "$old_subnet" != "$desired_subnet" ]; then
+            stop_host_connection_host_side "$host_port" || return 1
+            start_host_connection_host_side "$host_ip" "$host_port"
+            return
+        fi
+    fi
+
+    if [ -n "$desired_subnet" ]; then
+        ufw_output="$(LC_ALL=C sudo ufw allow proto tcp from "$desired_subnet" \
+            to "$host_ip" port "$host_port" 2>&1)" || ufw_rc=$?
+        if [ "$ufw_rc" -ne 0 ]; then
+            kill "$relay_pid" 2>/dev/null || true
+            echo "Could not create Host connection ufw slot for ${host_ip}:${host_port} from ${desired_subnet}." >&2
+            return 1
+        fi
+        if [ "$old_ufw_owned" = true ] \
+            || ! grep -qi 'Skipping adding existing rule' <<< "$ufw_output"; then
+            ufw_owned=true
+        fi
+    fi
+
+    mkdir -p "$HOST_CONNECTION_STATE_DIR"
+    state_subnet="$desired_subnet"
+    if [ -z "$state_subnet" ] && [ "$old_ufw_owned" = true ]; then
+        state_subnet="$old_subnet"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$host_ip" "$relay_pid" "$state_subnet" "$ufw_owned" \
+        > "${state_file}.tmp"
+    mv "${state_file}.tmp" "$state_file"
+}
+
 start_host_connection() {
     local source_container="$1" host_port="$2" local_port="$3" alias="$4"
     local host_ip
@@ -1610,6 +1789,7 @@ start_host_connection() {
 
     docker exec -u root "$source_container" \
         /usr/local/bin/start-host-connection-allow "$host_ip" "$host_port"
+    start_host_connection_host_side "$host_ip" "$host_port"
     start_container_connection "$source_container" "$host_ip" "$host_port" "$local_port" "$alias"
 }
 
@@ -3664,6 +3844,10 @@ if [ "$MODE" = "connect" ]; then
             stop_host_connection "$SOURCE_CONTAINER" "$TARGET_PORT" "$connection_local_port"
         fi
 
+        if ! host_connection_target_has_other_record "$TARGET_PORT"; then
+            stop_host_connection_host_side "$TARGET_PORT" || exit 1
+        fi
+
         tmp="${CONFIG_FILE}.tmp"
         awk -F '\t' -v p="$TARGET_PORT" '!($2 == "host" && $3 == p)' "$CONFIG_FILE" > "$tmp"
         mv "$tmp" "$CONFIG_FILE"
@@ -3688,6 +3872,10 @@ if [ "$MODE" = "connect" ]; then
     fi
     if [ "$TARGET_CONTAINER" != host ] && ! docker ps --filter "name=^${TARGET_CONTAINER}$" --format '{{.Names}}' | grep -qx "$TARGET_CONTAINER"; then
         echo "Target container is not running: $TARGET_CONTAINER" >&2
+        exit 1
+    fi
+    if [ "$TARGET_CONTAINER" = host ] && ! command -v socat >/dev/null 2>&1; then
+        echo "host socat not found. Install it (Debian/Ubuntu: sudo apt-get install -y socat; Fedora/RHEL: sudo dnf install -y socat; Arch: sudo pacman -S socat; macOS: brew install socat). It is required for the Host connection relay on this platform." >&2
         exit 1
     fi
 

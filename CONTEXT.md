@@ -155,6 +155,8 @@ firewall exception — a single-IP, single-port accept inside the
 that is re-established on every Container start and removed only by
 explicit removal or uninstall. The default local port mirrors the host
 port; fallbacks are chosen deterministically once, at creation time.
+On native Linux this means a standing, narrowly scoped host firewall
+rule that exists exactly as long as the Host connection entry does.
 Scope is one box by default, or every box for host services that any
 Container may signal. The exception is host-managed end to end: nothing
 inside the Container can create, widen, or remove it.

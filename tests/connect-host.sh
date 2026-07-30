@@ -1,5 +1,5 @@
 #!/bin/bash
-# Plain-bash lifecycle assertions for Docker Desktop Host connections.
+# Plain-bash lifecycle assertions for Docker Desktop and native-Docker Host connections.
 # Usage: bash tests/connect-host.sh
 
 set -u
@@ -16,6 +16,8 @@ export BOXA_CONNECT_TEST_HOST_IP="192.168.65.254"
 export BOXA_CONNECT_TEST_BOUND_PORTS=""
 export BOXA_CONNECT_TEST_FORWARD_PORTS=""
 export BOXA_CONNECT_TEST_CONTAINERS="boxa-source"
+export BOXA_CONNECT_TEST_UFW_ACTIVE=false
+export BOXA_CONNECT_TEST_MISSING_SOCAT=false
 : > "$BOXA_CONNECT_TEST_LOG"
 
 # Keep list_listening_ports_in_container's timeout path compatible with the
@@ -25,6 +27,15 @@ timeout() {
     "$@"
 }
 export -f timeout
+
+command() {
+    if [ "$BOXA_CONNECT_TEST_MISSING_SOCAT" = true ] \
+        && [ "${1:-}" = -v ] && [ "${2:-}" = socat ]; then
+        return 1
+    fi
+    builtin command "$@"
+}
+export -f command
 
 # docker-run.sh is host-side; this stub records the privileged and node execs
 # while presenting one running source Container. Resolution deliberately comes
@@ -66,9 +77,39 @@ docker() {
                     ;;
             esac
             ;;
+        network)
+            if [ "${2:-}" = inspect ] && [ "${3:-}" = devproxy ]; then
+                printf '%s\n' '172.18.0.0/24 '
+            fi
+            ;;
     esac
 }
 export -f docker
+
+sudo() {
+    "$@"
+}
+export -f sudo
+
+ufw() {
+    printf 'ufw %s\n' "$*" >> "$BOXA_CONNECT_TEST_LOG"
+    case "${1:-}" in
+        status)
+            if [ "$BOXA_CONNECT_TEST_UFW_ACTIVE" = true ]; then
+                printf '%s\n' 'Status: active'
+            else
+                printf '%s\n' 'Status: inactive'
+            fi
+            ;;
+        allow)
+            printf '%s\n' 'Rule added'
+            ;;
+        delete)
+            printf '%s\n' 'Rule deleted'
+            ;;
+    esac
+}
+export -f ufw
 
 # Minimal iptables model for the durable-slot helpers. State contains only the
 # accepted destination IP:port pairs; -S renders the final catch-all REJECT the
@@ -207,8 +248,67 @@ if [ ! -s "$extracted" ]; then
     exit 1
 fi
 export CONNECT_CONFIG_DIR="$_TMPROOT/home/.config/boxa/connect"
+export HOST_CONNECTION_STATE_DIR="$_TMPROOT/home/.local/state/boxa/host-connections"
 # shellcheck source=/dev/null
 source "$extracted"
+
+# Behavioral platform detection: a VM-owned address rejects the host bind, so
+# no host relay state or ufw INPUT slot is created.
+vm_host_port=18990
+BOXA_CONNECT_TEST_UFW_ACTIVE=true
+vm_ufw_calls_before="$(count_log_matches 'ufw allow proto tcp')"
+start_host_connection_host_side 192.168.65.254 "$vm_host_port"
+assert_eq "VM-owned Host IP leaves no relay state" "false" \
+    "$([ -f "$(host_connection_state_file "$vm_host_port")" ] && echo true || echo false)"
+assert_eq "VM-owned Host IP leaves ufw untouched" "$vm_ufw_calls_before" \
+    "$(count_log_matches 'ufw allow proto tcp')"
+
+# A bindable Host IP selects native Docker: relay only on that IP:port, exact
+# bridge-subnet ufw slot, live traffic, changed-IP convergence, and teardown.
+native_host_port=18991
+socat TCP-LISTEN:"$native_host_port",bind=127.0.0.1,reuseaddr,fork \
+    SYSTEM:"printf native-ok" >/dev/null 2>&1 &
+native_service_pid=$!
+start_host_connection_host_side 127.0.0.2 "$native_host_port"
+native_state_file="$(host_connection_state_file "$native_host_port")"
+IFS=$'\t' read -r native_ip native_relay_pid native_subnet native_ufw_owned \
+    < "$native_state_file"
+assert_eq "host-owned branch records exact relay IP" "127.0.0.2" "$native_ip"
+assert_eq "host-owned branch records exact bridge subnet" "172.18.0.0/24" "$native_subnet"
+assert_eq "host-owned branch owns newly added ufw slot" "true" "$native_ufw_owned"
+assert_contains "host-owned relay binds only resolved IP and port" \
+    "TCP-LISTEN:${native_host_port},bind=127.0.0.2," \
+    "$(tr '\0' ' ' < "/proc/${native_relay_pid}/cmdline")"
+assert_eq "host-owned relay reaches loopback service" "native-ok" \
+    "$(curl --silent --http0.9 --noproxy '*' "http://127.0.0.2:${native_host_port}")"
+assert_eq "host-owned branch opens exact ufw INPUT slot" "1" \
+    "$(count_log_matches "ufw allow proto tcp from 172.18.0.0/24 to 127.0.0.2 port ${native_host_port}")"
+
+start_host_connection_host_side 127.0.0.3 "$native_host_port"
+IFS=$'\t' read -r changed_ip changed_relay_pid _changed_subnet _changed_ufw_owned \
+    < "$native_state_file"
+assert_eq "changed gateway replaces relay IP" "127.0.0.3" "$changed_ip"
+assert_eq "changed gateway stops old relay" "false" \
+    "$(kill -0 "$native_relay_pid" 2>/dev/null && echo true || echo false)"
+assert_eq "changed gateway removes old ufw slot" "1" \
+    "$(count_log_matches "ufw delete allow proto tcp from 172.18.0.0/24 to 127.0.0.2 port ${native_host_port}")"
+assert_eq "changed gateway opens new ufw slot" "1" \
+    "$(count_log_matches "ufw allow proto tcp from 172.18.0.0/24 to 127.0.0.3 port ${native_host_port}")"
+stop_host_connection_host_side "$native_host_port"
+assert_eq "host-side teardown removes relay state" "false" \
+    "$([ -f "$native_state_file" ] && echo true || echo false)"
+assert_eq "host-side teardown stops current relay" "false" \
+    "$(kill -0 "$changed_relay_pid" 2>/dev/null && echo true || echo false)"
+kill "$native_service_pid" 2>/dev/null || true
+
+BOXA_CONNECT_TEST_MISSING_SOCAT=true
+missing_socat_output="$(run_boxa connect host 18992 --from source 2>&1 || true)"
+assert_contains "missing host socat prints exact install hint" \
+    "host socat not found. Install it (Debian/Ubuntu: sudo apt-get install -y socat; Fedora/RHEL: sudo dnf install -y socat; Arch: sudo pacman -S socat; macOS: brew install socat). It is required for the Host connection relay on this platform." \
+    "$missing_socat_output"
+assert_eq "missing host socat does not persist failed add" "" \
+    "$(awk -F '\t' '$2 == "host" && $3 == 18992 { print }' "$config_file")"
+BOXA_CONNECT_TEST_MISSING_SOCAT=false
 
 BOXA_CONNECT_TEST_HOST_IP="192.168.65.253"
 start_boxa_connections boxa-source >/dev/null
@@ -225,6 +325,9 @@ assert_contains "connections keeps STATUS column" "STATUS" "$connections_output"
 # Removal tears down the exact root slot and pid-backed forward before deleting
 # the row. With no persisted row, a later replay performs no Docker calls.
 BOXA_CONNECT_TEST_HOST_IP="192.168.65.254"
+start_host_connection_host_side 127.0.0.2 17777
+rm_host_state_file="$(host_connection_state_file 17777)"
+IFS=$'\t' read -r _rm_ip rm_relay_pid _rm_subnet _rm_owned < "$rm_host_state_file"
 rm_output="$(run_boxa connect rm host 17777 --from source)"
 assert_contains "rm reports removed Host target" \
     "Removed Host connection: boxa-source -> host:17777" "$rm_output"
@@ -232,6 +335,12 @@ assert_eq "rm invokes exact root firewall teardown" "1" \
     "$(count_log_matches '/usr/local/bin/stop-host-connection-allow 192.168.65.254 17777')"
 assert_eq "rm invokes node forward teardown" "1" \
     "$(count_log_matches '-u node -e PID_FILE=/tmp/boxa-connect-17777.pid')"
+assert_eq "rm stops native-Docker host relay" "false" \
+    "$(kill -0 "$rm_relay_pid" 2>/dev/null && echo true || echo false)"
+assert_eq "rm removes native-Docker host state" "false" \
+    "$([ -f "$rm_host_state_file" ] && echo true || echo false)"
+assert_eq "rm removes exact native-Docker ufw slot" "1" \
+    "$(count_log_matches 'ufw delete allow proto tcp from 172.18.0.0/24 to 127.0.0.2 port 17777')"
 assert_eq "rm drops persisted row" "0" "$(awk 'END { print NR }' "$config_file")"
 
 calls_before_empty_replay="$(awk 'END { print NR }' "$BOXA_CONNECT_TEST_LOG")"
@@ -303,6 +412,8 @@ assert_contains "help documents Host selection order" \
     "host port -> 15000-15999 checksum slot -> slot+1" "$connect_help"
 assert_contains "help documents explicit local port precedence" \
     "explicit local-port always wins" "$connect_help"
+assert_contains "help documents native-Linux standing firewall rule" \
+    "standing, narrowly scoped host" "$connect_help"
 
 overview_help="$(run_boxa help)"
 assert_contains "overview documents connect host" \
