@@ -51,6 +51,8 @@ Ports & connect:
   boxa connect <target> <port>   Forward one TCP port to another boxa
   boxa connect host <port> [local-port] [--name <label>]
                                    Forward one TCP port from the host
+                                   Auto-port: host port, checksum slot,
+                                   slot+1, then an interactive prompt
   boxa connections               List cross-boxa and Host TCP forwards
 
 Firewall:
@@ -268,7 +270,9 @@ Usage:
 With no arguments, pick a source, target boxaes, and published TCP services.
 The explicit form forwards one TCP port from the source boxa to a target.
 The reserved target `host` forwards a host service; --name sets its label.
-Without an explicit local-port, a Host connection uses the host port verbatim.
+Host auto-port order: host port -> 15000-15999 checksum slot -> slot+1 ->
+interactive prompt. An explicit local-port always wins. The selected port
+is persisted unchanged.
 Inner Docker connects to the forward at 10.0.2.2:<local-port>.
 
 Examples:
@@ -1406,6 +1410,56 @@ allocate_connection_port() {
     return 1
 }
 
+connection_port_is_persisted() {
+    local port="$1" config_file="$2"
+    awk -F '\t' -v p="$port" '$4 == p { found=1 } END { exit found ? 0 : 1 }' \
+        "$config_file" 2>/dev/null
+}
+
+select_host_connection_port() {
+    local source_project="$1" source_container="$2" host_port="$3" config_file="$4"
+    local listening_output checksum checksum_port next_port candidate entered
+
+    if ! listening_output=$(list_listening_ports_in_container "$source_container"); then
+        echo "Could not inspect listening ports in ${source_container}." >&2
+        return 1
+    fi
+
+    checksum=$(printf '%s' "${source_project}:host:${host_port}" | cksum | awk '{print $1}')
+    checksum_port=$((15000 + checksum % 1000))
+    next_port=$((15000 + (checksum_port - 15000 + 1) % 1000))
+
+    for candidate in "$host_port" "$checksum_port" "$next_port"; do
+        if ! grep -qxF "$candidate" <<< "$listening_output" \
+            && ! connection_port_is_persisted "$candidate" "$config_file"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+
+    while true; do
+        printf 'Local port (1-65535): ' >&2
+        if ! IFS= read -r entered; then
+            echo "No local port selected." >&2
+            return 1
+        fi
+        if ! [[ "$entered" =~ ^[0-9]+$ ]] || [ "$entered" -lt 1 ] || [ "$entered" -gt 65535 ]; then
+            echo "Local port must be a number from 1 to 65535." >&2
+            continue
+        fi
+        if grep -qxF "$entered" <<< "$listening_output"; then
+            echo "Local port ${entered} is already bound inside ${source_container}." >&2
+            continue
+        fi
+        if connection_port_is_persisted "$entered" "$config_file"; then
+            echo "Local port ${entered} is already used by a persisted connection." >&2
+            continue
+        fi
+        printf '%s' "$entered"
+        return 0
+    done
+}
+
 start_container_connection() {
     local source_container="$1" target_container="$2" target_port="$3" local_port="$4" alias="$5"
     local log_file="/tmp/boxa-connect-${local_port}.log"
@@ -1421,7 +1475,14 @@ start_container_connection() {
         "$source_container" bash -lc '
             set -euo pipefail
             if ss -ltn "sport = :${LOCAL_PORT}" | grep -q ":${LOCAL_PORT}"; then
-                exit 0
+                if [ -f "$PID_FILE" ]; then
+                    pid="$(cat "$PID_FILE")"
+                    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+                        exit 0
+                    fi
+                fi
+                echo "Local port ${LOCAL_PORT} is already bound by another process." >&2
+                exit 1
             fi
             if ! command -v socat >/dev/null 2>&1; then
                 echo "socat is not installed in this boxa image." >&2
@@ -1550,6 +1611,23 @@ list_listening_ports_in_container() {
                  print port
                }' \
         | sort -un
+}
+
+# Print the local ports whose boxa-managed forward PID is still alive. This is
+# paired with the listener probe by `boxa connections`, so an unrelated process
+# that steals a persisted port is reported as down rather than as our forward.
+list_running_connection_ports_in_container() {
+    local container="$1"
+    docker exec -u node "$container" bash -lc '
+        for pid_file in /tmp/boxa-connect-*.pid; do
+            [ -f "$pid_file" ] || continue
+            pid="$(cat "$pid_file")"
+            [[ "$pid" =~ ^[0-9]+$ ]] || continue
+            kill -0 "$pid" 2>/dev/null || continue
+            port="${pid_file#/tmp/boxa-connect-}"
+            printf "%s\n" "${port%.pid}"
+        done
+    ' | sort -un
 }
 
 discover_published_tcp_services() {
@@ -3475,7 +3553,7 @@ if [ "$MODE" = "connect" ]; then
         if [ -n "$existing" ]; then
             LOCAL_PORT="$existing"
         elif [ "$TARGET_CONTAINER" = host ]; then
-            LOCAL_PORT="$TARGET_PORT"
+            LOCAL_PORT="$(select_host_connection_port "$SOURCE_PROJECT" "$SOURCE_CONTAINER" "$TARGET_PORT" "$CONFIG_FILE")"
         else
             LOCAL_PORT="$(allocate_connection_port "$SOURCE_PROJECT" "$TARGET_CONTAINER" "$TARGET_PORT" "$CONFIG_FILE")"
         fi
@@ -3519,6 +3597,7 @@ if [ "$MODE" = "connections" ]; then
         fi
 
         declare -A listen_set=()
+        declare -A running_forward_set=()
         probe_failed=false
         if [ "$source_running" = true ]; then
             if listening_output=$(list_listening_ports_in_container "$source_container"); then
@@ -3534,6 +3613,16 @@ if [ "$MODE" = "connections" ]; then
                 probe_failed=true
                 echo "WARNING: could not probe listeners in ${source_container}; STATUS shown as 'down'." >&2
             fi
+            if running_forward_output=$(list_running_connection_ports_in_container "$source_container"); then
+                if [ -n "$running_forward_output" ]; then
+                    while IFS= read -r running_forward_port; do
+                        running_forward_set["$running_forward_port"]=1
+                    done <<< "$running_forward_output"
+                fi
+            else
+                probe_failed=true
+                echo "WARNING: could not probe connection processes in ${source_container}; STATUS shown as 'down'." >&2
+            fi
         fi
 
         while IFS=$'\t' read -r alias target_container target_port local_port; do
@@ -3547,7 +3636,9 @@ if [ "$MODE" = "connections" ]; then
             #             liveness probe could not confirm it)
             if [ "$source_running" = false ]; then
                 status="stopped"
-            elif [ "$probe_failed" = false ] && [ -n "$local_port" ] && [ "${listen_set[$local_port]:-0}" = 1 ]; then
+            elif [ "$probe_failed" = false ] && [ -n "$local_port" ] \
+                && [ "${listen_set[$local_port]:-0}" = 1 ] \
+                && [ "${running_forward_set[$local_port]:-0}" = 1 ]; then
                 status="up"
             else
                 status="down"

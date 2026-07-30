@@ -13,7 +13,17 @@ trap 'rm -rf "$_TMPROOT"' EXIT
 mkdir -p "$_TMPROOT/home"
 export BOXA_CONNECT_TEST_LOG="$_TMPROOT/docker.log"
 export BOXA_CONNECT_TEST_HOST_IP="192.168.65.254"
+export BOXA_CONNECT_TEST_BOUND_PORTS=""
+export BOXA_CONNECT_TEST_FORWARD_PORTS=""
 : > "$BOXA_CONNECT_TEST_LOG"
+
+# Keep list_listening_ports_in_container's timeout path compatible with the
+# exported docker function used by this test harness.
+timeout() {
+    shift
+    "$@"
+}
+export -f timeout
 
 # docker-run.sh is host-side; this stub records the privileged and node execs
 # while presenting one running source Container. Resolution deliberately comes
@@ -24,12 +34,22 @@ docker() {
         ps)
             case "$*" in
                 *'{{.Names}}'*) printf '%s\n' 'boxa-source' ;;
+                *'{{.ID}}'*) printf '%s\n' 'source-id' ;;
             esac
             ;;
         exec)
             case "$*" in
                 *'getent ahostsv4 host.docker.internal'*)
                     printf '%s\n' "$BOXA_CONNECT_TEST_HOST_IP"
+                    ;;
+                *'cat /proc/net/tcp /proc/net/tcp6'*)
+                    local port
+                    for port in ${BOXA_CONNECT_TEST_BOUND_PORTS//,/ }; do
+                        printf '  0: 0100007F:%04X 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 0 1 0000000000000000 100 0 0 10 0\n' "$port"
+                    done
+                    ;;
+                *'for pid_file in /tmp/boxa-connect-'*)
+                    printf '%s\n' "${BOXA_CONNECT_TEST_FORWARD_PORTS//,/$'\n'}"
                     ;;
             esac
             ;;
@@ -126,8 +146,8 @@ count_log_matches() {
 
 config_file="$_TMPROOT/home/.config/boxa/connect/source.tsv"
 
-# Add: `host` stays literal, --name is the alias, and the naive default mirrors
-# the Host port. The root firewall call is scoped to the freshly resolved IP
+# Add: `host` stays literal, --name is the alias, and a free Host port mirrors
+# locally. The root firewall call is scoped to the freshly resolved IP
 # and exact TCP port; socat setup remains a separate node-user exec.
 add_output="$(run_boxa connect host 17777 --name keep-awake --from source)"
 assert_contains "add reports Host target" \
@@ -206,11 +226,70 @@ start_boxa_connections boxa-source >/dev/null
 assert_eq "removed entry is not replayed" "$calls_before_empty_replay" \
     "$(awk 'END { print NR }' "$BOXA_CONNECT_TEST_LOG")"
 
+# A bound mirror falls back to the deterministic ADR 0019 checksum slot.
+fallback_host_port=17778
+checksum=$(printf '%s' "source:host:${fallback_host_port}" | cksum | awk '{print $1}')
+checksum_port=$((15000 + checksum % 1000))
+next_port=$((15000 + (checksum_port - 15000 + 1) % 1000))
+BOXA_CONNECT_TEST_BOUND_PORTS="$fallback_host_port"
+run_boxa connect host "$fallback_host_port" --from source >/dev/null
+assert_eq "bound mirror selects checksum fallback" "$checksum_port" \
+    "$(awk -F '\t' -v p="$fallback_host_port" '$3 == p { print $4 }' "$config_file")"
+run_boxa connect rm host "$fallback_host_port" --from source >/dev/null
+
+# A bound mirror and checksum slot use exactly slot+1 (wrapping in the pool).
+BOXA_CONNECT_TEST_BOUND_PORTS="${fallback_host_port},${checksum_port}"
+run_boxa connect host "$fallback_host_port" --from source >/dev/null
+assert_eq "bound mirror and checksum select slot+1" "$next_port" \
+    "$(awk -F '\t' -v p="$fallback_host_port" '$3 == p { print $4 }' "$config_file")"
+run_boxa connect rm host "$fallback_host_port" --from source >/dev/null
+
+# With all deterministic candidates bound, invalid and occupied answers are
+# rejected until a free interactive answer can be persisted.
+prompt_port=18888
+BOXA_CONNECT_TEST_BOUND_PORTS="${fallback_host_port},${checksum_port},${next_port}"
+prompt_output="$(printf 'invalid\n%s\n%s\n' "$checksum_port" "$prompt_port" \
+    | run_boxa connect host "$fallback_host_port" --from source 2>&1)"
+assert_contains "prompt validates numeric range" \
+    "Local port must be a number from 1 to 65535." "$prompt_output"
+assert_contains "prompt rejects an occupied port" \
+    "Local port ${checksum_port} is already bound inside boxa-source." "$prompt_output"
+assert_eq "prompt persists entered free port" "$prompt_port" \
+    "$(awk -F '\t' -v p="$fallback_host_port" '$3 == p { print $4 }' "$config_file")"
+
+# Re-add and replay both use the persisted port, even when every automatic
+# candidate and the persisted port are now occupied; neither reads stdin.
+BOXA_CONNECT_TEST_BOUND_PORTS="${BOXA_CONNECT_TEST_BOUND_PORTS},${prompt_port}"
+readd_output="$(run_boxa connect host "$fallback_host_port" --from source </dev/null)"
+assert_contains "re-add keeps persisted local port" \
+    "10.0.2.2:${prompt_port}" "$readd_output"
+replay_calls_before="$(count_log_matches 'cat /proc/net/tcp /proc/net/tcp6')"
+start_boxa_connections boxa-source >/dev/null
+assert_eq "replay never rescans occupied persisted port" "$replay_calls_before" \
+    "$(count_log_matches 'cat /proc/net/tcp /proc/net/tcp6')"
+stolen_output="$(run_boxa connections)"
+stolen_row="$(awk -v target="host:${fallback_host_port}" '$2 == target { print }' <<< "$stolen_output")"
+assert_contains "stolen persisted port is reported down" "down" "$stolen_row"
+
+# An explicit local port wins without scanning the mirror or fallbacks.
+run_boxa connect rm host "$fallback_host_port" --from source >/dev/null
+explicit_port=18889
+scan_calls_before="$(count_log_matches 'cat /proc/net/tcp /proc/net/tcp6')"
+run_boxa connect host "$fallback_host_port" "$explicit_port" --from source >/dev/null
+assert_eq "explicit local port skips selection scan" "$scan_calls_before" \
+    "$(count_log_matches 'cat /proc/net/tcp /proc/net/tcp6')"
+assert_eq "explicit local port is persisted" "$explicit_port" \
+    "$(awk -F '\t' -v p="$fallback_host_port" '$3 == p { print $4 }' "$config_file")"
+
 connect_help="$(run_boxa help connect)"
 assert_contains "help documents connect host" \
     "boxa connect host <port> [local-port]" "$connect_help"
 assert_contains "help documents --name" "--name <label>" "$connect_help"
 assert_contains "help documents Host rm" "boxa connect rm host <port>" "$connect_help"
+assert_contains "help documents Host selection order" \
+    "host port -> 15000-15999 checksum slot -> slot+1" "$connect_help"
+assert_contains "help documents explicit local port precedence" \
+    "explicit local-port always wins" "$connect_help"
 
 overview_help="$(run_boxa help)"
 assert_contains "overview documents connect host" \

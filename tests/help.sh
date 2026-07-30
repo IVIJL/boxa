@@ -81,6 +81,16 @@ assert_contains "fallback prints standard footer" \
 overview_help="$(run_boxa help)"
 assert_contains "overview advertises command help" \
     "Run 'boxa <command> --help' for details." "$overview_help"
+assert_contains "overview summarizes Host port selection order" \
+    "Auto-port: host port, checksum slot," "$overview_help"
+
+connect_help="$(run_boxa help connect)"
+assert_contains "connect help documents Host port selection order" \
+    "host port -> 15000-15999 checksum slot -> slot+1" "$connect_help"
+assert_contains "connect help documents prompt fallback" \
+    "slot+1 ->" "$connect_help"
+assert_contains "connect help documents explicit local port precedence" \
+    "explicit local-port always wins" "$connect_help"
 
 unknown_output="$(run_boxa help not-a-command 2>&1)"
 unknown_rc=$?
