@@ -782,6 +782,37 @@ setup_mcp_onboarding() {
     fi
 }
 
+# --- Keep-awake elective (ADR 0017 / ADR 0023) ------------------------------
+
+setup_keep_awake() {
+    info "Checking optional keep-awake daemon..."
+
+    local hook="$BOXA_DIR/scripts/ensure-keep-awake.sh"
+    if [ ! -x "$hook" ]; then
+        warn "scripts/ensure-keep-awake.sh missing or non-executable; skipping."
+        SKIPPED+=("keep-awake (hook missing)")
+        return
+    fi
+
+    local hook_args=(offer)
+    if $AUTO_YES; then
+        hook_args+=(--yes)
+    elif [ ! -t 0 ] || [ ! -t 1 ]; then
+        hook_args+=(--non-interactive)
+    fi
+
+    if "$hook" "${hook_args[@]}"; then
+        case "$("$hook" probe)" in
+            ok)       CONFIGURED+=("keep-awake daemon + platform autostart + global Host connection") ;;
+            declined) SKIPPED+=("keep-awake (declined; run 'boxa keep-awake enable' later)") ;;
+            *)        SKIPPED+=("keep-awake (not enabled; run 'boxa keep-awake enable' later)") ;;
+        esac
+    else
+        warn "Keep-awake setup failed — run 'boxa keep-awake enable' after fixing the reported prerequisite."
+        SKIPPED+=("keep-awake (setup failed; no partial state left behind)")
+    fi
+}
+
 # --- SSH agent configuration -------------------------------------------------
 
 configure_ssh_agent() {
@@ -1542,6 +1573,7 @@ main() {
         msg " 15. Detect your terminal and print the clipboard-image keybinding snippet"
         msg " 16. Optionally generate Claude Code token for containers"
         msg " 17. Check Docker availability"
+        msg " 18. Offer the optional keep-awake daemon (platform autostart + global Host connection)"
         echo ""
         if ! confirm "Continue?"; then
             msg "Aborted."
@@ -1610,6 +1642,9 @@ main() {
     echo ""
     check_docker
     add_docker_group
+
+    echo ""
+    setup_keep_awake
 
     print_summary
 }

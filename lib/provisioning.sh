@@ -32,8 +32,9 @@
 # (never decided). A non-mutating PROBE (`boxa::provisioning_probe <id>`)
 # reports that state; the matching REPAIR (`boxa::repair_elective <id>`) runs
 # the existing action for that step. Probe and repair read the SAME source of
-# truth (the https.conf opt-out, the MCP onboarding state, the token files), so
-# the report can never disagree with what a fix would do (ADR 0017 § 3).
+# truth (the https.conf opt-out, keep-awake marker/runtime state, MCP onboarding
+# state, and token files), so the report can never disagree with what a fix
+# would do (ADR 0017 § 3).
 # =============================================================================
 
 # --- Sourcing guard ----------------------------------------------------------
@@ -58,6 +59,7 @@ BOXA_PROVISIONING_STEPS=(
     "agent-allowlist-example|scripts/ensure-agent-allowlist-example.sh|A"
     "boxa-skill|scripts/ensure-boxa-skill.sh|A"
     "completions|scripts/ensure-completions.sh|A"
+    "keep-awake|scripts/ensure-keep-awake.sh|B"
     "mcp-onboarding|scripts/ensure-mcp-onboarding.sh|B"
     "claude-token|-|B"
     "https|-|B"
@@ -65,6 +67,7 @@ BOXA_PROVISIONING_STEPS=(
     "docker|-|C"
     "docker-group|-|C"
     "boxa-symlink|-|C"
+    "go|-|C"
 )
 
 # --- Registry accessors ------------------------------------------------------
@@ -146,6 +149,14 @@ boxa::provisioning_probe() {
                 printf 'declined'
             fi
             ;;
+        keep-awake)
+            local keep_awake_script="$BOXA_DIR/scripts/ensure-keep-awake.sh"
+            if [ ! -x "$keep_awake_script" ]; then
+                printf 'missing'
+            else
+                "$keep_awake_script" probe
+            fi
+            ;;
         *)
             printf 'missing'; return 2 ;;
     esac
@@ -167,6 +178,7 @@ _boxa::json_bool() {
 #   https         -> _boxa::run_https_upgrade (defined in docker-run.sh; in
 #                    scope when `boxa doctor` runs in-process)
 #   mcp-onboarding -> scripts/ensure-mcp-onboarding.sh (interactive offer)
+#   keep-awake    -> scripts/ensure-keep-awake.sh enable
 #   claude-token  -> re-exec the `boxa claude-token` command
 # Returns the action's exit status.
 boxa::repair_elective() {
@@ -190,6 +202,9 @@ boxa::repair_elective() {
                     python3 -m mcp.cli onboarding-rearm >/dev/null 2>&1 || true
             fi
             "$BOXA_DIR/scripts/ensure-mcp-onboarding.sh"
+            ;;
+        keep-awake)
+            "$BOXA_DIR/scripts/ensure-keep-awake.sh" enable
             ;;
         claude-token)
             "$BOXA_DIR/docker-run.sh" claude-token
@@ -257,6 +272,17 @@ boxa::prereq_state() {
                 printf 'missing'
             fi
             ;;
+        go)
+            # Go is required only while obtaining the elective keep-awake
+            # binary. A declined step or an already-installed binary makes
+            # this prerequisite not applicable.
+            if [ "$(boxa::provisioning_probe keep-awake 2>/dev/null || true)" = "declined" ] \
+                || "$BOXA_DIR/scripts/ensure-keep-awake.sh" go-prereq >/dev/null 2>&1; then
+                printf 'ok'
+            else
+                printf 'missing'
+            fi
+            ;;
         *)
             printf 'missing'; return 2 ;;
     esac
@@ -274,6 +300,8 @@ boxa::prereq_remedy() {
             printf 'Run: sudo usermod -aG docker %s  — then log out and back in.' "${USER:-$(id -un)}" ;;
         boxa-symlink)
             printf 'Re-run install.sh to (re)create the boxa command symlink at %s.' "$BOXA_SYMLINK_PATH" ;;
+        go)
+            "$BOXA_DIR/scripts/ensure-keep-awake.sh" go-remedy ;;
         *)
             printf 'Unknown prerequisite %s.' "$id" ;;
     esac

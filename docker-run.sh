@@ -81,6 +81,7 @@ Maintenance:
                                    Build/rebuild the boxa image
   boxa update                    Update boxa (pull repo + rebuild image)
   boxa doctor [--fix [step…]]    Check or repair host provisioning
+  boxa keep-awake <command>      Manage the optional host keep-awake daemon
   boxa prune [--all]             Remove build cache + dangling images (never volumes)
   boxa uninstall [--purge-ca]    Remove everything (containers, volumes, image).
   boxa claude-token              Generate/regenerate Claude Code token
@@ -217,6 +218,21 @@ Examples:
   boxa doctor --fix mcp-onboarding
 EOF
             ;;
+        keep-awake)
+            cat <<'EOF'
+Usage: boxa keep-awake <enable|disable|status>
+
+Manage the optional host daemon that prevents idle sleep while coding agents
+hold active leases. Enable builds it from the checked-out Go source, installs
+platform autostart, starts it, and creates a global Host connection on port
+17777. Disable reverses those changes; status reports every component.
+
+Commands:
+  enable   Build, install, start, and expose keep-awake to every box
+  disable  Stop and remove keep-awake, autostart, and its Host connection
+  status   Report daemon reachability, holders, autostart, and Host connection
+EOF
+            ;;
         build)
             cat <<'EOF'
 Usage: boxa build [--no-cache|--clean|--progress=plain]
@@ -329,7 +345,7 @@ EOF
     esac
 
     case "$command" in
-        agent-browser|mcp|allow-for|allow|mem|doctor|build|uninstall|ports|connect|dns-install|dns-status|dns-uninstall) ;;
+        agent-browser|mcp|allow-for|allow|mem|doctor|keep-awake|build|uninstall|ports|connect|dns-install|dns-status|dns-uninstall) ;;
         *) printf "\nRun 'boxa <command> --help' for details.\n" ;;
     esac
     exit 0
@@ -3161,6 +3177,7 @@ case "${1:-}" in
     build)     MODE="build";     shift ;;
     update)    MODE="update";    shift ;;
     doctor)    MODE="doctor";    shift; DOCTOR_ARGS=("$@") ;;
+    keep-awake) MODE="keep-awake"; shift; KEEP_AWAKE_ARGS=("$@") ;;
     dns-install)   MODE="dns-install";   shift ;;
     dns-status)    MODE="dns-status";    shift ;;
     dns-uninstall) MODE="dns-uninstall"; shift ;;
@@ -3177,6 +3194,18 @@ esac
 if [ "$MODE" = "ls" ]; then
     list_running_containers
     exit 0
+fi
+
+# --- boxa keep-awake -------------------------------------------------------
+
+if [ "$MODE" = "keep-awake" ]; then
+    keep_awake_command="${KEEP_AWAKE_ARGS[0]:-}"
+    if [ "${#KEEP_AWAKE_ARGS[@]}" -ne 1 ] \
+        || [[ "$keep_awake_command" != enable && "$keep_awake_command" != disable && "$keep_awake_command" != status ]]; then
+        echo "Usage: boxa keep-awake <enable|disable|status>" >&2
+        exit 2
+    fi
+    exec "$BOXA_DIR/scripts/ensure-keep-awake.sh" "$keep_awake_command"
 fi
 
 # --- boxa mem [project|path] -----------------------------------------------
@@ -3596,6 +3625,13 @@ if [ "$MODE" = "uninstall" ]; then
     # stops and removes the Containers needed to correlate those events.
     if [ -x "$BOXA_DIR/scripts/sweep-oom-events.sh" ]; then
         "$BOXA_DIR/scripts/sweep-oom-events.sh" || true
+    fi
+    # Keep-awake owns host autostart outside Docker. Tear it down before the
+    # existing Host connection sweep and leave that connection to the sweep's
+    # canonical removal path.
+    if [ -x "$BOXA_DIR/scripts/ensure-keep-awake.sh" ]; then
+        "$BOXA_DIR/scripts/ensure-keep-awake.sh" teardown \
+            --keep-connection --remove-state || true
     fi
     sweep_host_connections
     exec "$BOXA_DIR/build.sh" --uninstall "$@"

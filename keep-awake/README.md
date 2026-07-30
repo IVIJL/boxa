@@ -32,6 +32,6 @@ Only literal IP addresses are accepted and wildcard addresses (`0.0.0.0` and
 `::`) are rejected. Binding the port is the single-instance guard. The only
 disk write is the append-only `keep-awake.log`, configurable with `-log-file`.
 
-Linux uses a managed `systemd-inhibit --what=idle:sleep` process and macOS
-uses a managed `caffeinate -i` process. The Windows backend is a compile-only
-unsupported placeholder for issue 09.
+Linux uses a managed `systemd-inhibit --what=idle:sleep` process, macOS uses a
+managed `caffeinate -i` process, and Windows uses `SetThreadExecutionState` on
+a dedicated OS thread.

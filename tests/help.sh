@@ -42,11 +42,17 @@ assert_contains() {
     fi
 }
 
-for command in agent-browser mcp allow-for mem doctor build ports connect; do
+for command in agent-browser mcp allow-for mem doctor keep-awake build ports connect; do
     direct_help="$(run_boxa "$command" --help)"
     help_command="$(run_boxa help "$command")"
     assert_eq "$command help forms match" "$help_command" "$direct_help"
 done
+
+keep_awake_help="$(run_boxa help keep-awake)"
+assert_contains "keep-awake help documents lifecycle commands" \
+    "Usage: boxa keep-awake <enable|disable|status>" "$keep_awake_help"
+assert_contains "keep-awake help documents global Host connection" \
+    "creates a global Host connection on port" "$keep_awake_help"
 
 agent_help="$(run_boxa help agent-browser)"
 assert_contains "agent-browser lists blocked" \
@@ -87,6 +93,8 @@ assert_contains "overview documents global Host scope" \
     "[--all]" "$overview_help"
 assert_contains "overview warns global Host scope trusts every box" \
     "--all trusts it in every present/future box" "$overview_help"
+assert_contains "overview lists keep-awake" \
+    "boxa keep-awake <command>" "$overview_help"
 
 connect_help="$(run_boxa help connect)"
 assert_contains "connect help documents Host port selection order" \

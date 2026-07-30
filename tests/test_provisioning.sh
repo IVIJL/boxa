@@ -41,6 +41,28 @@ for s in mkcert agent-browser-helpers agent-browser-host-state \
     printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/scripts/ensure-$s.sh"
     chmod +x "$tmp/scripts/ensure-$s.sh"
 done
+cat > "$tmp/scripts/ensure-keep-awake.sh" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    probe)
+        if [ -f "$BOXA_DIR/_keep_awake_state" ]; then
+            cat "$BOXA_DIR/_keep_awake_state"
+        else
+            printf 'missing\n'
+        fi
+        ;;
+    enable)
+        printf 'ok\n' > "$BOXA_DIR/_keep_awake_state"
+        ;;
+    go-prereq)
+        [ ! -f "$BOXA_DIR/_go_missing" ]
+        ;;
+    go-remedy)
+        printf 'Run: install-go-for-test\n'
+        ;;
+esac
+EOF
+chmod +x "$tmp/scripts/ensure-keep-awake.sh"
 
 # shellcheck source=../lib/provisioning.sh disable=SC1091
 source "$REPO_DIR/lib/provisioning.sh"
@@ -51,8 +73,8 @@ check "field id"       "allow-for-host-state" "$(boxa::provisioning_field "$entr
 check "field script"   "scripts/ensure-allow-for-host-state.sh" "$(boxa::provisioning_field "$entry" script)"
 check "field category" "A" "$(boxa::provisioning_field "$entry" category)"
 
-# --- Registry: 9 category-A + 3 category-B + 4 category-C steps ---------------
-check "registry size" "16" "${#BOXA_PROVISIONING_STEPS[@]}"
+# --- Registry: 9 category-A + 4 category-B + 5 category-C steps ---------------
+check "registry size" "18" "${#BOXA_PROVISIONING_STEPS[@]}"
 
 # --- First run repairs the one stub that has work, rest already OK ------------
 boxa::run_provisioning repair-a >/dev/null
@@ -121,6 +143,16 @@ printf 'x\n' > "$HOME/.config/boxa/claude-token"
 check "probe token ok"      "ok"      "$(boxa::provisioning_probe claude-token)"
 rm "$HOME/.config/boxa/claude-token"
 
+# Probe and repair: keep-awake uses the canonical ensure script for both paths.
+rm -f "$tmp/_keep_awake_state"
+check "probe keep-awake missing" "missing" "$(boxa::provisioning_probe keep-awake)"
+printf 'declined\n' > "$tmp/_keep_awake_state"
+check "probe keep-awake declined" "declined" "$(boxa::provisioning_probe keep-awake)"
+boxa::run_provisioning fix keep-awake >/dev/null
+check "fix keep-awake reuses enable" "keep-awake" "${BOXA_PROVISIONING_REPAIRED[*]}"
+check "fix keep-awake reaches ok" "ok" "$(boxa::provisioning_probe keep-awake)"
+rm -f "$tmp/_keep_awake_state"
+
 # Stub the MCP Python core so the mcp-onboarding probe is DETERMINISTIC,
 # independent of any ambient `mcp` package in site-packages: shouldOffer=true
 # (missing) until a marker file appears, then profileExists=true (ok). The
@@ -141,12 +173,12 @@ if len(sys.argv) > 1 and sys.argv[1] == "onboarding-status":
         print('{ "shouldOffer": true, "profileExists": false, "seen": false }')
 PYEOF
 
-# report-electives: no mutation, classifies all three as missing in this fixture
-# (https stub unset; no token; mcp stub returns shouldOffer -> missing).
+# report-electives: no mutation, classifies all four as missing in this fixture
+# (keep-awake unset; https unset; no token; MCP shouldOffer -> missing).
 # shellcheck disable=SC2034  # read by the sourced https.sh stub via subshell
 TEST_HTTPS_STATE=""
 boxa::run_provisioning report-electives >/dev/null
-check "report missing count" "3" "${#BOXA_PROVISIONING_MISSING[@]}"
+check "report missing count" "4" "${#BOXA_PROVISIONING_MISSING[@]}"
 
 # fix re-probes after the action (P2): an action that runs but does NOT resolve
 # the elective is reported as still-missing, never faked as repaired.
@@ -207,6 +239,11 @@ check "prereq symlink rejects non-link" "missing" "$(boxa::prereq_state boxa-sym
 # remedy is a non-empty instruction
 if [ -n "$(boxa::prereq_remedy docker)" ]; then _r=0; else _r=1; fi
 check "prereq remedy nonempty" "0" "$_r"
+# Go is a diagnose-only prerequisite while keep-awake still needs its binary.
+touch "$tmp/_go_missing"
+check "prereq Go missing" "missing" "$(boxa::prereq_state go)"
+check "prereq Go exact remedy" "Run: install-go-for-test" "$(boxa::prereq_remedy go)"
+rm -f "$tmp/_go_missing"
 # default mode diagnoses a forced-missing prerequisite WITHOUT mutating it
 export BOXA_SYMLINK_PATH="$tmp/no-such-boxa"
 boxa::run_provisioning default >/dev/null 2>&1
