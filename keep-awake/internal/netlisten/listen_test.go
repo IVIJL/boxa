@@ -8,21 +8,38 @@ import (
 	"testing"
 )
 
-func TestAddressesAreLoopbackPlusExplicitAndNeverWildcard(t *testing.T) {
-	addresses, err := Addresses([]string{"192.168.65.1", "127.0.0.1", "::1"})
+func TestAddressesAllowLoopbackWithoutUnsafeOptIn(t *testing.T) {
+	addresses, err := Addresses([]string{"127.0.0.1", "::1"}, false)
 	if err != nil {
 		t.Fatalf("Addresses: %v", err)
 	}
-	want := []string{"127.0.0.1", "192.168.65.1", "::1"}
+	want := []string{"127.0.0.1", "::1"}
 	if strings.Join(addresses, ",") != strings.Join(want, ",") {
 		t.Fatalf("addresses=%v, want %v", addresses, want)
 	}
+	if _, err := Addresses([]string{"192.168.65.1"}, false); err == nil || !strings.Contains(err.Error(), "-listen-unsafe") {
+		t.Fatalf("non-loopback address did not require -listen-unsafe: %v", err)
+	}
+}
+
+func TestAddressesAllowSpecificNonLoopbackWithUnsafeOptIn(t *testing.T) {
+	addresses, err := Addresses([]string{"192.168.65.1"}, true)
+	if err != nil {
+		t.Fatalf("Addresses: %v", err)
+	}
+	want := []string{"127.0.0.1", "192.168.65.1"}
+	if strings.Join(addresses, ",") != strings.Join(want, ",") {
+		t.Fatalf("addresses=%v, want %v", addresses, want)
+	}
+}
+
+func TestAddressesNeverAllowWildcardOrHostname(t *testing.T) {
 	for _, wildcard := range []string{"0.0.0.0", "::"} {
-		if _, err := Addresses([]string{wildcard}); err == nil {
+		if _, err := Addresses([]string{wildcard}, true); err == nil {
 			t.Fatalf("wildcard %s was accepted", wildcard)
 		}
 	}
-	if _, err := Addresses([]string{"bridge.example"}); err == nil {
+	if _, err := Addresses([]string{"bridge.example"}, true); err == nil {
 		t.Fatal("hostname was accepted as a listen address")
 	}
 }

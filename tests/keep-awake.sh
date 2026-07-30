@@ -220,9 +220,22 @@ export BOXA_KEEP_AWAKE_INSTALL_DIR="$TMPROOT/windows-install"
 "$KEEP_AWAKE" enable >/dev/null
 assert_eq "Windows enable creates scheduled task" true "$(file_exists "$KEEP_AWAKE_TEST_TASK")"
 assert_contains "Windows task is scheduled at logon" "/SC ONLOGON" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+windows_wrapper="$TMPROOT/windows-install/start-keep-awake.ps1"
+assert_eq "Windows task installs runtime gateway wrapper" true "$(file_exists "$windows_wrapper")"
+assert_contains "Windows wrapper resolves vEthernet address at each start" \
+    "Get-NetIPAddress -AddressFamily IPv4" "$(cat "$windows_wrapper")"
+assert_contains "Windows wrapper retries while vEthernet is unavailable" \
+    "Start-Sleep -Seconds 2" "$(cat "$windows_wrapper")"
+assert_contains "Windows wrapper opts into the resolved non-loopback bind" \
+    "'-listen-address', \$gateway, '-listen-unsafe'" "$(cat "$windows_wrapper")"
+assert_contains "Windows wrapper logs loopback-only fallback" \
+    "starting with loopback-only binding" "$(cat "$windows_wrapper")"
+assert_eq "Windows task does not bake in the current WSL gateway" "0" \
+    "$(grep -c '172\.30\.96\.1' "$KEEP_AWAKE_TEST_LOG" || true)"
 assert_contains "Windows build targets Windows" "go GOOS=windows" "$(cat "$KEEP_AWAKE_TEST_LOG")"
 "$KEEP_AWAKE" disable >/dev/null
 assert_eq "Windows disable deletes scheduled task" false "$(file_exists "$KEEP_AWAKE_TEST_TASK")"
+assert_eq "Windows disable removes runtime gateway wrapper" false "$(file_exists "$windows_wrapper")"
 
 # Public CLI routes the three subcommands to the canonical helper and exposes
 # dedicated help without requiring Docker.

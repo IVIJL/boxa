@@ -32,10 +32,11 @@ func (s *stringList) Set(value string) error {
 }
 
 type config struct {
-	port       int
-	extra      stringList
-	defaultTTL time.Duration
-	logFile    string
+	port         int
+	extra        stringList
+	listenUnsafe bool
+	defaultTTL   time.Duration
+	logFile      string
 }
 
 func main() { os.Exit(realMain()) }
@@ -43,7 +44,8 @@ func main() { os.Exit(realMain()) }
 func realMain() (exitCode int) {
 	cfg := config{}
 	flag.IntVar(&cfg.port, "port", 17777, "HTTP listen port")
-	flag.Var(&cfg.extra, "listen-address", "additional bridge/vEthernet IP address (repeatable; wildcards forbidden)")
+	flag.Var(&cfg.extra, "listen-address", "additional IP address (repeatable; non-loopback requires -listen-unsafe; wildcards forbidden)")
+	flag.BoolVar(&cfg.listenUnsafe, "listen-unsafe", false, "WARNING: allow -listen-address to bind non-loopback interfaces, including LAN-facing ones")
 	flag.DurationVar(&cfg.defaultTTL, "default-ttl", 15*time.Minute, "lease TTL when the request omits ttl")
 	flag.StringVar(&cfg.logFile, "log-file", "keep-awake.log", "append-only daemon and crash log")
 	flag.Parse()
@@ -70,7 +72,7 @@ func realMain() (exitCode int) {
 		logger.Printf("port must be between 1 and 65535")
 		return 2
 	}
-	addresses, err := netlisten.Addresses(cfg.extra)
+	addresses, err := netlisten.Addresses(cfg.extra, cfg.listenUnsafe)
 	if err != nil {
 		logger.Printf("invalid configuration: %v", err)
 		return 2

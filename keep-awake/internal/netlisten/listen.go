@@ -12,8 +12,9 @@ var defaultAddresses = []string{"127.0.0.1"}
 type ListenFunc func(network, address string) (net.Listener, error)
 
 // Addresses combines the safe loopback default with explicitly configured IP
-// addresses. Unspecified wildcard addresses are always rejected.
-func Addresses(extra []string) ([]string, error) {
+// addresses. Non-loopback addresses require an explicit unsafe opt-in, while
+// unspecified wildcard addresses are always rejected.
+func Addresses(extra []string, allowUnsafe bool) ([]string, error) {
 	all := append(append([]string(nil), defaultAddresses...), extra...)
 	seen := make(map[string]bool, len(all))
 	result := make([]string, 0, len(all))
@@ -24,6 +25,9 @@ func Addresses(extra []string) ([]string, error) {
 		}
 		if ip.IsUnspecified() {
 			return nil, fmt.Errorf("listen address %q is a wildcard and is not allowed", address)
+		}
+		if !ip.IsLoopback() && !allowUnsafe {
+			return nil, fmt.Errorf("listen address %q is not loopback; pass -listen-unsafe to allow it", address)
 		}
 		canonical := ip.String()
 		if !seen[canonical] {

@@ -25,12 +25,14 @@ The daemon listens on `127.0.0.1:17777` by default. Add each container or WSL
 arrival interface explicitly, for example:
 
 ```text
-keep-awake -listen-address 192.168.65.1 -listen-address 172.17.0.1
+keep-awake -listen-unsafe -listen-address 192.168.65.1 -listen-address 172.17.0.1
 ```
 
-Only literal IP addresses are accepted and wildcard addresses (`0.0.0.0` and
-`::`) are rejected. Binding the port is the single-instance guard. The only
-disk write is the append-only `keep-awake.log`, configurable with `-log-file`.
+Only loopback addresses are accepted unless `-listen-unsafe` explicitly opts
+into non-loopback interfaces, which may include LAN-facing ones. Only literal
+IP addresses are accepted and wildcard addresses (`0.0.0.0` and `::`) are
+always rejected. Binding the port is the single-instance guard. The only disk
+write is the append-only `keep-awake.log`, configurable with `-log-file`.
 
 Linux uses a managed `systemd-inhibit --what=idle:sleep` process, macOS uses a
 managed `caffeinate -i` process, and Windows uses `SetThreadExecutionState` on

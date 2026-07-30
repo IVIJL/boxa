@@ -28,7 +28,7 @@ set -euo pipefail
 
 agent="${1:-claude}"
 event="${2:-activity}"
-session="${BOXA_PROJECT:-default}"
+session="${BOXA_PROJECT_NAME:-default}"
 
 keep_awake_host() {
     # Inside a box, the global Host connection listens locally.

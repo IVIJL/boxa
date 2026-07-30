@@ -19,6 +19,8 @@ KEEP_AWAKE_INSTALL_DIR=""
 KEEP_AWAKE_BINARY=""
 KEEP_AWAKE_WINDOWS_BINARY=""
 KEEP_AWAKE_WINDOWS_LOG=""
+KEEP_AWAKE_WRAPPER=""
+KEEP_AWAKE_WINDOWS_WRAPPER=""
 KEEP_AWAKE_AUTOSTART_FILE=""
 KEEP_AWAKE_BOXA="${BOXA_KEEP_AWAKE_BOXA_COMMAND:-$BOXA_DIR/docker-run.sh}"
 
@@ -86,8 +88,10 @@ keep_awake::init_windows_paths() {
     if [ -n "${BOXA_KEEP_AWAKE_INSTALL_DIR:-}" ]; then
         KEEP_AWAKE_INSTALL_DIR="$BOXA_KEEP_AWAKE_INSTALL_DIR"
         KEEP_AWAKE_BINARY="$KEEP_AWAKE_INSTALL_DIR/keep-awake.exe"
+        KEEP_AWAKE_WRAPPER="$KEEP_AWAKE_INSTALL_DIR/start-keep-awake.ps1"
         KEEP_AWAKE_WINDOWS_BINARY="$(wslpath -w "$KEEP_AWAKE_BINARY")"
         KEEP_AWAKE_WINDOWS_LOG="$(wslpath -w "$KEEP_AWAKE_LOG_FILE")"
+        KEEP_AWAKE_WINDOWS_WRAPPER="$(wslpath -w "$KEEP_AWAKE_WRAPPER")"
         return 0
     fi
     windows_local_appdata="$(powershell.exe -NoProfile -NonInteractive -Command \
@@ -98,8 +102,10 @@ keep_awake::init_windows_paths() {
     fi
     KEEP_AWAKE_INSTALL_DIR="$(wslpath -u "${windows_local_appdata}\\Boxa")"
     KEEP_AWAKE_BINARY="$KEEP_AWAKE_INSTALL_DIR/keep-awake.exe"
+    KEEP_AWAKE_WRAPPER="$KEEP_AWAKE_INSTALL_DIR/start-keep-awake.ps1"
     KEEP_AWAKE_WINDOWS_BINARY="${windows_local_appdata}\\Boxa\\keep-awake.exe"
     KEEP_AWAKE_WINDOWS_LOG="${windows_local_appdata}\\Boxa\\keep-awake.log"
+    KEEP_AWAKE_WINDOWS_WRAPPER="${windows_local_appdata}\\Boxa\\start-keep-awake.ps1"
 }
 
 keep_awake::state_field() {
@@ -250,6 +256,41 @@ keep_awake::build_binary() {
     fi
 }
 
+keep_awake::powershell_literal() {
+    local value="$1"
+    printf '%s' "${value//\'/\'\'}"
+}
+
+keep_awake::write_windows_wrapper() {
+    local binary_literal log_literal
+    binary_literal="$(keep_awake::powershell_literal "$KEEP_AWAKE_WINDOWS_BINARY")"
+    log_literal="$(keep_awake::powershell_literal "$KEEP_AWAKE_WINDOWS_LOG")"
+
+    if ! cat > "$KEEP_AWAKE_WRAPPER" <<EOF
+\$binary = '$binary_literal'
+\$logFile = '$log_literal'
+\$gateway = \$null
+for (\$attempt = 0; \$attempt -lt 30 -and -not \$gateway; \$attempt++) {
+    \$gateway = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { \$_.InterfaceAlias -like 'vEthernet (WSL*' -and \$_.IPAddress -notlike '169.254.*' } |
+        Select-Object -First 1 -ExpandProperty IPAddress
+    if (-not \$gateway) { Start-Sleep -Seconds 2 }
+}
+\$arguments = @('-port', '$KEEP_AWAKE_PORT', '-log-file', \$logFile)
+if (\$gateway) {
+    \$arguments += @('-listen-address', \$gateway, '-listen-unsafe')
+} else {
+    Add-Content -LiteralPath \$logFile -Value "\$(Get-Date -Format o) keep-awake: WSL vEthernet adapter unavailable after retries; starting with loopback-only binding."
+}
+& \$binary @arguments
+exit \$LASTEXITCODE
+EOF
+    then
+        return 1
+    fi
+    chmod 0600 "$KEEP_AWAKE_WRAPPER"
+}
+
 keep_awake::install_autostart() {
     mkdir -p "$KEEP_AWAKE_STATE_DIR"
     case "$KEEP_AWAKE_PLATFORM" in
@@ -297,10 +338,9 @@ EOF
             launchctl kickstart -k "gui/$(id -u)/$KEEP_AWAKE_LAUNCH_LABEL"
             ;;
         wsl2)
-            local action gateway
-            gateway="$(ip route show default 2>/dev/null | awk 'NR == 1 { print $3; exit }')"
-            action="\"$KEEP_AWAKE_WINDOWS_BINARY\" -port $KEEP_AWAKE_PORT -log-file \"$KEEP_AWAKE_WINDOWS_LOG\""
-            [ -z "$gateway" ] || action="$action -listen-address $gateway"
+            local action
+            keep_awake::write_windows_wrapper || return 1
+            action="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$KEEP_AWAKE_WINDOWS_WRAPPER\""
             schtasks.exe /Create /TN "$KEEP_AWAKE_TASK_NAME" /SC ONLOGON /TR "$action" /F >/dev/null
             schtasks.exe /Run /TN "$KEEP_AWAKE_TASK_NAME" >/dev/null
             ;;
@@ -321,6 +361,7 @@ keep_awake::remove_autostart() {
         wsl2)
             schtasks.exe /End /TN "$KEEP_AWAKE_TASK_NAME" >/dev/null 2>&1 || true
             schtasks.exe /Delete /TN "$KEEP_AWAKE_TASK_NAME" /F >/dev/null 2>&1 || true
+            rm -f "$KEEP_AWAKE_WRAPPER"
             ;;
     esac
 }
