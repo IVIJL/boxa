@@ -1826,6 +1826,80 @@ stop_host_connection() {
     stop_container_connection "$source_container" "$local_port"
 }
 
+remove_host_connection() {
+    local source_project="$1" source_container="$2" all_connections="$3" target_port="$4"
+    local config_file connection_description connection_row connection_local_port
+    local running_container tmp
+
+    if [ "$all_connections" = true ]; then
+        config_file="$(global_connection_config_file)"
+        connection_description="all boxes"
+    else
+        config_file="$(connection_config_file "$source_project")"
+        connection_description="$source_container"
+    fi
+    if [ ! -f "$config_file" ]; then
+        echo "No Host connection for ${connection_description} on port ${target_port}." >&2
+        return 1
+    fi
+    connection_row="$(awk -F '\t' -v p="$target_port" '$2 == "host" && $3 == p { print; exit }' "$config_file")"
+    if [ -z "$connection_row" ]; then
+        echo "No Host connection for ${connection_description} on port ${target_port}." >&2
+        return 1
+    fi
+    IFS=$'\t' read -r _alias _target _port connection_local_port <<< "$connection_row"
+
+    if [ "$all_connections" = true ]; then
+        while IFS= read -r running_container; do
+            [ -n "$running_container" ] || continue
+            stop_host_connection "$running_container" "$target_port" "$connection_local_port" || return 1
+        done < <(list_boxa_container_names)
+    elif docker ps --filter "name=^${source_container}$" --format '{{.Names}}' | grep -qx "$source_container"; then
+        stop_host_connection "$source_container" "$target_port" "$connection_local_port" || return 1
+    fi
+
+    if ! host_connection_target_has_other_record "$target_port"; then
+        stop_host_connection_host_side "$target_port" || return 1
+    fi
+
+    tmp="${config_file}.tmp"
+    awk -F '\t' -v p="$target_port" '!($2 == "host" && $3 == p)' "$config_file" > "$tmp"
+    mv "$tmp" "$config_file"
+    if [ "$all_connections" = true ]; then
+        echo "Removed global Host connection: all boxes -> host:${target_port}"
+    else
+        echo "Removed Host connection: ${source_container} -> host:${target_port}"
+    fi
+}
+
+sweep_host_connections() {
+    local config_file source_project source_container target_port
+    local global_config_file all_connections
+    local -a target_ports
+
+    [ -d "$CONNECT_CONFIG_DIR" ] || return 0
+    global_config_file="$(global_connection_config_file)"
+    for config_file in "$CONNECT_CONFIG_DIR"/*.tsv; do
+        [ -f "$config_file" ] || continue
+        if [ "$config_file" = "$global_config_file" ]; then
+            source_project=""
+            source_container=""
+            all_connections=true
+        else
+            source_project="$(basename "$config_file" .tsv)"
+            source_container="${BRAND_OBJECT_PREFIX}-${source_project}"
+            all_connections=false
+        fi
+        mapfile -t target_ports < <(
+            awk -F '\t' '$1 !~ /^#/ && $2 == "host" { print $3 }' "$config_file"
+        )
+        for target_port in "${target_ports[@]}"; do
+            remove_host_connection "$source_project" "$source_container" \
+                "$all_connections" "$target_port"
+        done
+    done
+}
+
 start_boxa_connections() {
     local container="$1"
     local source_project="${container#boxa-}"
@@ -3381,6 +3455,7 @@ if [ "$MODE" = "uninstall" ]; then
     if [ -x "$BOXA_DIR/scripts/sweep-oom-events.sh" ]; then
         "$BOXA_DIR/scripts/sweep-oom-events.sh" || true
     fi
+    sweep_host_connections
     exec "$BOXA_DIR/build.sh" --uninstall "$@"
 fi
 
@@ -3817,45 +3892,8 @@ if [ "$MODE" = "connect" ]; then
             exit 1
         fi
 
-        if [ "$ALL_CONNECTIONS" = true ]; then
-            CONFIG_FILE="$(global_connection_config_file)"
-            connection_description="all boxes"
-        else
-            CONFIG_FILE="$(connection_config_file "$SOURCE_PROJECT")"
-            connection_description="$SOURCE_CONTAINER"
-        fi
-        if [ ! -f "$CONFIG_FILE" ]; then
-            echo "No Host connection for ${connection_description} on port ${TARGET_PORT}." >&2
-            exit 1
-        fi
-        connection_row="$(awk -F '\t' -v p="$TARGET_PORT" '$2 == "host" && $3 == p { print; exit }' "$CONFIG_FILE")"
-        if [ -z "$connection_row" ]; then
-            echo "No Host connection for ${connection_description} on port ${TARGET_PORT}." >&2
-            exit 1
-        fi
-        IFS=$'\t' read -r _alias _target _port connection_local_port <<< "$connection_row"
-
-        if [ "$ALL_CONNECTIONS" = true ]; then
-            while IFS= read -r running_container; do
-                [ -n "$running_container" ] || continue
-                stop_host_connection "$running_container" "$TARGET_PORT" "$connection_local_port"
-            done < <(list_boxa_container_names)
-        elif docker ps --filter "name=^${SOURCE_CONTAINER}$" --format '{{.Names}}' | grep -qx "$SOURCE_CONTAINER"; then
-            stop_host_connection "$SOURCE_CONTAINER" "$TARGET_PORT" "$connection_local_port"
-        fi
-
-        if ! host_connection_target_has_other_record "$TARGET_PORT"; then
-            stop_host_connection_host_side "$TARGET_PORT" || exit 1
-        fi
-
-        tmp="${CONFIG_FILE}.tmp"
-        awk -F '\t' -v p="$TARGET_PORT" '!($2 == "host" && $3 == p)' "$CONFIG_FILE" > "$tmp"
-        mv "$tmp" "$CONFIG_FILE"
-        if [ "$ALL_CONNECTIONS" = true ]; then
-            echo "Removed global Host connection: all boxes -> host:${TARGET_PORT}"
-        else
-            echo "Removed Host connection: ${SOURCE_CONTAINER} -> host:${TARGET_PORT}"
-        fi
+        remove_host_connection "$SOURCE_PROJECT" "$SOURCE_CONTAINER" \
+            "$ALL_CONNECTIONS" "$TARGET_PORT" || exit 1
         exit 0
     fi
 

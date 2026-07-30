@@ -495,6 +495,78 @@ assert_contains "connect help documents global trust" \
 assert_contains "overview documents --all trust" \
     "--all trusts it in every present/future box" "$overview_help"
 
+# Uninstall enumerates every persisted Host record and routes each one through
+# the same removal helper as `connect rm`. A copied CLI with a no-op build.sh
+# exercises the real uninstall dispatch without touching host install state.
+rm -f "$CONNECT_CONFIG_DIR"/*.tsv
+uninstall_per_box_port=17782
+uninstall_second_port=17783
+uninstall_global_port=17784
+printf 'source-host\thost\t%s\t%s\n' \
+    "$uninstall_per_box_port" "$uninstall_per_box_port" \
+    > "$CONNECT_CONFIG_DIR/source.tsv"
+printf 'second-host\thost\t%s\t%s\n' \
+    "$uninstall_second_port" "$uninstall_second_port" \
+    > "$CONNECT_CONFIG_DIR/second.tsv"
+printf 'global-host\thost\t%s\t%s\n' \
+    "$uninstall_global_port" "$uninstall_global_port" \
+    > "$CONNECT_CONFIG_DIR/_all.tsv"
+
+start_host_connection_host_side 127.0.0.2 "$uninstall_per_box_port"
+start_host_connection_host_side 127.0.0.3 "$uninstall_second_port"
+start_host_connection_host_side 127.0.0.4 "$uninstall_global_port"
+IFS=$'\t' read -r _ip uninstall_per_box_pid _subnet _owned \
+    < "$(host_connection_state_file "$uninstall_per_box_port")"
+IFS=$'\t' read -r _ip uninstall_second_pid _subnet _owned \
+    < "$(host_connection_state_file "$uninstall_second_port")"
+IFS=$'\t' read -r _ip uninstall_global_pid _subnet _owned \
+    < "$(host_connection_state_file "$uninstall_global_port")"
+
+uninstall_cli_dir="$_TMPROOT/uninstall-cli"
+mkdir -p "$uninstall_cli_dir"
+cp "$BOXA" "$uninstall_cli_dir/docker-run.sh"
+cp -R "$BOXA_DIR/lib" "$uninstall_cli_dir/lib"
+ln -s /bin/true "$uninstall_cli_dir/build.sh"
+run_uninstall() {
+    HOME="$_TMPROOT/home" bash "$uninstall_cli_dir/docker-run.sh" uninstall
+}
+
+BOXA_CONNECT_TEST_CONTAINERS=$'boxa-source\nboxa-second'
+uninstall_ufw_deletes_before="$(count_log_matches 'ufw delete allow proto tcp')"
+uninstall_container_teardowns_before="$(count_log_matches '/usr/local/bin/stop-host-connection-allow')"
+uninstall_output="$(run_uninstall)"
+assert_contains "uninstall uses per-box rm reporting path" \
+    "Removed Host connection: boxa-source -> host:${uninstall_per_box_port}" \
+    "$uninstall_output"
+assert_contains "uninstall removes second per-box Host connection" \
+    "Removed Host connection: boxa-second -> host:${uninstall_second_port}" \
+    "$uninstall_output"
+assert_contains "uninstall uses global rm reporting path" \
+    "Removed global Host connection: all boxes -> host:${uninstall_global_port}" \
+    "$uninstall_output"
+assert_eq "uninstall removes every persisted Host entry" "0" \
+    "$(awk -F '\t' '$2 == "host" { count++ } END { print count + 0 }' "$CONNECT_CONFIG_DIR"/*.tsv)"
+assert_eq "uninstall stops every host relay" "false false false" \
+    "$(kill -0 "$uninstall_per_box_pid" 2>/dev/null && echo true || echo false) $(kill -0 "$uninstall_second_pid" 2>/dev/null && echo true || echo false) $(kill -0 "$uninstall_global_pid" 2>/dev/null && echo true || echo false)"
+assert_eq "uninstall removes every host relay state file" "false false false" \
+    "$([ -f "$(host_connection_state_file "$uninstall_per_box_port")" ] && echo true || echo false) $([ -f "$(host_connection_state_file "$uninstall_second_port")" ] && echo true || echo false) $([ -f "$(host_connection_state_file "$uninstall_global_port")" ] && echo true || echo false)"
+assert_eq "uninstall removes every ufw Host slot" "3" \
+    "$(( $(count_log_matches 'ufw delete allow proto tcp') - uninstall_ufw_deletes_before ))"
+assert_eq "uninstall tears down per-box plus global container slots" "4" \
+    "$(( $(count_log_matches '/usr/local/bin/stop-host-connection-allow') - uninstall_container_teardowns_before ))"
+
+empty_uninstall_ufw_deletes_before="$(count_log_matches 'ufw delete allow proto tcp')"
+empty_uninstall_container_teardowns_before="$(count_log_matches '/usr/local/bin/stop-host-connection-allow')"
+empty_uninstall_output="$(run_uninstall)"
+assert_eq "uninstall with no Host connections prints nothing extra" "" \
+    "$empty_uninstall_output"
+assert_eq "uninstall with no Host connections leaves ufw unchanged" \
+    "$empty_uninstall_ufw_deletes_before" \
+    "$(count_log_matches 'ufw delete allow proto tcp')"
+assert_eq "uninstall with no Host connections skips container teardown" \
+    "$empty_uninstall_container_teardowns_before" \
+    "$(count_log_matches '/usr/local/bin/stop-host-connection-allow')"
+
 if [ "$fail_count" -gt 0 ]; then
     printf '\n%d test(s) failed.\n' "$fail_count"
     exit 1
