@@ -49,7 +49,9 @@ Ports & connect:
                                    List active port routes
   boxa connect                   Pick source, targets, and services
   boxa connect <target> <port>   Forward one TCP port to another boxa
-  boxa connections               List cross-boxa TCP forwards
+  boxa connect host <port> [local-port] [--name <label>]
+                                   Forward one TCP port from the host
+  boxa connections               List cross-boxa and Host TCP forwards
 
 Firewall:
   boxa allow [domain]            List or add allowed firewall domain
@@ -260,22 +262,28 @@ EOF
 Usage:
   boxa connect
   boxa connect <target> <port> [local-port] [--from source]
+  boxa connect host <port> [local-port] [--name <label>] [--from source]
+  boxa connect rm host <port> [--from source]
 
 With no arguments, pick a source, target boxaes, and published TCP services.
 The explicit form forwards one TCP port from the source boxa to a target.
+The reserved target `host` forwards a host service; --name sets its label.
+Without an explicit local-port, a Host connection uses the host port verbatim.
 Inner Docker connects to the forward at 10.0.2.2:<local-port>.
 
 Examples:
   boxa connect api 5432
   boxa connect db 5432 15432
   boxa connect api 5432 --from web
+  boxa connect host 17777 --name keep-awake
+  boxa connect rm host 17777
 EOF
             ;;
         ls)             printf 'boxa ls                        List running containers\n' ;;
         stop)           printf 'boxa stop [name] [--clean]     Stop container (--clean removes volumes)\n' ;;
         remove)         printf 'boxa remove [name]             Remove project data (volumes)\n' ;;
         port)           printf 'boxa port <port>               Expose port via Traefik\n' ;;
-        connections)    printf 'boxa connections               List cross-boxa TCP forwards\n' ;;
+        connections)    printf 'boxa connections               List cross-boxa and Host TCP forwards\n' ;;
         deny)           printf 'boxa deny [domain]             Remove allowed domain (interactive)\n' ;;
         blocked)        printf 'boxa blocked                   Show blocked DNS queries, allow interactively\n' ;;
         dns-install|dns-status|dns-uninstall)
@@ -1425,17 +1433,81 @@ start_container_connection() {
         '
 }
 
+resolve_host_connection_ip() {
+    local source_container="$1"
+
+    docker exec -u root "$source_container" bash -lc '
+        getent ahostsv4 host.docker.internal | awk "NR == 1 { print \$1; exit }"
+    '
+}
+
+start_host_connection() {
+    local source_container="$1" host_port="$2" local_port="$3" alias="$4"
+    local host_ip
+
+    host_ip="$(resolve_host_connection_ip "$source_container")"
+    if [ -z "$host_ip" ]; then
+        echo "Could not resolve host.docker.internal inside ${source_container}." >&2
+        return 1
+    fi
+
+    docker exec -u root "$source_container" \
+        /usr/local/bin/start-host-connection-allow "$host_ip" "$host_port"
+    start_container_connection "$source_container" "$host_ip" "$host_port" "$local_port" "$alias"
+}
+
+stop_container_connection() {
+    local source_container="$1" local_port="$2"
+    local pid_file="/tmp/boxa-connect-${local_port}.pid"
+
+    docker exec -u node \
+        -e PID_FILE="$pid_file" \
+        "$source_container" bash -lc '
+            set -euo pipefail
+            if [ -f "$PID_FILE" ]; then
+                pid="$(cat "$PID_FILE")"
+                if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                    kill "$pid" 2>/dev/null || true
+                fi
+                rm -f "$PID_FILE"
+            fi
+        '
+}
+
+stop_host_connection() {
+    local source_container="$1" host_port="$2" local_port="$3"
+    local host_ip
+
+    host_ip="$(resolve_host_connection_ip "$source_container")"
+    if [ -z "$host_ip" ]; then
+        echo "Could not resolve host.docker.internal inside ${source_container}." >&2
+        return 1
+    fi
+
+    docker exec -u root "$source_container" \
+        /usr/local/bin/stop-host-connection-allow "$host_ip" "$host_port"
+    stop_container_connection "$source_container" "$local_port"
+}
+
 start_boxa_connections() {
     local container="$1"
     local source_project="${container#boxa-}"
-    local config_file
+    local config_file start_connection_fn
+    local -a start_connection_args
     config_file="$(connection_config_file "$source_project")"
     [ -f "$config_file" ] || return 0
 
     while IFS=$'\t' read -r alias target_container target_port local_port; do
         [ -n "${alias:-}" ] || continue
         case "$alias" in \#*) continue ;; esac
-        if start_container_connection "$container" "$target_container" "$target_port" "$local_port" "$alias"; then
+        if [ "$target_container" = host ]; then
+            start_connection_args=("$container" "$target_port" "$local_port" "$alias")
+            start_connection_fn=start_host_connection
+        else
+            start_connection_args=("$container" "$target_container" "$target_port" "$local_port" "$alias")
+            start_connection_fn=start_container_connection
+        fi
+        if "$start_connection_fn" "${start_connection_args[@]}"; then
             echo "Connection: ${alias} 10.0.2.2:${local_port} → ${target_container}:${target_port}"
         else
             echo "Failed to start connection ${alias} for ${container}." >&2
@@ -3268,7 +3340,14 @@ if [ "$MODE" = "connect" ]; then
         exit 0
     fi
 
+    CONNECT_ACTION="add"
+    if [ "${1:-}" = rm ]; then
+        CONNECT_ACTION="rm"
+        shift
+    fi
+
     SOURCE_TOKEN=""
+    CONNECTION_NAME=""
     POSITIONAL=()
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -3280,7 +3359,20 @@ if [ "$MODE" = "connect" ]; then
             --from=*)
                 SOURCE_TOKEN="${1#--from=}"
                 ;;
+            --name)
+                shift
+                CONNECTION_NAME="${1:-}"
+                [ -n "$CONNECTION_NAME" ] || { echo "--name requires a label." >&2; exit 1; }
+                ;;
+            --name=*)
+                CONNECTION_NAME="${1#--name=}"
+                [ -n "$CONNECTION_NAME" ] || { echo "--name requires a label." >&2; exit 1; }
+                ;;
             -h|--help) show_command_help connect ;;
+            --*)
+                echo "Unknown flag: $1" >&2
+                exit 2
+                ;;
             *)
                 POSITIONAL+=("$1")
                 ;;
@@ -3293,7 +3385,11 @@ if [ "$MODE" = "connect" ]; then
     LOCAL_PORT="${POSITIONAL[2]:-}"
 
     if [ -z "$TARGET_TOKEN" ] || [ -z "$TARGET_PORT" ]; then
-        echo "Usage: boxa connect <target> <port> [local-port] [--from source]" >&2
+        echo "Usage: boxa connect host <port> [local-port] [--name <label>] [--from source]" >&2
+        exit 1
+    fi
+    if [ "${#POSITIONAL[@]}" -gt 3 ]; then
+        echo "Too many positional arguments for boxa connect." >&2
         exit 1
     fi
     if ! [[ "$TARGET_PORT" =~ ^[0-9]+$ ]] || [ "$TARGET_PORT" -lt 1 ] || [ "$TARGET_PORT" -gt 65535 ]; then
@@ -3313,16 +3409,59 @@ if [ "$MODE" = "connect" ]; then
     SOURCE_PROJECT="$BOXA_PROJECT_NAME"
     SOURCE_CONTAINER="$BOXA_CONTAINER_NAME"
 
-    boxa::names_from_token "$TARGET_TOKEN"
-    TARGET_PROJECT="$BOXA_PROJECT_NAME"
-    TARGET_CONTAINER="$BOXA_CONTAINER_NAME"
+    if [ "$TARGET_TOKEN" = host ]; then
+        TARGET_PROJECT=host
+        TARGET_CONTAINER=host
+    else
+        boxa::names_from_token "$TARGET_TOKEN"
+        TARGET_PROJECT="$BOXA_PROJECT_NAME"
+        TARGET_CONTAINER="$BOXA_CONTAINER_NAME"
+    fi
+
+    if [ "$CONNECT_ACTION" = rm ]; then
+        if [ "$TARGET_CONTAINER" != host ]; then
+            echo "This slice supports removal only for the reserved target 'host'." >&2
+            exit 1
+        fi
+        if [ -n "$LOCAL_PORT" ] || [ -n "$CONNECTION_NAME" ]; then
+            echo "Usage: boxa connect rm host <port> [--from source]" >&2
+            exit 1
+        fi
+
+        CONFIG_FILE="$(connection_config_file "$SOURCE_PROJECT")"
+        if [ ! -f "$CONFIG_FILE" ]; then
+            echo "No Host connection for ${SOURCE_CONTAINER} on port ${TARGET_PORT}." >&2
+            exit 1
+        fi
+        connection_row="$(awk -F '\t' -v p="$TARGET_PORT" '$2 == "host" && $3 == p { print; exit }' "$CONFIG_FILE")"
+        if [ -z "$connection_row" ]; then
+            echo "No Host connection for ${SOURCE_CONTAINER} on port ${TARGET_PORT}." >&2
+            exit 1
+        fi
+        IFS=$'\t' read -r _alias _target _port connection_local_port <<< "$connection_row"
+
+        if docker ps --filter "name=^${SOURCE_CONTAINER}$" --format '{{.Names}}' | grep -qx "$SOURCE_CONTAINER"; then
+            stop_host_connection "$SOURCE_CONTAINER" "$TARGET_PORT" "$connection_local_port"
+        fi
+
+        tmp="${CONFIG_FILE}.tmp"
+        awk -F '\t' -v p="$TARGET_PORT" '!($2 == "host" && $3 == p)' "$CONFIG_FILE" > "$tmp"
+        mv "$tmp" "$CONFIG_FILE"
+        echo "Removed Host connection: ${SOURCE_CONTAINER} -> host:${TARGET_PORT}"
+        exit 0
+    fi
+
+    if [ "$TARGET_CONTAINER" != host ] && [ -n "$CONNECTION_NAME" ]; then
+        echo "--name is supported only for the reserved target 'host'." >&2
+        exit 1
+    fi
 
     if ! docker ps --filter "name=^${SOURCE_CONTAINER}$" --format '{{.Names}}' | grep -qx "$SOURCE_CONTAINER"; then
         echo "Source container is not running: $SOURCE_CONTAINER" >&2
         echo "Use --from <source> when running outside the source project directory." >&2
         exit 1
     fi
-    if ! docker ps --filter "name=^${TARGET_CONTAINER}$" --format '{{.Names}}' | grep -qx "$TARGET_CONTAINER"; then
+    if [ "$TARGET_CONTAINER" != host ] && ! docker ps --filter "name=^${TARGET_CONTAINER}$" --format '{{.Names}}' | grep -qx "$TARGET_CONTAINER"; then
         echo "Target container is not running: $TARGET_CONTAINER" >&2
         exit 1
     fi
@@ -3335,15 +3474,21 @@ if [ "$MODE" = "connect" ]; then
         existing=$(awk -F '\t' -v t="$TARGET_CONTAINER" -v p="$TARGET_PORT" '$2 == t && $3 == p { print $4; exit }' "$CONFIG_FILE")
         if [ -n "$existing" ]; then
             LOCAL_PORT="$existing"
+        elif [ "$TARGET_CONTAINER" = host ]; then
+            LOCAL_PORT="$TARGET_PORT"
         else
             LOCAL_PORT="$(allocate_connection_port "$SOURCE_PROJECT" "$TARGET_CONTAINER" "$TARGET_PORT" "$CONFIG_FILE")"
         fi
     fi
 
-    ALIAS="${TARGET_PROJECT}-${TARGET_PORT}"
+    ALIAS="${CONNECTION_NAME:-${TARGET_PROJECT}-${TARGET_PORT}}"
     upsert_connection_record "$SOURCE_PROJECT" "$ALIAS" "$TARGET_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT"
 
-    start_container_connection "$SOURCE_CONTAINER" "$TARGET_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT" "$ALIAS"
+    if [ "$TARGET_CONTAINER" = host ]; then
+        start_host_connection "$SOURCE_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT" "$ALIAS"
+    else
+        start_container_connection "$SOURCE_CONTAINER" "$TARGET_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT" "$ALIAS"
+    fi
 
     echo "Connected: ${SOURCE_CONTAINER} -> ${TARGET_CONTAINER}:${TARGET_PORT}"
     echo "Use from inner Docker containers: 10.0.2.2:${LOCAL_PORT}"
