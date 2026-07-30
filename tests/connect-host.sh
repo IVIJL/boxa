@@ -1,5 +1,5 @@
 #!/bin/bash
-# Plain-bash lifecycle assertions for per-box Docker Desktop Host connections.
+# Plain-bash lifecycle assertions for Docker Desktop Host connections.
 # Usage: bash tests/connect-host.sh
 
 set -u
@@ -15,6 +15,7 @@ export BOXA_CONNECT_TEST_LOG="$_TMPROOT/docker.log"
 export BOXA_CONNECT_TEST_HOST_IP="192.168.65.254"
 export BOXA_CONNECT_TEST_BOUND_PORTS=""
 export BOXA_CONNECT_TEST_FORWARD_PORTS=""
+export BOXA_CONNECT_TEST_CONTAINERS="boxa-source"
 : > "$BOXA_CONNECT_TEST_LOG"
 
 # Keep list_listening_ports_in_container's timeout path compatible with the
@@ -32,10 +33,22 @@ docker() {
     printf '%s\n' "$*" >> "$BOXA_CONNECT_TEST_LOG"
     case "${1:-}" in
         ps)
-            case "$*" in
-                *'{{.Names}}'*) printf '%s\n' 'boxa-source' ;;
-                *'{{.ID}}'*) printf '%s\n' 'source-id' ;;
-            esac
+            local container filter="" candidate
+            for candidate in "$@"; do
+                case "$candidate" in
+                    name=^boxa-*) filter="${candidate#name=^}"; filter="${filter%\$}" ;;
+                esac
+            done
+            while IFS= read -r container; do
+                [ -n "$container" ] || continue
+                if [ -z "$filter" ] || { [ "$filter" = "boxa-" ] && [[ "$container" == boxa-* ]]; } \
+                    || [ "$container" = "$filter" ]; then
+                    case "$*" in
+                        *'{{.Names}}'*) printf '%s\n' "$container" ;;
+                        *'{{.ID}}'*) printf '%s-id\n' "$container" ;;
+                    esac
+                fi
+            done <<< "${BOXA_CONNECT_TEST_CONTAINERS//,/$'\n'}"
             ;;
         exec)
             case "$*" in
@@ -294,6 +307,82 @@ assert_contains "help documents explicit local port precedence" \
 overview_help="$(run_boxa help)"
 assert_contains "overview documents connect host" \
     "boxa connect host <port> [local-port] [--name <label>]" "$overview_help"
+
+# Global scope is persisted once and applied immediately in every running box.
+# It coexists with the different-port per-box record above.
+global_config_file="$_TMPROOT/home/.config/boxa/connect/_all.tsv"
+global_host_port=17779
+BOXA_CONNECT_TEST_CONTAINERS=$'boxa-source\nboxa-second'
+global_output="$(run_boxa connect host "$global_host_port" --name shared-hook --all)"
+assert_contains "global add reports all-box scope" \
+    "Connected globally: all boxes -> host:${global_host_port}" "$global_output"
+assert_eq "global add persists one dedicated row" \
+    $'shared-hook\thost\t17779\t17779' "$(cat "$global_config_file")"
+assert_eq "global add starts firewall slot in two running boxes" "2" \
+    "$(count_log_matches "/usr/local/bin/start-host-connection-allow 192.168.65.254 ${global_host_port}")"
+assert_eq "global add starts forward in two running boxes" "2" \
+    "$(count_log_matches "-e TARGET_PORT=${global_host_port} -e LOCAL_PORT=${global_host_port}")"
+assert_eq "global and per-box files coexist" "$explicit_port" \
+    "$(awk -F '\t' -v p="$fallback_host_port" '$3 == p { print $4 }' "$config_file")"
+
+# A box started after creation replays the same global row despite having no
+# per-box file of its own.
+BOXA_CONNECT_TEST_HOST_IP="192.168.65.252"
+start_boxa_connections boxa-third >/dev/null
+assert_eq "future box replays global firewall slot" "1" \
+    "$(count_log_matches "-u root boxa-third /usr/local/bin/start-host-connection-allow 192.168.65.252 ${global_host_port}")"
+assert_eq "future box replays global forward" "1" \
+    "$(count_log_matches "-u node -e TARGET_CONTAINER=192.168.65.252 -e TARGET_PORT=${global_host_port}")"
+
+BOXA_CONNECT_TEST_CONTAINERS=$'boxa-source\nboxa-second\nboxa-third'
+connections_output="$(run_boxa connections)"
+assert_contains "connections has explicit scope column" "SCOPE" "$connections_output"
+for source in boxa-source boxa-second boxa-third; do
+    global_row="$(awk -v source="$source" -v target="host:${global_host_port}" \
+        '$1 == source && $2 == target { print }' <<< "$connections_output")"
+    assert_contains "connections marks global scope for ${source}" "all" "$global_row"
+done
+
+# Cross-scope collisions are rejected instead of silently replacing a forward
+# or sharing a firewall slot whose removal would break the other scope.
+local_collision_output="$(run_boxa connect host 17781 "$global_host_port" --from source 2>&1 || true)"
+assert_contains "per-box add rejects global local-port collision" \
+    "Local port ${global_host_port} is already used by a global persisted connection." \
+    "$local_collision_output"
+target_collision_output="$(run_boxa connect host "$global_host_port" --from source 2>&1 || true)"
+assert_contains "per-box add rejects global Host-port collision" \
+    "Host port ${global_host_port} already has a global connection" "$target_collision_output"
+global_collision_output="$(run_boxa connect host "$fallback_host_port" --all 2>&1 || true)"
+assert_contains "global add rejects existing per-box Host port" \
+    "Host port ${fallback_host_port} already has a per-box connection" "$global_collision_output"
+
+# Global removal tears down every running box and deletes the sole global row;
+# the unrelated per-box record remains and a future box cannot replay global.
+BOXA_CONNECT_TEST_HOST_IP="192.168.65.254"
+global_rm_output="$(run_boxa connect rm host "$global_host_port" --all)"
+assert_contains "global rm reports all-box scope" \
+    "Removed global Host connection: all boxes -> host:${global_host_port}" "$global_rm_output"
+assert_eq "global rm tears down firewall in all running boxes" "3" \
+    "$(count_log_matches "/usr/local/bin/stop-host-connection-allow 192.168.65.254 ${global_host_port}")"
+assert_eq "global rm tears down forwards in all running boxes" "3" \
+    "$(count_log_matches "-u node -e PID_FILE=/tmp/boxa-connect-${global_host_port}.pid")"
+assert_eq "global rm removes persisted global row" "0" \
+    "$(awk 'END { print NR }' "$global_config_file")"
+assert_eq "global rm preserves per-box row" "$explicit_port" \
+    "$(awk -F '\t' -v p="$fallback_host_port" '$3 == p { print $4 }' "$config_file")"
+global_calls_before_removed_replay="$(count_log_matches "TARGET_PORT=${global_host_port}")"
+start_boxa_connections boxa-fourth >/dev/null
+assert_eq "removed global entry is not replayed by future box" \
+    "$global_calls_before_removed_replay" "$(count_log_matches "TARGET_PORT=${global_host_port}")"
+
+conflict_output="$(run_boxa connect host 17780 --all --from source 2>&1 || true)"
+assert_contains "--all rejects per-box --from scope" \
+    "--all cannot be combined with --from." "$conflict_output"
+assert_contains "connect help documents --all" "--all" "$connect_help"
+assert_contains "connect help documents global trust" \
+    "deliberately widens trust" "$connect_help"
+assert_contains "overview documents --all trust" \
+    "--all trusts it in every present/future box" "$overview_help"
 
 if [ "$fail_count" -gt 0 ]; then
     printf '\n%d test(s) failed.\n' "$fail_count"

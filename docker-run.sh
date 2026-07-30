@@ -49,8 +49,9 @@ Ports & connect:
                                    List active port routes
   boxa connect                   Pick source, targets, and services
   boxa connect <target> <port>   Forward one TCP port to another boxa
-  boxa connect host <port> [local-port] [--name <label>]
+  boxa connect host <port> [local-port] [--name <label>] [--all]
                                    Forward one TCP port from the host
+                                   --all trusts it in every present/future box
                                    Auto-port: host port, checksum slot,
                                    slot+1, then an interactive prompt
   boxa connections               List cross-boxa and Host TCP forwards
@@ -264,12 +265,14 @@ EOF
 Usage:
   boxa connect
   boxa connect <target> <port> [local-port] [--from source]
-  boxa connect host <port> [local-port] [--name <label>] [--from source]
-  boxa connect rm host <port> [--from source]
+  boxa connect host <port> [local-port] [--name <label>] [--from source | --all]
+  boxa connect rm host <port> [--from source | --all]
 
 With no arguments, pick a source, target boxaes, and published TCP services.
 The explicit form forwards one TCP port from the source boxa to a target.
 The reserved target `host` forwards a host service; --name sets its label.
+Host connections are per-box by default. --all deliberately widens trust to
+every present and future box; it cannot be combined with --from.
 Host auto-port order: host port -> 15000-15999 checksum slot -> slot+1 ->
 interactive prompt. An explicit local-port always wins. The selected port
 is persisted unchanged.
@@ -280,7 +283,9 @@ Examples:
   boxa connect db 5432 15432
   boxa connect api 5432 --from web
   boxa connect host 17777 --name keep-awake
+  boxa connect host 17777 --name keep-awake --all
   boxa connect rm host 17777
+  boxa connect rm host 17777 --all
 EOF
             ;;
         ls)             printf 'boxa ls                        List running containers\n' ;;
@@ -1392,6 +1397,10 @@ connection_config_file() {
     printf '%s/%s.tsv' "$CONNECT_CONFIG_DIR" "$source_project"
 }
 
+global_connection_config_file() {
+    printf '%s/_all.tsv' "$CONNECT_CONFIG_DIR"
+}
+
 allocate_connection_port() {
     local source="$1" target="$2" target_port="$3" used_file="$4"
     local checksum candidate i
@@ -1418,7 +1427,10 @@ connection_port_is_persisted() {
 
 select_host_connection_port() {
     local source_project="$1" source_container="$2" host_port="$3" config_file="$4"
+    local global_config_file
     local listening_output checksum checksum_port next_port candidate entered
+
+    global_config_file="$(global_connection_config_file)"
 
     if ! listening_output=$(list_listening_ports_in_container "$source_container"); then
         echo "Could not inspect listening ports in ${source_container}." >&2
@@ -1431,7 +1443,8 @@ select_host_connection_port() {
 
     for candidate in "$host_port" "$checksum_port" "$next_port"; do
         if ! grep -qxF "$candidate" <<< "$listening_output" \
-            && ! connection_port_is_persisted "$candidate" "$config_file"; then
+            && ! connection_port_is_persisted "$candidate" "$config_file" \
+            && ! connection_port_is_persisted "$candidate" "$global_config_file"; then
             printf '%s' "$candidate"
             return 0
         fi
@@ -1451,7 +1464,90 @@ select_host_connection_port() {
             echo "Local port ${entered} is already bound inside ${source_container}." >&2
             continue
         fi
-        if connection_port_is_persisted "$entered" "$config_file"; then
+        if connection_port_is_persisted "$entered" "$config_file" \
+            || connection_port_is_persisted "$entered" "$global_config_file"; then
+            echo "Local port ${entered} is already used by a persisted connection." >&2
+            continue
+        fi
+        printf '%s' "$entered"
+        return 0
+    done
+}
+
+connection_port_is_persisted_per_box() {
+    local port="$1" config_file global_config_file
+    global_config_file="$(global_connection_config_file)"
+
+    for config_file in "$CONNECT_CONFIG_DIR"/*.tsv; do
+        [ -f "$config_file" ] || continue
+        [ "$config_file" != "$global_config_file" ] || continue
+        if connection_port_is_persisted "$port" "$config_file"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+host_connection_target_is_persisted_per_box() {
+    local host_port="$1" config_file global_config_file
+    global_config_file="$(global_connection_config_file)"
+
+    for config_file in "$CONNECT_CONFIG_DIR"/*.tsv; do
+        [ -f "$config_file" ] || continue
+        [ "$config_file" != "$global_config_file" ] || continue
+        if awk -F '\t' -v p="$host_port" \
+            '$2 == "host" && $3 == p { found=1 } END { exit found ? 0 : 1 }' "$config_file"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+select_global_host_connection_port() {
+    local host_port="$1" global_config_file="$2"
+    local running_containers listening_output checksum checksum_port next_port candidate entered container
+
+    running_containers="$(list_boxa_container_names)"
+    listening_output=""
+    while IFS= read -r container; do
+        [ -n "$container" ] || continue
+        local container_listening
+        if ! container_listening="$(list_listening_ports_in_container "$container")"; then
+            echo "Could not inspect listening ports in ${container}." >&2
+            return 1
+        fi
+        listening_output="$(printf '%s\n%s' "$listening_output" "$container_listening")"
+    done <<< "$running_containers"
+
+    checksum=$(printf '%s' "all:host:${host_port}" | cksum | awk '{print $1}')
+    checksum_port=$((15000 + checksum % 1000))
+    next_port=$((15000 + (checksum_port - 15000 + 1) % 1000))
+
+    for candidate in "$host_port" "$checksum_port" "$next_port"; do
+        if ! grep -qxF "$candidate" <<< "$listening_output" \
+            && ! connection_port_is_persisted "$candidate" "$global_config_file" \
+            && ! connection_port_is_persisted_per_box "$candidate"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+
+    while true; do
+        printf 'Local port (1-65535): ' >&2
+        if ! IFS= read -r entered; then
+            echo "No local port selected." >&2
+            return 1
+        fi
+        if ! [[ "$entered" =~ ^[0-9]+$ ]] || [ "$entered" -lt 1 ] || [ "$entered" -gt 65535 ]; then
+            echo "Local port must be a number from 1 to 65535." >&2
+            continue
+        fi
+        if grep -qxF "$entered" <<< "$listening_output"; then
+            echo "Local port ${entered} is already bound inside a running boxa container." >&2
+            continue
+        fi
+        if connection_port_is_persisted "$entered" "$global_config_file" \
+            || connection_port_is_persisted_per_box "$entered"; then
             echo "Local port ${entered} is already used by a persisted connection." >&2
             continue
         fi
@@ -1553,27 +1649,30 @@ stop_host_connection() {
 start_boxa_connections() {
     local container="$1"
     local source_project="${container#boxa-}"
-    local config_file start_connection_fn
+    local config_file global_config_file replay_file start_connection_fn
     local -a start_connection_args
     config_file="$(connection_config_file "$source_project")"
-    [ -f "$config_file" ] || return 0
+    global_config_file="$(global_connection_config_file)"
 
-    while IFS=$'\t' read -r alias target_container target_port local_port; do
-        [ -n "${alias:-}" ] || continue
-        case "$alias" in \#*) continue ;; esac
-        if [ "$target_container" = host ]; then
-            start_connection_args=("$container" "$target_port" "$local_port" "$alias")
-            start_connection_fn=start_host_connection
-        else
-            start_connection_args=("$container" "$target_container" "$target_port" "$local_port" "$alias")
-            start_connection_fn=start_container_connection
-        fi
-        if "$start_connection_fn" "${start_connection_args[@]}"; then
-            echo "Connection: ${alias} 10.0.2.2:${local_port} → ${target_container}:${target_port}"
-        else
-            echo "Failed to start connection ${alias} for ${container}." >&2
-        fi
-    done < "$config_file"
+    for replay_file in "$global_config_file" "$config_file"; do
+        [ -f "$replay_file" ] || continue
+        while IFS=$'\t' read -r alias target_container target_port local_port; do
+            [ -n "${alias:-}" ] || continue
+            case "$alias" in \#*) continue ;; esac
+            if [ "$target_container" = host ]; then
+                start_connection_args=("$container" "$target_port" "$local_port" "$alias")
+                start_connection_fn=start_host_connection
+            else
+                start_connection_args=("$container" "$target_container" "$target_port" "$local_port" "$alias")
+                start_connection_fn=start_container_connection
+            fi
+            if "$start_connection_fn" "${start_connection_args[@]}"; then
+                echo "Connection: ${alias} 10.0.2.2:${local_port} → ${target_container}:${target_port}"
+            else
+                echo "Failed to start connection ${alias} for ${container}." >&2
+            fi
+        done < "$replay_file"
+    done
 }
 
 list_boxa_container_names() {
@@ -1667,6 +1766,20 @@ upsert_connection_record() {
     local source_project="$1" alias="$2" target_container="$3" target_port="$4" local_port="$5"
     local config_file tmp
     config_file="$(connection_config_file "$source_project")"
+    mkdir -p "$CONNECT_CONFIG_DIR"
+    touch "$config_file"
+
+    tmp="${config_file}.tmp"
+    awk -F '\t' -v t="$target_container" -v p="$target_port" -v lp="$local_port" \
+        'BEGIN { OFS = FS } !($2 == t && $3 == p) && !($4 == lp)' "$config_file" > "$tmp"
+    printf '%s\t%s\t%s\t%s\n' "$alias" "$target_container" "$target_port" "$local_port" >> "$tmp"
+    mv "$tmp" "$config_file"
+}
+
+upsert_global_connection_record() {
+    local alias="$1" target_container="$2" target_port="$3" local_port="$4"
+    local config_file tmp
+    config_file="$(global_connection_config_file)"
     mkdir -p "$CONNECT_CONFIG_DIR"
     touch "$config_file"
 
@@ -3426,6 +3539,7 @@ if [ "$MODE" = "connect" ]; then
 
     SOURCE_TOKEN=""
     CONNECTION_NAME=""
+    ALL_CONNECTIONS=false
     POSITIONAL=()
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -3446,6 +3560,9 @@ if [ "$MODE" = "connect" ]; then
                 CONNECTION_NAME="${1#--name=}"
                 [ -n "$CONNECTION_NAME" ] || { echo "--name requires a label." >&2; exit 1; }
                 ;;
+            --all)
+                ALL_CONNECTIONS=true
+                ;;
             -h|--help) show_command_help connect ;;
             --*)
                 echo "Unknown flag: $1" >&2
@@ -3463,7 +3580,7 @@ if [ "$MODE" = "connect" ]; then
     LOCAL_PORT="${POSITIONAL[2]:-}"
 
     if [ -z "$TARGET_TOKEN" ] || [ -z "$TARGET_PORT" ]; then
-        echo "Usage: boxa connect host <port> [local-port] [--name <label>] [--from source]" >&2
+        echo "Usage: boxa connect host <port> [local-port] [--name <label>] [--from source | --all]" >&2
         exit 1
     fi
     if [ "${#POSITIONAL[@]}" -gt 3 ]; then
@@ -3479,13 +3596,27 @@ if [ "$MODE" = "connect" ]; then
         exit 1
     fi
 
-    if [ -n "$SOURCE_TOKEN" ]; then
+    if [ "$ALL_CONNECTIONS" = true ] && [ -n "$SOURCE_TOKEN" ]; then
+        echo "--all cannot be combined with --from." >&2
+        exit 1
+    fi
+    if [ "$ALL_CONNECTIONS" = true ] && [ "$TARGET_TOKEN" != host ]; then
+        echo "--all is supported only for the reserved target 'host'." >&2
+        exit 1
+    fi
+
+    if [ "$ALL_CONNECTIONS" = true ]; then
+        SOURCE_PROJECT=""
+        SOURCE_CONTAINER=""
+    elif [ -n "$SOURCE_TOKEN" ]; then
         boxa::names_from_token "$SOURCE_TOKEN"
+        SOURCE_PROJECT="$BOXA_PROJECT_NAME"
+        SOURCE_CONTAINER="$BOXA_CONTAINER_NAME"
     else
         boxa::names_from_path "$(pwd)"
+        SOURCE_PROJECT="$BOXA_PROJECT_NAME"
+        SOURCE_CONTAINER="$BOXA_CONTAINER_NAME"
     fi
-    SOURCE_PROJECT="$BOXA_PROJECT_NAME"
-    SOURCE_CONTAINER="$BOXA_CONTAINER_NAME"
 
     if [ "$TARGET_TOKEN" = host ]; then
         TARGET_PROJECT=host
@@ -3502,30 +3633,45 @@ if [ "$MODE" = "connect" ]; then
             exit 1
         fi
         if [ -n "$LOCAL_PORT" ] || [ -n "$CONNECTION_NAME" ]; then
-            echo "Usage: boxa connect rm host <port> [--from source]" >&2
+            echo "Usage: boxa connect rm host <port> [--from source | --all]" >&2
             exit 1
         fi
 
-        CONFIG_FILE="$(connection_config_file "$SOURCE_PROJECT")"
+        if [ "$ALL_CONNECTIONS" = true ]; then
+            CONFIG_FILE="$(global_connection_config_file)"
+            connection_description="all boxes"
+        else
+            CONFIG_FILE="$(connection_config_file "$SOURCE_PROJECT")"
+            connection_description="$SOURCE_CONTAINER"
+        fi
         if [ ! -f "$CONFIG_FILE" ]; then
-            echo "No Host connection for ${SOURCE_CONTAINER} on port ${TARGET_PORT}." >&2
+            echo "No Host connection for ${connection_description} on port ${TARGET_PORT}." >&2
             exit 1
         fi
         connection_row="$(awk -F '\t' -v p="$TARGET_PORT" '$2 == "host" && $3 == p { print; exit }' "$CONFIG_FILE")"
         if [ -z "$connection_row" ]; then
-            echo "No Host connection for ${SOURCE_CONTAINER} on port ${TARGET_PORT}." >&2
+            echo "No Host connection for ${connection_description} on port ${TARGET_PORT}." >&2
             exit 1
         fi
         IFS=$'\t' read -r _alias _target _port connection_local_port <<< "$connection_row"
 
-        if docker ps --filter "name=^${SOURCE_CONTAINER}$" --format '{{.Names}}' | grep -qx "$SOURCE_CONTAINER"; then
+        if [ "$ALL_CONNECTIONS" = true ]; then
+            while IFS= read -r running_container; do
+                [ -n "$running_container" ] || continue
+                stop_host_connection "$running_container" "$TARGET_PORT" "$connection_local_port"
+            done < <(list_boxa_container_names)
+        elif docker ps --filter "name=^${SOURCE_CONTAINER}$" --format '{{.Names}}' | grep -qx "$SOURCE_CONTAINER"; then
             stop_host_connection "$SOURCE_CONTAINER" "$TARGET_PORT" "$connection_local_port"
         fi
 
         tmp="${CONFIG_FILE}.tmp"
         awk -F '\t' -v p="$TARGET_PORT" '!($2 == "host" && $3 == p)' "$CONFIG_FILE" > "$tmp"
         mv "$tmp" "$CONFIG_FILE"
-        echo "Removed Host connection: ${SOURCE_CONTAINER} -> host:${TARGET_PORT}"
+        if [ "$ALL_CONNECTIONS" = true ]; then
+            echo "Removed global Host connection: all boxes -> host:${TARGET_PORT}"
+        else
+            echo "Removed Host connection: ${SOURCE_CONTAINER} -> host:${TARGET_PORT}"
+        fi
         exit 0
     fi
 
@@ -3534,7 +3680,8 @@ if [ "$MODE" = "connect" ]; then
         exit 1
     fi
 
-    if ! docker ps --filter "name=^${SOURCE_CONTAINER}$" --format '{{.Names}}' | grep -qx "$SOURCE_CONTAINER"; then
+    if [ "$ALL_CONNECTIONS" = false ] \
+        && ! docker ps --filter "name=^${SOURCE_CONTAINER}$" --format '{{.Names}}' | grep -qx "$SOURCE_CONTAINER"; then
         echo "Source container is not running: $SOURCE_CONTAINER" >&2
         echo "Use --from <source> when running outside the source project directory." >&2
         exit 1
@@ -3544,7 +3691,29 @@ if [ "$MODE" = "connect" ]; then
         exit 1
     fi
 
-    CONFIG_FILE="$(connection_config_file "$SOURCE_PROJECT")"
+    GLOBAL_CONFIG_FILE="$(global_connection_config_file)"
+    if [ "$ALL_CONNECTIONS" = true ]; then
+        if host_connection_target_is_persisted_per_box "$TARGET_PORT"; then
+            echo "Host port ${TARGET_PORT} already has a per-box connection; remove it before using --all." >&2
+            exit 1
+        fi
+        if [ -n "$LOCAL_PORT" ] && connection_port_is_persisted_per_box "$LOCAL_PORT"; then
+            echo "Local port ${LOCAL_PORT} is already used by a per-box persisted connection." >&2
+            exit 1
+        fi
+        CONFIG_FILE="$GLOBAL_CONFIG_FILE"
+    else
+        if awk -F '\t' -v p="$TARGET_PORT" \
+            '$2 == "host" && $3 == p { found=1 } END { exit found ? 0 : 1 }' "$GLOBAL_CONFIG_FILE" 2>/dev/null; then
+            echo "Host port ${TARGET_PORT} already has a global connection; remove it with rm --all first." >&2
+            exit 1
+        fi
+        if [ -n "$LOCAL_PORT" ] && connection_port_is_persisted "$LOCAL_PORT" "$GLOBAL_CONFIG_FILE"; then
+            echo "Local port ${LOCAL_PORT} is already used by a global persisted connection." >&2
+            exit 1
+        fi
+        CONFIG_FILE="$(connection_config_file "$SOURCE_PROJECT")"
+    fi
     mkdir -p "$CONNECT_CONFIG_DIR"
     touch "$CONFIG_FILE"
 
@@ -3552,6 +3721,8 @@ if [ "$MODE" = "connect" ]; then
         existing=$(awk -F '\t' -v t="$TARGET_CONTAINER" -v p="$TARGET_PORT" '$2 == t && $3 == p { print $4; exit }' "$CONFIG_FILE")
         if [ -n "$existing" ]; then
             LOCAL_PORT="$existing"
+        elif [ "$ALL_CONNECTIONS" = true ]; then
+            LOCAL_PORT="$(select_global_host_connection_port "$TARGET_PORT" "$CONFIG_FILE")"
         elif [ "$TARGET_CONTAINER" = host ]; then
             LOCAL_PORT="$(select_host_connection_port "$SOURCE_PROJECT" "$SOURCE_CONTAINER" "$TARGET_PORT" "$CONFIG_FILE")"
         else
@@ -3560,15 +3731,32 @@ if [ "$MODE" = "connect" ]; then
     fi
 
     ALIAS="${CONNECTION_NAME:-${TARGET_PROJECT}-${TARGET_PORT}}"
-    upsert_connection_record "$SOURCE_PROJECT" "$ALIAS" "$TARGET_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT"
+    if [ "$ALL_CONNECTIONS" = true ]; then
+        upsert_global_connection_record "$ALIAS" "$TARGET_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT"
+        global_start_failed=false
+        while IFS= read -r running_container; do
+            [ -n "$running_container" ] || continue
+            if ! start_host_connection "$running_container" "$TARGET_PORT" "$LOCAL_PORT" "$ALIAS"; then
+                echo "Failed to start global Host connection in ${running_container}." >&2
+                global_start_failed=true
+            fi
+        done < <(list_boxa_container_names)
+        [ "$global_start_failed" = false ] || exit 1
+    else
+        upsert_connection_record "$SOURCE_PROJECT" "$ALIAS" "$TARGET_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT"
+    fi
 
-    if [ "$TARGET_CONTAINER" = host ]; then
+    if [ "$ALL_CONNECTIONS" = true ]; then
+        echo "Connected globally: all boxes -> ${TARGET_CONTAINER}:${TARGET_PORT}"
+    elif [ "$TARGET_CONTAINER" = host ]; then
         start_host_connection "$SOURCE_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT" "$ALIAS"
     else
         start_container_connection "$SOURCE_CONTAINER" "$TARGET_CONTAINER" "$TARGET_PORT" "$LOCAL_PORT" "$ALIAS"
     fi
 
-    echo "Connected: ${SOURCE_CONTAINER} -> ${TARGET_CONTAINER}:${TARGET_PORT}"
+    if [ "$ALL_CONNECTIONS" = false ]; then
+        echo "Connected: ${SOURCE_CONTAINER} -> ${TARGET_CONTAINER}:${TARGET_PORT}"
+    fi
     echo "Use from inner Docker containers: 10.0.2.2:${LOCAL_PORT}"
     echo "Persisted in: $CONFIG_FILE"
     exit 0
@@ -3582,17 +3770,39 @@ if [ "$MODE" = "connections" ]; then
         exit 0
     fi
 
-    printf '%-25s %-28s %-16s %-8s %s\n' "SOURCE" "TARGET" "INNER ENDPOINT" "STATUS" "ALIAS"
+    global_config_file="$(global_connection_config_file)"
+    source_projects=""
     for f in "$CONNECT_CONFIG_DIR"/*.tsv; do
         [ -f "$f" ] || continue
-        source_project="$(basename "$f" .tsv)"
-        source_container="boxa-${source_project}"
+        [ "$f" != "$global_config_file" ] || continue
+        source_projects="$(printf '%s\n%s' "$source_projects" "$(basename "$f" .tsv)")"
+    done
+    while IFS= read -r running_container; do
+        [ -n "$running_container" ] || continue
+        source_projects="$(printf '%s\n%s' "$source_projects" "${running_container#boxa-}")"
+    done < <(list_boxa_container_names)
+    source_projects="$(printf '%s\n' "$source_projects" | grep -v '^$' | sort -u)"
+    if [ -z "$source_projects" ] && [ -f "$global_config_file" ]; then
+        source_projects="*"
+    fi
 
-        # Probe the source container's listeners once per file and reuse the
-        # set for every record below — one docker exec per source container
-        # plus a cheap membership test per record.
+    printf '%-25s %-28s %-16s %-8s %-7s %s\n' \
+        "SOURCE" "TARGET" "INNER ENDPOINT" "STATUS" "SCOPE" "ALIAS"
+    while IFS= read -r source_project; do
+        [ -n "$source_project" ] || continue
+        if [ "$source_project" = '*' ]; then
+            source_container="all boxes"
+            per_box_config_file=""
+        else
+            source_container="boxa-${source_project}"
+            per_box_config_file="$(connection_config_file "$source_project")"
+        fi
+
+        # Probe the source container once and reuse the result for its per-box
+        # records and every global record applied there.
         source_running=false
-        if docker ps --filter "name=^${source_container}$" --format '{{.ID}}' | grep -q .; then
+        if [ "$source_project" != '*' ] \
+            && docker ps --filter "name=^${source_container}$" --format '{{.ID}}' | grep -q .; then
             source_running=true
         fi
 
@@ -3625,29 +3835,40 @@ if [ "$MODE" = "connections" ]; then
             fi
         fi
 
-        while IFS=$'\t' read -r alias target_container target_port local_port; do
-            [ -n "${alias:-}" ] || continue
-            case "$alias" in \#*) continue ;; esac
-
-            # STATUS reflects the real state of the forward:
-            #   stopped — source container is not running
-            #   up      — source running and a listener holds the local port
-            #   down    — source running but no listener (dead forward, or the
-            #             liveness probe could not confirm it)
-            if [ "$source_running" = false ]; then
-                status="stopped"
-            elif [ "$probe_failed" = false ] && [ -n "$local_port" ] \
-                && [ "${listen_set[$local_port]:-0}" = 1 ] \
-                && [ "${running_forward_set[$local_port]:-0}" = 1 ]; then
-                status="up"
-            else
-                status="down"
+        for scoped_config_file in "$global_config_file" "$per_box_config_file"; do
+            if [ -z "$scoped_config_file" ] || [ ! -f "$scoped_config_file" ]; then
+                continue
             fi
+            if [ "$scoped_config_file" = "$global_config_file" ]; then
+                connection_scope="all"
+            else
+                connection_scope="box"
+            fi
+            while IFS=$'\t' read -r alias target_container target_port local_port; do
+                [ -n "${alias:-}" ] || continue
+                case "$alias" in \#*) continue ;; esac
 
-            printf '%-25s %-28s %-16s %-8s %s\n' \
-                "$source_container" "${target_container}:${target_port}" "10.0.2.2:${local_port}" "$status" "$alias"
-        done < "$f"
-    done
+                # STATUS reflects the real state of the forward:
+                #   stopped — source container is not running
+                #   up      — source running and a listener holds the local port
+                #   down    — source running but no listener (dead forward, or
+                #             the liveness probe could not confirm it)
+                if [ "$source_running" = false ]; then
+                    status="stopped"
+                elif [ "$probe_failed" = false ] && [ -n "$local_port" ] \
+                    && [ "${listen_set[$local_port]:-0}" = 1 ] \
+                    && [ "${running_forward_set[$local_port]:-0}" = 1 ]; then
+                    status="up"
+                else
+                    status="down"
+                fi
+
+                printf '%-25s %-28s %-16s %-8s %-7s %s\n' \
+                    "$source_container" "${target_container}:${target_port}" \
+                    "10.0.2.2:${local_port}" "$status" "$connection_scope" "$alias"
+            done < "$scoped_config_file"
+        done
+    done <<< "$source_projects"
     exit 0
 fi
 

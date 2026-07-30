@@ -83,6 +83,10 @@ assert_contains "overview advertises command help" \
     "Run 'boxa <command> --help' for details." "$overview_help"
 assert_contains "overview summarizes Host port selection order" \
     "Auto-port: host port, checksum slot," "$overview_help"
+assert_contains "overview documents global Host scope" \
+    "[--all]" "$overview_help"
+assert_contains "overview warns global Host scope trusts every box" \
+    "--all trusts it in every present/future box" "$overview_help"
 
 connect_help="$(run_boxa help connect)"
 assert_contains "connect help documents Host port selection order" \
@@ -91,6 +95,14 @@ assert_contains "connect help documents prompt fallback" \
     "slot+1 ->" "$connect_help"
 assert_contains "connect help documents explicit local port precedence" \
     "explicit local-port always wins" "$connect_help"
+assert_contains "connect help documents global Host add and rm" \
+    "[--from source | --all]" "$connect_help"
+assert_contains "connect help keeps Host scope per-box by default" \
+    "Host connections are per-box by default." "$connect_help"
+assert_contains "connect help warns --all deliberately widens trust" \
+    "--all deliberately widens trust to" "$connect_help"
+assert_contains "connect help rejects --all with --from" \
+    "cannot be combined with --from" "$connect_help"
 
 unknown_output="$(run_boxa help not-a-command 2>&1)"
 unknown_rc=$?
