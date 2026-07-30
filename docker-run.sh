@@ -1656,6 +1656,146 @@ host_connection_ufw_active() {
     LC_ALL=C sudo ufw status 2>/dev/null | grep -qi '^Status: active'
 }
 
+host_connection_ufw_rule_is_present() {
+    local host_ip="$1" host_port="$2" subnet="$3"
+
+    LC_ALL=C sudo ufw status 2>/dev/null \
+        | awk -v ip="$host_ip" -v port="${host_port}/tcp" -v source="$subnet" '
+            index($0, ip) && index($0, port) && $NF == source { found=1 }
+            END { exit found ? 0 : 1 }
+        '
+}
+
+host_connection_support_finding() {
+    local source_container="$1" host_port="$2"
+    local host_ip state_file state_ip relay_pid subnet ufw_owned
+
+    host_ip="$(resolve_host_connection_ip "$source_container")"
+    if [ -z "$host_ip" ]; then
+        printf 'host address could not be resolved'
+        return 0
+    fi
+    if ! docker exec -u root "$source_container" \
+        iptables -C OUTPUT -p tcp -d "$host_ip" --dport "$host_port" -j ACCEPT \
+        >/dev/null 2>&1; then
+        printf 'container firewall rule missing'
+        return 0
+    fi
+
+    state_file="$(host_connection_state_file "$host_port")"
+    [ -f "$state_file" ] || return 1
+    IFS=$'\t' read -r state_ip relay_pid subnet ufw_owned < "$state_file"
+    : "$ufw_owned"
+    if [ "$state_ip" != "$host_ip" ] \
+        || ! host_connection_relay_is_alive "$relay_pid" "$state_ip" "$host_port"; then
+        printf 'host relay dead or stale'
+        return 0
+    fi
+    if [ -n "$subnet" ] && host_connection_ufw_active \
+        && ! host_connection_ufw_rule_is_present "$state_ip" "$host_port" "$subnet"; then
+        printf 'host ufw slot missing'
+        return 0
+    fi
+    return 1
+}
+
+host_connection_tcp_touch() {
+    local source_container="$1" local_port="$2"
+
+    docker exec -u node -e LOCAL_PORT="$local_port" "$source_container" bash -lc '
+        exec 3<>"/dev/tcp/127.0.0.1/${LOCAL_PORT}" || exit 1
+        read_rc=0
+        IFS= read -r -t 0.5 -N 1 <&3 || read_rc=$?
+        exec 3<&-
+        exec 3>&-
+        [ "$read_rc" -eq 0 ] || [ "$read_rc" -gt 128 ]
+    ' >/dev/null 2>&1
+}
+
+host_connection_runtime_finding() {
+    local source_container="$1" host_port="$2" local_port="$3"
+    local listening_output running_output support_finding
+
+    if ! listening_output="$(list_listening_ports_in_container "$source_container")" \
+        || ! grep -qxF "$local_port" <<< "$listening_output"; then
+        printf 'managed listener missing'
+        return 0
+    fi
+    if ! running_output="$(list_running_connection_ports_in_container "$source_container")" \
+        || ! grep -qxF "$local_port" <<< "$running_output"; then
+        printf 'managed forward process missing'
+        return 0
+    fi
+    if support_finding="$(host_connection_support_finding "$source_container" "$host_port")"; then
+        printf '%s' "$support_finding"
+        return 0
+    fi
+    return 1
+}
+
+host_connection_repair_command() {
+    local alias="$1" host_port="$2" local_port="$3" source_project="$4"
+    local all_connections="$5"
+
+    printf 'boxa connect host %q %q --name %q' "$host_port" "$local_port" "$alias"
+    if [ "$all_connections" = true ]; then
+        printf ' --all'
+    else
+        printf ' --from %q' "$source_project"
+    fi
+}
+
+report_broken_host_connections() {
+    local config_file global_config_file source_project source_container all_connections
+    local alias target_container target_port local_port finding repair_command
+    local running_container report_started=false
+
+    [ -d "$CONNECT_CONFIG_DIR" ] || return 0
+    global_config_file="$(global_connection_config_file)"
+    for config_file in "$CONNECT_CONFIG_DIR"/*.tsv; do
+        [ -f "$config_file" ] || continue
+        if [ "$config_file" = "$global_config_file" ]; then
+            source_project=""
+            source_container="all boxes"
+            all_connections=true
+        else
+            source_project="$(basename "$config_file" .tsv)"
+            source_container="${BRAND_OBJECT_PREFIX}-${source_project}"
+            all_connections=false
+        fi
+        while IFS=$'\t' read -r alias target_container target_port local_port; do
+            [ -n "${alias:-}" ] || continue
+            case "$alias" in \#*) continue ;; esac
+            [ "$target_container" = host ] || continue
+            finding=""
+            if [ "$all_connections" = true ]; then
+                while IFS= read -r running_container; do
+                    [ -n "$running_container" ] || continue
+                    if finding="$(host_connection_runtime_finding \
+                        "$running_container" "$target_port" "$local_port")"; then
+                        finding="${running_container}: ${finding}"
+                        break
+                    fi
+                done < <(list_boxa_container_names)
+            elif docker ps --filter "name=^${source_container}$" \
+                --format '{{.ID}}' | grep -q .; then
+                finding="$(host_connection_runtime_finding \
+                    "$source_container" "$target_port" "$local_port")" || finding=""
+            fi
+            [ -n "$finding" ] || continue
+            if [ "$report_started" = false ]; then
+                echo ""
+                echo "Broken Host connections (report-only):"
+                report_started=true
+            fi
+            repair_command="$(host_connection_repair_command "$alias" "$target_port" \
+                "$local_port" "$source_project" "$all_connections")"
+            echo "  - ${source_container} -> host:${target_port}: ${finding}"
+            echo "      ${repair_command}"
+        done < "$config_file"
+    done
+}
+
 host_connection_bridge_subnet() {
     docker network inspect devproxy \
         --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null \
@@ -3415,6 +3555,8 @@ if [ "$MODE" = "doctor" ]; then
         fi
     fi
 
+    report_broken_host_connections
+
     if [ "${#BOXA_PROVISIONING_FAILED[@]}" -gt 0 ]; then
         echo ""
         echo "Failed:"
@@ -4012,7 +4154,7 @@ if [ "$MODE" = "connections" ]; then
         source_projects="*"
     fi
 
-    printf '%-25s %-28s %-16s %-8s %-7s %s\n' \
+    printf '%-25s %-28s %-16s %-12s %-7s %s\n' \
         "SOURCE" "TARGET" "INNER ENDPOINT" "STATUS" "SCOPE" "ALIAS"
     while IFS= read -r source_project; do
         [ -n "$source_project" ] || continue
@@ -4045,9 +4187,10 @@ if [ "$MODE" = "connections" ]; then
             else
                 # Probe failed (docker exec hung/errored). Surface it rather than
                 # silently claiming the forward is up; records fall back to
-                # "down" below since liveness could not be confirmed.
+                # "down" ("forward down" for Host records) below since
+                # liveness could not be confirmed.
                 probe_failed=true
-                echo "WARNING: could not probe listeners in ${source_container}; STATUS shown as 'down'." >&2
+                echo "WARNING: could not probe listeners in ${source_container}; STATUS shown as 'down'/'forward down'." >&2
             fi
             if running_forward_output=$(list_running_connection_ports_in_container "$source_container"); then
                 if [ -n "$running_forward_output" ]; then
@@ -4057,7 +4200,7 @@ if [ "$MODE" = "connections" ]; then
                 fi
             else
                 probe_failed=true
-                echo "WARNING: could not probe connection processes in ${source_container}; STATUS shown as 'down'." >&2
+                echo "WARNING: could not probe connection processes in ${source_container}; STATUS shown as 'down'/'forward down'." >&2
             fi
         fi
 
@@ -4084,12 +4227,25 @@ if [ "$MODE" = "connections" ]; then
                 elif [ "$probe_failed" = false ] && [ -n "$local_port" ] \
                     && [ "${listen_set[$local_port]:-0}" = 1 ] \
                     && [ "${running_forward_set[$local_port]:-0}" = 1 ]; then
-                    status="up"
+                    if [ "$target_container" = host ]; then
+                        if host_connection_support_finding \
+                            "$source_container" "$target_port" >/dev/null; then
+                            status="forward down"
+                        elif host_connection_tcp_touch "$source_container" "$local_port"; then
+                            status="up"
+                        else
+                            status="host down"
+                        fi
+                    else
+                        status="up"
+                    fi
+                elif [ "$target_container" = host ]; then
+                    status="forward down"
                 else
                     status="down"
                 fi
 
-                printf '%-25s %-28s %-16s %-8s %-7s %s\n' \
+                printf '%-25s %-28s %-16s %-12s %-7s %s\n' \
                     "$source_container" "${target_container}:${target_port}" \
                     "10.0.2.2:${local_port}" "$status" "$connection_scope" "$alias"
             done < "$scoped_config_file"

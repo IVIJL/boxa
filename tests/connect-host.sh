@@ -15,6 +15,8 @@ export BOXA_CONNECT_TEST_LOG="$_TMPROOT/docker.log"
 export BOXA_CONNECT_TEST_HOST_IP="192.168.65.254"
 export BOXA_CONNECT_TEST_BOUND_PORTS=""
 export BOXA_CONNECT_TEST_FORWARD_PORTS=""
+export BOXA_CONNECT_TEST_HOST_DOWN_PORTS=""
+export BOXA_CONNECT_TEST_RULE_MISSING_PORTS=""
 export BOXA_CONNECT_TEST_CONTAINERS="boxa-source"
 export BOXA_CONNECT_TEST_UFW_ACTIVE=false
 export BOXA_CONNECT_TEST_MISSING_SOCAT=false
@@ -65,6 +67,30 @@ docker() {
             case "$*" in
                 *'getent ahostsv4 host.docker.internal'*)
                     printf '%s\n' "$BOXA_CONNECT_TEST_HOST_IP"
+                    ;;
+                *'iptables -C OUTPUT -p tcp -d '*)
+                    local previous="" rule_port="" argument
+                    for argument in "$@"; do
+                        if [ "$previous" = --dport ]; then
+                            rule_port="$argument"
+                            break
+                        fi
+                        previous="$argument"
+                    done
+                    case ",${BOXA_CONNECT_TEST_RULE_MISSING_PORTS}," in
+                        *",${rule_port},"*) return 1 ;;
+                    esac
+                    ;;
+                *'/dev/tcp/127.0.0.1/'*'LOCAL_PORT'*)
+                    local_port=""
+                    for argument in "$@"; do
+                        case "$argument" in
+                            LOCAL_PORT=*) local_port="${argument#LOCAL_PORT=}" ;;
+                        esac
+                    done
+                    case ",${BOXA_CONNECT_TEST_HOST_DOWN_PORTS}," in
+                        *",${local_port},"*) return 1 ;;
+                    esac
                     ;;
                 *'cat /proc/net/tcp /proc/net/tcp6'*)
                     local port
@@ -322,6 +348,28 @@ assert_contains "connections lists Host target" "host:17777" "$connections_outpu
 assert_contains "connections lists --name label" "keep-awake" "$connections_output"
 assert_contains "connections keeps STATUS column" "STATUS" "$connections_output"
 
+# Host status combines forward artifacts with a real TCP touch through the
+# managed local listener. The existing up/down vocabulary stays intact while
+# naming which side failed.
+BOXA_CONNECT_TEST_BOUND_PORTS="17777"
+BOXA_CONNECT_TEST_FORWARD_PORTS="17777"
+healthy_row="$(run_boxa connections | awk '$2 == "host:17777" { print }')"
+assert_contains "live Host probe reports healthy service up" "up" "$healthy_row"
+
+BOXA_CONNECT_TEST_HOST_DOWN_PORTS="17777"
+host_down_row="$(run_boxa connections | awk '$2 == "host:17777" { print }')"
+assert_contains "live Host probe names non-answering host service" \
+    "host down" "$host_down_row"
+
+BOXA_CONNECT_TEST_HOST_DOWN_PORTS=""
+BOXA_CONNECT_TEST_RULE_MISSING_PORTS="17777"
+forward_down_row="$(run_boxa connections | awk '$2 == "host:17777" { print }')"
+assert_contains "live Host probe names broken forward" \
+    "forward down" "$forward_down_row"
+BOXA_CONNECT_TEST_RULE_MISSING_PORTS=""
+BOXA_CONNECT_TEST_BOUND_PORTS=""
+BOXA_CONNECT_TEST_FORWARD_PORTS=""
+
 # Removal tears down the exact root slot and pid-backed forward before deleting
 # the row. With no persisted row, a later replay performs no Docker calls.
 BOXA_CONNECT_TEST_HOST_IP="192.168.65.254"
@@ -566,6 +614,54 @@ assert_eq "uninstall with no Host connections leaves ufw unchanged" \
 assert_eq "uninstall with no Host connections skips container teardown" \
     "$empty_uninstall_container_teardowns_before" \
     "$(count_log_matches '/usr/local/bin/stop-host-connection-allow')"
+
+# Doctor uses the same non-mutating artifact checks, prints an idempotent
+# connect command, and adds no bytes at all when no Host records are persisted.
+doctor_cli_dir="$_TMPROOT/doctor-cli"
+mkdir -p "$doctor_cli_dir"
+cp "$BOXA" "$doctor_cli_dir/docker-run.sh"
+cp -R "$BOXA_DIR/lib" "$doctor_cli_dir/lib"
+cat > "$doctor_cli_dir/lib/provisioning.sh" <<'EOF'
+#!/bin/bash
+BOXA_PROVISIONING_STEPS=("stub-step|-|A")
+boxa::run_provisioning() {
+    BOXA_PROVISIONING_REPAIRED=()
+    BOXA_PROVISIONING_OK=("stub-step")
+    BOXA_PROVISIONING_SKIPPED=()
+    BOXA_PROVISIONING_PREREQ_MISSING=()
+    BOXA_PROVISIONING_MISSING=()
+    BOXA_PROVISIONING_DECLINED=()
+    BOXA_PROVISIONING_FAILED=()
+}
+boxa::prereq_remedy() { :; }
+EOF
+run_doctor() {
+    HOME="$_TMPROOT/home" bash "$doctor_cli_dir/docker-run.sh" doctor
+}
+
+rm -f "$CONNECT_CONFIG_DIR"/*.tsv
+printf 'peer\tboxa-target\t5432\t15432\n' > "$CONNECT_CONFIG_DIR/source.tsv"
+doctor_without_connections="$(run_doctor)"
+expected_doctor_without_connections=$'Running boxa doctor (repairing unconditional host provisioning)...\n\n\n=== boxa doctor summary ===\nAlready OK:\n  - stub-step\n\nHost provisioning is healthy.'
+assert_eq "doctor output with no Host connections is unchanged" \
+    "$expected_doctor_without_connections" "$doctor_without_connections"
+
+doctor_port=17790
+printf 'doctor-host\thost\t%s\t%s\n' "$doctor_port" "$doctor_port" \
+    > "$CONNECT_CONFIG_DIR/source.tsv"
+BOXA_CONNECT_TEST_BOUND_PORTS="$doctor_port"
+BOXA_CONNECT_TEST_FORWARD_PORTS="$doctor_port"
+BOXA_CONNECT_TEST_RULE_MISSING_PORTS="$doctor_port"
+doctor_repair_calls_before="$(count_log_matches '/usr/local/bin/start-host-connection-allow')"
+doctor_broken_output="$(run_doctor)"
+assert_contains "doctor reports broken Host forward" \
+    "boxa-source -> host:${doctor_port}: container firewall rule missing" \
+    "$doctor_broken_output"
+assert_contains "doctor prints exact idempotent Host repair command" \
+    "boxa connect host ${doctor_port} ${doctor_port} --name doctor-host --from source" \
+    "$doctor_broken_output"
+assert_eq "doctor never repairs a broken Host forward" "$doctor_repair_calls_before" \
+    "$(count_log_matches '/usr/local/bin/start-host-connection-allow')"
 
 if [ "$fail_count" -gt 0 ]; then
     printf '\n%d test(s) failed.\n' "$fail_count"
