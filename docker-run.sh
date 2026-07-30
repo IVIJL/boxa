@@ -1615,7 +1615,11 @@ start_container_connection() {
                 exit 1
             fi
             rm -f "$PID_FILE"
-            nohup socat TCP-LISTEN:"${LOCAL_PORT}",bind=127.0.0.1,reuseaddr,fork TCP:"${TARGET_CONTAINER}:${TARGET_PORT}" >"$LOG_FILE" 2>&1 &
+            if command -v setsid >/dev/null 2>&1; then
+                setsid nohup socat TCP-LISTEN:"${LOCAL_PORT}",bind=127.0.0.1,reuseaddr,fork TCP:"${TARGET_CONTAINER}:${TARGET_PORT}" >"$LOG_FILE" 2>&1 &
+            else
+                nohup socat TCP-LISTEN:"${LOCAL_PORT}",bind=127.0.0.1,reuseaddr,fork TCP:"${TARGET_CONTAINER}:${TARGET_PORT}" >"$LOG_FILE" 2>&1 &
+            fi
             echo $! > "$PID_FILE"
         '
 }
@@ -1665,6 +1669,30 @@ host_connection_relay_is_alive() {
     [ -r "/proc/${pid}/cmdline" ] || return 1
     cmdline="$({ tr '\0' ' ' < "/proc/${pid}/cmdline"; } 2>/dev/null || true)"
     [[ "$cmdline" == *"TCP-LISTEN:${host_port},bind=${host_ip},"* ]]
+}
+
+terminate_connection_process_group() {
+    local pid="${1:-}" attempt
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+
+    if kill -TERM -- "-$pid" 2>/dev/null; then
+        for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            : "$attempt"
+            kill -0 -- "-$pid" 2>/dev/null || break
+            sleep 0.01
+        done
+        if kill -0 -- "-$pid" 2>/dev/null; then
+            kill -KILL -- "-$pid" 2>/dev/null || true
+        fi
+    else
+        # Compatibility with state created without setsid: socat's forked
+        # connection handlers are direct children while the listener lives.
+        if command -v pkill >/dev/null 2>&1; then
+            pkill -TERM -P "$pid" 2>/dev/null || true
+        fi
+        kill -TERM "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
 }
 
 host_connection_ip_is_host_owned() {
@@ -1878,9 +1906,7 @@ stop_host_connection_host_side() {
     [ -f "$state_file" ] || return 0
     IFS=$'\t' read -r host_ip relay_pid subnet ufw_owned < "$state_file"
 
-    if host_connection_relay_is_alive "$relay_pid" "$host_ip" "$host_port"; then
-        kill "$relay_pid" 2>/dev/null || true
-    fi
+    terminate_connection_process_group "$relay_pid"
 
     if [ "$ufw_owned" = true ] && [ -n "$subnet" ]; then
         if ! host_connection_ipv4_is_valid "$host_ip" \
@@ -1942,8 +1968,13 @@ start_host_connection_host_side() {
     if [ -z "$relay_pid" ]; then
         mkdir -p "$HOST_CONNECTION_STATE_DIR"
         relay_log="$HOST_CONNECTION_STATE_DIR/${host_port}.relay.log"
-        nohup socat "TCP-LISTEN:${host_port},bind=${host_ip},fork,reuseaddr" \
-            "TCP:127.0.0.1:${host_port}" > "$relay_log" 2>&1 &
+        if command -v setsid >/dev/null 2>&1; then
+            setsid nohup socat "TCP-LISTEN:${host_port},bind=${host_ip},fork,reuseaddr" \
+                "TCP:127.0.0.1:${host_port}" > "$relay_log" 2>&1 &
+        else
+            nohup socat "TCP-LISTEN:${host_port},bind=${host_ip},fork,reuseaddr" \
+                "TCP:127.0.0.1:${host_port}" > "$relay_log" 2>&1 &
+        fi
         relay_pid=$!
         for relay_retry in 1 2 3 4 5 6 7 8 9 10; do
             : "$relay_retry"
@@ -1955,8 +1986,7 @@ start_host_connection_host_side() {
             sleep 0.02
         done
         if [ "$relay_ready" = false ]; then
-            kill "$relay_pid" 2>/dev/null || true
-            wait "$relay_pid" 2>/dev/null || true
+            terminate_connection_process_group "$relay_pid"
             rm -f "$state_file" "${state_file}.tmp" "$relay_log"
             echo "Host connection relay ${host_ip}:${host_port} did not become ready; cleaned up the failed relay and firewall state." >&2
             return 1
@@ -1966,7 +1996,7 @@ start_host_connection_host_side() {
     if host_connection_ufw_active; then
         desired_subnet="$(host_connection_bridge_subnet)"
         if ! host_connection_cidr_is_valid "$desired_subnet"; then
-            kill "$relay_pid" 2>/dev/null || true
+            terminate_connection_process_group "$relay_pid"
             echo "Could not determine the devproxy bridge subnet for Host connection ${host_ip}:${host_port}." >&2
             return 1
         fi
@@ -1981,7 +2011,7 @@ start_host_connection_host_side() {
         ufw_output="$(LC_ALL=C sudo ufw allow proto tcp from "$desired_subnet" \
             to "$host_ip" port "$host_port" 2>&1)" || ufw_rc=$?
         if [ "$ufw_rc" -ne 0 ]; then
-            kill "$relay_pid" 2>/dev/null || true
+            terminate_connection_process_group "$relay_pid"
             echo "Could not create Host connection ufw slot for ${host_ip}:${host_port} from ${desired_subnet}." >&2
             return 1
         fi
@@ -2038,7 +2068,12 @@ stop_container_connection() {
             if [ -f "$PID_FILE" ]; then
                 pid="$(cat "$PID_FILE")"
                 if [[ "$pid" =~ ^[0-9]+$ ]]; then
-                    kill "$pid" 2>/dev/null || true
+                    if ! kill -TERM -- "-$pid" 2>/dev/null; then
+                        if command -v pkill >/dev/null 2>&1; then
+                            pkill -TERM -P "$pid" 2>/dev/null || true
+                        fi
+                        kill -TERM "$pid" 2>/dev/null || true
+                    fi
                 fi
                 rm -f "$PID_FILE"
             fi

@@ -8,7 +8,21 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOXA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BOXA="$BOXA_DIR/docker-run.sh"
 _TMPROOT="$(mktemp -d)"
-trap 'rm -rf "$_TMPROOT"' EXIT
+cleanup() {
+    local pid_file pid
+    for pid_file in "$_TMPROOT"/mock-socat-child-*.pid; do
+        [ -f "$pid_file" ] || continue
+        pid="$(cat "$pid_file")"
+        if [[ "$pid" =~ ^[0-9]+$ ]]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    if [ -n "${BOXA_CONNECT_TEST_CONTAINER_PID_FILE:-}" ]; then
+        rm -f "$BOXA_CONNECT_TEST_CONTAINER_PID_FILE"
+    fi
+    rm -rf "$_TMPROOT"
+}
+trap cleanup EXIT
 
 mkdir -p "$_TMPROOT/home"
 export BOXA_CONNECT_TEST_LOG="$_TMPROOT/docker.log"
@@ -25,6 +39,7 @@ export BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_PORTS=""
 export BOXA_CONNECT_TEST_MISSING_PYTHON=false
 export BOXA_CONNECT_TEST_MISSING_IP=false
 export BOXA_CONNECT_TEST_INTERFACE_IPS="127.0.0.1"
+export BOXA_CONNECT_TEST_EXEC_NODE_TEARDOWN=false
 : > "$BOXA_CONNECT_TEST_LOG"
 
 # Keep list_listening_ports_in_container's timeout path compatible with the
@@ -86,6 +101,18 @@ docker() {
             ;;
         exec)
             local helper_port="${*: -1}"
+            if [ "$BOXA_CONNECT_TEST_EXEC_NODE_TEARDOWN" = true ]; then
+                local exec_pid_file="" argument
+                for argument in "$@"; do
+                    case "$argument" in
+                        PID_FILE=*) exec_pid_file="${argument#PID_FILE=}" ;;
+                    esac
+                done
+                if [ -n "$exec_pid_file" ]; then
+                    PID_FILE="$exec_pid_file" bash -lc "${*: -1}"
+                    return
+                fi
+            fi
             case "$*" in
                 *'/usr/local/bin/start-host-connection-allow '*)
                     case ",${BOXA_CONNECT_TEST_START_ALLOW_FAIL_PORTS}," in
@@ -323,6 +350,27 @@ export HOST_CONNECTION_STATE_DIR="$_TMPROOT/home/.local/state/boxa/host-connecti
 # shellcheck source=/dev/null
 source "$extracted"
 
+# The in-Container teardown executes through docker in production. Run that
+# exact embedded shell against a detached mock listener with a live child.
+container_forward_child_file="$_TMPROOT/mock-socat-child-container.pid"
+setsid bash -c "sleep 300 & printf '%s\n' \"\$!\" > \"\$1\"; wait" \
+    _ "$container_forward_child_file" &
+container_forward_pid=$!
+for _attempt in $(seq 1 50); do
+    [ -s "$container_forward_child_file" ] && break
+    sleep 0.01
+done
+container_forward_child_pid="$(cat "$container_forward_child_file")"
+BOXA_CONNECT_TEST_CONTAINER_PID_FILE="/tmp/boxa-connect-64999.pid"
+printf '%s\n' "$container_forward_pid" > "$BOXA_CONNECT_TEST_CONTAINER_PID_FILE"
+BOXA_CONNECT_TEST_EXEC_NODE_TEARDOWN=true
+stop_container_connection boxa-source 64999
+BOXA_CONNECT_TEST_EXEC_NODE_TEARDOWN=false
+assert_eq "container forward teardown stops listener" "false" \
+    "$(kill -0 "$container_forward_pid" 2>/dev/null && echo true || echo false)"
+assert_eq "container forward teardown stops listener child" "false" \
+    "$(kill -0 "$container_forward_child_pid" 2>/dev/null && echo true || echo false)"
+
 # Behavioral platform detection: a VM-owned address rejects the host bind, so
 # no host relay state or ufw INPUT slot is created.
 vm_host_port=18990
@@ -365,6 +413,15 @@ BOXA_CONNECT_TEST_INTERFACE_IPS="127.0.0.1"
 # A bindable Host IP selects native Docker: relay only on that IP:port, exact
 # bridge-subnet ufw slot, live traffic, changed-IP convergence, and teardown.
 native_host_port=18991
+relay_mock_bin="$_TMPROOT/relay-mock-bin"
+mkdir -p "$relay_mock_bin"
+printf '%s\n' \
+    '#!/bin/bash' \
+    'sleep 300 &' \
+    "printf '%s\\n' \"\$!\" > \"\$BOXA_CONNECT_TEST_SOCAT_CHILD_FILE\"" \
+    'exec /usr/bin/socat "$@"' \
+    > "$relay_mock_bin/socat"
+chmod +x "$relay_mock_bin/socat"
 socat TCP-LISTEN:"$native_host_port",bind=127.0.0.1,reuseaddr,fork \
     SYSTEM:"printf native-ok" >/dev/null 2>&1 &
 native_service_pid=$!
@@ -380,10 +437,16 @@ if [ "$native_service_ready" = false ]; then
     printf 'FAIL  native loopback service did not become ready\n'
     exit 1
 fi
-start_host_connection_host_side 127.0.0.2 "$native_host_port"
+native_child_file="$_TMPROOT/mock-socat-child-native.pid"
+BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$native_child_file" \
+    PATH="$relay_mock_bin:$PATH" \
+    start_host_connection_host_side 127.0.0.2 "$native_host_port"
 native_state_file="$(host_connection_state_file "$native_host_port")"
 IFS=$'\t' read -r native_ip native_relay_pid native_subnet native_ufw_owned \
     < "$native_state_file"
+native_relay_child_pid="$(cat "$native_child_file")"
+assert_eq "host relay mock starts a child process" "true" \
+    "$(kill -0 "$native_relay_child_pid" 2>/dev/null && echo true || echo false)"
 assert_eq "host-owned branch records exact relay IP" "127.0.0.2" "$native_ip"
 assert_eq "host-owned branch records exact bridge subnet" "172.18.0.0/24" "$native_subnet"
 assert_eq "host-owned branch owns newly added ufw slot" "true" "$native_ufw_owned"
@@ -395,12 +458,18 @@ assert_eq "host-owned relay reaches loopback service" "native-ok" \
 assert_eq "host-owned branch opens exact ufw INPUT slot" "1" \
     "$(count_log_matches "ufw allow proto tcp from 172.18.0.0/24 to 127.0.0.2 port ${native_host_port}")"
 
-start_host_connection_host_side 127.0.0.3 "$native_host_port"
+changed_child_file="$_TMPROOT/mock-socat-child-changed.pid"
+BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$changed_child_file" \
+    PATH="$relay_mock_bin:$PATH" \
+    start_host_connection_host_side 127.0.0.3 "$native_host_port"
 IFS=$'\t' read -r changed_ip changed_relay_pid _changed_subnet _changed_ufw_owned \
     < "$native_state_file"
+changed_relay_child_pid="$(cat "$changed_child_file")"
 assert_eq "changed gateway replaces relay IP" "127.0.0.3" "$changed_ip"
 assert_eq "changed gateway stops old relay" "false" \
     "$(kill -0 "$native_relay_pid" 2>/dev/null && echo true || echo false)"
+assert_eq "changed gateway stops old relay child" "false" \
+    "$(kill -0 "$native_relay_child_pid" 2>/dev/null && echo true || echo false)"
 assert_eq "changed gateway removes old ufw slot" "1" \
     "$(count_log_matches "ufw delete allow proto tcp from 172.18.0.0/24 to 127.0.0.2 port ${native_host_port}")"
 assert_eq "changed gateway opens new ufw slot" "1" \
@@ -410,6 +479,8 @@ assert_eq "host-side teardown removes relay state" "false" \
     "$([ -f "$native_state_file" ] && echo true || echo false)"
 assert_eq "host-side teardown stops current relay" "false" \
     "$(kill -0 "$changed_relay_pid" 2>/dev/null && echo true || echo false)"
+assert_eq "host-side teardown stops current relay child" "false" \
+    "$(kill -0 "$changed_relay_child_pid" 2>/dev/null && echo true || echo false)"
 kill "$native_service_pid" 2>/dev/null || true
 
 # A relay process that dies during startup must fail the add path and leave no
@@ -417,10 +488,17 @@ kill "$native_service_pid" 2>/dev/null || true
 failed_relay_port=18986
 failed_relay_bin="$_TMPROOT/failed-relay-bin"
 mkdir -p "$failed_relay_bin"
-printf '#!/usr/bin/env bash\nexit 1\n' > "$failed_relay_bin/socat"
+printf '%s\n' \
+    '#!/bin/bash' \
+    'sleep 300 &' \
+    "printf '%s\\n' \"\$!\" > \"\$BOXA_CONNECT_TEST_SOCAT_CHILD_FILE\"" \
+    'exit 1' \
+    > "$failed_relay_bin/socat"
 chmod +x "$failed_relay_bin/socat"
+failed_relay_child_file="$_TMPROOT/mock-socat-child-failed.pid"
 failed_relay_ufw_before="$(count_log_matches 'ufw allow proto tcp')"
-if failed_relay_output="$(PATH="$failed_relay_bin:$PATH" \
+if failed_relay_output="$(BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$failed_relay_child_file" \
+        PATH="$failed_relay_bin:$PATH" \
         start_host_connection_host_side 127.0.0.2 "$failed_relay_port" 2>&1)"; then
     failed_relay_status=success
 else
@@ -434,6 +512,9 @@ assert_eq "relay startup death leaves no state file" false \
     "$([ -f "$(host_connection_state_file "$failed_relay_port")" ] && echo true || echo false)"
 assert_eq "relay startup death leaves ufw untouched" "$failed_relay_ufw_before" \
     "$(count_log_matches 'ufw allow proto tcp')"
+failed_relay_child_pid="$(cat "$failed_relay_child_file")"
+assert_eq "relay startup failure stops relay child" "false" \
+    "$(kill -0 "$failed_relay_child_pid" 2>/dev/null && echo true || echo false)"
 BOXA_CONNECT_TEST_HOST_IP="127.0.0.2"
 failed_relay_slot_rollbacks_before="$(count_log_matches \
     "/usr/local/bin/stop-host-connection-allow 127.0.0.2 ${failed_relay_port}")"
@@ -547,9 +628,13 @@ BOXA_CONNECT_TEST_FORWARD_PORTS=""
 # Removal tears down the exact root slot and pid-backed forward before deleting
 # the row. With no persisted row, a later replay performs no Docker calls.
 BOXA_CONNECT_TEST_HOST_IP="192.168.65.254"
-start_host_connection_host_side 127.0.0.2 17777
+rm_child_file="$_TMPROOT/mock-socat-child-rm.pid"
+BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$rm_child_file" \
+    PATH="$relay_mock_bin:$PATH" \
+    start_host_connection_host_side 127.0.0.2 17777
 rm_host_state_file="$(host_connection_state_file 17777)"
 IFS=$'\t' read -r _rm_ip rm_relay_pid _rm_subnet _rm_owned < "$rm_host_state_file"
+rm_relay_child_pid="$(cat "$rm_child_file")"
 rm_output="$(run_boxa connect rm host 17777 --from source)"
 assert_contains "rm reports removed Host target" \
     "Removed Host connection: boxa-source -> host:17777" "$rm_output"
@@ -559,6 +644,8 @@ assert_eq "rm invokes node forward teardown" "1" \
     "$(count_log_matches '-u node -e PID_FILE=/tmp/boxa-connect-17777.pid')"
 assert_eq "rm stops native-Docker host relay" "false" \
     "$(kill -0 "$rm_relay_pid" 2>/dev/null && echo true || echo false)"
+assert_eq "rm stops native-Docker host relay child" "false" \
+    "$(kill -0 "$rm_relay_child_pid" 2>/dev/null && echo true || echo false)"
 assert_eq "rm removes native-Docker host state" "false" \
     "$([ -f "$rm_host_state_file" ] && echo true || echo false)"
 assert_eq "rm removes exact native-Docker ufw slot" "1" \
