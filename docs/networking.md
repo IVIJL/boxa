@@ -88,6 +88,85 @@ See [ADR 0019](adr/0019-cross-boxa-connect-via-socat-forward.md) for the design
 rationale (why a per-source socat forward rather than direct `devproxy`
 addressing, and why `10.0.2.2`).
 
+## Host connections
+
+A **Host connection** is a managed connection from a box to one TCP service on
+the host. Use it for a local LLM server, host-side database, notification sink,
+or any other host listener that code in the outer box or its inner Docker
+containers must reach. It is a different gate from the domain **Allowlist**:
+adding `host.docker.internal` to the Allowlist does not create this path.
+
+Create and remove Host connections from the host:
+
+```bash
+boxa connect host 17777 --name keep-awake
+boxa connect host 11434 15434 --name local-llm
+boxa connect host 17777 --name keep-awake --from web
+boxa connect host 17777 --name keep-awake --all
+
+boxa connect rm host 17777 --from web
+boxa connect rm host 17777 --all
+```
+
+The complete command forms are:
+
+```text
+boxa connect host <port> [local-port] [--name <label>] [--from source | --all]
+boxa connect rm host <port> [--from source | --all]
+```
+
+Without `--from`, the current directory selects the source box. `--from`
+selects it explicitly. Host connections are per-box by default; `--all`
+deliberately grants the connection to every present and future box. `--all`
+cannot be combined with `--from`. A per-box and global Host connection cannot
+use the same host port: remove the existing scope before creating the other.
+
+### Local address and port selection
+
+Boxa forwards `localhost:<local-port>` in the outer box to the host service at
+`<port>`. Inner Docker containers use the same stable DinD gateway as a
+**Cross-boxa connection**:
+
+| Client location | Address to use |
+|-----------------|----------------|
+| **Inner DinD container** (your compose service) | `10.0.2.2:<local-port>` |
+| A process in the outer box's main shell | `localhost:<local-port>` |
+
+An explicit `[local-port]` always wins. Otherwise Boxa tries, in order:
+
+1. the host port itself;
+2. a slot in `15000–15999`, calculated with `cksum` from
+   `project:host:port` (or `all:host:port` for `--all`);
+3. the next slot in that range, wrapping at the end;
+4. an interactive prompt.
+
+The selected local port is persisted unchanged. Restart and replay never scan
+for a replacement or prompt again.
+
+### Trust, platform behavior, and lifecycle
+
+A Host connection is a standing exception for one destination IP and one TCP
+port, lasting exactly as long as its persisted entry. It trusts the **port, not
+a particular application**: whatever listens on that host port is reachable,
+so authentication remains the service's responsibility.
+
+Every platform gets a narrowly scoped container firewall slot. On native
+Linux, Boxa also keeps a host `socat` relay and, when UFW is active, a standing
+host rule allowing the `devproxy` subnet to that one host IP:port. Docker
+Desktop supplies the host-side forwarding instead, so it needs neither the
+native relay nor the host UFW slot. Removing the entry tears down its forward,
+firewall slot, and native host-side resources; uninstall removes all Host
+connections. Persisted entries replay when a box starts.
+
+`boxa connections` reports Host records as `up`, `host down` (the host service
+is not listening), `forward down` (the in-container forward is missing), or
+`stopped` when the source box is not running. `boxa doctor` lists damaged
+runtime artifacts under `Broken Host connections (report-only):` and prints an
+idempotent repair command; it does not repair them automatically.
+
+See [ADR 0023](adr/0023-host-connections-durable-scoped-firewall-slot.md) for
+the trust model, native-Linux consequences, and design rationale.
+
 ## One-time host resolver setup for `.test`
 
 `.test` is an [RFC 2606](https://www.rfc-editor.org/rfc/rfc2606) reserved TLD;

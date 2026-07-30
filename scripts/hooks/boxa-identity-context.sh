@@ -33,9 +33,9 @@ You are inside a boxa container for project "$project".
 
 Boundaries:
 - The 'boxa' CLI lives on the host, not in this container. To start
-  or stop containers, open allow-for windows, manage the allowlist, or
-  drive the host Agent-browser Chrome, ask the user to run the
-  corresponding 'boxa …' command on host.
+  or stop containers, open allow-for windows, manage the allowlist,
+  create or remove Host connections, or drive the host Agent-browser
+  Chrome, ask the user to run the corresponding 'boxa …' command on host.
 - Container network is default-deny. Only ~15 allowlisted domains
   resolve; everything else is REJECTed at the firewall. If
   curl/npm/pip/fetch (container-side traffic) fails with a connection
@@ -43,6 +43,13 @@ Boundaries:
   Allowlist. Ask the user to run on host:
     boxa allow <domain>          (durable allowlist entry)
     boxa allow-for <minutes>     (time-bounded harvest window)
+- Container-to-host service traffic uses a SEPARATE Host connection
+  gate, not the domain Allowlist. If traffic from this container or
+  inner Docker needs a service listening on the host, ask the user to
+  run on host:
+    boxa connect host <port> --name <label> [--all]
+  Omit --all for this box; include it only to trust every present and
+  future box. An Allowlist entry for host.docker.internal is ineffective.
 - Agent-browser is a SEPARATE gate. Host Chrome browses through its
   own forward proxy with its own allowlist. Browser failures like
   ERR_TUNNEL_CONNECTION_FAILED or 'proxy denied' do NOT come from the
