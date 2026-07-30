@@ -123,6 +123,9 @@ firewall exception scoped to exactly one IP and one TCP port.
 - Multi-instance semantics of the target service (e.g. one box idles
   while another still works) are the service contract's problem —
   heartbeat/TTL APIs are recommended over pure busy/idle toggles.
+- A broken persisted forward emits a repair warning during Container start or
+  attach but does not block shell access; explicit `boxa connect` add still
+  fails when the forward cannot be established.
 
 ## References
 

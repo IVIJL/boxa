@@ -1668,13 +1668,10 @@ host_connection_relay_is_alive() {
 }
 
 host_connection_ip_is_host_owned() {
-    local host_ip="$1"
+    local host_ip="$1" platform interfaces
 
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "python3 is required to detect the Host connection relay platform." >&2
-        return 2
-    fi
-    python3 - "$host_ip" <<'PY'
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$host_ip" <<'PY'
 import socket
 import sys
 
@@ -1686,6 +1683,40 @@ except OSError:
 finally:
     sock.close()
 PY
+        return
+    fi
+
+    platform="$(uname -s 2>/dev/null || true)"
+    case "$platform" in
+        Linux)
+            if command -v ip >/dev/null 2>&1 \
+                && interfaces="$(ip -4 addr 2>/dev/null)" \
+                && [ -n "$interfaces" ]; then
+                awk -v target="$host_ip" '
+                    $1 == "inet" {
+                        split($2, address, "/")
+                        if (address[1] == target) found=1
+                    }
+                    END { exit found ? 0 : 1 }
+                ' <<< "$interfaces"
+                return
+            fi
+            ;;
+        Darwin)
+            if command -v ifconfig >/dev/null 2>&1 \
+                && interfaces="$(ifconfig 2>/dev/null)" \
+                && [ -n "$interfaces" ]; then
+                awk -v target="$host_ip" '
+                    $1 == "inet" && $2 == target { found=1 }
+                    END { exit found ? 0 : 1 }
+                ' <<< "$interfaces"
+                return
+            fi
+            ;;
+    esac
+
+    echo "Could not determine whether Host connection address ${host_ip} is host-owned: python3 is unavailable and the ${platform:-unknown-platform} interface probe could not run. Install python3 and retry." >&2
+    return 2
 }
 
 host_connection_ufw_active() {
@@ -1876,7 +1907,7 @@ start_host_connection_host_side() {
     local state_file old_ip="" old_pid="" old_subnet="" old_ufw_owned=false
     local relay_pid="" relay_log desired_subnet="" state_subnet=""
     local ufw_output ufw_rc=0 ufw_owned=false
-    local relay_retry ownership_rc=0
+    local relay_retry relay_ready=false ownership_rc=0
 
     state_file="$(host_connection_state_file "$host_port")"
     host_connection_ip_is_host_owned "$host_ip" || ownership_rc=$?
@@ -1916,14 +1947,19 @@ start_host_connection_host_side() {
         relay_pid=$!
         for relay_retry in 1 2 3 4 5 6 7 8 9 10; do
             : "$relay_retry"
+            if host_connection_relay_is_alive "$relay_pid" "$host_ip" "$host_port" \
+                && (exec 3<> "/dev/tcp/${host_ip}/${host_port}") 2>/dev/null; then
+                relay_ready=true
+                break
+            fi
             sleep 0.02
-            host_connection_relay_is_alive "$relay_pid" "$host_ip" "$host_port" || break
         done
-        if [ "$relay_retry" -lt 10 ] \
-            || ! host_connection_relay_is_alive "$relay_pid" "$host_ip" "$host_port"; then
+        if [ "$relay_ready" = false ]; then
+            kill "$relay_pid" 2>/dev/null || true
             wait "$relay_pid" 2>/dev/null || true
-            rm -f "$relay_log"
-            return 0
+            rm -f "$state_file" "${state_file}.tmp" "$relay_log"
+            echo "Host connection relay ${host_ip}:${host_port} did not become ready; cleaned up the failed relay and firewall state." >&2
+            return 1
         fi
     fi
 
@@ -1980,7 +2016,13 @@ start_host_connection() {
         echo "Could not create the container firewall slot for Host connection ${host_ip}:${host_port} in ${source_container}." >&2
         return 1
     fi
-    start_host_connection_host_side "$host_ip" "$host_port" || return 1
+    if ! start_host_connection_host_side "$host_ip" "$host_port"; then
+        if ! docker exec -u root "$source_container" \
+            /usr/local/bin/stop-host-connection-allow "$host_ip" "$host_port"; then
+            echo "Could not roll back the container firewall slot for failed Host connection ${host_ip}:${host_port} in ${source_container}." >&2
+        fi
+        return 1
+    fi
     start_container_connection "$source_container" "$host_ip" "$host_port" \
         "$local_port" "$alias" || return 1
 }
@@ -2099,13 +2141,17 @@ start_boxa_connections() {
     local container="$1"
     local source_project="${container#boxa-}"
     local config_file global_config_file replay_file start_connection_fn
-    local replay_failed=false
-    local -a start_connection_args
+    local -a start_connection_args repair_command repair_scope
     config_file="$(connection_config_file "$source_project")"
     global_config_file="$(global_connection_config_file)"
 
     for replay_file in "$global_config_file" "$config_file"; do
         [ -f "$replay_file" ] || continue
+        if [ "$replay_file" = "$global_config_file" ]; then
+            repair_scope=(--all)
+        else
+            repair_scope=(--from "$source_project")
+        fi
         while IFS=$'\t' read -r alias target_container target_port local_port; do
             [ -n "${alias:-}" ] || continue
             case "$alias" in \#*) continue ;; esac
@@ -2119,12 +2165,20 @@ start_boxa_connections() {
             if "$start_connection_fn" "${start_connection_args[@]}"; then
                 echo "Connection: ${alias} 10.0.2.2:${local_port} → ${target_container}:${target_port}"
             else
-                echo "Failed to start connection ${alias} for ${container}." >&2
-                replay_failed=true
+                if [ "$target_container" = host ]; then
+                    repair_command=(boxa connect host "$target_port" "$local_port" --name "$alias")
+                else
+                    repair_command=(boxa connect "${target_container#boxa-}" "$target_port" "$local_port")
+                fi
+                repair_command+=("${repair_scope[@]}")
+                printf 'WARNING: persisted connection %s for %s failed to start (%s:%s via 10.0.2.2:%s). Repair with: ' \
+                    "$alias" "$container" "$target_container" "$target_port" "$local_port" >&2
+                printf '%q ' "${repair_command[@]}" >&2
+                printf '\n' >&2
             fi
         done < "$replay_file"
     done
-    [ "$replay_failed" = false ]
+    return 0
 }
 
 list_boxa_container_names() {
@@ -2221,9 +2275,8 @@ upsert_connection_record() {
     mkdir -p "$CONNECT_CONFIG_DIR"
     touch "$config_file"
 
-    if awk -F '\t' -v t="$target_container" -v p="$target_port" -v lp="$local_port" \
-        '$4 == lp && !($2 == t && $3 == p) { found=1 } END { exit found ? 0 : 1 }' \
-        "$config_file"; then
+    if connection_record_local_port_conflicts "$config_file" "$target_container" \
+        "$target_port" "$local_port"; then
         echo "Local port ${local_port} is already used by another persisted connection." >&2
         return 1
     fi
@@ -2242,9 +2295,8 @@ upsert_global_connection_record() {
     mkdir -p "$CONNECT_CONFIG_DIR"
     touch "$config_file"
 
-    if awk -F '\t' -v t="$target_container" -v p="$target_port" -v lp="$local_port" \
-        '$4 == lp && !($2 == t && $3 == p) { found=1 } END { exit found ? 0 : 1 }' \
-        "$config_file"; then
+    if connection_record_local_port_conflicts "$config_file" "$target_container" \
+        "$target_port" "$local_port"; then
         echo "Local port ${local_port} is already used by another persisted connection." >&2
         return 1
     fi
@@ -2254,6 +2306,14 @@ upsert_global_connection_record() {
         'BEGIN { OFS = FS } !($2 == t && $3 == p)' "$config_file" > "$tmp"
     printf '%s\t%s\t%s\t%s\n' "$alias" "$target_container" "$target_port" "$local_port" >> "$tmp"
     mv "$tmp" "$config_file"
+}
+
+connection_record_local_port_conflicts() {
+    local config_file="$1" target_container="$2" target_port="$3" local_port="$4"
+
+    awk -F '\t' -v t="$target_container" -v p="$target_port" -v lp="$local_port" \
+        '$4 == lp && !($2 == t && $3 == p) { found=1 } END { exit found ? 0 : 1 }' \
+        "$config_file"
 }
 
 # Gracefully stop a boxa container — close allow-for window first, then
@@ -4068,6 +4128,8 @@ if [ "$MODE" = "connect" ]; then
     TARGET_TOKEN="${POSITIONAL[0]:-}"
     TARGET_PORT="${POSITIONAL[1]:-}"
     LOCAL_PORT="${POSITIONAL[2]:-}"
+    LOCAL_PORT_WAS_EXPLICIT=false
+    [ -z "$LOCAL_PORT" ] || LOCAL_PORT_WAS_EXPLICIT=true
 
     if [ -z "$TARGET_TOKEN" ] || [ -z "$TARGET_PORT" ]; then
         echo "Usage: boxa connect host <port> [local-port] [--name <label>] [--from source | --all]" >&2
@@ -4173,10 +4235,11 @@ if [ "$MODE" = "connect" ]; then
     mkdir -p "$CONNECT_CONFIG_DIR"
     touch "$CONFIG_FILE"
 
+    EXISTING_LOCAL_PORT="$(awk -F '\t' -v t="$TARGET_CONTAINER" -v p="$TARGET_PORT" \
+        '$2 == t && $3 == p { print $4; exit }' "$CONFIG_FILE")"
     if [ -z "$LOCAL_PORT" ]; then
-        existing=$(awk -F '\t' -v t="$TARGET_CONTAINER" -v p="$TARGET_PORT" '$2 == t && $3 == p { print $4; exit }' "$CONFIG_FILE")
-        if [ -n "$existing" ]; then
-            LOCAL_PORT="$existing"
+        if [ -n "$EXISTING_LOCAL_PORT" ]; then
+            LOCAL_PORT="$EXISTING_LOCAL_PORT"
         elif [ "$ALL_CONNECTIONS" = true ]; then
             LOCAL_PORT="$(select_global_host_connection_port "$TARGET_PORT" "$CONFIG_FILE")"
         elif [ "$TARGET_CONTAINER" = host ]; then
@@ -4184,6 +4247,20 @@ if [ "$MODE" = "connect" ]; then
         else
             LOCAL_PORT="$(allocate_connection_port "$SOURCE_PROJECT" "$TARGET_CONTAINER" "$TARGET_PORT" "$CONFIG_FILE")"
         fi
+    fi
+
+    if connection_record_local_port_conflicts "$CONFIG_FILE" "$TARGET_CONTAINER" \
+        "$TARGET_PORT" "$LOCAL_PORT"; then
+        echo "Local port ${LOCAL_PORT} is already used by another persisted connection." >&2
+        exit 1
+    fi
+
+    if [ "$TARGET_CONTAINER" = host ] \
+        && [ "$LOCAL_PORT_WAS_EXPLICIT" = true ] \
+        && [ -n "$EXISTING_LOCAL_PORT" ] \
+        && [ "$EXISTING_LOCAL_PORT" != "$LOCAL_PORT" ]; then
+        remove_host_connection "$SOURCE_PROJECT" "$SOURCE_CONTAINER" \
+            "$ALL_CONNECTIONS" "$TARGET_PORT" || exit 1
     fi
 
     ALIAS="${CONNECTION_NAME:-${TARGET_PROJECT}-${TARGET_PORT}}"

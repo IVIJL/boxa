@@ -157,6 +157,10 @@ Desktop supplies the host-side forwarding instead, so it needs neither the
 native relay nor the host UFW slot. Removing the entry tears down its forward,
 firewall slot, and native host-side resources; uninstall removes all Host
 connections. Persisted entries replay when a box starts.
+If a persisted forward cannot be replayed, Boxa prints the broken connection
+and its exact repair command but continues starting or attaching to the box;
+box availability takes precedence over the optional forward. An explicit
+`boxa connect` add still fails until its forward is established.
 
 `boxa connections` reports Host records as `up`, `host down` (the host service
 is not listening), `forward down` (the in-container forward is missing), or
