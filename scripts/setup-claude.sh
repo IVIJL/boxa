@@ -5,8 +5,8 @@ set -euo pipefail
 # Boxa-specific defaults are seeded only when the host file is missing,
 # so existing host config is never overwritten.
 
-readonly DEFAULTS="/etc/claude-defaults"
-readonly TARGET="/home/node/.claude"
+readonly DEFAULTS="${BOXA_CLAUDE_DEFAULTS:-/etc/claude-defaults}"
+readonly TARGET="${BOXA_CLAUDE_TARGET:-/home/node/.claude}"
 readonly PROJECT_NAME="${BOXA_PROJECT_NAME:-}"
 
 WARNINGS=()
@@ -96,6 +96,94 @@ migrate_enable_all_project_mcp_servers() {
         WARNINGS+=("Claude settings migration deferred — concurrent Claude settings update detected; it will retry on next start (the final revalidate/rename window cannot be locked against Claude)")
     elif [ "$status" -ne 0 ]; then
         WARNINGS+=("Claude settings migration failed — could not retire enableAllProjectMcpServers")
+    fi
+}
+
+# Every-start. Add boxa's keep-awake client hook to existing shared Claude
+# config without replacing unrelated user hooks or settings. Re-running is a
+# no-op once all three exact entries are present.
+migrate_agent_awake_hooks() {
+    local migration_dir="$TARGET/.boxa-migrations"
+    local status=0
+
+    mkdir -p "$TARGET/hooks" "$migration_dir"
+    if [ -f "$DEFAULTS/hooks/agent-awake.sh" ] \
+        && [ ! -f "$TARGET/hooks/agent-awake.sh" ]; then
+        cp "$DEFAULTS/hooks/agent-awake.sh" "$TARGET/hooks/agent-awake.sh"
+        seeded=$((seeded+1))
+    fi
+    [ -e "$TARGET/settings.json" ] || return 0
+
+    (
+        flock 9 || exit 3
+
+        local attempts_left=3 source="" tmp=""
+        while [ "$attempts_left" -gt 0 ]; do
+            attempts_left=$((attempts_left - 1))
+            source=$(mktemp "$TARGET/settings.json.source.XXXXXX") || exit 3
+            trap '[ -z "${source:-}" ] || rm -f "$source"; [ -z "${tmp:-}" ] || rm -f "$tmp"' EXIT
+            tmp=$(mktemp "$TARGET/settings.json.XXXXXX") || exit 3
+            if ! cp -- "$TARGET/settings.json" "$source" \
+               || ! jq -e '
+                    . as $settings
+                    | type == "object"
+                    and (.hooks == null or (.hooks | type == "object"))
+                    and (["UserPromptSubmit", "PreToolUse", "Stop"] | all(
+                        . as $event
+                        | ($settings.hooks[$event] == null
+                           or ($settings.hooks[$event] | type == "array"))
+                    ))
+                ' "$source" >/dev/null 2>&1; then
+                exit 2
+            fi
+
+            if ! jq '
+                def ensure_hook($event; $command):
+                    {hooks: [{type: "command", command: $command}]} as $entry
+                    | .hooks = (.hooks // {})
+                    | .hooks[$event] = ((.hooks[$event] // []) as $entries
+                        | if ($entries | index($entry)) == null
+                          then $entries + [$entry]
+                          else $entries
+                          end);
+                ensure_hook("UserPromptSubmit"; "/home/node/.claude/hooks/agent-awake.sh busy")
+                | ensure_hook("PreToolUse"; "/home/node/.claude/hooks/agent-awake.sh busy")
+                | ensure_hook("Stop"; "/home/node/.claude/hooks/agent-awake.sh idle")
+            ' "$source" > "$tmp"; then
+                exit 3
+            fi
+            if cmp -s "$source" "$tmp"; then
+                rm -f "$source" "$tmp"
+                source=""
+                tmp=""
+                trap - EXIT
+                exit 0
+            fi
+            # Claude does not share this lock; revalidate immediately before
+            # rename and retry if it changed the shared file meanwhile.
+            if ! cmp -s "$source" "$TARGET/settings.json"; then
+                rm -f "$source" "$tmp"
+                source=""
+                tmp=""
+                trap - EXIT
+                continue
+            fi
+            mv "$tmp" "$TARGET/settings.json"
+            rm -f "$source"
+            source=""
+            tmp=""
+            trap - EXIT
+            exit 0
+        done
+        exit 4
+    ) 9>"$migration_dir/agent-awake-hooks.lock" || status=$?
+
+    if [ "$status" -eq 2 ]; then
+        WARNINGS+=("Claude keep-awake hook migration skipped — $TARGET/settings.json has an unsupported shape or invalid JSON")
+    elif [ "$status" -eq 4 ]; then
+        WARNINGS+=("Claude keep-awake hook migration deferred — concurrent Claude settings update detected; it will retry on next start")
+    elif [ "$status" -ne 0 ]; then
+        WARNINGS+=("Claude keep-awake hook migration failed")
     fi
 }
 
@@ -237,6 +325,7 @@ print_summary() {
 main() {
     seed_defaults
     migrate_enable_all_project_mcp_servers
+    migrate_agent_awake_hooks
     make_workspace_symlink     # before pretrust (logical order, not strict dep)
     pretrust_workspace_paths
     ensure_npm_global_path     # must precede bootstrap_codex (shared parent dir)
@@ -247,4 +336,6 @@ main() {
     print_summary
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

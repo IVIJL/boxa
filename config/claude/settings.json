@@ -11,6 +11,14 @@
             "command": "/home/node/.claude/hooks/success_notify.sh"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/node/.claude/hooks/agent-awake.sh idle"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -19,6 +27,24 @@
           {
             "type": "command",
             "command": "/home/node/.claude/hooks/interaction_notify.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/node/.claude/hooks/agent-awake.sh busy"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/node/.claude/hooks/agent-awake.sh busy"
           }
         ]
       }

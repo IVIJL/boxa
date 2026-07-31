@@ -23,11 +23,19 @@ The installer offers this elective once. A decline is remembered; plain
 `boxa doctor` reports it without changing the choice. Enable it later with
 `boxa keep-awake enable` or `boxa doctor --fix keep-awake`.
 
-## Example activity hook
+## Built-in activity hook
 
-Clients should refresh a lease on each activity event. The daemon's default
-TTL is 15 minutes, so a missed stop event cannot hold the machine awake
-forever. On a clean stop, release the same agent/session lease immediately:
+Boxa's managed Claude config includes `agent-awake.sh` in every Container. It
+refreshes a 15-minute lease on `UserPromptSubmit` and `PreToolUse`, and releases
+the same project-scoped lease on `Stop`. The hook calls the Host connection on
+local port 17777 with a one-second timeout and always exits successfully, so it
+is a silent fast no-op until `boxa keep-awake enable` makes the daemon
+reachable. Existing Claude configs receive the hook and settings entries
+additively during Container setup.
+
+Third-party agents can implement the same activity/stop protocol. The daemon's
+default TTL is 15 minutes, so a missed stop event cannot hold the machine awake
+forever:
 
 ```bash
 #!/usr/bin/env bash

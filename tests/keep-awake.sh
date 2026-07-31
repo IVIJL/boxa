@@ -52,6 +52,16 @@ assert_contains() {
     fi
 }
 
+assert_file_exists() {
+    local label="$1" path="$2"
+    if [ -e "$path" ]; then
+        printf 'PASS  %s\n' "$label"
+    else
+        printf 'FAIL  %s\n      missing file: %s\n' "$label" "$path"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
 mkdir -p "$TMPROOT/bash-only"
 ln -s "$(command -v bash)" "$TMPROOT/bash-only/bash"
 
@@ -163,6 +173,9 @@ EOF
 
 cat > "$TMPROOT/bin/curl" <<'EOF'
 #!/usr/bin/env bash
+case "$*" in
+    *'/v1/busy/'*|*'/v1/idle/'*) printf 'curl %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG" ;;
+esac
 [ "$KEEP_AWAKE_TEST_CURL_HEALTHY" = true ] || exit 7
 printf '{"activeHolders":[{"agent":"codex","session":"test","remainingTTLSeconds":899}],"isInhibited":true,"version":"test"}\n'
 EOF
@@ -203,6 +216,75 @@ EOF
 chmod +x "$TMPROOT/bin"/*
 export TMPROOT
 export PATH="$TMPROOT/bin:$PATH"
+
+# The managed client hook uses the Host connection API, is project-scoped,
+# bounds curl to one second, and silently succeeds when the daemon is absent.
+agent_awake="$BOXA_DIR/config/claude/hooks/agent-awake.sh"
+: > "$KEEP_AWAKE_TEST_LOG"
+BOXA_PROJECT_NAME=sample-project "$agent_awake" busy
+assert_contains "busy hook calls versioned Host connection endpoint" \
+    "http://127.0.0.1:17777/v1/busy/claude?ttl=900&session=sample-project" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "busy hook caps curl at one second" \
+    "curl -fsS -m 1" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+: > "$KEEP_AWAKE_TEST_LOG"
+env -u BOXA_PROJECT_NAME "$agent_awake" idle
+assert_contains "idle hook uses the default session" \
+    "http://127.0.0.1:17777/v1/idle/claude?session=default" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+export KEEP_AWAKE_TEST_CURL_HEALTHY=false
+hook_down_output="$($agent_awake busy 2>&1)"
+assert_eq "unreachable daemon leaves hook silent" "" "$hook_down_output"
+assert_eq "unreachable daemon leaves hook successful" pass \
+    "$($agent_awake busy >/dev/null 2>&1 && printf pass || printf fail)"
+export KEEP_AWAKE_TEST_CURL_HEALTHY=true
+
+# Existing shared settings are merged rather than replaced. Calling the
+# migration twice must leave one exact entry per event and preserve custom data.
+claude_defaults="$BOXA_DIR/config/claude"
+claude_target="$TMPROOT/claude-target"
+mkdir -p "$claude_target/hooks"
+cat > "$claude_target/settings.json" <<'EOF'
+{
+  "customUserSetting": true,
+  "hooks": {
+    "Stop": [{"hooks": [{"type": "command", "command": "/custom/stop.sh"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/custom/prompt.sh"}]}]
+  }
+}
+EOF
+for _ in 1 2; do
+    BOXA_CLAUDE_DEFAULTS="$claude_defaults" BOXA_CLAUDE_TARGET="$claude_target" \
+        bash -c 'source "$1"; migrate_agent_awake_hooks' \
+        _ "$BOXA_DIR/scripts/setup-claude.sh"
+done
+assert_file_exists "settings migration installs missing managed hook" \
+    "$claude_target/hooks/agent-awake.sh"
+assert_eq "settings migration preserves custom settings" true \
+    "$(jq -r '.customUserSetting' "$claude_target/settings.json")"
+assert_eq "settings migration preserves custom hooks" 2 \
+    "$(jq '[.hooks[][]?.hooks[]? | select(.command | startswith("/custom/"))] | length' \
+        "$claude_target/settings.json")"
+assert_eq "settings migration adds one prompt heartbeat" 1 \
+    "$(jq '[.hooks.UserPromptSubmit[] | select(.hooks == [{"type":"command","command":"/home/node/.claude/hooks/agent-awake.sh busy"}])] | length' \
+        "$claude_target/settings.json")"
+assert_eq "settings migration adds one pre-tool heartbeat" 1 \
+    "$(jq '[.hooks.PreToolUse[] | select(.hooks == [{"type":"command","command":"/home/node/.claude/hooks/agent-awake.sh busy"}])] | length' \
+        "$claude_target/settings.json")"
+assert_eq "settings migration adds one stop release" 1 \
+    "$(jq '[.hooks.Stop[] | select(.hooks == [{"type":"command","command":"/home/node/.claude/hooks/agent-awake.sh idle"}])] | length' \
+        "$claude_target/settings.json")"
+
+# Managed defaults retain notify hooks while wiring all keep-awake events.
+assert_eq "managed defaults preserve success notify hook" 1 \
+    "$(jq '[.hooks.Stop[]?.hooks[]? | select(.command == "/home/node/.claude/hooks/success_notify.sh")] | length' \
+        "$BOXA_DIR/config/claude/settings.json")"
+assert_eq "managed defaults preserve interaction notify hook" 1 \
+    "$(jq '[.hooks.UserPromptSubmit[]?.hooks[]? | select(.command == "/home/node/.claude/hooks/interaction_notify.sh")] | length' \
+        "$BOXA_DIR/config/claude/settings.json")"
+assert_eq "managed defaults contain all client signal entries" 3 \
+    "$(jq '[.hooks[][]?.hooks[]? | select(.command | startswith("/home/node/.claude/hooks/agent-awake.sh "))] | length' \
+        "$BOXA_DIR/config/claude/settings.json")"
 
 # The fresh-install offer records a decline once without needing Go.
 decline_output="$(printf 'n\n' | "$KEEP_AWAKE" offer --interactive)"
@@ -284,7 +366,18 @@ assert_contains "status reports reachable daemon" "Daemon reachable: yes" "$stat
 assert_contains "status reports active holders" '"agent":"codex"' "$status_output"
 assert_contains "status reports autostart" "Autostart installed: yes" "$status_output"
 assert_contains "status reports Host connection" "Host connection present: yes" "$status_output"
+assert_contains "status reports complete client signal path" \
+    "Client signal: signal path OK" "$status_output"
 assert_contains "status reports Linux tray separately" "Tray: running" "$status_output"
+
+missing_defaults="$TMPROOT/missing-claude-defaults"
+mkdir -p "$missing_defaults"
+missing_client_status="$(BOXA_KEEP_AWAKE_CLAUDE_DEFAULTS="$missing_defaults" \
+    "$KEEP_AWAKE" status)"
+assert_contains "status reports missing managed hook" \
+    "managed hook file" "$missing_client_status"
+assert_contains "status reports missing managed settings" \
+    "managed settings file" "$missing_client_status"
 
 disable_output="$("$KEEP_AWAKE" disable)"
 assert_contains "disable reports all reversed components" \
@@ -302,6 +395,8 @@ disabled_status="$("$KEEP_AWAKE" status)"
 assert_contains "disabled status reports daemon down" "Daemon reachable: no" "$disabled_status"
 assert_contains "disabled status reports autostart absent" "Autostart installed: no" "$disabled_status"
 assert_contains "disabled status reports Host connection absent" "Host connection present: no" "$disabled_status"
+assert_contains "disabled status reports unreachable client signal daemon" \
+    "Client signal: missing reachable daemon" "$disabled_status"
 assert_contains "disabled status reports tray not installed" "Tray: not installed" "$disabled_status"
 export KEEP_AWAKE_TEST_CURL_HEALTHY=true
 

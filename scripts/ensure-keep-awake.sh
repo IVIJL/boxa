@@ -32,6 +32,7 @@ KEEP_AWAKE_TRAY_IDLE_ICON=""
 KEEP_AWAKE_WINDOWS_TRAY_FILE=""
 KEEP_AWAKE_BOXA="${BOXA_KEEP_AWAKE_BOXA_COMMAND:-$BOXA_DIR/docker-run.sh}"
 KEEP_AWAKE_GO_IMAGE="golang:1.22"
+KEEP_AWAKE_CLAUDE_DEFAULTS="${BOXA_KEEP_AWAKE_CLAUDE_DEFAULTS:-$BOXA_DIR/config/claude}"
 
 usage() {
     cat <<'EOF'
@@ -165,6 +166,36 @@ keep_awake::daemon_url() {
 
 keep_awake::daemon_status_json() {
     curl -fsS --max-time 2 "$(keep_awake::daemon_url)" 2>/dev/null
+}
+
+keep_awake::client_signal_status() {
+    local daemon="$1"
+    local -a missing=()
+    local settings="$KEEP_AWAKE_CLAUDE_DEFAULTS/settings.json"
+    local hook="$KEEP_AWAKE_CLAUDE_DEFAULTS/hooks/agent-awake.sh"
+
+    [ -f "$hook" ] || missing+=("managed hook file")
+    if [ ! -f "$settings" ]; then
+        missing+=("managed settings file")
+    elif ! jq -e '
+        def has_hook($event; $command):
+            any(.hooks[$event][]?.hooks[]?;
+                .type == "command" and .command == $command);
+        has_hook("UserPromptSubmit"; "/home/node/.claude/hooks/agent-awake.sh busy")
+        and has_hook("PreToolUse"; "/home/node/.claude/hooks/agent-awake.sh busy")
+        and has_hook("Stop"; "/home/node/.claude/hooks/agent-awake.sh idle")
+    ' "$settings" >/dev/null 2>&1; then
+        missing+=("managed settings entries")
+    fi
+    [ "$daemon" = yes ] || missing+=("reachable daemon")
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        printf 'signal path OK\n'
+    else
+        local joined
+        joined="$(IFS=', '; printf '%s' "${missing[*]}")"
+        printf 'missing %s\n' "$joined"
+    fi
 }
 
 keep_awake::autostart_installed() {
@@ -698,7 +729,7 @@ keep_awake::disable() {
 }
 
 keep_awake::status() {
-    local status_json="" holders="[]" daemon=no autostart=no connection=no tray
+    local status_json="" holders="[]" daemon=no autostart=no connection=no tray client_signal
     keep_awake::init_paths || return 1
     if status_json="$(keep_awake::daemon_status_json)"; then
         daemon=yes
@@ -709,10 +740,12 @@ keep_awake::status() {
     keep_awake::autostart_installed && autostart=yes
     keep_awake::host_connection_present && connection=yes
     tray="$(keep_awake::tray::status)"
+    client_signal="$(keep_awake::client_signal_status "$daemon")"
     printf 'Daemon reachable: %s\n' "$daemon"
     printf 'Holders: %s\n' "$holders"
     printf 'Autostart installed: %s\n' "$autostart"
     printf 'Host connection present: %s\n' "$connection"
+    printf 'Client signal: %s\n' "$client_signal"
     printf 'Tray: %s\n' "$tray"
 }
 
