@@ -23,6 +23,7 @@ KEEP_AWAKE_WRAPPER=""
 KEEP_AWAKE_WINDOWS_WRAPPER=""
 KEEP_AWAKE_AUTOSTART_FILE=""
 KEEP_AWAKE_BOXA="${BOXA_KEEP_AWAKE_BOXA_COMMAND:-$BOXA_DIR/docker-run.sh}"
+KEEP_AWAKE_GO_IMAGE="golang:1.22"
 
 usage() {
     cat <<'EOF'
@@ -188,7 +189,7 @@ keep_awake::go_remedy() {
     platform="$(keep_awake::platform 2>/dev/null || true)"
     case "$platform" in
         macos)
-            printf 'Run: brew install go'
+            printf 'Have Docker installed and running. Local fallback: Run: brew install go'
             ;;
         linux|wsl2)
             manager=""
@@ -197,29 +198,34 @@ keep_awake::go_remedy() {
                 manager=""
             done
             case "$manager" in
-                apt-get) printf 'Run: sudo apt-get install -y golang-go' ;;
-                dnf)     printf 'Run: sudo dnf install -y golang' ;;
-                pacman)  printf 'Run: sudo pacman -S go' ;;
-                zypper)  printf 'Run: sudo zypper install -y go' ;;
-                apk)     printf 'Run: sudo apk add go' ;;
-                *)       printf 'Install Go from https://go.dev/doc/install' ;;
+                apt-get) printf 'Have Docker installed and running. Local fallback: Run: sudo apt-get install -y golang-go' ;;
+                dnf)     printf 'Have Docker installed and running. Local fallback: Run: sudo dnf install -y golang' ;;
+                pacman)  printf 'Have Docker installed and running. Local fallback: Run: sudo pacman -S go' ;;
+                zypper)  printf 'Have Docker installed and running. Local fallback: Run: sudo zypper install -y go' ;;
+                apk)     printf 'Have Docker installed and running. Local fallback: Run: sudo apk add go' ;;
+                *)       printf 'Have Docker installed and running. Local fallback: install Go from https://go.dev/doc/install' ;;
             esac
             ;;
         *)
-            printf 'Install Go from https://go.dev/doc/install'
+            printf 'Have Docker installed and running. Local fallback: install Go from https://go.dev/doc/install'
             ;;
     esac
 }
 
 keep_awake::go_prereq() {
     keep_awake::init_paths >/dev/null 2>&1 || return 1
-    [ -x "$KEEP_AWAKE_BINARY" ] || command -v go >/dev/null 2>&1
+    [ -x "$KEEP_AWAKE_BINARY" ] \
+        || command -v docker >/dev/null 2>&1 \
+        || command -v go >/dev/null 2>&1
 }
 
 keep_awake::check_enable_prereqs() {
     keep_awake::init_paths || return 1
-    if [ ! -x "$KEEP_AWAKE_BINARY" ] && ! command -v go >/dev/null 2>&1; then
-        printf 'keep-awake: Go toolchain not found. %s\n' "$(keep_awake::go_remedy)" >&2
+    if [ ! -x "$KEEP_AWAKE_BINARY" ] \
+        && ! command -v docker >/dev/null 2>&1 \
+        && ! command -v go >/dev/null 2>&1; then
+        printf 'keep-awake: Docker and local Go fallback not found. %s\n' \
+            "$(keep_awake::go_remedy)" >&2
         return 1
     fi
     command -v curl >/dev/null 2>&1 || {
@@ -253,11 +259,46 @@ keep_awake::check_enable_prereqs() {
 }
 
 keep_awake::build_binary() {
-    local output="$1"
-    if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ]; then
-        (cd "$BOXA_DIR/keep-awake" && GOOS=windows go build -trimpath -o "$output" .)
+    local output="$1" output_dir output_name
+    local -a docker_args
+    output_dir="$(dirname "$output")"
+    output_name="$(basename "$output")"
+
+    if command -v docker >/dev/null 2>&1; then
+        docker_args=(
+            run --rm
+            --user "$(id -u):$(id -g)"
+            --env CGO_ENABLED=0
+            --env GOCACHE=/tmp/gocache
+            --env GOMODCACHE=/tmp/gomodcache
+        )
+        if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ]; then
+            docker_args+=(--env GOOS=windows)
+        fi
+        docker_args+=(
+            --volume "$BOXA_DIR/keep-awake:/src:ro"
+            --volume "$output_dir:/out"
+            --workdir /src
+            "$KEEP_AWAKE_GO_IMAGE"
+            go build -trimpath -o "/out/$output_name" .
+        )
+        if docker "${docker_args[@]}"; then
+            return 0
+        fi
+        printf 'keep-awake: Docker build failed; falling back to the local Go toolchain.\n' >&2
     else
-        (cd "$BOXA_DIR/keep-awake" && go build -trimpath -o "$output" .)
+        printf 'keep-awake: Docker command not found; falling back to the local Go toolchain.\n' >&2
+    fi
+
+    if ! command -v go >/dev/null 2>&1; then
+        printf 'keep-awake: local Go fallback unavailable. %s\n' \
+            "$(keep_awake::go_remedy)" >&2
+        return 1
+    fi
+    if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ]; then
+        (cd "$BOXA_DIR/keep-awake" && CGO_ENABLED=0 GOOS=windows go build -trimpath -o "$output" .)
+    else
+        (cd "$BOXA_DIR/keep-awake" && CGO_ENABLED=0 go build -trimpath -o "$output" .)
     fi
 }
 
@@ -420,7 +461,7 @@ keep_awake::enable() {
         built_binary="$tmp_dir/$(basename "$KEEP_AWAKE_BINARY")"
         if ! keep_awake::build_binary "$built_binary"; then
             rm -rf "$tmp_dir"
-            printf 'keep-awake: Go build failed; no host state was changed.\n' >&2
+            printf 'keep-awake: binary build failed; no host state was changed.\n' >&2
             return 1
         fi
         if ! mkdir -p "$KEEP_AWAKE_INSTALL_DIR" \

@@ -223,9 +223,10 @@ EOF
 Usage: boxa keep-awake <enable|disable|status>
 
 Manage the optional host daemon that prevents idle sleep while coding agents
-hold active leases. Enable builds it from the checked-out Go source, installs
-platform autostart, starts it, and creates a global Host connection on port
-17777. Disable reverses those changes; status reports every component.
+hold active leases. Enable builds it from the checked-out Go source in a
+pinned golang Docker container (with local Go as fallback), installs platform
+autostart, starts it, and creates a global Host connection on port 17777.
+Disable reverses those changes; status reports every component.
 
 Commands:
   enable   Build, install, start, and expose keep-awake to every box
