@@ -52,6 +52,17 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local label="$1" needle="$2" haystack="$3"
+    if [[ "$haystack" != *"$needle"* ]]; then
+        printf 'PASS  %s\n' "$label"
+    else
+        printf 'FAIL  %s\n      unexpected: %q\n      actual:     %q\n' \
+            "$label" "$needle" "$haystack"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
 assert_file_exists() {
     local label="$1" path="$2"
     if [ -e "$path" ]; then
@@ -330,7 +341,11 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$host_output_dir" ] && [ -n "$container_output" ] || exit 2
 output_name="${container_output#/out/}"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$host_output_dir/$output_name"
+{
+    printf '#!/usr/bin/env bash\n'
+    printf '%s\n' 'printf "daemon %s\n" "$*" >> "$KEEP_AWAKE_TEST_LOG"'
+    printf 'exit 0\n'
+} > "$host_output_dir/$output_name"
 chmod +x "$host_output_dir/$output_name"
 EOF
 chmod +x "$TMPROOT/bin/docker"
@@ -349,6 +364,8 @@ assert_eq "enable starts independent Linux tray unit" true \
     "$(file_exists "$KEEP_AWAKE_TEST_TRAY_SYSTEMD")"
 assert_eq "enable creates global Host connection" true "$(file_exists "$KEEP_AWAKE_TEST_CONNECT")"
 assert_eq "enabled elective probes OK" ok "$("$KEEP_AWAKE" probe)"
+assert_contains "default enable persists system autostart mode" "autostart=system" \
+    "$(cat "$XDG_CONFIG_HOME/boxa/keep-awake.conf")"
 docker_build_log="$(grep '^docker ' "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "default build uses the pinned golang image" "golang:1.22" "$docker_build_log"
 assert_contains "Docker build mounts source read-only" \
@@ -365,6 +382,7 @@ status_output="$("$KEEP_AWAKE" status)"
 assert_contains "status reports reachable daemon" "Daemon reachable: yes" "$status_output"
 assert_contains "status reports active holders" '"agent":"codex"' "$status_output"
 assert_contains "status reports autostart" "Autostart installed: yes" "$status_output"
+assert_contains "status reports system autostart mode" "autostart: system" "$status_output"
 assert_contains "status reports Host connection" "Host connection present: yes" "$status_output"
 assert_contains "status reports complete client signal path" \
     "Client signal: signal path OK" "$status_output"
@@ -399,6 +417,59 @@ assert_contains "disabled status reports unreachable client signal daemon" \
     "Client signal: missing reachable daemon" "$disabled_status"
 assert_contains "disabled status reports tray not installed" "Tray: not installed" "$disabled_status"
 export KEEP_AWAKE_TEST_CURL_HEALTHY=true
+
+# Terminal and none modes start the daemon without system or tray autostart.
+# Terminal prints resolved WezTerm argv; none leaves startup entirely to the
+# user. Both remain healthy according to the elective probe.
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+: > "$KEEP_AWAKE_TEST_LOG"
+terminal_output="$("$KEEP_AWAKE" enable --autostart terminal)"
+assert_eq "terminal mode installs no Linux autostart" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_SYSTEMD")"
+assert_eq "terminal mode installs no tray autostart" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_TRAY_SYSTEMD")"
+assert_contains "terminal mode prints WezTerm gui-startup hook" \
+    "wezterm.on('gui-startup'" "$terminal_output"
+assert_contains "Linux terminal snippet uses resolved binary path" \
+    "$TMPROOT/install/keep-awake" "$terminal_output"
+assert_contains "Linux terminal snippet keeps daemon port argument" \
+    "'-port', '17777'" "$terminal_output"
+assert_contains "Linux terminal snippet keeps resolved log path" \
+    "$XDG_STATE_HOME/boxa/keep-awake/keep-awake.log" "$terminal_output"
+assert_contains "terminal mode starts daemon immediately" \
+    "daemon -port 17777 -log-file $XDG_STATE_HOME/boxa/keep-awake/keep-awake.log" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "terminal mode is persisted" "autostart=terminal" \
+    "$(cat "$XDG_CONFIG_HOME/boxa/keep-awake.conf")"
+terminal_status="$("$KEEP_AWAKE" status)"
+assert_contains "terminal status reports selected mode" "autostart: terminal" \
+    "$terminal_status"
+assert_contains "terminal status explains absent tray" \
+    "Tray: not installed (autostart: terminal)" "$terminal_status"
+assert_eq "terminal mode probes OK without system autostart" ok "$("$KEEP_AWAKE" probe)"
+terminal_disable="$("$KEEP_AWAKE" disable)"
+assert_contains "terminal disable reminds user to remove WezTerm block" \
+    "Remove the Boxa keep-awake gui-startup block" "$terminal_disable"
+
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+: > "$KEEP_AWAKE_TEST_LOG"
+none_output="$("$KEEP_AWAKE" enable --autostart none)"
+assert_eq "none mode installs no Linux autostart" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_SYSTEMD")"
+assert_eq "none mode installs no tray autostart" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_TRAY_SYSTEMD")"
+assert_not_contains "none mode prints no WezTerm snippet" "gui-startup" "$none_output"
+assert_contains "none mode starts daemon immediately" \
+    "daemon -port 17777 -log-file $XDG_STATE_HOME/boxa/keep-awake/keep-awake.log" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "none mode is persisted" "autostart=none" \
+    "$(cat "$XDG_CONFIG_HOME/boxa/keep-awake.conf")"
+none_status="$("$KEEP_AWAKE" status)"
+assert_contains "none status reports selected mode" "autostart: none" "$none_status"
+assert_contains "none status explains absent tray" \
+    "Tray: not installed (autostart: none)" "$none_status"
+assert_eq "none mode probes OK without system autostart" ok "$("$KEEP_AWAKE" probe)"
+"$KEEP_AWAKE" disable >/dev/null
 
 # Missing Linux tray prerequisites and tray startup failures are notices only;
 # the daemon remains fully enabled and the tray has its own status.
@@ -439,7 +510,11 @@ while [ "$#" -gt 0 ]; do
     if [ "$1" = -o ]; then output="$2"; shift 2; else shift; fi
 done
 [ -n "$output" ] || exit 2
-printf '#!/usr/bin/env bash\nexit 0\n' > "$output"
+{
+    printf '#!/usr/bin/env bash\n'
+    printf '%s\n' 'printf "daemon %s\n" "$*" >> "$KEEP_AWAKE_TEST_LOG"'
+    printf 'exit 0\n'
+} > "$output"
 chmod +x "$output"
 EOF
 chmod +x "$TMPROOT/bin/go"
@@ -557,6 +632,8 @@ assert_eq "Windows task does not bake in the current WSL gateway" "0" \
     "$(grep -c '172\.30\.96\.1' "$KEEP_AWAKE_TEST_LOG" || true)"
 assert_contains "Windows Docker build targets Windows" \
     "--env GOOS=windows" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "Windows Docker build uses GUI subsystem" \
+    "-ldflags -H=windowsgui" "$(cat "$KEEP_AWAKE_TEST_LOG")"
 rm -f "$windows_wrapper"
 broken_windows_status="$("$KEEP_AWAKE" status 2>&1)"
 assert_contains "Windows status rejects task with missing wrapper" \
@@ -573,17 +650,56 @@ assert_eq "Windows disable deletes tray task" false \
 assert_eq "Windows disable removes runtime gateway wrapper" false "$(file_exists "$windows_wrapper")"
 assert_eq "Windows disable removes tray script" false "$(file_exists "$windows_tray")"
 
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+: > "$KEEP_AWAKE_TEST_LOG"
+windows_terminal_output="$("$KEEP_AWAKE" enable --autostart terminal)"
+assert_eq "Windows terminal mode creates no daemon task" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_TASK")"
+assert_eq "Windows terminal mode creates no tray task" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_TRAY_TASK")"
+assert_contains "Windows terminal mode retains generated wrapper" \
+    "Get-WslGateway" "$(cat "$windows_wrapper")"
+assert_contains "Windows terminal snippet launches PowerShell" \
+    "'powershell.exe'" "$windows_terminal_output"
+assert_contains "Windows terminal snippet hides its window" \
+    "'-WindowStyle', 'Hidden'" "$windows_terminal_output"
+assert_contains "Windows terminal snippet uses resolved wrapper path" \
+    'C:\\Boxa\\start-keep-awake.ps1' "$windows_terminal_output"
+assert_not_contains "Windows terminal snippet never launches raw executable" \
+    'keep-awake.exe' "$windows_terminal_output"
+assert_contains "Windows terminal status explains absent tray" \
+    "Tray: not installed (autostart: terminal)" "$("$KEEP_AWAKE" status)"
+"$KEEP_AWAKE" disable >/dev/null
+
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+: > "$KEEP_AWAKE_TEST_LOG"
+export KEEP_AWAKE_TEST_DOCKER_FAIL=true
+"$KEEP_AWAKE" enable --autostart none >/dev/null 2>&1
+windows_local_build_log="$(grep '^go ' "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "Windows local Go build targets Windows" "GOOS=windows" \
+    "$windows_local_build_log"
+assert_contains "Windows local Go build uses GUI subsystem" \
+    "-ldflags -H=windowsgui" "$windows_local_build_log"
+"$KEEP_AWAKE" disable >/dev/null
+export KEEP_AWAKE_TEST_DOCKER_FAIL=false
+
 # Public CLI routes the three subcommands to the canonical helper and exposes
 # dedicated help without requiring Docker.
 export BOXA_KEEP_AWAKE_PLATFORM=linux
 export BOXA_KEEP_AWAKE_INSTALL_DIR="$TMPROOT/cli-install"
 cli_help="$(bash "$BOXA_DIR/docker-run.sh" keep-awake --help)"
 assert_contains "CLI help documents enable/disable/status" \
-    "Usage: boxa keep-awake <enable|disable|status>" "$cli_help"
+    "Usage: boxa keep-awake <enable|disable|status> [options]" "$cli_help"
+assert_contains "CLI help documents autostart modes" \
+    "--autostart <system|terminal|none>" "$cli_help"
 assert_contains "CLI help documents the Docker-first build" \
     "pinned golang Docker container" "$cli_help"
 cli_status="$(bash "$BOXA_DIR/docker-run.sh" keep-awake status)"
 assert_contains "CLI status reaches canonical helper" "Daemon reachable: yes" "$cli_status"
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+cli_none_output="$(bash "$BOXA_DIR/docker-run.sh" keep-awake enable --autostart none)"
+assert_contains "CLI routes enable autostart option" "autostart none" "$cli_none_output"
+"$KEEP_AWAKE" disable >/dev/null
 
 if [ "$fail_count" -gt 0 ]; then
     printf '\n%d test(s) failed.\n' "$fail_count"

@@ -220,16 +220,18 @@ EOF
             ;;
         keep-awake)
             cat <<'EOF'
-Usage: boxa keep-awake <enable|disable|status>
+Usage: boxa keep-awake <enable|disable|status> [options]
 
 Manage the optional host daemon that prevents idle sleep while coding agents
 hold active leases. Enable builds it from the checked-out Go source in a
 pinned golang Docker container (with local Go as fallback), installs platform
-autostart, starts it, and creates a global Host connection on port 17777.
+system autostart by default, starts it, and creates a global Host connection on
+port 17777. Use enable --autostart <system|terminal|none> to choose startup.
 Disable reverses those changes; status reports every component.
 
 Commands:
-  enable   Build, install, start, and expose keep-awake to every box
+  enable [--autostart <system|terminal|none>]
+           Build, install, start, and expose keep-awake to every box
   disable  Stop and remove keep-awake, autostart, and its Host connection
   status   Report daemon reachability, holders, autostart, and Host connection
 EOF
@@ -3406,12 +3408,15 @@ fi
 
 if [ "$MODE" = "keep-awake" ]; then
     keep_awake_command="${KEEP_AWAKE_ARGS[0]:-}"
-    if [ "${#KEEP_AWAKE_ARGS[@]}" -ne 1 ] \
-        || [[ "$keep_awake_command" != enable && "$keep_awake_command" != disable && "$keep_awake_command" != status ]]; then
-        echo "Usage: boxa keep-awake <enable|disable|status>" >&2
+    if [[ "$keep_awake_command" != enable && "$keep_awake_command" != disable && "$keep_awake_command" != status ]] \
+        || { [ "$keep_awake_command" != enable ] && [ "${#KEEP_AWAKE_ARGS[@]}" -ne 1 ]; } \
+        || { [ "$keep_awake_command" = enable ] \
+            && [ "${#KEEP_AWAKE_ARGS[@]}" -ne 1 ] \
+            && [ "${#KEEP_AWAKE_ARGS[@]}" -ne 3 ]; }; then
+        echo "Usage: boxa keep-awake <enable|disable|status> [options]" >&2
         exit 2
     fi
-    exec "$BOXA_DIR/scripts/ensure-keep-awake.sh" "$keep_awake_command"
+    exec "$BOXA_DIR/scripts/ensure-keep-awake.sh" "${KEEP_AWAKE_ARGS[@]}"
 fi
 
 # --- boxa mem [project|path] -----------------------------------------------

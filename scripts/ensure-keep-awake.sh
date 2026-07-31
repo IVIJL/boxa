@@ -45,6 +45,9 @@ Options for offer:
   --non-interactive  Print the later-enable command without recording a choice.
   --interactive      Force the prompt (test seam).
 
+Options for enable:
+  --autostart MODE   Start mode: system (default), terminal, or none.
+
 Options for teardown:
   --keep-connection  Leave Host connection removal to the caller's sweep.
   --remove-state     Remove the elective marker (uninstall).
@@ -137,15 +140,25 @@ keep_awake::state_field() {
 }
 
 keep_awake::write_state() {
-    local enabled="$1" optout="$2" tmp
+    local enabled="$1" optout="$2" autostart="${3:-system}" tmp
     mkdir -p "$KEEP_AWAKE_CONFIG_DIR" || return 1
     tmp="${KEEP_AWAKE_STATE_FILE}.tmp.$$"
-    if ! printf 'enabled=%s\noptout=%s\n' "$enabled" "$optout" > "$tmp" \
+    if ! printf 'enabled=%s\noptout=%s\nautostart=%s\n' \
+        "$enabled" "$optout" "$autostart" > "$tmp" \
         || ! chmod 0600 "$tmp" \
         || ! mv "$tmp" "$KEEP_AWAKE_STATE_FILE"; then
         rm -f "$tmp"
         return 1
     fi
+}
+
+keep_awake::autostart_mode() {
+    local mode
+    mode="$(keep_awake::state_field autostart 2>/dev/null || true)"
+    case "$mode" in
+        system|terminal|none) printf '%s\n' "$mode" ;;
+        *) printf 'system\n' ;;
+    esac
 }
 
 keep_awake::host_connection_present() {
@@ -220,12 +233,14 @@ keep_awake::autostart_installed() {
 }
 
 keep_awake::probe() {
+    local autostart_mode
     keep_awake::init_paths || { printf 'missing\n'; return 0; }
+    autostart_mode="$(keep_awake::autostart_mode)"
     if [ "$(keep_awake::state_field optout 2>/dev/null || true)" = true ]; then
         printf 'declined\n'
     elif [ "$(keep_awake::state_field enabled 2>/dev/null || true)" = true ] \
         && [ -x "$KEEP_AWAKE_BINARY" ] \
-        && keep_awake::autostart_installed \
+        && { [ "$autostart_mode" != system ] || keep_awake::autostart_installed; } \
         && keep_awake::host_connection_present \
         && keep_awake::daemon_status_json >/dev/null; then
         printf 'ok\n'
@@ -270,6 +285,7 @@ keep_awake::go_prereq() {
 }
 
 keep_awake::check_enable_prereqs() {
+    local autostart_mode="$1"
     keep_awake::init_paths || return 1
     if [ ! -x "$KEEP_AWAKE_BINARY" ] \
         && ! command -v docker >/dev/null 2>&1 \
@@ -288,20 +304,20 @@ keep_awake::check_enable_prereqs() {
     }
     case "$KEEP_AWAKE_PLATFORM" in
         linux)
-            command -v systemctl >/dev/null 2>&1 || {
+            [ "$autostart_mode" != system ] || command -v systemctl >/dev/null 2>&1 || {
                 printf 'keep-awake: systemctl is required for Linux user autostart.\n' >&2; return 1;
             }
             ;;
         macos)
-            command -v launchctl >/dev/null 2>&1 || {
+            [ "$autostart_mode" != system ] || command -v launchctl >/dev/null 2>&1 || {
                 printf 'keep-awake: launchctl is required for macOS user autostart.\n' >&2; return 1;
             }
             ;;
         wsl2)
             if ! command -v powershell.exe >/dev/null 2>&1 \
-                || ! command -v schtasks.exe >/dev/null 2>&1 \
-                || ! command -v wslpath >/dev/null 2>&1; then
-                    printf 'keep-awake: WSL interop requires powershell.exe, schtasks.exe, and wslpath.\n' >&2
+                || ! command -v wslpath >/dev/null 2>&1 \
+                || { [ "$autostart_mode" = system ] && ! command -v schtasks.exe >/dev/null 2>&1; }; then
+                    printf 'keep-awake: WSL interop prerequisites are missing for the selected autostart mode.\n' >&2
                     return 1
             fi
             ;;
@@ -310,7 +326,7 @@ keep_awake::check_enable_prereqs() {
 
 keep_awake::build_binary() {
     local output="$1" output_dir output_name
-    local -a docker_args
+    local -a docker_args go_args
     output_dir="$(dirname "$output")"
     output_name="$(basename "$output")"
 
@@ -325,12 +341,17 @@ keep_awake::build_binary() {
         if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ]; then
             docker_args+=(--env GOOS=windows)
         fi
+        go_args=(go build -trimpath)
+        if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ]; then
+            go_args+=(-ldflags -H=windowsgui)
+        fi
+        go_args+=(-o "/out/$output_name" .)
         docker_args+=(
             --volume "$BOXA_DIR/keep-awake:/src:ro"
             --volume "$output_dir:/out"
             --workdir /src
             "$KEEP_AWAKE_GO_IMAGE"
-            go build -trimpath -o "/out/$output_name" .
+            "${go_args[@]}"
         )
         if docker "${docker_args[@]}"; then
             return 0
@@ -346,9 +367,68 @@ keep_awake::build_binary() {
         return 1
     fi
     if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ]; then
-        (cd "$BOXA_DIR/keep-awake" && CGO_ENABLED=0 GOOS=windows go build -trimpath -o "$output" .)
+        (cd "$BOXA_DIR/keep-awake" \
+            && CGO_ENABLED=0 GOOS=windows go build -trimpath \
+                -ldflags -H=windowsgui -o "$output" .)
     else
         (cd "$BOXA_DIR/keep-awake" && CGO_ENABLED=0 go build -trimpath -o "$output" .)
+    fi
+}
+
+keep_awake::start_direct() {
+    mkdir -p "$KEEP_AWAKE_STATE_DIR"
+    case "$KEEP_AWAKE_PLATFORM" in
+        linux|macos)
+            "$KEEP_AWAKE_BINARY" -port "$KEEP_AWAKE_PORT" \
+                -log-file "$KEEP_AWAKE_LOG_FILE" >/dev/null 2>&1 &
+            ;;
+        wsl2)
+            keep_awake::write_windows_wrapper || return 1
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden \
+                -File "$KEEP_AWAKE_WINDOWS_WRAPPER" >/dev/null 2>&1 &
+            ;;
+    esac
+}
+
+keep_awake::lua_quote() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '"%s"' "$value"
+}
+
+keep_awake::print_terminal_snippet() {
+    local binary log wrapper
+    binary="$(keep_awake::lua_quote "$KEEP_AWAKE_BINARY")"
+    log="$(keep_awake::lua_quote "$KEEP_AWAKE_LOG_FILE")"
+    wrapper="$(keep_awake::lua_quote "$KEEP_AWAKE_WINDOWS_WRAPPER")"
+    printf '\nAdd this block to wezterm.lua:\n\n'
+    if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ]; then
+        cat <<EOF
+local wezterm = require 'wezterm'
+
+wezterm.on('gui-startup', function()
+  wezterm.background_child_process {
+    'powershell.exe',
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-WindowStyle', 'Hidden',
+    '-File', $wrapper,
+  }
+end)
+EOF
+    else
+        cat <<EOF
+local wezterm = require 'wezterm'
+
+wezterm.on('gui-startup', function()
+  wezterm.background_child_process {
+    $binary,
+    '-port', '$KEEP_AWAKE_PORT',
+    '-log-file', $log,
+  }
+end)
+EOF
     fi
 }
 
@@ -403,6 +483,32 @@ EOF
         return 1
     fi
     chmod 0600 "$KEEP_AWAKE_WRAPPER"
+}
+
+keep_awake::stop_direct() {
+    local binary_literal expected pid
+    case "$KEEP_AWAKE_PLATFORM" in
+        linux|macos)
+            expected="$KEEP_AWAKE_BINARY -port $KEEP_AWAKE_PORT -log-file $KEEP_AWAKE_LOG_FILE"
+            while IFS= read -r pid; do
+                if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                    kill "$pid" 2>/dev/null || true
+                fi
+            done < <(
+                ps -ax -o pid= -o command= 2>/dev/null \
+                    | awk -v expected="$expected" '
+                        { pid=$1; $1=""; sub(/^ /, "") }
+                        $0 == expected { print pid }
+                    '
+            )
+            ;;
+        wsl2)
+            binary_literal="$(keep_awake::powershell_literal "$KEEP_AWAKE_WINDOWS_BINARY")"
+            powershell.exe -NoProfile -NonInteractive -Command \
+                "\$binary = '$binary_literal'; Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -eq \$binary } | ForEach-Object { Stop-Process -Id \$_.ProcessId -ErrorAction SilentlyContinue }" \
+                >/dev/null 2>&1 || true
+            ;;
+    esac
 }
 
 keep_awake::install_autostart() {
@@ -638,6 +744,7 @@ keep_awake::rollback() {
     keep_awake::remove_host_connection >/dev/null 2>&1 || true
     keep_awake::tray::remove >/dev/null 2>&1 || true
     keep_awake::remove_autostart
+    keep_awake::stop_direct
     rm -f "$KEEP_AWAKE_BINARY"
 }
 
@@ -652,8 +759,19 @@ keep_awake::wait_until_reachable() {
 }
 
 keep_awake::enable() {
-    local tmp_dir="" built_binary=""
-    keep_awake::check_enable_prereqs || return 1
+    local autostart_mode=system tmp_dir="" built_binary=""
+    if [ "$#" -gt 0 ]; then
+        if [ "$#" -ne 2 ] || [ "$1" != --autostart ]; then
+            printf 'keep-awake enable: expected --autostart <system|terminal|none>\n' >&2
+            return 2
+        fi
+        autostart_mode="$2"
+    fi
+    case "$autostart_mode" in
+        system|terminal|none) ;;
+        *) printf 'keep-awake enable: invalid autostart mode: %s\n' "$autostart_mode" >&2; return 2 ;;
+    esac
+    keep_awake::check_enable_prereqs "$autostart_mode" || return 1
 
     if [ ! -x "$KEEP_AWAKE_BINARY" ]; then
         tmp_dir="$(mktemp -d)"
@@ -673,10 +791,20 @@ keep_awake::enable() {
         rm -rf "$tmp_dir"
     fi
 
-    if ! keep_awake::install_autostart; then
-        keep_awake::rollback
-        printf 'keep-awake: autostart installation failed; rolled back.\n' >&2
-        return 1
+    if [ "$autostart_mode" = system ]; then
+        if ! keep_awake::install_autostart; then
+            keep_awake::rollback
+            printf 'keep-awake: autostart installation failed; rolled back.\n' >&2
+            return 1
+        fi
+    else
+        keep_awake::tray::remove >/dev/null 2>&1 || true
+        keep_awake::remove_autostart
+        if ! keep_awake::start_direct; then
+            keep_awake::rollback
+            printf 'keep-awake: daemon start failed; rolled back.\n' >&2
+            return 1
+        fi
     fi
     if ! keep_awake::wait_until_reachable; then
         keep_awake::rollback
@@ -689,18 +817,26 @@ keep_awake::enable() {
         printf 'keep-awake: Host connection setup failed; rolled back.\n' >&2
         return 1
     fi
-    if ! keep_awake::write_state true false; then
+    if ! keep_awake::write_state true false "$autostart_mode"; then
         keep_awake::rollback
         printf 'keep-awake: could not record enabled state; rolled back.\n' >&2
         return 1
     fi
-    keep_awake::tray::enable
-    printf 'Keep-awake enabled: daemon running, autostart installed, Host connection active on port %s.\n' \
-        "$KEEP_AWAKE_PORT"
+    if [ "$autostart_mode" = system ]; then
+        keep_awake::tray::enable
+        printf 'Keep-awake enabled: daemon running, autostart installed, Host connection active on port %s.\n' \
+            "$KEEP_AWAKE_PORT"
+    else
+        printf 'Keep-awake enabled: daemon running, autostart %s, Host connection active on port %s.\n' \
+            "$autostart_mode" "$KEEP_AWAKE_PORT"
+        if [ "$autostart_mode" = terminal ]; then
+            keep_awake::print_terminal_snippet
+        fi
+    fi
 }
 
 keep_awake::teardown() {
-    local keep_connection=false remove_state=false arg rc=0
+    local keep_connection=false remove_state=false arg autostart_mode rc=0
     for arg in "$@"; do
         case "$arg" in
             --keep-connection) keep_connection=true ;;
@@ -709,28 +845,36 @@ keep_awake::teardown() {
         esac
     done
     keep_awake::init_paths || return 1
+    autostart_mode="$(keep_awake::autostart_mode)"
     if ! $keep_connection; then
         keep_awake::remove_host_connection || rc=1
     fi
     keep_awake::tray::remove || rc=1
     keep_awake::remove_autostart
+    keep_awake::stop_direct
     rm -f "$KEEP_AWAKE_BINARY" || rc=1
     if $remove_state; then
         rm -f "$KEEP_AWAKE_STATE_FILE" || rc=1
     else
-        keep_awake::write_state false true || rc=1
+        keep_awake::write_state false true "$autostart_mode" || rc=1
     fi
     return "$rc"
 }
 
 keep_awake::disable() {
+    local autostart_mode
+    autostart_mode="$(keep_awake::autostart_mode)"
     keep_awake::teardown
     printf 'Keep-awake disabled: daemon stopped, autostart removed, Host connection removed.\n'
+    if [ "$autostart_mode" = terminal ]; then
+        printf 'Remove the Boxa keep-awake gui-startup block from wezterm.lua.\n'
+    fi
 }
 
 keep_awake::status() {
-    local status_json="" holders="[]" daemon=no autostart=no connection=no tray client_signal
+    local status_json="" holders="[]" daemon=no autostart=no connection=no tray client_signal autostart_mode
     keep_awake::init_paths || return 1
+    autostart_mode="$(keep_awake::autostart_mode)"
     if status_json="$(keep_awake::daemon_status_json)"; then
         daemon=yes
         holders="$(printf '%s\n' "$status_json" \
@@ -739,11 +883,16 @@ keep_awake::status() {
     fi
     keep_awake::autostart_installed && autostart=yes
     keep_awake::host_connection_present && connection=yes
-    tray="$(keep_awake::tray::status)"
+    if [ "$autostart_mode" = system ]; then
+        tray="$(keep_awake::tray::status)"
+    else
+        tray="not installed (autostart: $autostart_mode)"
+    fi
     client_signal="$(keep_awake::client_signal_status "$daemon")"
     printf 'Daemon reachable: %s\n' "$daemon"
     printf 'Holders: %s\n' "$holders"
     printf 'Autostart installed: %s\n' "$autostart"
+    printf 'autostart: %s\n' "$autostart_mode"
     printf 'Host connection present: %s\n' "$connection"
     printf 'Client signal: %s\n' "$client_signal"
     printf 'Tray: %s\n' "$tray"
@@ -762,7 +911,7 @@ keep_awake::offer() {
     state="$(keep_awake::probe)"
     [ "$state" = missing ] || return 0
     if $force_yes; then
-        keep_awake::enable
+        keep_awake::enable --autostart system
         return
     fi
     if $force_noninteractive || { ! $force_interactive && { [ ! -t 0 ] || [ ! -t 1 ]; }; }; then
@@ -773,7 +922,7 @@ keep_awake::offer() {
     printf 'Enable keep-awake now? [y/N] '
     read -r answer || answer=""
     case "$answer" in
-        y|Y|yes|YES) keep_awake::enable ;;
+        y|Y|yes|YES) keep_awake::enable --autostart system ;;
         *)
             keep_awake::init_paths
             keep_awake::write_state false true
@@ -789,7 +938,7 @@ fi
 case "$command_name" in
     offer)       keep_awake::offer "$@" ;;
     probe)       keep_awake::probe ;;
-    enable)      keep_awake::enable ;;
+    enable)      keep_awake::enable "$@" ;;
     disable)     keep_awake::disable ;;
     status)      keep_awake::status ;;
     teardown)    keep_awake::teardown "$@" ;;

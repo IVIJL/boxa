@@ -19,6 +19,22 @@ boxa keep-awake status
 boxa keep-awake disable
 ```
 
+## Start with your terminal instead of the system
+
+Run `boxa keep-awake enable --autostart terminal` to install and start the
+daemon without a system service or tray autostart. The command prints a
+ready-to-paste WezTerm `gui-startup` block containing the resolved installed
+paths. On WSL2 the block starts the generated PowerShell wrapper, which resolves
+the current WSL gateway; on Linux and macOS it starts the installed binary with
+the same arguments as system autostart.
+
+For another terminal, run the printed wrapper or equivalent binary command from
+its startup hook. Duplicate launches are safe because the daemon's port bind is
+the single-instance guard. A terminal-started daemon ends with that terminal
+session, while system autostart is always available after login; an idle daemon
+does not inhibit sleep. Use `--autostart none` when another startup mechanism is
+entirely user-managed.
+
 The installer offers this elective once. A decline is remembered; plain
 `boxa doctor` reports it without changing the choice. Enable it later with
 `boxa keep-awake enable` or `boxa doctor --fix keep-awake`.
