@@ -9,6 +9,8 @@ BOXA_DIR="${BOXA_DIR:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}"
 KEEP_AWAKE_PORT="${BOXA_KEEP_AWAKE_PORT:-17777}"
 KEEP_AWAKE_TASK_NAME="BoxaKeepAwake"
 KEEP_AWAKE_LAUNCH_LABEL="dev.boxa.keep-awake"
+KEEP_AWAKE_TRAY_TASK_NAME="BoxaKeepAwakeTray"
+KEEP_AWAKE_TRAY_LAUNCH_LABEL="dev.boxa.keep-awake-tray"
 KEEP_AWAKE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/boxa"
 KEEP_AWAKE_STATE_FILE="$KEEP_AWAKE_CONFIG_DIR/keep-awake.conf"
 KEEP_AWAKE_CONNECT_FILE="$KEEP_AWAKE_CONFIG_DIR/connect/_all.tsv"
@@ -22,6 +24,12 @@ KEEP_AWAKE_WINDOWS_LOG=""
 KEEP_AWAKE_WRAPPER=""
 KEEP_AWAKE_WINDOWS_WRAPPER=""
 KEEP_AWAKE_AUTOSTART_FILE=""
+KEEP_AWAKE_TRAY_FILE=""
+KEEP_AWAKE_TRAY_BINARY=""
+KEEP_AWAKE_TRAY_AUTOSTART_FILE=""
+KEEP_AWAKE_TRAY_BUSY_ICON=""
+KEEP_AWAKE_TRAY_IDLE_ICON=""
+KEEP_AWAKE_WINDOWS_TRAY_FILE=""
 KEEP_AWAKE_BOXA="${BOXA_KEEP_AWAKE_BOXA_COMMAND:-$BOXA_DIR/docker-run.sh}"
 KEEP_AWAKE_GO_IMAGE="golang:1.22"
 
@@ -63,11 +71,18 @@ keep_awake::init_paths() {
             KEEP_AWAKE_INSTALL_DIR="${BOXA_KEEP_AWAKE_INSTALL_DIR:-$HOME/.local/lib/boxa/keep-awake}"
             KEEP_AWAKE_BINARY="$KEEP_AWAKE_INSTALL_DIR/keep-awake"
             KEEP_AWAKE_AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/boxa-keep-awake.service"
+            KEEP_AWAKE_TRAY_FILE="$KEEP_AWAKE_INSTALL_DIR/keep-awake-tray.sh"
+            KEEP_AWAKE_TRAY_AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/boxa-keep-awake-tray.service"
+            KEEP_AWAKE_TRAY_BUSY_ICON="$KEEP_AWAKE_INSTALL_DIR/busy.svg"
+            KEEP_AWAKE_TRAY_IDLE_ICON="$KEEP_AWAKE_INSTALL_DIR/idle.svg"
             ;;
         macos)
             KEEP_AWAKE_INSTALL_DIR="${BOXA_KEEP_AWAKE_INSTALL_DIR:-$HOME/Library/Application Support/Boxa}"
             KEEP_AWAKE_BINARY="$KEEP_AWAKE_INSTALL_DIR/keep-awake"
             KEEP_AWAKE_AUTOSTART_FILE="$HOME/Library/LaunchAgents/${KEEP_AWAKE_LAUNCH_LABEL}.plist"
+            KEEP_AWAKE_TRAY_FILE="$KEEP_AWAKE_INSTALL_DIR/KeepAwakeTray.swift"
+            KEEP_AWAKE_TRAY_BINARY="$KEEP_AWAKE_INSTALL_DIR/keep-awake-tray"
+            KEEP_AWAKE_TRAY_AUTOSTART_FILE="$HOME/Library/LaunchAgents/${KEEP_AWAKE_TRAY_LAUNCH_LABEL}.plist"
             ;;
         wsl2)
             keep_awake::init_windows_paths
@@ -93,6 +108,8 @@ keep_awake::init_windows_paths() {
         KEEP_AWAKE_WINDOWS_BINARY="$(wslpath -w "$KEEP_AWAKE_BINARY")"
         KEEP_AWAKE_WINDOWS_LOG="$(wslpath -w "$KEEP_AWAKE_LOG_FILE")"
         KEEP_AWAKE_WINDOWS_WRAPPER="$(wslpath -w "$KEEP_AWAKE_WRAPPER")"
+        KEEP_AWAKE_TRAY_FILE="$KEEP_AWAKE_INSTALL_DIR/keep-awake-tray.ps1"
+        KEEP_AWAKE_WINDOWS_TRAY_FILE="$(wslpath -w "$KEEP_AWAKE_TRAY_FILE")"
         return 0
     fi
     windows_local_appdata="$(powershell.exe -NoProfile -NonInteractive -Command \
@@ -107,6 +124,8 @@ keep_awake::init_windows_paths() {
     KEEP_AWAKE_WINDOWS_BINARY="${windows_local_appdata}\\Boxa\\keep-awake.exe"
     KEEP_AWAKE_WINDOWS_LOG="${windows_local_appdata}\\Boxa\\keep-awake.log"
     KEEP_AWAKE_WINDOWS_WRAPPER="${windows_local_appdata}\\Boxa\\start-keep-awake.ps1"
+    KEEP_AWAKE_TRAY_FILE="$KEEP_AWAKE_INSTALL_DIR/keep-awake-tray.ps1"
+    KEEP_AWAKE_WINDOWS_TRAY_FILE="${windows_local_appdata}\\Boxa\\keep-awake-tray.ps1"
 }
 
 keep_awake::state_field() {
@@ -430,6 +449,154 @@ keep_awake::remove_autostart() {
     esac
 }
 
+keep_awake::tray::remove() {
+    case "$KEEP_AWAKE_PLATFORM" in
+        linux)
+            systemctl --user disable --now boxa-keep-awake-tray.service >/dev/null 2>&1 || true
+            rm -f "$KEEP_AWAKE_TRAY_AUTOSTART_FILE" "$KEEP_AWAKE_TRAY_FILE" \
+                "$KEEP_AWAKE_TRAY_BUSY_ICON" "$KEEP_AWAKE_TRAY_IDLE_ICON"
+            systemctl --user daemon-reload >/dev/null 2>&1 || true
+            ;;
+        macos)
+            launchctl bootout "gui/$(id -u)" "$KEEP_AWAKE_TRAY_AUTOSTART_FILE" >/dev/null 2>&1 || true
+            rm -f "$KEEP_AWAKE_TRAY_AUTOSTART_FILE" "$KEEP_AWAKE_TRAY_FILE" \
+                "$KEEP_AWAKE_TRAY_BINARY"
+            ;;
+        wsl2)
+            schtasks.exe /End /TN "$KEEP_AWAKE_TRAY_TASK_NAME" >/dev/null 2>&1 || true
+            schtasks.exe /Delete /TN "$KEEP_AWAKE_TRAY_TASK_NAME" /F >/dev/null 2>&1 || true
+            rm -f "$KEEP_AWAKE_TRAY_FILE"
+            ;;
+    esac
+}
+
+keep_awake::tray::install_linux() {
+    mkdir -p "$(dirname "$KEEP_AWAKE_TRAY_AUTOSTART_FILE")" || return 1
+    install -m 0755 "$BOXA_DIR/keep-awake/tray/keep-awake-tray.sh" "$KEEP_AWAKE_TRAY_FILE" \
+        || return 1
+    install -m 0644 "$BOXA_DIR/keep-awake/tray/busy.svg" "$KEEP_AWAKE_TRAY_BUSY_ICON" \
+        || return 1
+    install -m 0644 "$BOXA_DIR/keep-awake/tray/idle.svg" "$KEEP_AWAKE_TRAY_IDLE_ICON" \
+        || return 1
+    if ! cat > "$KEEP_AWAKE_TRAY_AUTOSTART_FILE" <<EOF
+[Unit]
+Description=Boxa keep-awake tray indicator
+After=graphical-session.target
+
+[Service]
+ExecStart=$KEEP_AWAKE_TRAY_FILE $KEEP_AWAKE_PORT $KEEP_AWAKE_INSTALL_DIR
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+EOF
+    then
+        return 1
+    fi
+    systemctl --user daemon-reload \
+        && systemctl --user enable --now boxa-keep-awake-tray.service
+}
+
+keep_awake::tray::install_macos() {
+    install -m 0644 "$BOXA_DIR/keep-awake/tray/KeepAwakeTray.swift" "$KEEP_AWAKE_TRAY_FILE" \
+        || return 1
+    swiftc "$KEEP_AWAKE_TRAY_FILE" -framework AppKit -framework Foundation \
+        -o "$KEEP_AWAKE_TRAY_BINARY" || return 1
+    chmod 0755 "$KEEP_AWAKE_TRAY_BINARY" || return 1
+    mkdir -p "$(dirname "$KEEP_AWAKE_TRAY_AUTOSTART_FILE")" || return 1
+    if ! cat > "$KEEP_AWAKE_TRAY_AUTOSTART_FILE" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$KEEP_AWAKE_TRAY_LAUNCH_LABEL</string>
+  <key>ProgramArguments</key><array>
+    <string>$KEEP_AWAKE_TRAY_BINARY</string><string>$KEEP_AWAKE_PORT</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+</dict></plist>
+EOF
+    then
+        return 1
+    fi
+    launchctl bootout "gui/$(id -u)" "$KEEP_AWAKE_TRAY_AUTOSTART_FILE" >/dev/null 2>&1 || true
+    launchctl bootstrap "gui/$(id -u)" "$KEEP_AWAKE_TRAY_AUTOSTART_FILE" \
+        && launchctl kickstart -k "gui/$(id -u)/$KEEP_AWAKE_TRAY_LAUNCH_LABEL"
+}
+
+keep_awake::tray::install_windows() {
+    local action
+    install -m 0600 "$BOXA_DIR/keep-awake/tray/keep-awake-tray.ps1" "$KEEP_AWAKE_TRAY_FILE" \
+        || return 1
+    action="powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"$KEEP_AWAKE_WINDOWS_TRAY_FILE\" $KEEP_AWAKE_PORT"
+    schtasks.exe /Create /TN "$KEEP_AWAKE_TRAY_TASK_NAME" /SC ONLOGON /TR "$action" /F >/dev/null \
+        && schtasks.exe /Run /TN "$KEEP_AWAKE_TRAY_TASK_NAME" >/dev/null
+}
+
+keep_awake::tray::enable() {
+    case "$KEEP_AWAKE_PLATFORM" in
+        linux)
+            if ! command -v yad >/dev/null 2>&1; then
+                printf 'keep-awake: tray skipped; yad is missing. Install the yad package to enable it.\n' >&2
+                return 0
+            fi
+            if keep_awake::tray::install_linux; then return 0; fi
+            ;;
+        macos)
+            if ! command -v swiftc >/dev/null 2>&1; then
+                printf 'keep-awake: tray skipped; swiftc is missing. Run: xcode-select --install\n' >&2
+                return 0
+            fi
+            if keep_awake::tray::install_macos; then return 0; fi
+            ;;
+        wsl2)
+            if keep_awake::tray::install_windows; then return 0; fi
+            ;;
+    esac
+    printf 'keep-awake: tray installation failed; daemon remains enabled without the optional tray.\n' >&2
+    keep_awake::tray::remove >/dev/null 2>&1 || true
+    return 0
+}
+
+keep_awake::tray::status() {
+    case "$KEEP_AWAKE_PLATFORM" in
+        linux)
+            if [ -f "$KEEP_AWAKE_TRAY_FILE" ] \
+                && [ -f "$KEEP_AWAKE_TRAY_AUTOSTART_FILE" ] \
+                && systemctl --user is-active boxa-keep-awake-tray.service >/dev/null 2>&1; then
+                printf 'running\n'
+            elif ! command -v yad >/dev/null 2>&1; then
+                printf 'skipped-missing-prereq\n'
+            else
+                printf 'not installed\n'
+            fi
+            ;;
+        macos)
+            if [ -x "$KEEP_AWAKE_TRAY_BINARY" ] \
+                && [ -f "$KEEP_AWAKE_TRAY_AUTOSTART_FILE" ] \
+                && launchctl print "gui/$(id -u)/$KEEP_AWAKE_TRAY_LAUNCH_LABEL" 2>/dev/null \
+                    | grep -q 'state = running'; then
+                printf 'running\n'
+            elif ! command -v swiftc >/dev/null 2>&1; then
+                printf 'skipped-missing-prereq\n'
+            else
+                printf 'not installed\n'
+            fi
+            ;;
+        wsl2)
+            if [ -f "$KEEP_AWAKE_TRAY_FILE" ] \
+                && powershell.exe -NoProfile -NonInteractive -Command \
+                    "if ((Get-ScheduledTask -TaskName '$KEEP_AWAKE_TRAY_TASK_NAME' -ErrorAction SilentlyContinue).State -eq 'Running') { exit 0 } else { exit 1 }" \
+                    >/dev/null 2>&1; then
+                printf 'running\n'
+            else
+                printf 'not installed\n'
+            fi
+            ;;
+    esac
+}
+
 keep_awake::remove_host_connection() {
     if keep_awake::host_connection_present; then
         "$KEEP_AWAKE_BOXA" connect rm host "$KEEP_AWAKE_PORT" --all
@@ -438,6 +605,7 @@ keep_awake::remove_host_connection() {
 
 keep_awake::rollback() {
     keep_awake::remove_host_connection >/dev/null 2>&1 || true
+    keep_awake::tray::remove >/dev/null 2>&1 || true
     keep_awake::remove_autostart
     rm -f "$KEEP_AWAKE_BINARY"
 }
@@ -495,6 +663,7 @@ keep_awake::enable() {
         printf 'keep-awake: could not record enabled state; rolled back.\n' >&2
         return 1
     fi
+    keep_awake::tray::enable
     printf 'Keep-awake enabled: daemon running, autostart installed, Host connection active on port %s.\n' \
         "$KEEP_AWAKE_PORT"
 }
@@ -512,6 +681,7 @@ keep_awake::teardown() {
     if ! $keep_connection; then
         keep_awake::remove_host_connection || rc=1
     fi
+    keep_awake::tray::remove || rc=1
     keep_awake::remove_autostart
     rm -f "$KEEP_AWAKE_BINARY" || rc=1
     if $remove_state; then
@@ -528,7 +698,7 @@ keep_awake::disable() {
 }
 
 keep_awake::status() {
-    local status_json="" holders="[]" daemon=no autostart=no connection=no
+    local status_json="" holders="[]" daemon=no autostart=no connection=no tray
     keep_awake::init_paths || return 1
     if status_json="$(keep_awake::daemon_status_json)"; then
         daemon=yes
@@ -538,10 +708,12 @@ keep_awake::status() {
     fi
     keep_awake::autostart_installed && autostart=yes
     keep_awake::host_connection_present && connection=yes
+    tray="$(keep_awake::tray::status)"
     printf 'Daemon reachable: %s\n' "$daemon"
     printf 'Holders: %s\n' "$holders"
     printf 'Autostart installed: %s\n' "$autostart"
     printf 'Host connection present: %s\n' "$connection"
+    printf 'Tray: %s\n' "$tray"
 }
 
 keep_awake::offer() {

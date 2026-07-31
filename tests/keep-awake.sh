@@ -15,12 +15,16 @@ export BOXA_KEEP_AWAKE_INSTALL_DIR="$TMPROOT/install"
 export BOXA_KEEP_AWAKE_BOXA_COMMAND="$TMPROOT/bin/boxa"
 export KEEP_AWAKE_TEST_LOG="$TMPROOT/calls.log"
 export KEEP_AWAKE_TEST_TASK="$TMPROOT/task"
+export KEEP_AWAKE_TEST_TRAY_TASK="$TMPROOT/tray-task"
 export KEEP_AWAKE_TEST_LAUNCHD="$TMPROOT/launchd"
+export KEEP_AWAKE_TEST_TRAY_LAUNCHD="$TMPROOT/tray-launchd"
 export KEEP_AWAKE_TEST_SYSTEMD="$TMPROOT/systemd"
+export KEEP_AWAKE_TEST_TRAY_SYSTEMD="$TMPROOT/tray-systemd"
 export KEEP_AWAKE_TEST_CONNECT="$XDG_CONFIG_HOME/boxa/connect/_all.tsv"
 export KEEP_AWAKE_TEST_CURL_HEALTHY=true
 export KEEP_AWAKE_TEST_CONNECT_FAIL=false
 export KEEP_AWAKE_TEST_DOCKER_FAIL=false
+export KEEP_AWAKE_TEST_TRAY_START_FAIL=false
 mkdir -p "$HOME" "$TMPROOT/bin"
 : > "$KEEP_AWAKE_TEST_LOG"
 
@@ -55,35 +59,75 @@ file_exists() {
 cat > "$TMPROOT/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
+if [[ "$*" == *boxa-keep-awake-tray.service* ]]; then
+    marker="$KEEP_AWAKE_TEST_TRAY_SYSTEMD"
+else
+    marker="$KEEP_AWAKE_TEST_SYSTEMD"
+fi
 case " $* " in
-    *' is-enabled '*) [ -f "$KEEP_AWAKE_TEST_SYSTEMD" ] ;;
-    *' enable --now '*) : > "$KEEP_AWAKE_TEST_SYSTEMD" ;;
-    *' disable --now '*) rm -f "$KEEP_AWAKE_TEST_SYSTEMD" ;;
+    *' is-enabled '*|*' is-active '*) [ -f "$marker" ] ;;
+    *' enable --now '*)
+        if [ "$marker" = "$KEEP_AWAKE_TEST_TRAY_SYSTEMD" ] \
+            && [ "$KEEP_AWAKE_TEST_TRAY_START_FAIL" = true ]; then
+            exit 1
+        fi
+        : > "$marker"
+        ;;
+    *' disable --now '*) rm -f "$marker" ;;
 esac
 EOF
 
 cat > "$TMPROOT/bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'launchctl %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
+if [[ "$*" == *keep-awake-tray* ]]; then
+    marker="$KEEP_AWAKE_TEST_TRAY_LAUNCHD"
+else
+    marker="$KEEP_AWAKE_TEST_LAUNCHD"
+fi
 case "${1:-}" in
-    print)     [ -f "$KEEP_AWAKE_TEST_LAUNCHD" ] ;;
-    bootstrap) : > "$KEEP_AWAKE_TEST_LAUNCHD" ;;
-    bootout)   rm -f "$KEEP_AWAKE_TEST_LAUNCHD" ;;
+    print)
+        [ -f "$marker" ] || exit 1
+        printf 'state = running\n'
+        ;;
+    bootstrap)
+        if [ "$marker" = "$KEEP_AWAKE_TEST_TRAY_LAUNCHD" ] \
+            && [ "$KEEP_AWAKE_TEST_TRAY_START_FAIL" = true ]; then
+            exit 1
+        fi
+        : > "$marker"
+        ;;
+    bootout)   rm -f "$marker" ;;
 esac
 EOF
 
 cat > "$TMPROOT/bin/schtasks.exe" <<'EOF'
 #!/usr/bin/env bash
 printf 'schtasks %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
+if [[ "$*" == *BoxaKeepAwakeTray* ]]; then
+    marker="$KEEP_AWAKE_TEST_TRAY_TASK"
+else
+    marker="$KEEP_AWAKE_TEST_TASK"
+fi
 case "${1:-}" in
-    /Query)  [ -f "$KEEP_AWAKE_TEST_TASK" ] ;;
-    /Create) : > "$KEEP_AWAKE_TEST_TASK" ;;
-    /Delete) rm -f "$KEEP_AWAKE_TEST_TASK" ;;
+    /Query)  [ -f "$marker" ] ;;
+    /Create)
+        if [ "$marker" = "$KEEP_AWAKE_TEST_TRAY_TASK" ] \
+            && [ "$KEEP_AWAKE_TEST_TRAY_START_FAIL" = true ]; then
+            exit 1
+        fi
+        : > "$marker"
+        ;;
+    /Delete) rm -f "$marker" ;;
 esac
 EOF
 
 cat > "$TMPROOT/bin/powershell.exe" <<'EOF'
 #!/usr/bin/env bash
+if [[ "$*" == *Get-ScheduledTask* ]]; then
+    [ -f "$KEEP_AWAKE_TEST_TRAY_TASK" ]
+    exit
+fi
 printf 'C:\Users\Test\AppData\Local\r\n'
 EOF
 
@@ -109,6 +153,22 @@ EOF
 cat > "$TMPROOT/bin/sleep" <<'EOF'
 #!/usr/bin/env bash
 exit 0
+EOF
+
+cat > "$TMPROOT/bin/yad" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+cat > "$TMPROOT/bin/swiftc" <<'EOF'
+#!/usr/bin/env bash
+output=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = -o ]; then output="$2"; shift 2; else shift; fi
+done
+[ -n "$output" ] || exit 2
+printf '#!/usr/bin/env bash\nexit 0\n' > "$output"
+chmod +x "$output"
 EOF
 
 cat > "$TMPROOT/bin/boxa" <<'EOF'
@@ -186,6 +246,10 @@ assert_contains "enable reports all converged components" \
     "daemon running, autostart installed, Host connection active" "$enable_output"
 assert_eq "enable installs binary" true "$(file_exists "$TMPROOT/install/keep-awake")"
 assert_eq "enable installs Linux autostart" true "$(file_exists "$KEEP_AWAKE_TEST_SYSTEMD")"
+assert_eq "enable installs Linux tray source" true \
+    "$(file_exists "$TMPROOT/install/keep-awake-tray.sh")"
+assert_eq "enable starts independent Linux tray unit" true \
+    "$(file_exists "$KEEP_AWAKE_TEST_TRAY_SYSTEMD")"
 assert_eq "enable creates global Host connection" true "$(file_exists "$KEEP_AWAKE_TEST_CONNECT")"
 assert_eq "enabled elective probes OK" ok "$("$KEEP_AWAKE" probe)"
 docker_build_log="$(grep '^docker ' "$KEEP_AWAKE_TEST_LOG")"
@@ -205,12 +269,17 @@ assert_contains "status reports reachable daemon" "Daemon reachable: yes" "$stat
 assert_contains "status reports active holders" '"agent":"codex"' "$status_output"
 assert_contains "status reports autostart" "Autostart installed: yes" "$status_output"
 assert_contains "status reports Host connection" "Host connection present: yes" "$status_output"
+assert_contains "status reports Linux tray separately" "Tray: running" "$status_output"
 
 disable_output="$("$KEEP_AWAKE" disable)"
 assert_contains "disable reports all reversed components" \
     "daemon stopped, autostart removed, Host connection removed" "$disable_output"
 assert_eq "disable removes binary" false "$(file_exists "$TMPROOT/install/keep-awake")"
 assert_eq "disable removes Linux autostart" false "$(file_exists "$KEEP_AWAKE_TEST_SYSTEMD")"
+assert_eq "disable removes Linux tray source" false \
+    "$(file_exists "$TMPROOT/install/keep-awake-tray.sh")"
+assert_eq "disable stops Linux tray unit" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_TRAY_SYSTEMD")"
 assert_eq "disable removes Host connection" false "$(file_exists "$KEEP_AWAKE_TEST_CONNECT")"
 assert_eq "disable records deliberate opt-out" declined "$("$KEEP_AWAKE" probe)"
 export KEEP_AWAKE_TEST_CURL_HEALTHY=false
@@ -218,7 +287,37 @@ disabled_status="$("$KEEP_AWAKE" status)"
 assert_contains "disabled status reports daemon down" "Daemon reachable: no" "$disabled_status"
 assert_contains "disabled status reports autostart absent" "Autostart installed: no" "$disabled_status"
 assert_contains "disabled status reports Host connection absent" "Host connection present: no" "$disabled_status"
+assert_contains "disabled status reports tray not installed" "Tray: not installed" "$disabled_status"
 export KEEP_AWAKE_TEST_CURL_HEALTHY=true
+
+# Missing Linux tray prerequisites and tray startup failures are notices only;
+# the daemon remains fully enabled and the tray has its own status.
+mv "$TMPROOT/bin/yad" "$TMPROOT/bin/yad.mock"
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+missing_yad_output="$(PATH="$TMPROOT/bin:/usr/bin:/bin" "$KEEP_AWAKE" enable 2>&1)"
+assert_contains "missing yad prints package remedy" "Install the yad package" "$missing_yad_output"
+assert_eq "missing yad still enables daemon" ok \
+    "$(PATH="$TMPROOT/bin:/usr/bin:/bin" "$KEEP_AWAKE" probe)"
+assert_eq "missing yad installs no tray source" false \
+    "$(file_exists "$TMPROOT/install/keep-awake-tray.sh")"
+missing_yad_status="$(PATH="$TMPROOT/bin:/usr/bin:/bin" "$KEEP_AWAKE" status)"
+assert_contains "status reports missing Linux tray prerequisite" \
+    "Tray: skipped-missing-prereq" "$missing_yad_status"
+PATH="$TMPROOT/bin:/usr/bin:/bin" "$KEEP_AWAKE" disable >/dev/null
+mv "$TMPROOT/bin/yad.mock" "$TMPROOT/bin/yad"
+
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+export KEEP_AWAKE_TEST_TRAY_START_FAIL=true
+tray_failure_output="$("$KEEP_AWAKE" enable 2>&1)"
+assert_contains "tray startup failure is reported as optional" \
+    "daemon remains enabled without the optional tray" "$tray_failure_output"
+assert_eq "tray startup failure still enables daemon" ok "$("$KEEP_AWAKE" probe)"
+assert_eq "tray startup failure cleans partial artifacts" false \
+    "$(file_exists "$TMPROOT/install/keep-awake-tray.sh")"
+assert_contains "failed tray status is not installed" "Tray: not installed" \
+    "$("$KEEP_AWAKE" status)"
+export KEEP_AWAKE_TEST_TRAY_START_FAIL=false
+"$KEEP_AWAKE" disable >/dev/null
 
 # A failed container build falls back to local Go, in that order.
 cat > "$TMPROOT/bin/go" <<'EOF'
@@ -263,6 +362,10 @@ export KEEP_AWAKE_TEST_CONNECT_FAIL=false
 "$KEEP_AWAKE" teardown --keep-connection --remove-state
 assert_eq "uninstall teardown removes binary" false "$(file_exists "$TMPROOT/install/keep-awake")"
 assert_eq "uninstall teardown removes autostart" false "$(file_exists "$KEEP_AWAKE_TEST_SYSTEMD")"
+assert_eq "uninstall teardown removes tray unit" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_TRAY_SYSTEMD")"
+assert_eq "uninstall teardown removes tray artifacts" false \
+    "$(file_exists "$TMPROOT/install/keep-awake-tray.sh")"
 assert_eq "uninstall teardown leaves connection for sweep" true "$(file_exists "$KEEP_AWAKE_TEST_CONNECT")"
 assert_eq "uninstall teardown removes elective marker" false \
     "$(file_exists "$XDG_CONFIG_HOME/boxa/keep-awake.conf")"
@@ -274,16 +377,54 @@ export BOXA_KEEP_AWAKE_PLATFORM=macos
 export BOXA_KEEP_AWAKE_INSTALL_DIR="$TMPROOT/macos-install"
 "$KEEP_AWAKE" enable >/dev/null
 assert_eq "macOS enable bootstraps launchd user agent" true "$(file_exists "$KEEP_AWAKE_TEST_LAUNCHD")"
+assert_eq "macOS enable compiles tray beside daemon" true \
+    "$(file_exists "$TMPROOT/macos-install/keep-awake-tray")"
+assert_eq "macOS enable bootstraps separate tray agent" true \
+    "$(file_exists "$KEEP_AWAKE_TEST_TRAY_LAUNCHD")"
 assert_contains "macOS launchd command is user-scoped" "launchctl bootstrap gui/" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "macOS status reports tray separately" "Tray: running" \
+    "$("$KEEP_AWAKE" status)"
 "$KEEP_AWAKE" disable >/dev/null
 assert_eq "macOS disable removes launchd user agent" false "$(file_exists "$KEEP_AWAKE_TEST_LAUNCHD")"
+assert_eq "macOS disable removes tray agent" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_TRAY_LAUNCHD")"
+assert_eq "macOS disable removes compiled tray" false \
+    "$(file_exists "$TMPROOT/macos-install/keep-awake-tray")"
+
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+mv "$TMPROOT/bin/swiftc" "$TMPROOT/bin/swiftc.mock"
+missing_swift_output="$(PATH="$TMPROOT/bin:/usr/bin:/bin" "$KEEP_AWAKE" enable 2>&1)"
+assert_contains "missing swiftc prints Xcode CLT remedy" \
+    "xcode-select --install" "$missing_swift_output"
+assert_eq "missing swiftc still enables daemon" ok \
+    "$(PATH="$TMPROOT/bin:/usr/bin:/bin" "$KEEP_AWAKE" probe)"
+missing_swift_status="$(PATH="$TMPROOT/bin:/usr/bin:/bin" "$KEEP_AWAKE" status)"
+assert_contains "status reports missing macOS tray prerequisite" \
+    "Tray: skipped-missing-prereq" "$missing_swift_status"
+PATH="$TMPROOT/bin:/usr/bin:/bin" "$KEEP_AWAKE" disable >/dev/null
+mv "$TMPROOT/bin/swiftc.mock" "$TMPROOT/bin/swiftc"
 
 rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
 export BOXA_KEEP_AWAKE_PLATFORM=wsl2
 export BOXA_KEEP_AWAKE_INSTALL_DIR="$TMPROOT/windows-install"
 "$KEEP_AWAKE" enable >/dev/null
 assert_eq "Windows enable creates scheduled task" true "$(file_exists "$KEEP_AWAKE_TEST_TASK")"
+assert_eq "Windows enable creates separate tray task" true \
+    "$(file_exists "$KEEP_AWAKE_TEST_TRAY_TASK")"
 assert_contains "Windows task is scheduled at logon" "/SC ONLOGON" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "Windows tray task is scheduled at logon" \
+    "/Create /TN BoxaKeepAwakeTray /SC ONLOGON" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+windows_tray="$TMPROOT/windows-install/keep-awake-tray.ps1"
+assert_eq "Windows tray script is installed beside daemon" true "$(file_exists "$windows_tray")"
+assert_contains "Windows tray polls versioned status endpoint" \
+    "http://localhost:\$Port/v1/status" "$(cat "$windows_tray")"
+assert_contains "Windows tray uses inhibition state" 'status.isInhibited' "$(cat "$windows_tray")"
+assert_contains "Windows tray lists active holders" 'Status.activeHolders' "$(cat "$windows_tray")"
+assert_contains "Windows tray keeps single-instance mutex" \
+    'Local\BoxaKeepAwakeTray' "$(cat "$windows_tray")"
+assert_contains "Windows tray keeps crash log trap" "Tray CRASHED" "$(cat "$windows_tray")"
+assert_contains "Windows status reports tray separately" "Tray: running" \
+    "$("$KEEP_AWAKE" status)"
 windows_wrapper="$TMPROOT/windows-install/start-keep-awake.ps1"
 assert_eq "Windows task installs runtime gateway wrapper" true "$(file_exists "$windows_wrapper")"
 assert_contains "Windows wrapper resolves vEthernet address at each start" \
@@ -317,7 +458,10 @@ assert_eq "Windows doctor probe rejects task with missing wrapper" missing \
 "$KEEP_AWAKE" enable >/dev/null
 "$KEEP_AWAKE" disable >/dev/null
 assert_eq "Windows disable deletes scheduled task" false "$(file_exists "$KEEP_AWAKE_TEST_TASK")"
+assert_eq "Windows disable deletes tray task" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_TRAY_TASK")"
 assert_eq "Windows disable removes runtime gateway wrapper" false "$(file_exists "$windows_wrapper")"
+assert_eq "Windows disable removes tray script" false "$(file_exists "$windows_tray")"
 
 # Public CLI routes the three subcommands to the canonical helper and exposes
 # dedicated help without requiring Docker.
