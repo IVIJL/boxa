@@ -52,6 +52,23 @@ assert_contains() {
     fi
 }
 
+mkdir -p "$TMPROOT/bash-only"
+ln -s "$(command -v bash)" "$TMPROOT/bash-only/bash"
+
+# Source the Linux tray functions without starting yad, then exercise both the
+# optional jq path and the dependency-free fallback with valid hostile names.
+linux_tray="$BOXA_DIR/keep-awake/tray/keep-awake-tray.sh"
+hostile_status='{"activeHolders":[{"agent":"co]d\"ex\\path","session":"s]e\"ss\\ion","remainingTTLSeconds":42},{"agent":"plain","remainingTTLSeconds":7}],"isInhibited":true}'
+jq_holders="$(bash -c 'source "$1" 17777 "$2"; keep_awake_tray::holders "$3"' \
+    _ "$linux_tray" "$TMPROOT" "$hostile_status")"
+assert_eq "Linux tray decodes hostile holder names with jq" \
+    'co]d"ex\path/s]e"ss\ion (42s), plain (7s)' "$jq_holders"
+fallback_holders="$(PATH="$TMPROOT/bash-only" bash -c \
+    'source "$1" 17777 "$2"; keep_awake_tray::holders "$3"' \
+    _ "$linux_tray" "$TMPROOT" "$hostile_status")"
+assert_eq "Linux tray hides hostile holder names without jq" \
+    "holder details unavailable" "$fallback_holders"
+
 file_exists() {
     [ -e "$1" ] && printf true || printf false
 }
@@ -197,8 +214,6 @@ assert_eq "decided offer does not prompt again" "" "$second_offer"
 # With neither Docker nor Go available, enable prints the Docker-first remedy
 # and mutates no binary, autostart, or Host connection state.
 rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
-mkdir -p "$TMPROOT/bash-only"
-ln -s "$(command -v bash)" "$TMPROOT/bash-only/bash"
 missing_tools_output="$(PATH="$TMPROOT/bash-only" "$KEEP_AWAKE" enable 2>&1 || true)"
 assert_contains "missing build tools recommend Docker first" \
     "Have Docker installed and running" "$missing_tools_output"

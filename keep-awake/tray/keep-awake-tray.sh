@@ -6,22 +6,23 @@ port="${1:-17777}"
 icon_dir="${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 keep_awake_tray::holders() {
-    local json="$1" objects object agent session ttl label labels=""
-    objects="$(printf '%s\n' "$json" \
-        | sed -nE 's/.*"activeHolders":\[([^]]*)].*/\1/p' \
-        | sed 's/},{/}\n{/g')"
-    while IFS= read -r object; do
-        [ -n "$object" ] || continue
-        agent="$(printf '%s\n' "$object" | sed -nE 's/.*"agent":"([^"]*)".*/\1/p')"
-        session="$(printf '%s\n' "$object" | sed -nE 's/.*"session":"([^"]*)".*/\1/p')"
-        ttl="$(printf '%s\n' "$object" | sed -nE 's/.*"remainingTTLSeconds":([0-9]+).*/\1/p')"
-        [ -n "$agent" ] || continue
-        label="$agent"
-        [ -z "$session" ] || label="$label/$session"
-        [ -z "$ttl" ] || label="$label (${ttl}s)"
-        if [ -n "$labels" ]; then labels="$labels, $label"; else labels="$label"; fi
-    done <<< "$objects"
-    printf '%s\n' "$labels"
+    local json="$1"
+    if ! command -v jq >/dev/null 2>&1; then
+        printf 'holder details unavailable\n'
+        return 0
+    fi
+    printf '%s\n' "$json" | jq -r '
+        [
+            .activeHolders[]?
+            | select((.agent | type) == "string")
+            | .agent
+                + (if (.session? | type) == "string" and (.session | length) > 0
+                    then "/" + .session else "" end)
+                + (if (.remainingTTLSeconds? | type) == "number"
+                    then " (" + (.remainingTTLSeconds | tostring) + "s)" else "" end)
+        ]
+        | join(", ")
+    ' 2>/dev/null || printf 'holder details unavailable\n'
 }
 
 keep_awake_tray::updates() {
@@ -45,7 +46,9 @@ keep_awake_tray::updates() {
     done
 }
 
-keep_awake_tray::updates | yad --notification --listen \
-    --image="$icon_dir/idle.svg" \
-    --text='Boxa keep-awake: starting' \
-    --menu='Quit!quit'
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    keep_awake_tray::updates | yad --notification --listen \
+        --image="$icon_dir/idle.svg" \
+        --text='Boxa keep-awake: starting' \
+        --menu='Quit!quit'
+fi
