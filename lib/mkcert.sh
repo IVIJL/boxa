@@ -166,7 +166,14 @@ seed_local_ca() {
         echo "seed_local_ca: no usable mkcert >= $BOXA_MKCERT_MIN_VERSION — install or upgrade it first" >&2
         return 1
     fi
-    if ! "$bin" -install >&2; then
+    # TRUST_STORES pins the targets to the system store (+ NSS for Firefox
+    # when certutil exists — mkcert degrades to a warning without it). This
+    # deliberately excludes "java": with JAVA_HOME set (e.g. Android Studio's
+    # bundled JBR under /Applications, whose cacerts is not writable) mkcert
+    # would try keytool -importcert, hit "Operation not permitted" and fail
+    # the whole install even though the system store succeeded. Boxa's HTTPS
+    # (Traefik + browsers + curl) never consults the Java trust store.
+    if ! TRUST_STORES="system,nss" "$bin" -install >&2; then
         echo "seed_local_ca: 'mkcert -install' failed" >&2
         return 1
     fi

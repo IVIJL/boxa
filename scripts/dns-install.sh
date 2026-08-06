@@ -587,9 +587,22 @@ _dns::purge_ca_native() {
     local bin
     bin="$(_mkcert::resolve_bin)"
     _info "Running 'mkcert -uninstall' (sudo / Touch ID may prompt)..."
-    if ! "$bin" -uninstall >&2; then
+    # Same TRUST_STORES pin as seed_local_ca so an unwritable Java keystore
+    # (e.g. Android Studio's JBR under /Applications) cannot fail the
+    # system/NSS cleanup that actually matters.
+    if ! TRUST_STORES="system,nss" "$bin" -uninstall >&2; then
         _warn "mkcert -uninstall failed — native trust store may still contain a boxa CA."
         return 1
+    fi
+    # Legacy sweep: boxa versions before the TRUST_STORES pin ran an unscoped
+    # `mkcert -install`, which also seeded any writable Java cacerts. Try to
+    # clean that up too, but strictly best-effort — mkcert only attempts the
+    # Java store when it detects one, and an unwritable store must not turn a
+    # successful system/NSS uninstall into a purge failure.
+    if [ -n "${JAVA_HOME:-}" ] || command -v java >/dev/null 2>&1; then
+        if ! TRUST_STORES="java" "$bin" -uninstall >/dev/null 2>&1; then
+            _warn "Could not remove the boxa CA from the Java trust store (best-effort; it may never have been installed there, or the keystore is read-only)."
+        fi
     fi
     return 0
 }
