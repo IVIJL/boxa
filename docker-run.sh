@@ -121,6 +121,7 @@ Commands:
   stop [project]                          Stop a session
   status [project]                        Show session status
   open [--project|-p NAME] <url> [...]    Open one or more URLs
+  paste [project]                         Type the host clipboard into Chrome
   allow-for <N> [project]                 Open a network window for N minutes
   allow-for --stop [project]              Close the window immediately
   allow [domain]                          List or add an allowlist entry
@@ -133,6 +134,12 @@ Quote a glob for subdomains (for example, '*.example.com'). Allow automatically
 pairs apex and www hosts (qr.cz also adds www.qr.cz); deny removes both. Both
 commands SIGHUP every live proxy.
 
+On macOS the session sandbox denies Chrome the system pasteboard, so neither a
+page nor the agent can read what you last copied — and Cmd+V inside the agent
+window does nothing. Use paste instead: the broker reads the clipboard outside
+the sandbox and types it into the focused element, so Chrome only ever sees what
+you hand it. Set BOXA_AGENT_BROWSER_ALLOW_CLIPBOARD=1 before start to opt out.
+
 blocked reads the last session's live or archived proxy log. It resolves an
 explicit project, then the CWD basename, then offers a picker over live sessions
 and Containers with archived logs.
@@ -140,6 +147,7 @@ and Containers with archived logs.
 Examples:
   boxa agent-browser start my-app
   boxa agent-browser open https://example.com
+  boxa agent-browser paste
   boxa agent-browser allow '*.example.com'
   boxa agent-browser blocked -p my-app
 EOF
@@ -5013,14 +5021,14 @@ fi
 
 if [ "$MODE" = "agent-browser" ]; then
     if [ -z "$AGENT_BROWSER_SUB" ]; then
-        echo "Usage: boxa agent-browser <start|stop|status|open|allow-for|allow|deny|blocked> [args]" >&2
+        echo "Usage: boxa agent-browser <start|stop|status|open|paste|allow-for|allow|deny|blocked> [args]" >&2
         exit 2
     fi
     case "$AGENT_BROWSER_SUB" in
-        start|stop|status|open|allow-for|allow|deny|blocked|-h|--help|help) ;;
+        start|stop|status|open|paste|allow-for|allow|deny|blocked|-h|--help|help) ;;
         *)
             echo "Unknown agent-browser subcommand: $AGENT_BROWSER_SUB" >&2
-            echo "Usage: boxa agent-browser <start|stop|status|open|allow-for|allow|deny|blocked> [args]" >&2
+            echo "Usage: boxa agent-browser <start|stop|status|open|paste|allow-for|allow|deny|blocked> [args]" >&2
             exit 2
             ;;
     esac

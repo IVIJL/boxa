@@ -43,7 +43,7 @@ _boxa() {
                 'deny:Remove allowed domain (interactive)'
                 'blocked:Show blocked DNS + agent-browser denials (interactive)'
                 'allow-for:Open a time-bounded Allow-for window (default 15 min)'
-                'agent-browser:Control Host agent Chrome (start/stop/status/open/allow-for/allow/deny/blocked)'
+                'agent-browser:Control Host agent Chrome (start/stop/status/open/paste/allow-for/allow/deny/blocked)'
                 'cursor:Open Cursor attached to running boxa'
                 'code:Open VS Code attached to running boxa'
                 'clip:Grab clipboard image for container use'
@@ -173,6 +173,7 @@ _boxa() {
                             'stop:Stop session and clean up resources'
                             'status:Show session state (Chrome/proxy/watchdog PIDs)'
                             'open:Open URL(s) as new tabs in the running session'
+                            'paste:Type the host clipboard into the focused element'
                             'allow-for:Open time-bounded network window (default mode)'
                             'allow:List or add agent-browser allowed domain'
                             'deny:Remove agent-browser allowed domain'
@@ -190,7 +191,7 @@ _boxa() {
                                 _describe 'start flags' flags
                                 _boxa_containers
                                 ;;
-                            stop|status)
+                            stop|status|paste)
                                 _boxa_containers
                                 ;;
                             open)

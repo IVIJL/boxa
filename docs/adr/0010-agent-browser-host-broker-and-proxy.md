@@ -89,6 +89,28 @@ Residual deltas vs the Linux uid split, stated honestly:
   forced this; they are boxa-authored code, not a browser executing
   hostile content). Their file access runs as the developer on macOS.
 
+**Clipboard (amended 2026-08-06).** The profile also denies the
+pasteboard Mach service (`com.apple.pasteboard.1`). Without it, a page —
+or the agent itself, which over CDP can grant its own
+`clipboardReadWrite` permission — reads whatever the developer last
+copied; verified before the deny with `navigator.clipboard.readText()`
+returning a freshly copied secret, and after it returning nothing.
+
+macOS routes user-initiated `Cmd+V` through that same service and gives
+no way to distinguish it from a scripted read, so the deny necessarily
+takes manual paste with it. `agent-browser-broker.sh paste <container>`
+restores the workflow from the other side: the broker (unconfined, runs
+as the developer) reads the clipboard and delivers the text over CDP as
+`Input.insertText`, a synthetic input event that never touches the OS
+pasteboard. Chrome therefore sees exactly what the developer chose to
+hand it, when they chose to. `BOXA_AGENT_BROWSER_ALLOW_CLIPBOARD=1`
+omits the deny for anyone who prefers native paste over the guarantee.
+
+Not yet closed on Linux: `boxa-agent` holds an X/Wayland display grant,
+and X selections are readable by any client on the display, so the
+equivalent deny has no counterpart there yet. The `paste` subcommand
+works on both platforms; the *guarantee* is macOS-only today.
+
 Agent state trees (`/var/lib/boxa-agent/{profiles,downloads}`,
 `/var/log/boxa/agent-browser`) are developer-owned on macOS;
 `ensure-agent-browser-host-state.sh` re-owns pre-existing installs on

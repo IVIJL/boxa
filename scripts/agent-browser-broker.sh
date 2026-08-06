@@ -257,6 +257,20 @@ _write_chrome_seatbelt_profile() {
     local profile_dir_real download_dir_real
     profile_dir_real="$(cd "$profile_dir" 2>/dev/null && pwd -P)" || profile_dir_real="$profile_dir"
     download_dir_real="$(cd "$download_dir" 2>/dev/null && pwd -P)" || download_dir_real="$download_dir"
+    # Deny the pasteboard Mach service: without it a page (or the agent via
+    # CDP, which can grant itself the clipboard permission) reads whatever the
+    # developer last copied — passwords, tokens, 2FA codes. Verified: with the
+    # deny in place `navigator.clipboard.readText()` yields nothing.
+    #
+    # This necessarily kills Cmd+V inside the agent window too — macOS routes
+    # user-initiated paste through the same service and cannot distinguish it
+    # from a scripted read. `agent-browser-broker.sh paste` restores the
+    # workflow by reading the clipboard OUTSIDE the sandbox and typing the
+    # text in over CDP, so Chrome only ever sees what the developer
+    # deliberately handed it. BOXA_AGENT_BROWSER_ALLOW_CLIPBOARD=1 is the
+    # escape hatch for anyone who wants the old (unconfined) behaviour back.
+    local clipboard_deny='(deny mach-lookup (global-name "com.apple.pasteboard.1"))'
+    [ "${BOXA_AGENT_BROWSER_ALLOW_CLIPBOARD:-0}" = 1 ] && clipboard_deny=""
     cat > "$profile_sb" <<EOF
 (version 1)
 (allow default)
@@ -274,6 +288,7 @@ ${home_deny}
     (subpath "/private/var/folders")
     (subpath "/private/tmp")
     (subpath "/dev"))
+${clipboard_deny}
 EOF
 }
 
@@ -304,6 +319,7 @@ Usage:
   agent-browser-broker.sh stop       <container>
   agent-browser-broker.sh status     <container>
   agent-browser-broker.sh open       <container> <url> [<url>...]
+  agent-browser-broker.sh paste      <container>
   agent-browser-broker.sh allow-for  <minutes> <container>
   agent-browser-broker.sh allow-for  --stop    <container>
   agent-browser-broker.sh allow      [<domain>]
@@ -6569,6 +6585,342 @@ cmd_open() {
     fi
 }
 
+# --- subcommand: paste -------------------------------------------------------
+
+# Read the host clipboard and hand its text to the focused element in the
+# session's active page.
+#
+# This exists because the seatbelt profile denies Host agent Chrome the
+# pasteboard service outright (see _write_chrome_seatbelt_profile), which also
+# takes Cmd+V with it. The broker runs UNCONFINED as the developer, so it can
+# read the clipboard and push the text over CDP as `Input.insertText` — a
+# synthetic input event that never touches the OS pasteboard. Net effect:
+# Chrome sees exactly what the developer chose to paste, at the moment they
+# chose it, and can never help itself to the clipboard's contents.
+# Fill `_CLIPBOARD_CMD` with the host's clipboard reader. Returns 1 when the
+# platform has none, so the caller can name the missing package.
+#
+# The command is never run through `$(…)`: command substitution eats trailing
+# newlines (mangling copied scripts) and an argv hand-off would expose the
+# secret in `ps`. cmd_paste pipes it straight into the CDP helper's stdin.
+_host_clipboard_cmd() {
+    _CLIPBOARD_CMD=()
+    if [ "$_AGENT_IS_DARWIN" = 1 ]; then
+        command -v pbpaste >/dev/null 2>&1 || return 1
+        _CLIPBOARD_CMD=(pbpaste)
+        return 0
+    fi
+    # Wayland first (wl-clipboard), then X11 (xclip / xsel). `--no-newline`
+    # suppresses the newline wl-paste otherwise APPENDS to text that lacks
+    # one; it never strips a newline the clipboard genuinely holds, so the
+    # bytes stay exact either way.
+    #
+    # wl-paste is preferred only when a Wayland display is actually there:
+    # distros ship wl-clipboard alongside xclip, and on an X11 session it
+    # would fail every time while the working X11 reader sat unused.
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-paste >/dev/null 2>&1; then
+        _CLIPBOARD_CMD=(wl-paste --no-newline)
+        return 0
+    fi
+    if command -v xclip >/dev/null 2>&1; then
+        _CLIPBOARD_CMD=(xclip -selection clipboard -o)
+        return 0
+    fi
+    if command -v xsel >/dev/null 2>&1; then
+        _CLIPBOARD_CMD=(xsel --clipboard --output)
+        return 0
+    fi
+    # Wayland tool present but no WAYLAND_DISPLAY and no X11 reader: still
+    # better to try it than to claim nothing is installed.
+    if command -v wl-paste >/dev/null 2>&1; then
+        _CLIPBOARD_CMD=(wl-paste --no-newline)
+        return 0
+    fi
+    return 1
+}
+
+# Type the text on stdin into the focused editable element of the session's
+# ACTIVE page. Reads the CDP port from $1; the text never appears in argv.
+#
+# Exit codes: 0 inserted (character count on stdout), 3 empty clipboard,
+# 4 no unambiguous active page, 5 nothing editable has focus, 1 CDP failure.
+_insert_text_via_cdp() {
+    local cdp_port="$1"
+    # `3<&0` duplicates the incoming pipe onto fd 3 BEFORE the heredoc takes
+    # stdin over for the program text — redirections apply left to right, so
+    # the clipboard survives on fd 3 for the script to read.
+    python3 - "$cdp_port" 3<&0 <<'PY'
+import base64
+import http.client
+import json
+import os
+import socket
+import struct
+import sys
+
+
+def http_get(port, path):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8")
+    conn.close()
+    return json.loads(body)
+
+
+def ws_connect(url):
+    rest = url[len("ws://") :]
+    host_port, path = rest.split("/", 1)
+    host, port_s = host_port.split(":")
+    sock = socket.create_connection((host, int(port_s)), timeout=3)
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    req = (
+        f"GET /{path} HTTP/1.1\r\n"
+        f"Host: {host}:{port_s}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    sock.sendall(req.encode("ascii"))
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("websocket handshake aborted")
+        buf += chunk
+    if b"101" not in buf.split(b"\r\n", 1)[0]:
+        raise RuntimeError("websocket handshake refused")
+    return sock
+
+
+def ws_send(sock, payload):
+    data = payload.encode("utf-8")
+    header = bytearray([0x81])
+    mask = os.urandom(4)
+    if len(data) < 126:
+        header.append(0x80 | len(data))
+    elif len(data) < 65536:
+        header.append(0x80 | 126)
+        header += struct.pack(">H", len(data))
+    else:
+        header.append(0x80 | 127)
+        header += struct.pack(">Q", len(data))
+    header += mask
+    sock.sendall(bytes(header) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+
+def ws_recv(sock):
+    def must(n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise RuntimeError("websocket closed")
+            buf += chunk
+        return buf
+
+    while True:
+        b0, b1 = must(2)
+        opcode = b0 & 0x0F
+        plen = b1 & 0x7F
+        if plen == 126:
+            (plen,) = struct.unpack(">H", must(2))
+        elif plen == 127:
+            (plen,) = struct.unpack(">Q", must(8))
+        mask = must(4) if (b1 & 0x80) else None
+        data = must(plen)
+        if mask:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        if opcode == 0x1:
+            return data.decode("utf-8")
+        if opcode == 0x8:
+            raise RuntimeError("websocket closed by remote")
+
+
+class Page:
+    """One CDP page connection with a synchronous request/response `call`."""
+
+    def __init__(self, target):
+        self.target = target
+        self.sock = ws_connect(target["webSocketDebuggerUrl"])
+        self.next_id = 0
+
+    def call(self, method, params=None):
+        self.next_id += 1
+        msg = {"id": self.next_id, "method": method}
+        if params is not None:
+            msg["params"] = params
+        ws_send(self.sock, json.dumps(msg))
+        while True:
+            resp = json.loads(ws_recv(self.sock))
+            if resp.get("id") == self.next_id:
+                if "error" in resp:
+                    raise RuntimeError(resp["error"])
+                return resp.get("result", {})
+
+    def probe(self):
+        expr = (
+            "JSON.stringify({"
+            "visible: document.visibilityState === 'visible',"
+            "focused: document.hasFocus(),"
+            # An IFRAME as activeElement means focus was delegated into the
+            # frame — the top document cannot see the real control (and for a
+            # cross-origin frame never will), but CDP's Input.insertText goes
+            # to the focused frame regardless. Counting it as editable keeps
+            # embedded editors, auth widgets and payment forms working.
+            # A checkbox, button, range or file picker swallows insertText
+            # without changing anything, which would have this command report
+            # a paste that never happened.
+            "editable: (function () {"
+            "var e = document.activeElement;"
+            "if (!e) { return false; }"
+            "if (e.isContentEditable) { return true; }"
+            "if (e.tagName === 'IFRAME') { return true; }"
+            "if (e.disabled || e.readOnly) { return false; }"
+            "if (e.tagName === 'TEXTAREA') { return true; }"
+            "if (e.tagName !== 'INPUT') { return false; }"
+            "var opaque = ['checkbox','radio','button','submit','reset',"
+            "'file','range','color','image','hidden','date','time',"
+            "'datetime-local','month','week'];"
+            "return opaque.indexOf((e.type || 'text').toLowerCase()) === -1;"
+            "})()"
+            "})"
+        )
+        res = self.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
+        return json.loads(res["result"]["value"])
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def pick_target(pages):
+    """Choose the page the developer is actually looking at.
+
+    Tab order in /json/list is not a contract, and pasting a password into
+    whichever tab happens to be listed first is exactly the failure this
+    command exists to prevent. `visibilityState` marks the selected tab of
+    each window even when Chrome is not the frontmost app (the normal case:
+    the developer triggers this from a terminal), and `document.hasFocus()`
+    disambiguates when several windows each have a selected tab.
+
+    With several windows and nothing focused — the shape you get when the
+    terminal is frontmost — there is deliberately NO further tiebreak. A
+    stale editable field in a background window is not evidence that it is
+    the intended target, and guessing wrong types a password into the wrong
+    site. The caller turns this into "click the field and retry".
+    """
+    visible = [p for p in pages if p.state["visible"]]
+    if not visible:
+        return None
+    if len(visible) == 1:
+        return visible[0]
+    focused = [p for p in visible if p.state["focused"]]
+    if len(focused) == 1:
+        return focused[0]
+    return None
+
+
+def main():
+    port = int(sys.argv[1])
+    with os.fdopen(3, "rb", closefd=False) as clipboard:
+        text = clipboard.read().decode("utf-8", "replace")
+    if not text:
+        return 3
+
+    targets = [
+        t
+        for t in http_get(port, "/json/list")
+        if t.get("type") == "page" and t.get("webSocketDebuggerUrl")
+    ]
+    pages = []
+    for target in targets:
+        try:
+            page = Page(target)
+            page.state = page.probe()
+            pages.append(page)
+        except Exception:
+            continue
+
+    try:
+        chosen = pick_target(pages)
+        if chosen is None:
+            for page in pages:
+                if page.state["visible"]:
+                    print(f"  candidate: {page.target.get('url', '')[:100]}", file=sys.stderr)
+            return 4
+        if not chosen.state["editable"]:
+            print(f"  active tab: {chosen.target.get('url', '')[:100]}", file=sys.stderr)
+            return 5
+        chosen.call("Input.insertText", {"text": text})
+    finally:
+        for page in pages:
+            page.close()
+    print(len(text))
+    return 0
+
+
+try:
+    sys.exit(main())
+except Exception as exc:
+    print(f"paste failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+cmd_paste() {
+    local container
+    container="$(_require_container_arg "${1:-}")"
+
+    local state_file
+    state_file="$(_state_file "$container")"
+    if [ ! -f "$state_file" ]; then
+        local replacement
+        if replacement="$(_offer_session_picker "$container")"; then
+            container="$replacement"
+            state_file="$(_state_file "$container")"
+        else
+            _die "No active session for ${container}. Run 'boxa agent-browser start ${container}' first."
+        fi
+    fi
+
+    local cdp_port chrome_pid profile_dir
+    cdp_port="$(_state_get "$state_file" cdp_port_host || true)"
+    chrome_pid="$(_state_get "$state_file" chrome_pid || true)"
+    profile_dir="$(_state_get "$state_file" profile_dir || true)"
+    { [ -n "$cdp_port" ] && [ "$cdp_port" != "null" ]; } \
+        || _die "State file ${state_file} is missing cdp_port_host."
+    { [ -n "$chrome_pid" ] && [ "$chrome_pid" != "null" ]; } \
+        || _die "State file ${state_file} is missing chrome_pid."
+    if ! _pid_matches_marker "$chrome_pid" "--user-data-dir=$profile_dir"; then
+        _die "Chrome for ${container} is not alive (pid ${chrome_pid} no longer matches profile marker). Restart the session."
+    fi
+
+    if ! _host_clipboard_cmd; then
+        if [ "$_AGENT_IS_DARWIN" = 1 ]; then
+            _die "Could not read the host clipboard: pbpaste is unavailable."
+        fi
+        _die "Could not read the host clipboard — install wl-clipboard (Wayland) or xclip/xsel (X11)."
+    fi
+
+    # Pipe, never substitute: this keeps the clipboard exact (including
+    # trailing newlines) and keeps it out of argv, where `ps` would show it.
+    local count rc=0
+    count="$("${_CLIPBOARD_CMD[@]}" 2>/dev/null | _insert_text_via_cdp "$cdp_port")" || rc=$?
+    case "$rc" in
+        0) ;;
+        3) _die "Host clipboard is empty; nothing to paste." ;;
+        4) _die "Could not tell which tab is active in ${container}'s Chrome (candidates above). Click into the field you want and retry." ;;
+        5) _die "Nothing editable has focus in ${container}'s Chrome. Click into the field you want and retry." ;;
+        *) _die "Failed to insert the clipboard text into ${container}'s Chrome." ;;
+    esac
+    # Report the length only — the text is routinely a password or a token.
+    _log "Pasted ${count} character(s) into the focused element of ${container}'s Chrome."
+}
+
 # --- subcommand: status ------------------------------------------------------
 
 cmd_status() {
@@ -6696,6 +7048,7 @@ main() {
         stop)      cmd_stop        "$@" ;;
         status)    cmd_status      "$@" ;;
         open)      cmd_open        "$@" ;;
+        paste)     cmd_paste       "$@" ;;
         allow-for) cmd_allow_for   "$@" ;;
         allow)     cmd_agent_allow "$@" ;;
         deny)      cmd_agent_deny  "$@" ;;

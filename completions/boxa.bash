@@ -79,7 +79,7 @@ _boxa() {
             fi
             ;;
         agent-browser)
-            local ab_subs="start stop status open allow-for allow deny blocked help"
+            local ab_subs="start stop status open paste allow-for allow deny blocked help"
             if [ "$cword" -eq 2 ]; then
                 # shellcheck disable=SC2207
                 COMPREPLY=( $(compgen -W "$ab_subs" -- "$cur") )
