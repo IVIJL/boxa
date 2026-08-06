@@ -130,6 +130,28 @@ if ! id -nG "$invoker" 2>/dev/null | tr ' ' '\n' | grep -qx boxa-agent; then
     fi
 fi
 
+# macOS: agent-side processes (proxy, Chrome, relay) run as the invoking
+# developer, not boxa-agent — Quartz WindowServer only renders windows for
+# the console-session uid and the boxa-agent login keychain is unusable
+# (see the broker's _AGENT_RUN block). The agent state trees must therefore
+# be developer-owned. Installs that predate this switch ran Chrome as
+# boxa-agent and left dirs the developer cannot write; re-own them here so
+# `boxa update` self-heals without a manual chown.
+if [ "$platform" = "macos" ]; then
+    for agent_dir in /var/lib/boxa-agent/profiles /var/lib/boxa-agent/downloads /var/log/boxa/agent-browser; do
+        [ -d "$agent_dir" ] || continue
+        dir_owner="$(stat -f %Su "$agent_dir" 2>/dev/null || true)"
+        if [ "$dir_owner" != "$invoker" ]; then
+            if sudo chown -R "${invoker}:" "$agent_dir"; then
+                loud "Re-chowned $agent_dir to $invoker (agent-side processes run as the developer on macOS)"
+                actions=$((actions + 1))
+            else
+                warn "Failed to chown $agent_dir to $invoker — agent-browser sessions may fail with permission errors."
+            fi
+        fi
+    done
+fi
+
 # mkcert root-CA trust for boxa-agent. Idempotent: re-imports only
 # when fingerprint differs (fresh install or CA rotation). Per
 # feedback_active_migration_for_breakfix this lives inside the update

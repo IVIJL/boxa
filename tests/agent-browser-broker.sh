@@ -29,6 +29,19 @@ BROKER="$SCRIPT_DIR/../scripts/agent-browser-broker.sh"
 # shellcheck disable=SC1090
 source <(sed '$d' "$BROKER")
 
+# Normalize the agent OS identity to the Linux shape regardless of the
+# machine running the tests. The broker picks these arrays at source time
+# from `uname -s` (on macOS agent-side processes run as the developer —
+# see its _AGENT_RUN block), but every assertion below models the Linux
+# contract: kills and fs ops are expected to go through the `sudo()` stubs.
+# Without this pin the same suite would assert different call shapes per
+# host OS.
+_AGENT_IS_DARWIN=0
+_AGENT_RUN=(sudo -u boxa-agent)
+_AGENT_FS=(sudo)
+_AGENT_SUDO_STR="sudo -u boxa-agent"
+_AGENT_STATE_OWNER="boxa-agent"
+
 # The broker sets `set -euo pipefail` at its top, which the source above
 # inherits. This harness DELIBERATELY drives the helpers down their failing
 # return paths (refused ufw selectors return 1, etc.) and inspects `$?`, so

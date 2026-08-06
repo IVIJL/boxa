@@ -49,6 +49,52 @@ reads of the developer's home directory, downloads to autostart paths,
 and any other process-privilege-level attack — `--user-data-dir`
 alone does not isolate process write perms.
 
+**macOS exception (amended 2026-08-06).** On Darwin the agent-side
+processes (Chrome, proxy, relay) run as the *invoking developer*, not
+`boxa-agent` — but Chrome is confined by a **per-session macOS seatbelt
+profile** (`sandbox-exec`) so the core guarantee of this ADR ("Host
+agent Chrome cannot read or exfiltrate anything of the developer's,
+above all `~/.ssh`") holds by kernel enforcement, not by uid.
+
+Why not the uid split: Quartz WindowServer only renders windows for the
+uid that owns the logged-in console session and offers no xhost-style
+per-uid grant, so a `boxa-agent`-owned Chrome starts, binds CDP, passes
+the smoke test — and is permanently invisible. It also drags in that
+user's locked login keychain (endless "reset keychain" dialogs) and
+demands a sudo password for every lifecycle operation. Restoring the
+split would need a logged-in `boxa-agent` GUI session (fast user
+switching), which is not automatable in good conscience.
+
+The seatbelt profile (written by the broker into the session profile
+dir at start): denies `file-read*` **and** `file-write*` under `/Users`
+(all homes), `/Volumes` (external disks, Time Machine) and
+`/private/var/root`; denies writes everywhere else except the session
+profile dir, download dir, the OS temp trees and `/dev`; allows the
+rest (system libraries, frameworks) for a functioning browser. Session
+dirs live under `/var/lib/boxa-agent` — outside every home — so Chrome
+needs nothing from `$HOME`. TLS trust evaluation happens in `trustd`,
+outside the sandbox, so mkcert HTTPS on dev URLs still verifies.
+
+Residual deltas vs the Linux uid split, stated honestly:
+
+- Chrome's **internal** sandbox is off on macOS (`--no-sandbox`):
+  helper processes cannot initialise their own sandbox nested inside a
+  seatbelt profile (`sandbox_init` → EPERM; the GPU process dies). The
+  outer kernel profile confines renderers instead — a compromised
+  renderer can read world-readable system paths (as it could on Linux
+  running as `boxa-agent`) but cannot touch `/Users` or `/Volumes`.
+- Reads of world-readable paths outside the denied trees are allowed —
+  equivalent to what the `boxa-agent` uid can read on Linux.
+- The proxy and relay are NOT seatbelt-confined (no GUI constraint
+  forced this; they are boxa-authored code, not a browser executing
+  hostile content). Their file access runs as the developer on macOS.
+
+Agent state trees (`/var/lib/boxa-agent/{profiles,downloads}`,
+`/var/log/boxa/agent-browser`) are developer-owned on macOS;
+`ensure-agent-browser-host-state.sh` re-owns pre-existing installs on
+`boxa update`. Chrome additionally gets `--use-mock-keychain` so the
+ephemeral automation profile never touches any keychain.
+
 Launch flags:
 
 ```

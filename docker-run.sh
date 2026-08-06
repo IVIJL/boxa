@@ -1073,8 +1073,15 @@ _boxa::remove_project_agent_browser_archives() {
     # and silently leave this project's archives behind. Sudo for the
     # listing parallels the sudo for deletion below; if enumeration fails
     # we surface a warning rather than masking the cleanup gap.
+    #
+    # macOS: the archive tree is developer-owned (the broker's _AGENT_RUN
+    # block — agent-side processes run as the developer there), so both the
+    # listing and the deletion run unprefixed; `env` keeps the array
+    # non-empty for bash-3.2 `set -u`.
+    local -a agent_run=(sudo -u boxa-agent)
+    [ "$(uname -s 2>/dev/null || echo Unknown)" = "Darwin" ] && agent_run=(env)
     local listing
-    if ! listing=$(sudo -u boxa-agent \
+    if ! listing=$("${agent_run[@]}" \
         find "$archive_dir" -maxdepth 1 -type f \
              \( -name "${container}-*.netlog.json" \
              -o -name "${container}-*.proxy.log" \
@@ -1109,7 +1116,7 @@ _boxa::remove_project_agent_browser_archives() {
 
     [ "${#victims[@]}" -gt 0 ] || return 0
 
-    if sudo -u boxa-agent rm -f -- "${victims[@]}" 2>/dev/null; then
+    if "${agent_run[@]}" rm -f -- "${victims[@]}" 2>/dev/null; then
         echo "  Removed ${#victims[@]} agent-browser archive file(s)"
     else
         echo "  WARN: failed to remove some agent-browser archive files in $archive_dir" >&2

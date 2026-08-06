@@ -143,6 +143,140 @@ AGENT_WATCHDOG_INTERVAL_DEFAULT=10
 # host port Chrome chose this session. ADR 0010 § Actor 2.
 BRIDGE_CONTAINER_PORT="9222"
 
+# --- Agent OS identity (platform-dependent) ----------------------------------
+#
+# On Linux/WSL2 every agent-side process (proxy, Chrome, socat relay) runs
+# as the dedicated low-privilege `boxa-agent` OS user (ADR 0010 § Actor 1),
+# via the `_AGENT_RUN` prefix below.
+#
+# On macOS that uid split cannot work for a GUI process: Quartz WindowServer
+# only renders windows for the uid that owns the logged-in console session,
+# and there is no xhost-style per-uid display grant to borrow. Chrome
+# launched via `sudo -u boxa-agent` therefore starts, binds CDP, passes the
+# smoke test — and stays permanently INVISIBLE. Running as boxa-agent also
+# drags in that user's login keychain (locked, password unknown to the
+# developer → endless "reset keychain" dialogs) and makes every lifecycle
+# op prompt for a sudo password. So on Darwin the agent-side processes run
+# as the invoking developer instead — but the CORE GUARANTEE (Host agent
+# Chrome must not be able to read anything of the developer's, above all
+# ~/.ssh) is NOT traded away: Chrome is confined by a macOS seatbelt
+# profile (`sandbox-exec`, see _write_chrome_seatbelt_profile) that
+# kernel-denies all reads AND writes under /Users, /Volumes and root's
+# home, and denies writes everywhere except the session profile/download
+# dirs and the OS temp trees. The session dirs live under
+# /var/lib/boxa-agent — outside every home — so Chrome needs nothing from
+# $HOME. ADR 0010 § "macOS exception" records the residual deltas vs the
+# Linux uid split.
+#
+# `env` (not an empty array) keeps `"${_AGENT_RUN[@]}"` well-defined under
+# `set -u` on macOS's stock bash 3.2, where expanding an empty array errors.
+#
+# `_AGENT_SUDO_STR` is the string form for detached `sh -c` bodies (the
+# window-expiry timer), which cannot expand the parent's array; it is
+# exported and expanded UNQUOTED there so the empty macOS value vanishes.
+#
+# `_AGENT_STATE_OWNER` is the chown target for the agent-side state dirs
+# (profiles, downloads, netlog archive) created on first start.
+if [ "$(uname -s 2>/dev/null || echo Unknown)" = "Darwin" ]; then
+    _AGENT_IS_DARWIN=1
+    _AGENT_RUN=(env)
+    _AGENT_RUN_GUI=(env)
+    # Filesystem ops on agent-owned session state (test/cat/rm/mv/chmod in
+    # the managed profile/archive trees). Root on Linux (the 0700
+    # boxa-agent-owned parents block the developer); plain on macOS where
+    # the same trees are developer-owned — avoids a sudo password prompt on
+    # every session stop.
+    _AGENT_FS=(env)
+    _AGENT_SUDO_STR=""
+    _AGENT_STATE_OWNER="$(id -un)"
+else
+    _AGENT_IS_DARWIN=0
+    _AGENT_RUN=(sudo -u boxa-agent)
+    _AGENT_FS=(sudo)
+    # GUI variant forwards the caller's display/audio session credentials —
+    # `sudo -u` would otherwise reset the environment and Chrome could not
+    # reach the X11/Wayland/WSLg socket. See the Chrome launch site.
+    # SC2054 false positive: the commas separate the --preserve-env VAR list
+    # inside ONE word, not array elements.
+    # shellcheck disable=SC2054
+    _AGENT_RUN_GUI=(sudo --preserve-env=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,XDG_SESSION_TYPE,PULSE_SERVER -u boxa-agent)
+    _AGENT_SUDO_STR="sudo -u boxa-agent"
+    _AGENT_STATE_OWNER="boxa-agent"
+fi
+export _AGENT_SUDO_STR
+
+# Signal an agent-side PID (signal flags first, PID last — mirrors kill's
+# own argv shape). Normally a plain `"${_AGENT_RUN[@]}" kill`; on macOS a
+# session started by a PRE-migration broker still has boxa-agent-owned
+# Chrome/proxy/relay, so a failed same-user kill on a still-alive PID
+# (EPERM, not ESRCH) retries once via `sudo -u boxa-agent` — otherwise the
+# post-update stop would silently strand all three processes while tearing
+# down their state. One-shot migration path; new macOS sessions are
+# developer-owned and never take the retry.
+_agent_kill() {
+    "${_AGENT_RUN[@]}" kill "$@" 2>/dev/null && return 0
+    if [ "$_AGENT_STATE_OWNER" != "boxa-agent" ] && _pid_alive_on_host "${!#}"; then
+        sudo -u boxa-agent kill "$@" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+# Write the per-session macOS seatbelt profile ($1) that confines Host
+# agent Chrome (see the _AGENT_RUN block). Deny-first on user data:
+# everything under /Users (ALL homes, not just the developer's), /Volumes
+# (external disks, Time Machine) and root's home is unreadable AND
+# unwritable; writes anywhere else are denied except the session profile
+# dir ($2), download dir ($3), the OS temp trees and /dev. Chrome's
+# binary, frameworks and system libraries stay readable via
+# `(allow default)`. TLS trust for mkcert HTTPS evaluates in trustd —
+# outside this sandbox — so dev-URL certificates still verify.
+#
+# The uncommon case of a home dir outside /Users gets an explicit extra
+# deny so the guarantee ("Chrome cannot read the developer's files")
+# never silently depends on the default layout.
+#
+# SBPL rule precedence is last-match, so the specific write allowances
+# below override the blanket write deny, and the /Users deny overrides
+# `(allow default)`. Verified empirically on this shape: a renderer
+# navigating to file://$HOME/.ssh/... gets ERR_FILE_NOT_FOUND (kernel
+# EPERM underneath) and writes outside the allowlist fail.
+_write_chrome_seatbelt_profile() {
+    local profile_sb="$1" profile_dir="$2" download_dir="$3"
+    local home_deny=""
+    case "${HOME:-}" in
+        /Users/*|"") : ;;
+        *) home_deny="(deny file-read* file-write* (subpath \"${HOME}\"))" ;;
+    esac
+    cat > "$profile_sb" <<EOF
+(version 1)
+(allow default)
+(deny file-read* file-write*
+    (subpath "/Users")
+    (subpath "/Volumes")
+    (subpath "/private/var/root"))
+${home_deny}
+(deny file-write* (subpath "/"))
+(allow file-write*
+    (subpath "${profile_dir}")
+    (subpath "${download_dir}")
+    (subpath "/private/var/folders")
+    (subpath "/private/tmp")
+    (subpath "/dev"))
+EOF
+}
+
+# chown $1 to the agent state owner, escalating only when the owner actually
+# differs. On macOS the owner is the invoking developer, so per-session
+# archive chowns are no-ops — skipping them avoids gratuitous sudo password
+# prompts (fresh root-owned dirs from `sudo mkdir` still get the real chown).
+_chown_agent_state() {
+    local target="$1" cur
+    cur="$(stat -f %Su -- "$target" 2>/dev/null \
+        || stat -c %U -- "$target" 2>/dev/null || true)"
+    [ "$cur" = "$_AGENT_STATE_OWNER" ] && return 0
+    sudo chown "${_AGENT_STATE_OWNER}:" "$target"
+}
+
 # --- Logging -----------------------------------------------------------------
 
 _log()  { printf '%s\n' "$*"; }
@@ -1502,13 +1636,13 @@ _cleanup_session_dirs() {
     local profile_dir="${1:-}" download_dir="${2:-}" session_prefix="${3:-}"
     if [ -n "$profile_dir" ] \
         && _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" "$session_prefix" \
-        && sudo test -d "$profile_dir"; then
-        sudo rm -rf -- "$profile_dir" || _warn "Failed to remove profile dir ${profile_dir}."
+        && "${_AGENT_FS[@]}" test -d "$profile_dir"; then
+        "${_AGENT_FS[@]}" rm -rf -- "$profile_dir" || _warn "Failed to remove profile dir ${profile_dir}."
     fi
     if [ -n "$download_dir" ] \
         && _is_managed_path "$download_dir" "$AGENT_DOWNLOADS_DIR" "$session_prefix" \
-        && sudo test -d "$download_dir"; then
-        sudo rm -rf -- "$download_dir" || _warn "Failed to remove download dir ${download_dir}."
+        && "${_AGENT_FS[@]}" test -d "$download_dir"; then
+        "${_AGENT_FS[@]}" rm -rf -- "$download_dir" || _warn "Failed to remove download dir ${download_dir}."
     fi
 }
 
@@ -1559,8 +1693,8 @@ _surface_launch_logs() {
     : "$profile_dir"  # documented for callers; reads go via the explicit paths
     local stderr_body="" stdout_body="" launch_body=""
 
-    stderr_body="$(sudo cat "$stderr_log" 2>/dev/null || true)"
-    stdout_body="$(sudo cat "$stdout_log" 2>/dev/null || true)"
+    stderr_body="$("${_AGENT_FS[@]}" cat "$stderr_log" 2>/dev/null || true)"
+    stdout_body="$("${_AGENT_FS[@]}" cat "$stdout_log" 2>/dev/null || true)"
     [ -n "$launch_log" ] && launch_body="$(cat "$launch_log" 2>/dev/null || true)"
 
     if [ -n "$stderr_body" ]; then
@@ -2837,19 +2971,19 @@ _cleanup_failed_start() {
     # `_warn`) so there is no warn-spam for the expected dead-process case.
     if [ -n "$_CFS_CHROME_PID" ] \
         && _pid_matches_marker "$_CFS_CHROME_PID" "--user-data-dir=$_CFS_PROFILE_DIR"; then
-        sudo -u boxa-agent kill "$_CFS_CHROME_PID" 2>/dev/null || true
+        _agent_kill "$_CFS_CHROME_PID" 2>/dev/null || true
     elif [ -n "$_CFS_CHROME_PID" ]; then
         _log "Failed-start cleanup: Chrome PID ${_CFS_CHROME_PID} already gone or reused; skipping kill."
     fi
     if [ -n "$_CFS_RELAY_PID" ] \
         && _pid_matches_marker "$_CFS_RELAY_PID" "TCP-LISTEN:${_CFS_CDP_PORT}"; then
-        sudo -u boxa-agent kill "$_CFS_RELAY_PID" 2>/dev/null || true
+        _agent_kill "$_CFS_RELAY_PID" 2>/dev/null || true
     elif [ -n "$_CFS_RELAY_PID" ]; then
         _log "Failed-start cleanup: relay PID ${_CFS_RELAY_PID} already gone or reused; skipping kill."
     fi
     if [ -n "$_CFS_PROXY_PID" ] \
         && _pid_matches_marker "$_CFS_PROXY_PID" "--listen 127.0.0.1:${_CFS_PROXY_PORT}"; then
-        sudo -u boxa-agent kill "$_CFS_PROXY_PID" 2>/dev/null || true
+        _agent_kill "$_CFS_PROXY_PID" 2>/dev/null || true
     elif [ -n "$_CFS_PROXY_PID" ]; then
         _log "Failed-start cleanup: proxy PID ${_CFS_PROXY_PID} already gone or reused; skipping kill."
     fi
@@ -2954,17 +3088,17 @@ _stage_proxy_inputs() {
     # agent. This sidesteps SC2024: `sudo -u ... tee dest <src` would
     # do the source-read in the invoking shell anyway, but the linter
     # warns about it because the redirect could mislead the reader.
-    sudo -u boxa-agent install -m 640 /dev/null "$staged_allowlist"
+    "${_AGENT_RUN[@]}" install -m 640 /dev/null "$staged_allowlist"
     if [ -r "$AGENT_ALLOWLIST_PATH" ]; then
         cat -- "$AGENT_ALLOWLIST_PATH" \
-            | sudo -u boxa-agent tee "$staged_allowlist" >/dev/null
-        sudo -u boxa-agent chmod 640 "$staged_allowlist" 2>/dev/null || true
+            | "${_AGENT_RUN[@]}" tee "$staged_allowlist" >/dev/null
+        "${_AGENT_RUN[@]}" chmod 640 "$staged_allowlist" 2>/dev/null || true
     fi
 
-    sudo -u boxa-agent install -m 640 /dev/null "$staged_mode"
+    "${_AGENT_RUN[@]}" install -m 640 /dev/null "$staged_mode"
     printf 'default\n' \
-        | sudo -u boxa-agent tee "$staged_mode" >/dev/null
-    sudo -u boxa-agent chmod 640 "$staged_mode" 2>/dev/null || true
+        | "${_AGENT_RUN[@]}" tee "$staged_mode" >/dev/null
+    "${_AGENT_RUN[@]}" chmod 640 "$staged_mode" 2>/dev/null || true
 }
 
 # Launch the forward proxy as `boxa-agent`. Echoes "<pid>" on success,
@@ -2980,8 +3114,8 @@ _start_proxy() {
 
     # boxa-agent must own the live log file (the in-container `node`
     # user has no path to it; see ADR 0010 § Tamper-proof property).
-    sudo -u boxa-agent touch "$proxy_log_live"
-    sudo -u boxa-agent chmod 640 "$proxy_log_live" 2>/dev/null || true
+    "${_AGENT_RUN[@]}" touch "$proxy_log_live"
+    "${_AGENT_RUN[@]}" chmod 640 "$proxy_log_live" 2>/dev/null || true
 
     _detach_cmd
     # OUTER wrapper redirections (after the closing `'`) are NOT redundant with
@@ -3010,8 +3144,8 @@ _start_proxy() {
     # SC2024 false positive: the outer `>"$launch_log"` is INTENTIONALLY applied
     # by this (developer) shell, not as root — the log is developer-owned in
     # SESSIONS_DIR. We do not want a privileged redirect here.
-    # shellcheck disable=SC2024
-    sudo -u boxa-agent "${_DETACH_CMD[@]}" sh -c '
+    # shellcheck disable=SC2024,SC2016
+    "${_AGENT_RUN[@]}" "${_DETACH_CMD[@]}" sh -c '
         exec "$1" \
             --listen "127.0.0.1:$2" \
             --allowlist "$3" \
@@ -3164,15 +3298,15 @@ _sweep_if_stale() {
     # into the boxa-agent-owned tree without elevation.
     if [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ] \
         && _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" "${container}-" \
-        && sudo test -d "$profile_dir"; then
+        && "${_AGENT_FS[@]}" test -d "$profile_dir"; then
         _warn "Cleaning up stale session resources from ${profile_dir}..."
-        sudo rm -rf -- "$profile_dir" || _warn "Failed to remove stale profile dir ${profile_dir}."
+        "${_AGENT_FS[@]}" rm -rf -- "$profile_dir" || _warn "Failed to remove stale profile dir ${profile_dir}."
     fi
     if [ -n "$download_dir" ] && [ "$download_dir" != "null" ] \
         && _is_managed_path "$download_dir" "$AGENT_DOWNLOADS_DIR" "${container}-" \
-        && sudo test -d "$download_dir"; then
+        && "${_AGENT_FS[@]}" test -d "$download_dir"; then
         _warn "Cleaning up stale session resources from ${download_dir}..."
-        sudo rm -rf -- "$download_dir" || _warn "Failed to remove stale download dir ${download_dir}."
+        "${_AGENT_FS[@]}" rm -rf -- "$download_dir" || _warn "Failed to remove stale download dir ${download_dir}."
     fi
 
     # Close any container-side firewall slot the crashed session left
@@ -3436,20 +3570,21 @@ cmd_start() {
         "$start_state_file" "$container" "$granted_display" "$$" \
         || exit 1
 
-    # Profile + downloads dir, owned by boxa-agent. /var/lib/boxa-agent
-    # may not exist before the first session — create it once, then chown.
+    # Profile + downloads dir, owned by the agent state owner (boxa-agent
+    # on Linux, the developer on macOS — see _AGENT_STATE_OWNER). The
+    # /var/lib/boxa-agent parent may not exist before the first session —
+    # create it once, then chown.
     # `install -d` is the portable atomic equivalent of mkdir+chmod+chown,
     # but requires the target's parent to exist; we layer manually so the
     # first time through still works on a fresh host.
-    # Trailing colon on chown = "owner's primary group", portable on Linux
-    # (GNU coreutils) and macOS (BSD chown). On Linux the primary group is
-    # `boxa-agent` (--user-group in lib/host-platform.sh); on macOS
-    # sysadminctl assigns `staff`. Either way no extra group lookup is needed.
+    # Trailing colon on chown (inside _chown_agent_state) = "owner's primary
+    # group", portable on Linux (GNU coreutils) and macOS (BSD chown), so no
+    # extra group lookup is needed.
     local agent_parent
     for agent_parent in "$AGENT_PROFILES_DIR" "$AGENT_DOWNLOADS_DIR"; do
         if [ ! -d "$agent_parent" ]; then
             sudo mkdir -p "$agent_parent"
-            sudo chown boxa-agent: "$agent_parent"
+            _chown_agent_state "$agent_parent"
             sudo chmod 700 "$agent_parent"
         fi
     done
@@ -3461,7 +3596,7 @@ cmd_start() {
     # already be in the boxa-agent group to read individual files.
     if [ ! -d "$AGENT_NETLOG_ARCHIVE_DIR" ]; then
         sudo mkdir -p "$AGENT_NETLOG_ARCHIVE_DIR"
-        sudo chown boxa-agent: "$AGENT_NETLOG_ARCHIVE_DIR"
+        _chown_agent_state "$AGENT_NETLOG_ARCHIVE_DIR"
         sudo chmod 750 "$AGENT_NETLOG_ARCHIVE_DIR"
     fi
 
@@ -3483,7 +3618,7 @@ cmd_start() {
     # consumer of the field. Keeping it as the live path keeps the field
     # meaningful while the session is running (e.g. `status` could surface it).
     netlog_path="${profile_dir}/netlog.json"
-    sudo -u boxa-agent mkdir -p "$profile_dir" "$download_dir"
+    "${_AGENT_RUN[@]}" mkdir -p "$profile_dir" "$download_dir"
     # Record the dirs for the consolidated failed-start cleanup (finding 2):
     # from now on an abort removes them via the EXIT trap.
     _CFS_PROFILE_DIR="$profile_dir"
@@ -3499,8 +3634,8 @@ cmd_start() {
     # dir we delete on `stop`, instead of escaping to ~boxa-agent.
     # `prompt_for_download: false` keeps the agent from blocking on a
     # save dialog inside a CDP-driven Chrome.
-    sudo -u boxa-agent mkdir -p "$profile_dir/Default"
-    sudo -u boxa-agent tee "$profile_dir/Default/Preferences" >/dev/null <<EOF
+    "${_AGENT_RUN[@]}" mkdir -p "$profile_dir/Default"
+    "${_AGENT_RUN[@]}" tee "$profile_dir/Default/Preferences" >/dev/null <<EOF
 {
   "download": {
     "default_directory": "${download_dir}",
@@ -3558,10 +3693,10 @@ EOF
 
     _log "Starting Host agent Chrome for ${container} on 127.0.0.1:${cdp_port}..."
 
-    # Forward the caller's GUI session credentials so Chrome (running as
-    # boxa-agent) can open a window on the user's display. `sudo -u`
-    # would otherwise reset the environment and Chrome would fail to
-    # connect to the X11/Wayland/WSLg socket.
+    # Linux/WSL2: forward the caller's GUI session credentials so Chrome
+    # (running as boxa-agent) can open a window on the user's display —
+    # see _AGENT_RUN_GUI. `sudo -u` would otherwise reset the environment
+    # and Chrome would fail to connect to the X11/Wayland/WSLg socket.
     #
     # WSL2 + WSLg (the user's primary platform): WAYLAND_DISPLAY +
     # XDG_RUNTIME_DIR point at /mnt/wslg, world-readable by default so
@@ -3577,16 +3712,44 @@ EOF
     # X11 connection failure in chrome.stderr.log; the CDP smoke test
     # then fails and we roll back below.
     #
-    # macOS Quartz: needs `open -na Chrome ... --user` or a logged-in
-    # boxa-agent session; that work also lives in slice 03.
+    # macOS Quartz: Chrome runs as the invoking developer (see the
+    # _AGENT_RUN block up top) — WindowServer only renders windows for
+    # the console-session uid, so a boxa-agent-owned Chrome would be
+    # permanently invisible. _AGENT_RUN_GUI is a plain `env` there, and the
+    # confinement the Linux uid split provides comes from the per-session
+    # seatbelt profile below instead: `sandbox-exec` kernel-denies Chrome
+    # every read/write under /Users and /Volumes. `--no-sandbox` is macOS-
+    # only and REQUIRED for that: Chrome's own helpers cannot initialise
+    # their sandbox nested inside a seatbelt profile (sandbox_init → EPERM,
+    # GPU process dies); the outer kernel profile confines them instead.
+    #
+    # `--use-mock-keychain` (below) keeps macOS Chrome away from the login
+    # keychain entirely — an ephemeral automation profile has no business
+    # prompting for Safe Storage access. Ignored on Linux (no keychain).
+    local chrome_sandbox_cmd="" chrome_platform_flags=""
+    if [ "$_AGENT_IS_DARWIN" = 1 ]; then
+        local chrome_seatbelt="${profile_dir}/chrome-seatbelt.sb"
+        _write_chrome_seatbelt_profile "$chrome_seatbelt" "$profile_dir" "$download_dir" \
+            || _die "Failed to write the Chrome seatbelt profile at ${chrome_seatbelt}."
+        chrome_sandbox_cmd="sandbox-exec -f ${chrome_seatbelt}"
+        chrome_platform_flags="--no-sandbox"
+    else
+        # X11 Ozone backend is Linux/WSLg-specific; macOS Chrome uses the
+        # native Quartz backend and gets no ozone flag at all.
+        chrome_platform_flags="--ozone-platform=x11"
+    fi
     _detach_cmd
     # SC2024 false positive: the outer `>"$launch_log"` is INTENTIONALLY applied
     # by this (developer) shell, not as root — the log is developer-owned in
     # SESSIONS_DIR. We do not want a privileged redirect here.
-    # shellcheck disable=SC2024
-    sudo --preserve-env=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,XDG_SESSION_TYPE,PULSE_SERVER \
-        -u boxa-agent "${_DETACH_CMD[@]}" sh -c '
-        exec "$1" \
+    #
+    # $8 (sandbox-exec prefix) and $9 (platform flags) expand UNQUOTED on
+    # purpose: both are broker-controlled, space-separated words (paths under
+    # the managed profile dir contain no whitespace) and empty on Linux,
+    # where the unquoted expansion vanishes entirely.
+    # shellcheck disable=SC2024,SC2016
+    "${_AGENT_RUN_GUI[@]}" "${_DETACH_CMD[@]}" sh -c '
+        exec ${8:-} "$1" \
             --remote-debugging-port="$2" \
             --remote-debugging-address=127.0.0.1 \
             --user-data-dir="$3" \
@@ -3601,12 +3764,13 @@ EOF
             --log-net-log="$5" \
             --proxy-server="http://127.0.0.1:$6" \
             --proxy-bypass-list="$7" \
-            --ozone-platform=x11 \
+            --use-mock-keychain \
             --test-type \
+            ${9:-} \
             </dev/null \
             >"$3/chrome.stdout.log" \
             2>"$3/chrome.stderr.log"
-    ' agent-browser-chrome "$chrome_bin" "$cdp_port" "$profile_dir" "$download_dir" "$netlog_path" "$proxy_port" "$AGENT_PROXY_BYPASS_LIST" </dev/null >"$launch_log" 2>&1 &
+    ' agent-browser-chrome "$chrome_bin" "$cdp_port" "$profile_dir" "$download_dir" "$netlog_path" "$proxy_port" "$AGENT_PROXY_BYPASS_LIST" "$chrome_sandbox_cmd" "$chrome_platform_flags" </dev/null >"$launch_log" 2>&1 &
     disown 2>/dev/null || true
 
     # Reconcile Chrome's actual PID via pgrep on the unique --user-data-dir
@@ -3716,8 +3880,8 @@ EOF
         # SC2024 false positive: the outer `>"$launch_log"` is INTENTIONALLY
         # applied by this (developer) shell, not as root — the log is
         # developer-owned in SESSIONS_DIR. We do not want a privileged redirect.
-        # shellcheck disable=SC2024
-        sudo -u boxa-agent "${_DETACH_CMD[@]}" sh -c '
+        # shellcheck disable=SC2024,SC2016
+        "${_AGENT_RUN[@]}" "${_DETACH_CMD[@]}" sh -c '
             exec socat \
                 "TCP-LISTEN:$2,bind=$1,fork,reuseaddr" \
                 "TCP:127.0.0.1:$2" \
@@ -4274,9 +4438,9 @@ _restage_allowlist_only() {
     # piping the user's contents through `sudo -u boxa-agent tee`
     # both refills and respects the destination's owner.
     cat -- "$AGENT_ALLOWLIST_PATH" \
-        | sudo -u boxa-agent tee "$staged_allowlist" >/dev/null \
+        | "${_AGENT_RUN[@]}" tee "$staged_allowlist" >/dev/null \
         || _warn "Failed to re-stage allowlist to ${staged_allowlist}; proxy will keep prior allowlist."
-    sudo -u boxa-agent chmod 640 "$staged_allowlist" 2>/dev/null || true
+    "${_AGENT_RUN[@]}" chmod 640 "$staged_allowlist" 2>/dev/null || true
 }
 
 # Compose the JSON form of the mode-file. The proxy daemon's _read_mode
@@ -4311,9 +4475,9 @@ _write_mode_file_pair() {
     local payload
     payload="$(_mode_file_json "$mode" "$expires_at")"
     printf '%s' "$payload" \
-        | sudo -u boxa-agent tee "$staged" >/dev/null \
+        | "${_AGENT_RUN[@]}" tee "$staged" >/dev/null \
         || _die "Failed to write staged mode file ${staged}."
-    sudo -u boxa-agent chmod 640 "$staged" 2>/dev/null || true
+    "${_AGENT_RUN[@]}" chmod 640 "$staged" 2>/dev/null || true
 
     mkdir -p "$AGENT_PROXY_STATE_DIR"
     printf '%s' "$payload" > "$AGENT_PROXY_MODE_FILE"
@@ -4577,10 +4741,12 @@ _start_window_timer() {
         # signaller already arranged the next state.
         if [ "$rc" -eq 0 ]; then
             # Rewrite the staged (proxy-canonical) mode file to default.
-            # The staged file lives in a 0700 boxa-agent-owned dir, so
-            # the write goes through sudo.
+            # The staged file lives in a 0700 agent-owned dir, so the
+            # write goes through the inherited identity prefix — expanded
+            # UNQUOTED on purpose: "sudo -u boxa-agent" on Linux, empty on
+            # macOS where the dir is developer-owned.
             printf "%s" "$2" \
-                | sudo -u boxa-agent tee "$3/active-mode" >/dev/null 2>&1 || true
+                | ${_AGENT_SUDO_STR:-} tee "$3/active-mode" >/dev/null 2>&1 || true
             # Rewrite the user-state copy in $HOME so the historical
             # record matches reality.
             if [ -n "$6" ]; then
@@ -4612,10 +4778,18 @@ PYEOF
             # Only signal the proxy when its current cmdline still
             # bears the marker we recorded — the listen-port plus the
             # rest of the proxy bin name. Defends against PID reuse.
-            if [ -r "/proc/$4/cmdline" ] \
-                && tr "\0" " " < "/proc/$4/cmdline" 2>/dev/null \
-                    | grep -qF -- "$5"; then
-                sudo -u boxa-agent kill -HUP "$4" 2>/dev/null || true
+            # /proc is Linux-only; on macOS fall back to ps, mirroring
+            # _pid_matches_marker (without the fallback the proxy would
+            # NEVER get the expiry SIGHUP on a Mac and the window would
+            # stay open until session stop).
+            proxy_cmdline=""
+            if [ -r "/proc/$4/cmdline" ]; then
+                proxy_cmdline=$(tr "\0" " " < "/proc/$4/cmdline" 2>/dev/null || true)
+            elif [ ! -d /proc ]; then
+                proxy_cmdline=$(ps -p "$4" -o command= 2>/dev/null || true)
+            fi
+            if printf "%s" "$proxy_cmdline" | grep -qF -- "$5"; then
+                ${_AGENT_SUDO_STR:-} kill -HUP "$4" 2>/dev/null || true
             fi
             # Toast emit (slice 08, timer-expiry path). The full JSON
             # body is composed inline so we do not depend on sourcing
@@ -4810,7 +4984,7 @@ _sighup_all_proxies() {
         fi
         _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" || continue
         _restage_allowlist_only "$profile_dir"
-        sudo -u boxa-agent kill -HUP "$proxy_pid" 2>/dev/null || true
+        _agent_kill -HUP "$proxy_pid" 2>/dev/null || true
     done
     shopt -u nullglob
 }
@@ -4961,7 +5135,7 @@ _prune_archive_for() {
     # calls (cached creds), and a sudo failure here is downgraded to a
     # warning rather than aborting session start.
     local listing
-    if ! listing=$(sudo -u boxa-agent \
+    if ! listing=$("${_AGENT_RUN[@]}" \
         find "$AGENT_NETLOG_ARCHIVE_DIR" -maxdepth 1 -type f \
              -name "${container}-*.proxy.log" 2>/dev/null); then
         _warn "agent-browser: could not enumerate archive for prune — retention skipped this session"
@@ -5011,7 +5185,7 @@ _prune_archive_for() {
         # found it); the other two extensions are best-effort.
         for ext in proxy.log netlog.json summary.md; do
             victim="${AGENT_NETLOG_ARCHIVE_DIR}/${base}.${ext}"
-            if ! sudo -u boxa-agent rm -f -- "$victim" 2>/dev/null; then
+            if ! "${_AGENT_RUN[@]}" rm -f -- "$victim" 2>/dev/null; then
                 _warn "agent-browser: failed to prune ${victim}"
             fi
         done
@@ -5072,7 +5246,7 @@ _denied_hosts_from_log() {
     if [ -r "$log_path" ]; then
         reader=(cat -- "$log_path")
     else
-        reader=(sudo -u boxa-agent cat -- "$log_path")
+        reader=("${_AGENT_RUN[@]}" cat -- "$log_path")
     fi
     if command -v jq >/dev/null 2>&1; then
         "${reader[@]}" 2>/dev/null \
@@ -5461,7 +5635,7 @@ PY
     _restage_allowlist_only "$profile_dir"
     _write_mode_file_pair "$profile_dir" "harvest" "$new_expires"
 
-    sudo -u boxa-agent kill -HUP "$proxy_pid" 2>/dev/null \
+    _agent_kill -HUP "$proxy_pid" 2>/dev/null \
         || _warn "Failed to send SIGHUP to proxy PID ${proxy_pid}; the proxy will still notice expiry on the next request via the mode-file timestamp."
 
     local seconds
@@ -5545,7 +5719,7 @@ PY
     if [ -n "$proxy_pid" ] && [ "$proxy_pid" != "null" ] \
         && [ -n "$proxy_port" ] && [ "$proxy_port" != "null" ] \
         && _pid_matches_marker "$proxy_pid" "$proxy_marker"; then
-        sudo -u boxa-agent kill -HUP "$proxy_pid" 2>/dev/null \
+        _agent_kill -HUP "$proxy_pid" 2>/dev/null \
             || _warn "SIGHUP to proxy PID ${proxy_pid} failed; the proxy will pick up the new mode file on its next request anyway."
     fi
 
@@ -5714,7 +5888,7 @@ PY
         # signal directly. Use sudo to send SIGTERM, then a SIGKILL fallback
         # if Chrome doesn't exit promptly. kill exit-code is ignored — the
         # liveness re-check below is the authoritative answer.
-        sudo -u boxa-agent kill "$chrome_pid" 2>/dev/null || true
+        _agent_kill "$chrome_pid" 2>/dev/null || true
         local term_wait
         for term_wait in 1 2 3 4 5 6 7 8 9 10; do
             : "$term_wait"
@@ -5723,7 +5897,7 @@ PY
         done
         if _pid_matches_marker "$chrome_pid" "$chrome_marker"; then
             _warn "Chrome did not exit on SIGTERM, sending SIGKILL."
-            sudo -u boxa-agent kill -9 "$chrome_pid" 2>/dev/null || true
+            _agent_kill -9 "$chrome_pid" 2>/dev/null || true
         fi
     else
         _log "Chrome PID ${chrome_pid:-?} already gone or reused."
@@ -5732,14 +5906,14 @@ PY
     if [ -n "$relay_pid" ] && [ "$relay_pid" != "null" ] \
         && _pid_matches_marker "$relay_pid" "$relay_marker"; then
         _log "Stopping host relay PID ${relay_pid}..."
-        sudo -u boxa-agent kill "$relay_pid" 2>/dev/null || true
+        _agent_kill "$relay_pid" 2>/dev/null || true
     fi
 
     if [ -n "$proxy_pid" ] && [ "$proxy_pid" != "null" ] \
         && [ -n "$proxy_port" ] && [ "$proxy_port" != "null" ] \
         && _pid_matches_marker "$proxy_pid" "$proxy_marker"; then
         _log "Stopping Agent-browser proxy PID ${proxy_pid}..."
-        sudo -u boxa-agent kill "$proxy_pid" 2>/dev/null || true
+        _agent_kill "$proxy_pid" 2>/dev/null || true
     fi
 
     if _container_running "$container" \
@@ -5807,10 +5981,10 @@ PY
         && _is_managed_path "$netlog_path" "$profile_dir"; then
         netlog_is_managed=true
     fi
-    if [ "$netlog_is_managed" = true ] && sudo test -f "$netlog_path"; then
+    if [ "$netlog_is_managed" = true ] && "${_AGENT_FS[@]}" test -f "$netlog_path"; then
         if [ ! -d "$AGENT_NETLOG_ARCHIVE_DIR" ]; then
             sudo mkdir -p "$AGENT_NETLOG_ARCHIVE_DIR"
-            sudo chown boxa-agent: "$AGENT_NETLOG_ARCHIVE_DIR"
+            _chown_agent_state "$AGENT_NETLOG_ARCHIVE_DIR"
             sudo chmod 750 "$AGENT_NETLOG_ARCHIVE_DIR"
         fi
         local ts_suffix archive_path
@@ -5823,9 +5997,9 @@ PY
         # separators in container/ts that survived earlier checks.
         archive_path="${AGENT_NETLOG_ARCHIVE_DIR}/${container}-${ts_suffix}.netlog.json"
         if _is_managed_path "$archive_path" "$AGENT_NETLOG_ARCHIVE_DIR" "${container}-"; then
-            if sudo mv -- "$netlog_path" "$archive_path" 2>/dev/null; then
-                sudo chown boxa-agent: "$archive_path" 2>/dev/null || true
-                sudo chmod 640 "$archive_path" 2>/dev/null || true
+            if "${_AGENT_FS[@]}" mv -- "$netlog_path" "$archive_path" 2>/dev/null; then
+                _chown_agent_state "$archive_path" 2>/dev/null || true
+                "${_AGENT_FS[@]}" chmod 640 "$archive_path" 2>/dev/null || true
                 _log "Archived netlog: ${archive_path}"
                 archived_netlog_path="$archive_path"
             else
@@ -5849,10 +6023,10 @@ PY
         && _is_managed_path "$proxy_log_path" "$profile_dir"; then
         proxy_log_is_managed=true
     fi
-    if [ "$proxy_log_is_managed" = true ] && sudo test -f "$proxy_log_path"; then
+    if [ "$proxy_log_is_managed" = true ] && "${_AGENT_FS[@]}" test -f "$proxy_log_path"; then
         if [ ! -d "$AGENT_NETLOG_ARCHIVE_DIR" ]; then
             sudo mkdir -p "$AGENT_NETLOG_ARCHIVE_DIR"
-            sudo chown boxa-agent: "$AGENT_NETLOG_ARCHIVE_DIR"
+            _chown_agent_state "$AGENT_NETLOG_ARCHIVE_DIR"
             sudo chmod 750 "$AGENT_NETLOG_ARCHIVE_DIR"
         fi
         local proxy_ts_suffix proxy_archive_path
@@ -5861,9 +6035,9 @@ PY
         [ -n "$proxy_ts_suffix" ] || proxy_ts_suffix="$(date -u +"%Y%m%dT%H%M%SZ")"
         proxy_archive_path="${AGENT_NETLOG_ARCHIVE_DIR}/${container}-${proxy_ts_suffix}.proxy.log"
         if _is_managed_path "$proxy_archive_path" "$AGENT_NETLOG_ARCHIVE_DIR" "${container}-"; then
-            if sudo mv -- "$proxy_log_path" "$proxy_archive_path" 2>/dev/null; then
-                sudo chown boxa-agent: "$proxy_archive_path" 2>/dev/null || true
-                sudo chmod 640 "$proxy_archive_path" 2>/dev/null || true
+            if "${_AGENT_FS[@]}" mv -- "$proxy_log_path" "$proxy_archive_path" 2>/dev/null; then
+                _chown_agent_state "$proxy_archive_path" 2>/dev/null || true
+                "${_AGENT_FS[@]}" chmod 640 "$proxy_archive_path" 2>/dev/null || true
                 _log "Archived proxy log: ${proxy_archive_path}"
                 archived_proxy_log_path="$proxy_archive_path"
             else
@@ -5895,7 +6069,7 @@ PY
         summary_path="${AGENT_NETLOG_ARCHIVE_DIR}/${container}-${summary_ts_suffix}.summary.md"
         if _is_managed_path "$summary_path" "$AGENT_NETLOG_ARCHIVE_DIR" "${container}-"; then
             session_ended_at="$(_iso_utc_now)"
-            local summary_cmd=(sudo -u boxa-agent python3 "$AGENT_SUMMARIZE_BIN"
+            local summary_cmd=("${_AGENT_RUN[@]}" python3 "$AGENT_SUMMARIZE_BIN"
                 "--output" "$summary_path"
                 "--session-start" "${session_created_at:-unknown}"
                 "--session-end" "$session_ended_at"
@@ -5915,12 +6089,12 @@ PY
             if [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ] \
                 && _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" "${container}-"; then
                 staged_allowlist="${profile_dir}/allowed-domains.conf"
-                if sudo test -f "$staged_allowlist"; then
+                if "${_AGENT_FS[@]}" test -f "$staged_allowlist"; then
                     summary_cmd+=("--allowlist" "$staged_allowlist")
                 fi
             fi
             if "${summary_cmd[@]}"; then
-                sudo chmod 640 "$summary_path" 2>/dev/null || true
+                "${_AGENT_FS[@]}" chmod 640 "$summary_path" 2>/dev/null || true
                 _log "Wrote session summary: ${summary_path}"
             else
                 _warn "Summary generator exited non-zero; session teardown continues."
@@ -5947,16 +6121,16 @@ PY
     # so a tampered state JSON cannot redirect rm at a sibling session.
     if [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ] \
         && _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" "${container}-" \
-        && sudo test -d "$profile_dir"; then
-        sudo rm -rf -- "$profile_dir" || _warn "Failed to remove profile dir ${profile_dir}."
+        && "${_AGENT_FS[@]}" test -d "$profile_dir"; then
+        "${_AGENT_FS[@]}" rm -rf -- "$profile_dir" || _warn "Failed to remove profile dir ${profile_dir}."
         _log "Removed profile dir ${profile_dir}."
     elif [ -n "$profile_dir" ] && [ "$profile_dir" != "null" ]; then
         _warn "State profile_dir '${profile_dir}' is outside the managed parent or session; skipping rm."
     fi
     if [ -n "$download_dir" ] && [ "$download_dir" != "null" ] \
         && _is_managed_path "$download_dir" "$AGENT_DOWNLOADS_DIR" "${container}-" \
-        && sudo test -d "$download_dir"; then
-        sudo rm -rf -- "$download_dir" || _warn "Failed to remove download dir ${download_dir}."
+        && "${_AGENT_FS[@]}" test -d "$download_dir"; then
+        "${_AGENT_FS[@]}" rm -rf -- "$download_dir" || _warn "Failed to remove download dir ${download_dir}."
         _log "Removed download dir ${download_dir}."
     elif [ -n "$download_dir" ] && [ "$download_dir" != "null" ]; then
         _warn "State download_dir '${download_dir}' is outside the managed parent or session; skipping rm."
