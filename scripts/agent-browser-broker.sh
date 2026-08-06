@@ -721,16 +721,46 @@ PY
 
 # --- Detach helper -----------------------------------------------------------
 
-# Echo the literal command used to detach a child from the broker's session.
+# Fill the global `_DETACH_CMD` array with the command used to detach a child
+# from the broker's session. Used as a prefix in front of the actual command:
+# `"${_DETACH_CMD[@]}" real-command args…`. Handed back via a global (rather
+# than stdout) because the prefix is a multi-WORD command on platforms without
+# `setsid`, and a single string cannot carry it safely — the `sh -c` body below
+# contains spaces, so a quoted string would arrive as ONE argument while an
+# unquoted one would be torn apart by word-splitting.
+# Same global-handback pattern as `_START_PROXY_PID`. The value derives solely
+# from `command -v setsid`, so it is stable for the process lifetime: a later
+# `_detach_cmd` call from another function cannot invalidate an earlier reader.
+#
 # `setsid` is the strongest detach (new session + SIGHUP ignored) but is
-# Linux-only; macOS lacks it. `nohup` alone covers the SIGHUP case, which
-# is the only signal the broker's shell exit would otherwise raise on the
-# child. Used as a prefix in front of the actual command.
-_detach_prefix() {
+# Linux-only; macOS lacks it.
+#
+# We deliberately do NOT fall back to `nohup(1)` there. Unlike GNU/BSD nohup,
+# Apple's nohup is not merely "ignore SIGHUP and exec": it also calls launchd's
+# `_vprocmgr_detach_from_console()` to move the process out of the caller's
+# login session. That call FAILS whenever the process runs under
+# `sudo -u <other user>` — the target uid does not own the caller's launchd
+# session — and nohup then dies via `err()` BEFORE exec'ing its payload:
+#
+#     nohup: can't detach from console: Inappropriate ioctl for device
+#
+# (The errno is a red herring: `_vprocmgr_detach_from_console()` leaves errno
+# untouched, so `err()` prints the stale ENOTTY left behind by nohup's own
+# earlier `isatty(STDERR_FILENO)` probe, which "fails" precisely because we
+# redirect the wrapper's stderr into a log file.) Every
+# `sudo -u boxa-agent "${_DETACH_CMD[@]}" …` launch below — the proxy and
+# Chrome — would therefore never start on macOS, surfacing as a bare
+# "proxy failed to launch" with that misleading ioctl line.
+#
+# `sh -c 'trap "" HUP; exec "$@"'` reproduces exactly the property we actually
+# need from nohup — an IGNORED SIGHUP disposition, which (unlike an installed
+# handler) survives execve per POSIX — with no launchd involvement and no
+# behavioural difference on Linux.
+_detach_cmd() {
     if command -v setsid >/dev/null 2>&1; then
-        printf 'setsid\n'
+        _DETACH_CMD=(setsid)
     else
-        printf 'nohup\n'
+        _DETACH_CMD=(sh -c 'trap "" HUP; exec "$@"' _)
     fi
 }
 
@@ -898,6 +928,36 @@ _kill_bridge_in_container() {
     _log "Stopping in-container bridge PID ${bridge_pid} in ${container}..."
     docker exec "$container" kill "$bridge_pid" 2>/dev/null \
         || _warn "agent-browser: could not kill in-container bridge PID ${bridge_pid} in ${container} (already exited, reused, or the container vanished mid-teardown)."
+}
+
+# --- Host address ownership --------------------------------------------------
+
+# True when IPv4 address $1 is configured on one of THIS host's interfaces,
+# i.e. a listener could bind() to it. Used to decide whether the host-side
+# socat relay is applicable at all before demanding the binary.
+#
+# `host.docker.internal` resolves to a host-owned bridge IP on native Linux and
+# on Docker-CE-under-WSL2 (relay required), but to the Docker Desktop VM's magic
+# address (192.168.65.254) on macOS and Windows — an address no host interface
+# carries, so a bind there fails with EADDRNOTAVAIL and the relay is neither
+# possible nor needed (Docker Desktop forwards to host loopback itself).
+#
+# Unknown-tooling case returns 0 (assume owned): that preserves the historical
+# "relay required" behaviour rather than silently skipping a relay a host does
+# need.
+_host_owns_ipv4() {
+    local ip="${1:-}"
+    [ -n "$ip" ] || return 1
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 -o addr show 2>/dev/null \
+            | awk '{print $4}' | cut -d/ -f1 | grep -qxF "$ip"
+        return $?
+    fi
+    if command -v ifconfig >/dev/null 2>&1; then
+        ifconfig 2>/dev/null | awk '/[[:space:]]inet /{print $2}' | grep -qxF "$ip"
+        return $?
+    fi
+    return 0
 }
 
 # --- UFW / host firewall slot ------------------------------------------------
@@ -2923,11 +2983,10 @@ _start_proxy() {
     sudo -u boxa-agent touch "$proxy_log_live"
     sudo -u boxa-agent chmod 640 "$proxy_log_live" 2>/dev/null || true
 
-    local detach
-    detach="$(_detach_prefix)"
+    _detach_cmd
     # OUTER wrapper redirections (after the closing `'`) are NOT redundant with
     # the inner ones. The inner redirects only take effect once `sh -c` runs;
-    # the backgrounded `sudo "$detach" sh -c …` inherits the parent's stdin
+    # the backgrounded `sudo "${_DETACH_CMD[@]}" sh -c …` inherits the parent's stdin
     # AND stdout/stderr first.
     #   - `</dev/null`: when the broker has a real controlling TTY (interactive
     #     shell), a detached `sudo`/`setsid` reading from that TTY in the
@@ -2952,7 +3011,7 @@ _start_proxy() {
     # by this (developer) shell, not as root — the log is developer-owned in
     # SESSIONS_DIR. We do not want a privileged redirect here.
     # shellcheck disable=SC2024
-    sudo -u boxa-agent "$detach" sh -c '
+    sudo -u boxa-agent "${_DETACH_CMD[@]}" sh -c '
         exec "$1" \
             --listen "127.0.0.1:$2" \
             --allowlist "$3" \
@@ -3520,14 +3579,13 @@ EOF
     #
     # macOS Quartz: needs `open -na Chrome ... --user` or a logged-in
     # boxa-agent session; that work also lives in slice 03.
-    local detach
-    detach="$(_detach_prefix)"
+    _detach_cmd
     # SC2024 false positive: the outer `>"$launch_log"` is INTENTIONALLY applied
     # by this (developer) shell, not as root — the log is developer-owned in
     # SESSIONS_DIR. We do not want a privileged redirect here.
     # shellcheck disable=SC2024
     sudo --preserve-env=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,XDG_SESSION_TYPE,PULSE_SERVER \
-        -u boxa-agent "$detach" sh -c '
+        -u boxa-agent "${_DETACH_CMD[@]}" sh -c '
         exec "$1" \
             --remote-debugging-port="$2" \
             --remote-debugging-address=127.0.0.1 \
@@ -3617,7 +3675,24 @@ EOF
     resolved_hdi="$(docker exec "$container" \
         getent ahostsv4 host.docker.internal 2>/dev/null | awk '{print $1}' | head -1 || true)"
 
+    # A relay is only APPLICABLE when the resolved address is one this host can
+    # actually bind. On Docker Desktop (macOS / Windows) `host.docker.internal`
+    # is the VM's magic 192.168.65.254, which no host interface carries: socat
+    # would exit immediately with EADDRNOTAVAIL and we would take the benign
+    # "proceeding without it" branch below regardless. Deciding that HERE keeps
+    # the hard socat requirement on the hosts that genuinely need the relay
+    # (native Linux, Docker-CE-under-WSL2) instead of aborting the whole start
+    # on a platform that would never have used the binary.
+    local relay_applicable=0
     if [ -n "$resolved_hdi" ] && [ "$resolved_hdi" != "127.0.0.1" ]; then
+        if _host_owns_ipv4 "$resolved_hdi"; then
+            relay_applicable=1
+        else
+            _log "host.docker.internal -> ${resolved_hdi} is not host-owned; skipping the host relay (Docker Desktop magic forwarding expected)."
+        fi
+    fi
+
+    if [ "$relay_applicable" -eq 1 ]; then
         # Host-side socat is required for the relay. On native Linux /
         # Docker-CE-under-WSL2 it's the only path that makes the in-container
         # bridge reach Chrome on loopback. Surface a clear install hint up
@@ -3642,7 +3717,7 @@ EOF
         # applied by this (developer) shell, not as root — the log is
         # developer-owned in SESSIONS_DIR. We do not want a privileged redirect.
         # shellcheck disable=SC2024
-        sudo -u boxa-agent "$detach" sh -c '
+        sudo -u boxa-agent "${_DETACH_CMD[@]}" sh -c '
             exec socat \
                 "TCP-LISTEN:$2,bind=$1,fork,reuseaddr" \
                 "TCP:127.0.0.1:$2" \
@@ -3957,15 +4032,14 @@ EOF
     # an arg), occasionally returning the wrapper PID instead.
     local watchdog_pid=""
     if [ -x "$AGENT_WATCHDOG_SCRIPT" ]; then
-        local watchdog_detach
-        watchdog_detach="$(_detach_prefix)"
+        _detach_cmd
         local watchdog_log="$SESSIONS_DIR/${container}.watchdog.log"
         local watchdog_pidfile="$SESSIONS_DIR/${container}.watchdog.pid"
         # Stale pidfile cleanup from any prior session that crashed
         # before pidfile removal. The sweep above already covered
         # the prior session's processes; this just removes the file.
         rm -f -- "$watchdog_pidfile" 2>/dev/null || true
-        $watchdog_detach "$AGENT_WATCHDOG_SCRIPT" \
+        "${_DETACH_CMD[@]}" "$AGENT_WATCHDOG_SCRIPT" \
             "$container" "$chrome_pid" "$AGENT_BROKER_SELF" "$watchdog_pidfile" \
             </dev/null >>"$watchdog_log" 2>&1 &
         disown 2>/dev/null || true
@@ -4397,9 +4471,8 @@ _emit_pending_event() {
     mv -- "$pending_tmp" "$pending" 2>/dev/null || { rm -f -- "$pending_tmp"; return 0; }
 
     if [ -x "$AGENT_DELIVER_BIN" ]; then
-        local detach
-        detach="$(_detach_prefix)"
-        "$detach" "$AGENT_DELIVER_BIN" "$pending" </dev/null >/dev/null 2>&1 &
+        _detach_cmd
+        "${_DETACH_CMD[@]}" "$AGENT_DELIVER_BIN" "$pending" </dev/null >/dev/null 2>&1 &
         disown 2>/dev/null || true
     fi
     return 0
@@ -4475,8 +4548,8 @@ _start_window_timer() {
     _is_managed_path "$profile_dir" "$AGENT_PROFILES_DIR" \
         || _die "Refusing to spawn timer with profile_dir outside managed parent."
 
-    local detach mode_default_json
-    detach="$(_detach_prefix)"
+    local mode_default_json
+    _detach_cmd
     mode_default_json="$(_mode_file_json default)"
 
     # The single-quoted body below is intentionally not expanded by the
@@ -4484,7 +4557,7 @@ _start_window_timer() {
     # `sh -c` once it starts running. Shellcheck would warn on the
     # trap's $sleep_pid otherwise.
     # shellcheck disable=SC2016
-    "$detach" sh -c '
+    "${_DETACH_CMD[@]}" sh -c '
         # Trap so any signal received here (most importantly SIGTERM
         # from `cmd_stop` killing the timer pid) propagates to the
         # `sleep` child — otherwise the sleep keeps running detached.
