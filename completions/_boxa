@@ -187,6 +187,7 @@ _boxa() {
                                 local -a flags
                                 flags=(
                                     '--no-open:Skip auto-opening listening-port tabs'
+                                    '--no-clipboard:Deny Chrome the system pasteboard (macOS)'
                                 )
                                 _describe 'start flags' flags
                                 _boxa_containers

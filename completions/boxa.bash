@@ -88,12 +88,24 @@ _boxa() {
             local ab_sub="${words[2]}"
             case "$ab_sub" in
                 start)
-                    if [ "$cword" -eq 3 ]; then
+                    # Both flags may appear, in either order, before the
+                    # optional project name. Offer whichever flag is still
+                    # unused alongside the container list.
+                    local ab_start_words="" ab_i
+                    for (( ab_i = 3; ab_i < cword; ab_i++ )); do
+                        case "${words[ab_i]}" in
+                            --no-open|--no-clipboard) ;;
+                            *) ab_start_words="taken" ;;
+                        esac
+                    done
+                    if [ -z "$ab_start_words" ]; then
+                        local ab_flags=""
+                        [[ " ${words[*]:3:cword-3} " == *" --no-open "* ]] \
+                            || ab_flags="$ab_flags --no-open"
+                        [[ " ${words[*]:3:cword-3} " == *" --no-clipboard "* ]] \
+                            || ab_flags="$ab_flags --no-clipboard"
                         # shellcheck disable=SC2207
-                        COMPREPLY=( $(compgen -W "--no-open $(_boxa_containers_bash)" -- "$cur") )
-                    elif [ "$cword" -eq 4 ] && [ "${words[3]}" = "--no-open" ]; then
-                        # shellcheck disable=SC2207
-                        COMPREPLY=( $(compgen -W "$(_boxa_containers_bash)" -- "$cur") )
+                        COMPREPLY=( $(compgen -W "$ab_flags $(_boxa_containers_bash)" -- "$cur") )
                     fi
                     ;;
                 stop|status)

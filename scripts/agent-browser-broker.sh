@@ -257,20 +257,29 @@ _write_chrome_seatbelt_profile() {
     local profile_dir_real download_dir_real
     profile_dir_real="$(cd "$profile_dir" 2>/dev/null && pwd -P)" || profile_dir_real="$profile_dir"
     download_dir_real="$(cd "$download_dir" 2>/dev/null && pwd -P)" || download_dir_real="$download_dir"
-    # Deny the pasteboard Mach service: without it a page (or the agent via
-    # CDP, which can grant itself the clipboard permission) reads whatever the
-    # developer last copied — passwords, tokens, 2FA codes. Verified: with the
-    # deny in place `navigator.clipboard.readText()` yields nothing.
+    # OPT-IN pasteboard deny (`start --no-clipboard` /
+    # BOXA_AGENT_BROWSER_NO_CLIPBOARD=1). Off by default, and the default is a
+    # deliberate trade-off, not an oversight:
     #
-    # This necessarily kills Cmd+V inside the agent window too — macOS routes
-    # user-initiated paste through the same service and cannot distinguish it
-    # from a scripted read. `agent-browser-broker.sh paste` restores the
-    # workflow by reading the clipboard OUTSIDE the sandbox and typing the
-    # text in over CDP, so Chrome only ever sees what the developer
-    # deliberately handed it. BOXA_AGENT_BROWSER_ALLOW_CLIPBOARD=1 is the
-    # escape hatch for anyone who wants the old (unconfined) behaviour back.
-    local clipboard_deny='(deny mach-lookup (global-name "com.apple.pasteboard.1"))'
-    [ "${BOXA_AGENT_BROWSER_ALLOW_CLIPBOARD:-0}" = 1 ] && clipboard_deny=""
+    # What the deny buys: neither a page nor the agent (which over CDP can
+    # grant itself the clipboard permission, or synthesise a paste keystroke)
+    # can read what the developer last copied. Verified —
+    # `navigator.clipboard.readText()` returns nothing with it in place.
+    #
+    # What it costs, and why it cannot be the default:
+    #   1. macOS routes user-initiated Cmd+V through the SAME service and
+    #      offers no way to distinguish it from a scripted read, so the deny
+    #      takes manual paste with it. `paste` below is the workaround, but a
+    #      CLI round-trip is not a substitute for Cmd+V.
+    #   2. AppKit builds every drag-and-drop on a pasteboard. Denied, the
+    #      NSDraggingSession initialiser raises, nothing catches it, and Chrome
+    #      dies on SIGTRAP (observed: -[NSDraggingSession _initWithPasteboard:]
+    #      → objc_exception_throw → _crashOnException). Any drag inside the
+    #      window kills the session.
+    local clipboard_deny=""
+    if [ "${BOXA_AGENT_BROWSER_NO_CLIPBOARD:-0}" = 1 ]; then
+        clipboard_deny='(deny mach-lookup (global-name "com.apple.pasteboard.1"))'
+    fi
     cat > "$profile_sb" <<EOF
 (version 1)
 (allow default)
@@ -3452,10 +3461,14 @@ cmd_start() {
     # ports. Default is on: most start invocations want the URLs in
     # tabs, and users who don't can opt out per-session or alias the
     # flag in their shell.
+    # `--no-clipboard` (macOS) additionally denies Chrome the system
+    # pasteboard for the whole session — see _write_chrome_seatbelt_profile
+    # for what that buys and what it costs.
     local container="" no_open=false
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --no-open) no_open=true; shift ;;
+            --no-clipboard) BOXA_AGENT_BROWSER_NO_CLIPBOARD=1; shift ;;
             --)        shift; break ;;
             -*)        _die "Unknown flag for start: $1" ;;
             *)         [ -z "$container" ] || _die "Unexpected positional: $1"

@@ -117,7 +117,7 @@ Manage the Agent-browser session for a boxa Container. The session launches
 Host agent Chrome on the host and an in-Container CDP bridge. See ADR 0010.
 
 Commands:
-  start [--no-open] [project]             Start a session
+  start [--no-open] [--no-clipboard] [proj]  Start a session
   stop [project]                          Stop a session
   status [project]                        Show session status
   open [--project|-p NAME] <url> [...]    Open one or more URLs
@@ -134,11 +134,12 @@ Quote a glob for subdomains (for example, '*.example.com'). Allow automatically
 pairs apex and www hosts (qr.cz also adds www.qr.cz); deny removes both. Both
 commands SIGHUP every live proxy.
 
-On macOS the session sandbox denies Chrome the system pasteboard, so neither a
-page nor the agent can read what you last copied — and Cmd+V inside the agent
-window does nothing. Use paste instead: the broker reads the clipboard outside
-the sandbox and types it into the focused element, so Chrome only ever sees what
-you hand it. Set BOXA_AGENT_BROWSER_ALLOW_CLIPBOARD=1 before start to opt out.
+start --no-clipboard (macOS) denies Chrome the system pasteboard for the whole
+session: neither a page nor the agent can then read what you last copied. The
+cost is real — Cmd+V inside that window stops working (use paste instead, which
+types the clipboard in from outside the sandbox), and drag-and-drop crashes
+Chrome, because AppKit builds every drag on a pasteboard. Without the flag the
+clipboard behaves normally.
 
 blocked reads the last session's live or archived proxy log. It resolves an
 explicit project, then the CWD basename, then offers a picker over live sessions
@@ -3355,15 +3356,18 @@ case "${1:-}" in
                  fi
                  unset ab_expect_project
              elif [ "$AGENT_BROWSER_SUB" = "start" ]; then
-                 # `start` shape: [--no-open] [project]. Single known
-                 # flag plus an optional project token; anything else
-                 # is an error so we don't silently forward typos to
-                 # the broker.
+                 # `start` shape: [--no-open] [--no-clipboard] [project].
+                 # Known flags plus an optional project token; anything
+                 # else is an error so we don't silently forward typos
+                 # to the broker.
                  for arg in "$@"; do
                      case "$arg" in
                          '') ;;
                          --no-open)
                              AGENT_BROWSER_START_FLAGS+=(--no-open)
+                             ;;
+                         --no-clipboard)
+                             AGENT_BROWSER_START_FLAGS+=(--no-clipboard)
                              ;;
                          -*)
                              echo "Unknown flag for agent-browser start: $arg" >&2
