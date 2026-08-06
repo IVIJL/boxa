@@ -300,19 +300,31 @@ command -v keychain >/dev/null 2>&1 && eval "$(keychain --eval --quiet --agents 
 # ── WezTerm (tab title / CWD tracking) ────────────────────
 if [ -n "$DEVCONTAINER" ]; then
     # Boxa: OSC 7 with hostname for tab title prefix (cwd.host in WezTerm).
-    # HOST_HOME as safe CWD so new tabs open in host's ~ instead of /workspace.
+    # The project is bind-mounted at the IDENTICAL path as on the host, so the
+    # physical path (pwd -P resolves the /workspace symlink) is valid on the
+    # host too and a new tab opens in the same directory. Outside the project
+    # mount fall back to HOST_HOME so the tab never lands in a container-only
+    # path.
     # shellcheck disable=SC1003
     __wezterm_osc7() {
-        printf '\033]7;file://%s%s\033\\' "${HOSTNAME}" "${HOST_HOME:-/}"
+        local host_pwd
+        host_pwd=$(pwd -P)
+        case "$host_pwd" in
+            "${BOXA_PROJECT_HOST_PATH:-/nonexistent}"|"${BOXA_PROJECT_HOST_PATH:-/nonexistent}"/*) ;;
+            *) host_pwd="${HOST_HOME:-/}" ;;
+        esac
+        printf '\033]7;file://%s%s\033\\' "${HOSTNAME}" "$host_pwd"
         printf '\033]1;%s\033\\' "${PWD##*/}"
     }
     precmd_functions+=(__wezterm_osc7)
 else
-    # Host WSL: OSC 7 doesn't set cwd, but empty OSC 7 clears stale cwd.host
-    # left over from a previous container session. OSC 1 sets the tab title.
+    # Host WSL: OSC 7 with real cwd and EMPTY host — the WezTerm spawn helper
+    # opens new tabs in the same directory; the empty host also overwrites a
+    # stale cwd.host left over from a previous container session (tab title
+    # logic treats it as host WSL). OSC 1 sets the tab title.
     # shellcheck disable=SC1003
     __wezterm_title() {
-        printf '\033]7;\033\\'
+        printf '\033]7;file://%s\033\\' "$PWD"
         printf '\033]1;%s\033\\' "${PWD##*/}"
     }
     precmd_functions+=(__wezterm_title)
