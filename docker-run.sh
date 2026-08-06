@@ -3578,8 +3578,23 @@ if [ "$MODE" = "update" ]; then
     # Re-exec with updated script after pull (skip pull on second run)
     if [ "${BOXA_UPDATE_PULLED:-}" != "1" ]; then
         echo "Updating boxa..."
-        pull_output=$(git -C "$BOXA_DIR" pull --ff-only origin main 2>&1)
+        # Capture rc explicitly. Under `set -euo pipefail`, a failing command
+        # substitution in an assignment aborts the script *before* the echo
+        # below — so a failed `git pull` (diverged local commits that --ff-only
+        # refuses to merge, a dirty tree, or no network to the remote) would
+        # exit 1 with git's message captured into $pull_output and then thrown
+        # away, printing nothing. `|| pull_rc=$?` keeps us alive so the error
+        # always reaches the user.
+        pull_rc=0
+        pull_output=$(git -C "$BOXA_DIR" pull --ff-only origin main 2>&1) || pull_rc=$?
         echo "$pull_output"
+        if [ "$pull_rc" -ne 0 ]; then
+            printf '\033[1;31m==> ERROR: git pull failed (rc=%s) — see the message above.\033[0m\n' "$pull_rc" >&2
+            echo "    Common causes: local commits diverged from origin/main (--ff-only refuses to" >&2
+            echo "    merge), a dirty working tree, or no network to the git remote." >&2
+            echo "    Fix the repo at $BOXA_DIR, then re-run 'boxa update'." >&2
+            exit "$pull_rc"
+        fi
         if ! echo "$pull_output" | grep -q "Already up to date"; then
             echo "Re-running with updated script..."
             BOXA_UPDATE_PULLED=1 exec "$BOXA_DIR/docker-run.sh" update "$@"
@@ -5458,6 +5473,24 @@ if [ "$(uname -s 2>/dev/null || echo Unknown)" = "Darwin" ]; then
     DOCKER_ARGS+=(-v boxa-mac-claude-bin:/home/node/.local/share/claude)
 else
     [ -d "$HOME/.local/share/claude" ] && DOCKER_ARGS+=(-v "$HOME/.local/share/claude:/home/node/.local/share/claude:ro")
+fi
+
+# Inner rootless Docker (DinD) storage-driver selection.
+# On a native Linux host the rootless daemon auto-selects overlay2 (the host
+# kernel exposes unprivileged overlay), which is fast — leave it alone. On a
+# macOS host the container runs inside Docker Desktop's LinuxKit VM, whose
+# kernel does NOT expose unprivileged overlay to the rootless daemon, so it
+# falls back to fuse-overlayfs. In that nested VM + rootless configuration
+# fuse-overlayfs produces a filesystem runc cannot exec binaries from (kernel
+# returns EINVAL), breaking every inner `docker run`/`docker build`. Pin vfs
+# there: slower and disk-heavier (no CoW layer dedup) but the only driver that
+# works. BOXA_DIND_STORAGE_DRIVER overrides on any host — set it to overlay2 if
+# a future Docker Desktop kernel gains unprivileged-overlay support, or to try
+# another driver — and it is passed through verbatim to start-rootless-docker.
+if [ -n "${BOXA_DIND_STORAGE_DRIVER:-}" ]; then
+    DOCKER_ARGS+=(-e "BOXA_DIND_STORAGE_DRIVER=$BOXA_DIND_STORAGE_DRIVER")
+elif [ "$(uname -s 2>/dev/null || echo Unknown)" = "Darwin" ]; then
+    DOCKER_ARGS+=(-e "BOXA_DIND_STORAGE_DRIVER=vfs")
 fi
 
 # Host ~/.codex directory (RW; Codex CLI auth + config shared with host)

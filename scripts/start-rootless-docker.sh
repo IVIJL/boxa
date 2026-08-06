@@ -28,11 +28,34 @@ secure_socket_for_node() {
 # through the audited resolver and populates the allowlist ipset.
 DAEMON_JSON="$HOME/.config/docker/daemon.json"
 mkdir -p "$(dirname "$DAEMON_JSON")"
+
+# Base patch pins DNS. On hosts where the rootless daemon's auto-selected
+# driver is broken (macOS/LinuxKit → fuse-overlayfs, runc EINVAL), docker-run.sh
+# passes BOXA_DIND_STORAGE_DRIVER (typically vfs) so we also pin storage-driver
+# here. Built via jq --arg so the value is JSON-escaped, never interpolated
+# into the filter string. The `storage-driver` key is added when the env var
+# is set and removed when it is not, so a native-Linux run (or a run after the
+# override was dropped) keeps the daemon's fast auto-selection.
+if [ -n "${BOXA_DIND_STORAGE_DRIVER:-}" ]; then
+    # $drv is a jq variable bound via --arg below (JSON-escaped by jq), not a
+    # shell variable — single quotes are intentional so the shell leaves it be.
+    # shellcheck disable=SC2016
+    jq_filter='. + {"dns": ["10.0.2.2"], "storage-driver": $drv}'
+    jq_args=(--arg drv "$BOXA_DIND_STORAGE_DRIVER")
+    echo "Pinning inner Docker storage-driver to '${BOXA_DIND_STORAGE_DRIVER}'."
+else
+    # Also DROP any storage-driver pinned by a previous run: daemon.json
+    # persists in the container image/volume, so without the del() a
+    # one-off override would stay sticky forever and keep a native-Linux
+    # daemon off its fast auto-selected driver.
+    jq_filter='del(."storage-driver") + {"dns": ["10.0.2.2"]}'
+    jq_args=()
+fi
 if [ -f "$DAEMON_JSON" ]; then
     tmp=$(mktemp)
-    jq '. + {"dns": ["10.0.2.2"]}' "$DAEMON_JSON" > "$tmp" && mv "$tmp" "$DAEMON_JSON"
+    jq "${jq_args[@]}" "$jq_filter" "$DAEMON_JSON" > "$tmp" && mv "$tmp" "$DAEMON_JSON"
 else
-    printf '%s\n' '{"dns": ["10.0.2.2"]}' > "$DAEMON_JSON"
+    jq -n "${jq_args[@]}" "$jq_filter" > "$DAEMON_JSON"
 fi
 
 # Skip if already running
