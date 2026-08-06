@@ -247,6 +247,16 @@ _write_chrome_seatbelt_profile() {
         /Users/*|"") : ;;
         *) home_deny="(deny file-read* file-write* (subpath \"${HOME}\"))" ;;
     esac
+    # Seatbelt matches syscall paths AFTER symlink resolution, and the state
+    # tree lives under /var/lib — a symlink to /private/var/lib on macOS. An
+    # allow on the literal "/var/lib/..." path therefore never matches: Chrome
+    # aborts on its very first profile write ("Failed to create SingletonLock:
+    # Operation not permitted"). Emit BOTH spellings — the literal one is
+    # harmless where identical, and resolving via `pwd -P` keeps this correct
+    # for any other symlinked prefix too.
+    local profile_dir_real download_dir_real
+    profile_dir_real="$(cd "$profile_dir" 2>/dev/null && pwd -P)" || profile_dir_real="$profile_dir"
+    download_dir_real="$(cd "$download_dir" 2>/dev/null && pwd -P)" || download_dir_real="$download_dir"
     cat > "$profile_sb" <<EOF
 (version 1)
 (allow default)
@@ -258,7 +268,9 @@ ${home_deny}
 (deny file-write* (subpath "/"))
 (allow file-write*
     (subpath "${profile_dir}")
+    (subpath "${profile_dir_real}")
     (subpath "${download_dir}")
+    (subpath "${download_dir_real}")
     (subpath "/private/var/folders")
     (subpath "/private/tmp")
     (subpath "/dev"))
@@ -534,7 +546,7 @@ _with_port_ban_lock() {
     local lockfile="${AGENT_PORT_BAN_FILE}.lock"
     if ! command -v flock >/dev/null 2>&1; then
         if [ "$_PORT_BAN_FLOCK_WARNED" = 0 ]; then
-            _warn "agent-browser: 'flock' not found; the unusable-port list is updated UNSERIALIZED (a concurrent start could drop a learned ban). Install util-linux to close it."
+            _warn "agent-browser: 'flock' not found; the unusable-port list is updated UNSERIALIZED (a concurrent start could drop a learned ban). Install util-linux (macOS: 'brew install flock') to close it."
             _PORT_BAN_FLOCK_WARNED=1
         fi
         "$@"
@@ -1767,7 +1779,7 @@ _with_xhost_grant_lock() {
     # minimal-host case, not an error worth aborting teardown over.
     if ! command -v flock >/dev/null 2>&1; then
         if [ "$_XHOST_FLOCK_WARNED" = 0 ]; then
-            _warn "agent-browser: 'flock' not found; X-grant critical sections run UNSERIALIZED (a concurrent start/stop race on the shared display grant is possible). Install util-linux to close it."
+            _warn "agent-browser: 'flock' not found; X-grant critical sections run UNSERIALIZED (a concurrent start/stop race on the shared display grant is possible). Install util-linux (macOS: 'brew install flock') to close it."
             _XHOST_FLOCK_WARNED=1
         fi
         "$@"
