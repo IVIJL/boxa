@@ -277,13 +277,13 @@ assert_eq "settings migration preserves custom hooks" 2 \
     "$(jq '[.hooks[][]?.hooks[]? | select(.command | startswith("/custom/"))] | length' \
         "$claude_target/settings.json")"
 assert_eq "settings migration adds one prompt heartbeat" 1 \
-    "$(jq '[.hooks.UserPromptSubmit[] | select(.hooks == [{"type":"command","command":"/home/node/.claude/hooks/agent-awake.sh busy"}])] | length' \
+    "$(jq '[.hooks.UserPromptSubmit[] | select(.hooks == [{"type":"command","command":"~/.claude/hooks/agent-awake.sh busy"}])] | length' \
         "$claude_target/settings.json")"
 assert_eq "settings migration adds one pre-tool heartbeat" 1 \
-    "$(jq '[.hooks.PreToolUse[] | select(.hooks == [{"type":"command","command":"/home/node/.claude/hooks/agent-awake.sh busy"}])] | length' \
+    "$(jq '[.hooks.PreToolUse[] | select(.hooks == [{"type":"command","command":"~/.claude/hooks/agent-awake.sh busy"}])] | length' \
         "$claude_target/settings.json")"
 assert_eq "settings migration adds one stop release" 1 \
-    "$(jq '[.hooks.Stop[] | select(.hooks == [{"type":"command","command":"/home/node/.claude/hooks/agent-awake.sh idle"}])] | length' \
+    "$(jq '[.hooks.Stop[] | select(.hooks == [{"type":"command","command":"~/.claude/hooks/agent-awake.sh idle"}])] | length' \
         "$claude_target/settings.json")"
 
 # Managed defaults retain notify hooks while wiring all keep-awake events.
@@ -294,7 +294,7 @@ assert_eq "managed defaults preserve interaction notify hook" 1 \
     "$(jq '[.hooks.UserPromptSubmit[]?.hooks[]? | select(.command == "/home/node/.claude/hooks/interaction_notify.sh")] | length' \
         "$BOXA_DIR/config/claude/settings.json")"
 assert_eq "managed defaults contain all client signal entries" 3 \
-    "$(jq '[.hooks[][]?.hooks[]? | select(.command | startswith("/home/node/.claude/hooks/agent-awake.sh "))] | length' \
+    "$(jq '[.hooks[][]?.hooks[]? | select(.command | startswith("~/.claude/hooks/agent-awake.sh "))] | length' \
         "$BOXA_DIR/config/claude/settings.json")"
 
 # The fresh-install offer records a decline once without needing Go.

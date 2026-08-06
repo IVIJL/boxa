@@ -194,9 +194,9 @@ keep_awake::client_signal_status() {
         def has_hook($event; $command):
             any(.hooks[$event][]?.hooks[]?;
                 .type == "command" and .command == $command);
-        has_hook("UserPromptSubmit"; "/home/node/.claude/hooks/agent-awake.sh busy")
-        and has_hook("PreToolUse"; "/home/node/.claude/hooks/agent-awake.sh busy")
-        and has_hook("Stop"; "/home/node/.claude/hooks/agent-awake.sh idle")
+        has_hook("UserPromptSubmit"; "~/.claude/hooks/agent-awake.sh busy")
+        and has_hook("PreToolUse"; "~/.claude/hooks/agent-awake.sh busy")
+        and has_hook("Stop"; "~/.claude/hooks/agent-awake.sh idle")
     ' "$settings" >/dev/null 2>&1; then
         missing+=("managed settings entries")
     fi

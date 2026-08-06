@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/node/.claude/hooks/agent-awake.sh idle"
+            "command": "~/.claude/hooks/agent-awake.sh idle"
           }
         ]
       }
@@ -34,7 +34,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/node/.claude/hooks/agent-awake.sh busy"
+            "command": "~/.claude/hooks/agent-awake.sh busy"
           }
         ]
       }
@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/node/.claude/hooks/agent-awake.sh busy"
+            "command": "~/.claude/hooks/agent-awake.sh busy"
           }
         ]
       }

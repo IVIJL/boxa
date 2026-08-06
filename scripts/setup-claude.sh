@@ -138,6 +138,33 @@ migrate_agent_awake_hooks() {
             fi
 
             if ! jq '
+                # The hook command must be the TILDE form: /home/node/.claude
+                # is a bind mount of the host ~/.claude, so this settings.json
+                # is ALSO read by the host Claude session, where the
+                # container-absolute /home/node path does not exist and every
+                # hook fire surfaces a "No such file or directory" error.
+                # Tilde resolves correctly on both sides of the mount.
+                def rewrite_legacy($event; $old; $new):
+                    .hooks = (.hooks // {})
+                    | .hooks[$event] = ((.hooks[$event] // []) | map(
+                        if has("hooks") then
+                            .hooks = ((.hooks // []) | map(
+                                if .type == "command" and .command == $old
+                                then .command = $new
+                                else . end))
+                        else . end));
+                # Order-preserving exact-duplicate removal, on BOTH levels —
+                # needed when a config already carried the legacy and the
+                # tilde command side by side (as two event entries, or as two
+                # commands inside one entry): the rewrite above makes them
+                # identical and without the dedupe each hook would fire twice.
+                def dedupe_list:
+                    reduce .[] as $e ([];
+                        if index($e) == null then . + [$e] else . end);
+                def dedupe_event($event):
+                    .hooks[$event] = ((.hooks[$event] // [])
+                        | map(if has("hooks") then .hooks = ((.hooks // []) | dedupe_list) else . end)
+                        | dedupe_list);
                 def ensure_hook($event; $command):
                     {hooks: [{type: "command", command: $command}]} as $entry
                     | .hooks = (.hooks // {})
@@ -146,9 +173,15 @@ migrate_agent_awake_hooks() {
                           then $entries + [$entry]
                           else $entries
                           end);
-                ensure_hook("UserPromptSubmit"; "/home/node/.claude/hooks/agent-awake.sh busy")
-                | ensure_hook("PreToolUse"; "/home/node/.claude/hooks/agent-awake.sh busy")
-                | ensure_hook("Stop"; "/home/node/.claude/hooks/agent-awake.sh idle")
+                rewrite_legacy("UserPromptSubmit"; "/home/node/.claude/hooks/agent-awake.sh busy"; "~/.claude/hooks/agent-awake.sh busy")
+                | rewrite_legacy("PreToolUse"; "/home/node/.claude/hooks/agent-awake.sh busy"; "~/.claude/hooks/agent-awake.sh busy")
+                | rewrite_legacy("Stop"; "/home/node/.claude/hooks/agent-awake.sh idle"; "~/.claude/hooks/agent-awake.sh idle")
+                | dedupe_event("UserPromptSubmit")
+                | dedupe_event("PreToolUse")
+                | dedupe_event("Stop")
+                | ensure_hook("UserPromptSubmit"; "~/.claude/hooks/agent-awake.sh busy")
+                | ensure_hook("PreToolUse"; "~/.claude/hooks/agent-awake.sh busy")
+                | ensure_hook("Stop"; "~/.claude/hooks/agent-awake.sh idle")
             ' "$source" > "$tmp"; then
                 exit 3
             fi
