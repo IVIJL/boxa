@@ -4,11 +4,15 @@ set -euo pipefail
 #
 # Provisions five pieces of state that live outside Docker and therefore
 # survive container teardown:
-#   1. /var/log/boxa/allow-for/ as root:root 0755 — the harvest log
-#      directory. Mounted read-write into every container so the in-container
+#   1. /var/log/boxa/allow-for/ as root:root 0755 (Linux/WSL2) — the harvest
+#      log directory. Mounted read-write into every container so the in-container
 #      root daemon can write reports; the node user (host UID 1000) can read
 #      but cannot delete or overwrite, which is the tamper-proof guarantee
-#      ADR 0009 §3-4 hangs the security argument on.
+#      ADR 0009 §3-4 hangs the security argument on. On macOS this dir is
+#      host-user-owned instead (Docker Desktop's virtiofs maps container-root
+#      onto the host user, so root:root would be unwritable and the UID split
+#      unenforceable anyway) — see the ROOT_OWNED_* block below and ADR 0009
+#      (Revision — macOS).
 #   2. /var/log/boxa/allow-for/pending/ as <host-uid>:<host-gid> 0755 —
 #      the pending notification subdir (ADR 0009 Phase 3). Files inside
 #      are still written by container root as root:root 0644, but the
@@ -59,6 +63,24 @@ OOM_ARCHIVE_DIR="/var/log/boxa/oom"
 HOST_UID=$(id -u)
 HOST_GID=$(id -g)
 WSL_APP_ID="Boxa.AllowFor"
+
+# Ownership for the two "root-owned" dirs (harvest log parent + atomic-publish
+# .tmp). On Linux/WSL2 they are root:root so the in-container root daemon writes
+# while the node user (= host UID) only reads — the tamper-proof guarantee of
+# ADR 0009. On macOS that guarantee is structurally unattainable behind Docker
+# Desktop's virtiofs, which maps EVERY container UID (both the root daemon and
+# the node user) onto the single file-sharing host user: a root:root dir gives
+# container-root NO write bit (allow-for dies with EACCES writing the daemon
+# log) while the node user shares the writer's identity anyway. So on macOS we
+# own these dirs by the host user — allow-for works, and no property a Mac bind
+# mount could ever enforce is lost. See ADR 0009 (Revision — macOS) and 0016.
+if [ "$(uname -s 2>/dev/null || echo Unknown)" = "Darwin" ]; then
+    ROOT_OWNED_UID="$HOST_UID"; ROOT_OWNED_GID="$HOST_GID"
+    ROOT_OWNED_LABEL="host user ${HOST_UID}:${HOST_GID}"
+else
+    ROOT_OWNED_UID=0; ROOT_OWNED_GID=0
+    ROOT_OWNED_LABEL="root:root"
+fi
 
 # --- Argument parsing --------------------------------------------------------
 # `--quiet-if-noop` suppresses the per-step "already correct, skipping"
@@ -135,14 +157,14 @@ ensure_log_dir() {
     if [ -d "$ALLOW_FOR_LOG_DIR" ]; then
         local stat_out
         stat_out="$(_stat_owner_mode "$ALLOW_FOR_LOG_DIR" || true)"
-        if [ "$stat_out" = "0:0:755" ]; then
-            _noop_msg "$ALLOW_FOR_LOG_DIR already root:root 0755 — skipping."
+        if [ "$stat_out" = "${ROOT_OWNED_UID}:${ROOT_OWNED_GID}:755" ]; then
+            _noop_msg "$ALLOW_FOR_LOG_DIR already ${ROOT_OWNED_LABEL} 0755 — skipping."
             return 0
         fi
     fi
 
-    _info "Creating $ALLOW_FOR_LOG_DIR (root:root 0755) — sudo may prompt."
-    if ! sudo install -d -o 0 -g 0 -m 0755 "$ALLOW_FOR_LOG_DIR"; then
+    _info "Creating $ALLOW_FOR_LOG_DIR (${ROOT_OWNED_LABEL} 0755) — sudo may prompt."
+    if ! sudo install -d -o "$ROOT_OWNED_UID" -g "$ROOT_OWNED_GID" -m 0755 "$ALLOW_FOR_LOG_DIR"; then
         _warn "Failed to create $ALLOW_FOR_LOG_DIR — 'boxa allow-for' will not work until this is fixed."
         return 1
     fi
@@ -183,18 +205,18 @@ ensure_pending_dir() {
 # both write (no symlink planting) and read (no enumeration of in-flight
 # tempfile names).
 ensure_tmp_dir() {
-    local want="0:0:700"
+    local want="${ROOT_OWNED_UID}:${ROOT_OWNED_GID}:700"
     if [ -d "$ALLOW_FOR_TMP_DIR" ]; then
         local stat_out
         stat_out="$(_stat_owner_mode "$ALLOW_FOR_TMP_DIR" || true)"
         if [ "$stat_out" = "$want" ]; then
-            _noop_msg "$ALLOW_FOR_TMP_DIR already root:root 0700 — skipping."
+            _noop_msg "$ALLOW_FOR_TMP_DIR already ${ROOT_OWNED_LABEL} 0700 — skipping."
             return 0
         fi
     fi
 
-    _info "Creating $ALLOW_FOR_TMP_DIR (root:root 0700) — sudo may prompt."
-    if ! sudo install -d -o 0 -g 0 -m 0700 "$ALLOW_FOR_TMP_DIR"; then
+    _info "Creating $ALLOW_FOR_TMP_DIR (${ROOT_OWNED_LABEL} 0700) — sudo may prompt."
+    if ! sudo install -d -o "$ROOT_OWNED_UID" -g "$ROOT_OWNED_GID" -m 0700 "$ALLOW_FOR_TMP_DIR"; then
         _warn "Failed to create $ALLOW_FOR_TMP_DIR — 'boxa allow-for' notifications will not deliver until this is fixed (TOCTOU-safe publish requires this dir)."
         return 1
     fi

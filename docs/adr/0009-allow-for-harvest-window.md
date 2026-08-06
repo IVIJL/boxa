@@ -260,6 +260,41 @@ Linux. Decisions taken, after a grilling session:
   default GUI handler by MIME type (parity with the Windows toast), not a
   terminal editor that would not surface from a detached GUI process.
 
+## Revision — 2026-08-06: harvest-log ownership on a macOS host
+
+The tamper-proof harvest log (point 4) rests on a UID split that only exists on
+a native Linux / WSL2 host: the log dir is `root:root 0755`, the in-container
+**root** daemon writes 0644 files, and the **node** user (= host UID 1000) can
+read but not overwrite. That split requires container-root and container-node to
+be *distinct* UIDs on the underlying filesystem — true when the bind mount is a
+real Linux mount.
+
+On a **macOS host** it is not. Docker Desktop shares host paths through a
+virtiofs/gRPC-FUSE layer that maps **every** container UID — the root daemon and
+the node user alike — onto the single file-sharing host user. Two consequences:
+
+1. A `root:root 0755` dir gives the mapped container-root **no write bit**, so
+   `start-allow-for-window` dies with `EACCES` opening the daemon log and the
+   whole window fails to open (`teardown daemon failed to start — rolling back`).
+2. Even if it could write, container-node shares the writer's host identity, so
+   the root-vs-node overwrite protection cannot be enforced regardless of mode.
+
+The tamper-proof property is therefore **structurally unattainable** on a macOS
+bind mount — nothing boxa does with permissions can restore it there. Given
+that, `ensure-allow-for-host-state.sh` owns the harvest-log parent and the
+`.tmp` publish dir by the **host user** on macOS (they are already host-owned on
+every platform for `pending/` and `oom/`). This makes `allow-for` functional on
+macOS and loses no guarantee a Mac bind mount could ever have provided. The
+Linux/WSL2 `root:root` ownership — and its genuine tamper-proof guarantee — is
+unchanged; the branch keys off `uname -s = Darwin`.
+
+Restoring the guarantee on macOS would require a **named volume** (a real Linux
+filesystem inside the LinuxKit VM, where the UID split holds) instead of the
+host bind mount — at the cost of reworking the host-side notification delivery
+and log-review paths, which read `/var/log/boxa/allow-for/` directly on the
+host. Deferred: on macOS the harvest log is informational and the primary boxa
+security boundary (an agent cannot escape the container, ADR 0003) is untouched.
+
 ## References
 
 - `init-firewall.sh` — gains the DNS-pinning rules and the
