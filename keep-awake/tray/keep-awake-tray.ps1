@@ -20,6 +20,9 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $Port = if ($args.Count -gt 0) { [int]$args[0] } else { 17777 }
+# Terminal mode passes the terminal's process name; the tray then lives only
+# as long as that process (no icon once the terminal session ends).
+$FollowProcess = if ($args.Count -gt 1) { [string]$args[1] } else { '' }
 
 function New-CircleIcon([System.Drawing.Color]$Color) {
     $bitmap = New-Object System.Drawing.Bitmap 32, 32
@@ -78,6 +81,12 @@ $quit.add_Click({ $tray.Visible = $false; $form.Close() })
 $tray.ContextMenuStrip = $menu
 
 $update = {
+    if ($FollowProcess -and -not (Get-Process -Name $FollowProcess -ErrorAction SilentlyContinue)) {
+        Write-TrayLog "Followed process '$FollowProcess' exited; closing tray."
+        $tray.Visible = $false
+        $form.Close()
+        return
+    }
     $status = Get-KeepAwakeStatus
     if ($null -eq $status) {
         $tray.Icon = $idleIcon

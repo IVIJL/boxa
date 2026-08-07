@@ -415,6 +415,7 @@ wezterm.on('gui-startup', function()
     '-ExecutionPolicy', 'Bypass',
     '-WindowStyle', 'Hidden',
     '-File', $wrapper,
+    '-TrayFollow', 'wezterm-gui',
   }
 end)
 EOF
@@ -439,13 +440,25 @@ keep_awake::powershell_literal() {
 }
 
 keep_awake::write_windows_wrapper() {
-    local binary_literal log_literal
+    local binary_literal log_literal tray_literal
     binary_literal="$(keep_awake::powershell_literal "$KEEP_AWAKE_WINDOWS_BINARY")"
     log_literal="$(keep_awake::powershell_literal "$KEEP_AWAKE_WINDOWS_LOG")"
+    tray_literal="$(keep_awake::powershell_literal "$KEEP_AWAKE_WINDOWS_TRAY_FILE")"
 
     if ! cat > "$KEEP_AWAKE_WRAPPER" <<EOF
+param([string]\$TrayFollow = '')
 \$binary = '$binary_literal'
 \$logFile = '$log_literal'
+\$trayFile = '$tray_literal'
+# Terminal mode: the wezterm snippet passes -TrayFollow so the tray starts
+# with the terminal and exits with it; the system-mode scheduled task path
+# omits it and keeps its own tray task.
+if (\$TrayFollow -and (Test-Path -LiteralPath \$trayFile)) {
+    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden',
+        '-ExecutionPolicy', 'Bypass', '-File', ('"' + \$trayFile + '"'),
+        '$KEEP_AWAKE_PORT', \$TrayFollow)
+}
 function Get-WslGateway {
     Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { \$_.InterfaceAlias -like 'vEthernet (WSL*' -and \$_.IPAddress -notlike '169.254.*' } |
@@ -603,9 +616,30 @@ keep_awake::tray::remove() {
         wsl2)
             schtasks.exe /End /TN "$KEEP_AWAKE_TRAY_TASK_NAME" >/dev/null 2>&1 || true
             schtasks.exe /Delete /TN "$KEEP_AWAKE_TRAY_TASK_NAME" /F >/dev/null 2>&1 || true
+            # Terminal mode has no scheduled task; stop a wrapper-spawned tray too.
+            powershell.exe -NoProfile -NonInteractive -Command \
+                "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { \$_.ProcessId -ne \$PID -and \$_.CommandLine -like '*keep-awake-tray.ps1*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }" \
+                >/dev/null 2>&1 || true
             rm -f "$KEEP_AWAKE_TRAY_FILE"
             ;;
     esac
+}
+
+# Terminal-mode tray (wsl2 only): install the script without a scheduled task
+# and best-effort start it now — the running WezTerm already missed its
+# gui-startup, so the first icon should not wait for the next launch.
+keep_awake::tray::enable_terminal() {
+    [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] || return 0
+    if ! install -m 0600 "$BOXA_DIR/keep-awake/tray/keep-awake-tray.ps1" "$KEEP_AWAKE_TRAY_FILE"; then
+        printf 'keep-awake: tray installation failed; daemon remains enabled without the optional tray.\n' >&2
+        return 0
+    fi
+    if ! powershell.exe -NoProfile -NonInteractive -Command \
+        "Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', '\"$(keep_awake::powershell_literal "$KEEP_AWAKE_WINDOWS_TRAY_FILE")\"', '$KEEP_AWAKE_PORT', 'wezterm-gui')" \
+        >/dev/null 2>&1; then
+        printf 'keep-awake: tray start failed; it will start with the next WezTerm launch.\n' >&2
+    fi
+    return 0
 }
 
 keep_awake::tray::install_linux() {
@@ -728,6 +762,11 @@ keep_awake::tray::status() {
                     "if ((Get-ScheduledTask -TaskName '$KEEP_AWAKE_TRAY_TASK_NAME' -ErrorAction SilentlyContinue).State -eq 'Running') { exit 0 } else { exit 1 }" \
                     >/dev/null 2>&1; then
                 printf 'running\n'
+            elif [ -f "$KEEP_AWAKE_TRAY_FILE" ] \
+                && powershell.exe -NoProfile -NonInteractive -Command \
+                    "if (Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { \$_.ProcessId -ne \$PID -and \$_.CommandLine -like '*keep-awake-tray.ps1*' }) { exit 0 } else { exit 1 }" \
+                    >/dev/null 2>&1; then
+                printf 'running\n'
             else
                 printf 'not installed\n'
             fi
@@ -828,10 +867,16 @@ keep_awake::enable() {
         connection_summary="Host connection INCOMPLETE (see errors above)"
     fi
     if [ "$autostart_mode" = system ]; then
+        # A leftover terminal-mode tray would hold the single-instance mutex
+        # and starve the scheduled-task tray; clear it before installing.
+        keep_awake::tray::remove >/dev/null 2>&1 || true
         keep_awake::tray::enable
         printf 'Keep-awake enabled: daemon running, autostart installed, %s.\n' \
             "$connection_summary"
     else
+        if [ "$autostart_mode" = terminal ]; then
+            keep_awake::tray::enable_terminal
+        fi
         printf 'Keep-awake enabled: daemon running, autostart %s, %s.\n' \
             "$autostart_mode" "$connection_summary"
         if [ "$autostart_mode" = terminal ]; then
@@ -899,6 +944,11 @@ keep_awake::status() {
     fi
     if [ "$autostart_mode" = system ]; then
         tray="$(keep_awake::tray::status)"
+    elif [ "$autostart_mode" = terminal ] && [ "$KEEP_AWAKE_PLATFORM" = wsl2 ]; then
+        tray="$(keep_awake::tray::status)"
+        if [ "$tray" = "not installed" ]; then
+            tray="not running (starts with WezTerm)"
+        fi
     else
         tray="not installed (autostart: $autostart_mode)"
     fi

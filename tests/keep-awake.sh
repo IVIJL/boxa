@@ -21,6 +21,7 @@ export KEEP_AWAKE_TEST_TRAY_LAUNCHD="$TMPROOT/tray-launchd"
 export KEEP_AWAKE_TEST_SYSTEMD="$TMPROOT/systemd"
 export KEEP_AWAKE_TEST_TRAY_SYSTEMD="$TMPROOT/tray-systemd"
 export KEEP_AWAKE_TEST_CONNECT="$XDG_CONFIG_HOME/boxa/connect/_all.tsv"
+export KEEP_AWAKE_TEST_TRAY_PROCESS=false
 export KEEP_AWAKE_TEST_CURL_HEALTHY=true
 export KEEP_AWAKE_TEST_CONNECT_FAIL=false
 export KEEP_AWAKE_TEST_DOCKER_FAIL=false
@@ -165,6 +166,18 @@ cat > "$TMPROOT/bin/powershell.exe" <<'EOF'
 if [[ "$*" == *Get-ScheduledTask* ]]; then
     [ -f "$KEEP_AWAKE_TEST_TRAY_TASK" ]
     exit
+fi
+if [[ "$*" == *Get-CimInstance* && "$*" == *Stop-Process* ]]; then
+    printf 'powershell %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
+    exit 0
+fi
+if [[ "$*" == *Get-CimInstance* ]]; then
+    [ "$KEEP_AWAKE_TEST_TRAY_PROCESS" = true ]
+    exit
+fi
+if [[ "$*" == *Start-Process* && "$*" == *keep-awake-tray* ]]; then
+    printf 'powershell %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
+    exit 0
 fi
 printf 'C:\Users\Test\AppData\Local\r\n'
 EOF
@@ -684,8 +697,40 @@ assert_contains "Windows terminal snippet uses resolved wrapper path" \
     'C:\\Boxa\\start-keep-awake.ps1' "$windows_terminal_output"
 assert_not_contains "Windows terminal snippet never launches raw executable" \
     'keep-awake.exe' "$windows_terminal_output"
-assert_contains "Windows terminal status explains absent tray" \
-    "Tray: not installed (autostart: terminal)" "$("$KEEP_AWAKE" status)"
+assert_contains "Windows terminal snippet passes tray follow target" \
+    "'-TrayFollow', 'wezterm-gui'" "$windows_terminal_output"
+assert_eq "Windows terminal mode installs tray script" true \
+    "$(file_exists "$windows_tray")"
+assert_contains "Windows terminal tray follows terminal process" \
+    "Get-Process -Name \$FollowProcess" "$(cat "$windows_tray")"
+assert_contains "Windows terminal enable starts tray immediately" \
+    "'17777', 'wezterm-gui'" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "Windows terminal wrapper accepts tray follow parameter" \
+    "param([string]\$TrayFollow" "$(cat "$windows_wrapper")"
+assert_contains "Windows terminal wrapper spawns tray only when following" \
+    "if (\$TrayFollow -and (Test-Path -LiteralPath \$trayFile))" "$(cat "$windows_wrapper")"
+assert_contains "Windows terminal status reports dormant tray" \
+    "Tray: not running (starts with WezTerm)" "$("$KEEP_AWAKE" status)"
+export KEEP_AWAKE_TEST_TRAY_PROCESS=true
+assert_contains "Windows terminal status reports live tray" \
+    "Tray: running" "$("$KEEP_AWAKE" status)"
+export KEEP_AWAKE_TEST_TRAY_PROCESS=false
+"$KEEP_AWAKE" disable >/dev/null
+assert_eq "Windows terminal disable removes tray script" false \
+    "$(file_exists "$windows_tray")"
+assert_contains "Windows terminal disable stops running tray" \
+    "Stop-Process" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+
+# Switching terminal -> system must clear the process-following tray first,
+# or it would hold the single-instance mutex and starve the scheduled tray.
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+"$KEEP_AWAKE" enable --autostart terminal >/dev/null
+: > "$KEEP_AWAKE_TEST_LOG"
+"$KEEP_AWAKE" enable >/dev/null
+assert_contains "Windows system enable stops leftover terminal tray" \
+    "Stop-Process" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_eq "Windows system enable recreates tray task" true \
+    "$(file_exists "$KEEP_AWAKE_TEST_TRAY_TASK")"
 "$KEEP_AWAKE" disable >/dev/null
 
 rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
