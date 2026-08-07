@@ -1988,11 +1988,15 @@ start_host_connection_host_side() {
     state_file="$(host_connection_state_file "$host_port")"
     host_connection_ip_is_host_owned "$host_ip" || ownership_rc=$?
     if [ "$ownership_rc" -gt 1 ]; then
+        echo "Could not determine whether ${host_ip} is host-owned; aborting Host connection ${host_ip}:${host_port} setup." >&2
         return "$ownership_rc"
     fi
     if [ "$ownership_rc" -eq 1 ]; then
         if [ -f "$state_file" ]; then
-            stop_host_connection_host_side "$host_port" || return 1
+            if ! stop_host_connection_host_side "$host_port"; then
+                echo "Could not clean up stale host relay state for Host connection port ${host_port}." >&2
+                return 1
+            fi
         fi
         return 0
     fi
@@ -2131,8 +2135,11 @@ start_host_connection() {
         fi
         return 1
     fi
-    start_container_connection "$source_container" "$host_ip" "$host_port" \
-        "$local_port" "$alias" || return 1
+    if ! start_container_connection "$source_container" "$host_ip" "$host_port" \
+        "$local_port" "$alias"; then
+        echo "Could not start the container-side forward for Host connection ${host_ip}:${host_port} in ${source_container}." >&2
+        return 1
+    fi
 }
 
 stop_container_connection() {
@@ -2200,7 +2207,10 @@ stop_host_connection() {
         echo "Could not remove the container firewall slot for Host connection ${host_ip}:${host_port} in ${source_container}." >&2
         return 1
     fi
-    stop_container_connection "$source_container" "$local_port" || return 1
+    if ! stop_container_connection "$source_container" "$local_port"; then
+        echo "Could not stop the container-side forward for Host connection port ${local_port} in ${source_container}." >&2
+        return 1
+    fi
 }
 
 remove_host_connection() {
