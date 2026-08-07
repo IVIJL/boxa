@@ -1610,6 +1610,8 @@ start_container_connection() {
     local log_file="/tmp/boxa-connect-${local_port}.log"
     local pid_file="/tmp/boxa-connect-${local_port}.pid"
 
+    # bash -c, not -lc: a login shell sources ~/.bash_logout on exit, where
+    # clear_console fails without a TTY and, under set -e, overrides our exit 0.
     docker exec -u node \
         -e TARGET_CONTAINER="$target_container" \
         -e TARGET_PORT="$target_port" \
@@ -1617,7 +1619,7 @@ start_container_connection() {
         -e CONNECT_ALIAS="$alias" \
         -e LOG_FILE="$log_file" \
         -e PID_FILE="$pid_file" \
-        "$source_container" bash -lc '
+        "$source_container" bash -c '
             set -euo pipefail
             if ss -ltn "sport = :${LOCAL_PORT}" | grep -q ":${LOCAL_PORT}"; then
                 if [ -f "$PID_FILE" ]; then
@@ -2146,10 +2148,11 @@ stop_container_connection() {
     local source_container="$1" local_port="$2"
     local pid_file="/tmp/boxa-connect-${local_port}.pid"
 
+    # bash -c, not -lc: see start_container_connection (~/.bash_logout + set -e).
     docker exec -u node \
         -e PID_FILE="$pid_file" \
         -e LOCAL_PORT="$local_port" \
-        "$source_container" bash -lc '
+        "$source_container" bash -c '
             set -euo pipefail
             if [ -f "$PID_FILE" ]; then
                 pid="$(cat "$PID_FILE")"
