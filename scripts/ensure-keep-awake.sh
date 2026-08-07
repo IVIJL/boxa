@@ -140,11 +140,11 @@ keep_awake::state_field() {
 }
 
 keep_awake::write_state() {
-    local enabled="$1" optout="$2" autostart="${3:-system}" tmp
+    local enabled="$1" optout="$2" autostart="${3:-system}" connection="${4:-ok}" tmp
     mkdir -p "$KEEP_AWAKE_CONFIG_DIR" || return 1
     tmp="${KEEP_AWAKE_STATE_FILE}.tmp.$$"
-    if ! printf 'enabled=%s\noptout=%s\nautostart=%s\n' \
-        "$enabled" "$optout" "$autostart" > "$tmp" \
+    if ! printf 'enabled=%s\noptout=%s\nautostart=%s\nconnection=%s\n' \
+        "$enabled" "$optout" "$autostart" "$connection" > "$tmp" \
         || ! chmod 0600 "$tmp" \
         || ! mv "$tmp" "$KEEP_AWAKE_STATE_FILE"; then
         rm -f "$tmp"
@@ -242,6 +242,7 @@ keep_awake::probe() {
         && [ -x "$KEEP_AWAKE_BINARY" ] \
         && { [ "$autostart_mode" != system ] || keep_awake::autostart_installed; } \
         && keep_awake::host_connection_present \
+        && [ "$(keep_awake::state_field connection 2>/dev/null || true)" != incomplete ] \
         && keep_awake::daemon_status_json >/dev/null; then
         printf 'ok\n'
     else
@@ -811,27 +812,36 @@ keep_awake::enable() {
         printf 'keep-awake: daemon did not become reachable; rolled back.\n' >&2
         return 1
     fi
-    if ! "$KEEP_AWAKE_BOXA" connect host "$KEEP_AWAKE_PORT" "$KEEP_AWAKE_PORT" \
-        --name keep-awake --all; then
-        keep_awake::rollback
-        printf 'keep-awake: Host connection setup failed; rolled back.\n' >&2
-        return 1
-    fi
-    if ! keep_awake::write_state true false "$autostart_mode"; then
+    # A connection failure (typically one stale box refusing the firewall
+    # slot) must NOT tear down a working daemon: keep everything installed,
+    # record state, and let a re-run of enable retry the connection.
+    local host_connection_active=true connection_state=ok
+    "$KEEP_AWAKE_BOXA" connect host "$KEEP_AWAKE_PORT" "$KEEP_AWAKE_PORT" \
+        --name keep-awake --all || { host_connection_active=false; connection_state=incomplete; }
+    if ! keep_awake::write_state true false "$autostart_mode" "$connection_state"; then
         keep_awake::rollback
         printf 'keep-awake: could not record enabled state; rolled back.\n' >&2
         return 1
     fi
+    local connection_summary="Host connection active on port $KEEP_AWAKE_PORT"
+    if [ "$host_connection_active" = false ]; then
+        connection_summary="Host connection INCOMPLETE (see errors above)"
+    fi
     if [ "$autostart_mode" = system ]; then
         keep_awake::tray::enable
-        printf 'Keep-awake enabled: daemon running, autostart installed, Host connection active on port %s.\n' \
-            "$KEEP_AWAKE_PORT"
+        printf 'Keep-awake enabled: daemon running, autostart installed, %s.\n' \
+            "$connection_summary"
     else
-        printf 'Keep-awake enabled: daemon running, autostart %s, Host connection active on port %s.\n' \
-            "$autostart_mode" "$KEEP_AWAKE_PORT"
+        printf 'Keep-awake enabled: daemon running, autostart %s, %s.\n' \
+            "$autostart_mode" "$connection_summary"
         if [ "$autostart_mode" = terminal ]; then
             keep_awake::print_terminal_snippet
         fi
+    fi
+    if [ "$host_connection_active" = false ]; then
+        printf 'keep-awake: Host connection failed in at least one box; daemon, autostart, and tray stay installed.\n' >&2
+        printf 'keep-awake: fix the reported boxes, then re-run "boxa keep-awake enable" to retry the connection.\n' >&2
+        return 1
     fi
 }
 
@@ -883,6 +893,10 @@ keep_awake::status() {
     fi
     keep_awake::autostart_installed && autostart=yes
     keep_awake::host_connection_present && connection=yes
+    if [ "$connection" = yes ] \
+        && [ "$(keep_awake::state_field connection 2>/dev/null || true)" = incomplete ]; then
+        connection='incomplete (re-run: boxa keep-awake enable)'
+    fi
     if [ "$autostart_mode" = system ]; then
         tray="$(keep_awake::tray::status)"
     else

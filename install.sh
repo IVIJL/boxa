@@ -808,8 +808,8 @@ setup_keep_awake() {
             *)        SKIPPED+=("keep-awake (not enabled; run 'boxa keep-awake enable' later)") ;;
         esac
     else
-        warn "Keep-awake setup failed — run 'boxa keep-awake enable' after fixing the reported prerequisite."
-        SKIPPED+=("keep-awake (setup failed; no partial state left behind)")
+        warn "Keep-awake setup incomplete — re-run 'boxa keep-awake enable' after fixing the reported problem."
+        SKIPPED+=("keep-awake (setup incomplete; re-run 'boxa keep-awake enable')")
     fi
 }
 

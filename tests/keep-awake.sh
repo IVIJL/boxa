@@ -216,9 +216,11 @@ cat > "$TMPROOT/bin/boxa" <<'EOF'
 #!/usr/bin/env bash
 printf 'boxa %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
 if [ "${1:-}" = connect ] && [ "${2:-}" = host ]; then
-    [ "$KEEP_AWAKE_TEST_CONNECT_FAIL" = false ] || exit 1
+    # Mirrors docker-run.sh: the global record persists before the per-box
+    # loop, so a partial failure still leaves the record behind.
     mkdir -p "$(dirname "$KEEP_AWAKE_TEST_CONNECT")"
     printf 'keep-awake\thost\t17777\t17777\n' > "$KEEP_AWAKE_TEST_CONNECT"
+    [ "$KEEP_AWAKE_TEST_CONNECT_FAIL" = false ] || exit 1
 elif [ "${1:-}" = connect ] && [ "${2:-}" = rm ]; then
     rm -f "$KEEP_AWAKE_TEST_CONNECT"
 fi
@@ -531,15 +533,30 @@ assert_contains "local fallback also disables CGO" "CGO_ENABLED=0" "$build_call_
 "$KEEP_AWAKE" disable >/dev/null
 export KEEP_AWAKE_TEST_DOCKER_FAIL=false
 
-# A post-start Host connection failure rolls back every newly-created part.
+# A post-start Host connection failure keeps the daemon, autostart, and state
+# installed; only the connection is reported for retry (issue 15).
 rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
 export KEEP_AWAKE_TEST_CONNECT_FAIL=true
-rollback_output="$("$KEEP_AWAKE" enable 2>&1 || true)"
-assert_contains "Host connection failure reports rollback" "Host connection setup failed; rolled back" "$rollback_output"
-assert_eq "rollback removes binary" false "$(file_exists "$TMPROOT/install/keep-awake")"
-assert_eq "rollback removes autostart" false "$(file_exists "$KEEP_AWAKE_TEST_SYSTEMD")"
-assert_eq "rollback removes Host connection" false "$(file_exists "$KEEP_AWAKE_TEST_CONNECT")"
+partial_rc=0
+partial_output="$("$KEEP_AWAKE" enable 2>&1)" || partial_rc=$?
+assert_contains "connect failure reports kept install" \
+    "daemon, autostart, and tray stay installed" "$partial_output"
+assert_contains "connect failure advises retry" \
+    're-run "boxa keep-awake enable"' "$partial_output"
+assert_eq "connect failure exits non-zero" 1 "$partial_rc"
+assert_eq "connect failure keeps binary" true "$(file_exists "$TMPROOT/install/keep-awake")"
+assert_eq "connect failure keeps autostart" true "$(file_exists "$KEEP_AWAKE_TEST_SYSTEMD")"
+assert_contains "connect failure records enabled state" "enabled=true" \
+    "$(cat "$XDG_CONFIG_HOME/boxa/keep-awake.conf" 2>/dev/null || true)"
+assert_contains "connect failure records incomplete connection" "connection=incomplete" \
+    "$(cat "$XDG_CONFIG_HOME/boxa/keep-awake.conf" 2>/dev/null || true)"
+assert_eq "incomplete connection keeps probe unconverged" missing "$("$KEEP_AWAKE" probe)"
+assert_contains "incomplete connection surfaces in status" \
+    "incomplete (re-run: boxa keep-awake enable)" "$("$KEEP_AWAKE" status)"
 export KEEP_AWAKE_TEST_CONNECT_FAIL=false
+"$KEEP_AWAKE" enable >/dev/null
+assert_eq "successful retry restores probe ok" ok "$("$KEEP_AWAKE" probe)"
+"$KEEP_AWAKE" disable >/dev/null
 
 # Uninstall teardown stops daemon/autostart and removes its marker while
 # deliberately leaving the Host connection to docker-run.sh's existing sweep.

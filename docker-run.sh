@@ -2081,6 +2081,30 @@ start_host_connection_host_side() {
     mv "${state_file}.tmp" "$state_file"
 }
 
+# Boxes started from an image built before Host connections lack the
+# root-owned allow/deny helpers baked into newer images. Inject them from the
+# repo copy so a global connection can reach such boxes without a restart —
+# the helpers are self-contained (plain iptables against the final OUTPUT
+# REJECT rule, present in old firewalls too).
+ensure_host_connection_helpers() {
+    local source_container="$1" helper
+
+    if docker exec -u root "$source_container" sh -c \
+        'test -x /usr/local/bin/start-host-connection-allow \
+         && test -x /usr/local/bin/stop-host-connection-allow' 2>/dev/null; then
+        return 0
+    fi
+    for helper in start-host-connection-allow stop-host-connection-allow; do
+        docker cp "$BOXA_DIR/scripts/${helper}.sh" \
+            "${source_container}:/usr/local/bin/${helper}" || return 1
+    done
+    docker exec -u root "$source_container" sh -c \
+        'chown root:root /usr/local/bin/start-host-connection-allow \
+             /usr/local/bin/stop-host-connection-allow \
+         && chmod 755 /usr/local/bin/start-host-connection-allow \
+             /usr/local/bin/stop-host-connection-allow'
+}
+
 start_host_connection() {
     local source_container="$1" host_port="$2" local_port="$3" alias="$4"
     local host_ip
@@ -2091,6 +2115,10 @@ start_host_connection() {
         return 1
     fi
 
+    if ! ensure_host_connection_helpers "$source_container"; then
+        echo "Could not provision Host connection helpers in ${source_container} (image predates Host connections?)." >&2
+        return 1
+    fi
     if ! docker exec -u root "$source_container" \
         /usr/local/bin/start-host-connection-allow "$host_ip" "$host_port"; then
         echo "Could not create the container firewall slot for Host connection ${host_ip}:${host_port} in ${source_container}." >&2
@@ -2163,6 +2191,10 @@ stop_host_connection() {
         return 1
     fi
 
+    if ! ensure_host_connection_helpers "$source_container"; then
+        echo "Could not provision Host connection helpers in ${source_container} (image predates Host connections?)." >&2
+        return 1
+    fi
     if ! docker exec -u root "$source_container" \
         /usr/local/bin/stop-host-connection-allow "$host_ip" "$host_port"; then
         echo "Could not remove the container firewall slot for Host connection ${host_ip}:${host_port} in ${source_container}." >&2
@@ -2174,7 +2206,7 @@ stop_host_connection() {
 remove_host_connection() {
     local source_project="$1" source_container="$2" all_connections="$3" target_port="$4"
     local config_file connection_description connection_row connection_local_port
-    local running_container tmp
+    local running_container tmp global_stop_failed
 
     if [ "$all_connections" = true ]; then
         config_file="$(global_connection_config_file)"
@@ -2195,10 +2227,20 @@ remove_host_connection() {
     IFS=$'\t' read -r _alias _target _port connection_local_port <<< "$connection_row"
 
     if [ "$all_connections" = true ]; then
+        # One broken box must not strand the slots in every healthy box:
+        # clean what we can, keep the record and host relay for a retry.
+        global_stop_failed=false
         while IFS= read -r running_container; do
             [ -n "$running_container" ] || continue
-            stop_host_connection "$running_container" "$target_port" "$connection_local_port" || return 1
+            if ! stop_host_connection "$running_container" "$target_port" "$connection_local_port"; then
+                echo "Failed to remove global Host connection in ${running_container}." >&2
+                global_stop_failed=true
+            fi
         done < <(list_boxa_container_names)
+        if [ "$global_stop_failed" = true ]; then
+            echo "Global Host connection on port ${target_port} kept persisted; fix the reported boxes and re-run the removal." >&2
+            return 1
+        fi
     elif docker ps --filter "name=^${source_container}$" --format '{{.Names}}' | grep -qx "$source_container"; then
         stop_host_connection "$source_container" "$target_port" "$connection_local_port" || return 1
     fi

@@ -34,8 +34,10 @@ export BOXA_CONNECT_TEST_RULE_MISSING_PORTS=""
 export BOXA_CONNECT_TEST_CONTAINERS="boxa-source"
 export BOXA_CONNECT_TEST_UFW_ACTIVE=false
 export BOXA_CONNECT_TEST_MISSING_SOCAT=false
+export BOXA_CONNECT_TEST_HELPERS_MISSING=false
 export BOXA_CONNECT_TEST_START_ALLOW_FAIL_PORTS=""
 export BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_PORTS=""
+export BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_CONTAINERS=""
 export BOXA_CONNECT_TEST_MISSING_PYTHON=false
 export BOXA_CONNECT_TEST_MISSING_IP=false
 export BOXA_CONNECT_TEST_MISSING_SETSID=false
@@ -121,6 +123,12 @@ docker() {
                 fi
             fi
             case "$*" in
+                *'test -x /usr/local/bin/start-host-connection-allow'*)
+                    if [ "$BOXA_CONNECT_TEST_HELPERS_MISSING" = true ]; then
+                        return 1
+                    fi
+                    return 0
+                    ;;
                 *'/usr/local/bin/start-host-connection-allow '*)
                     case ",${BOXA_CONNECT_TEST_START_ALLOW_FAIL_PORTS}," in
                         *",${helper_port},"*) return 1 ;;
@@ -130,6 +138,12 @@ docker() {
                     case ",${BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_PORTS}," in
                         *",${helper_port},"*) return 1 ;;
                     esac
+                    local fail_container
+                    for fail_container in ${BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_CONTAINERS//,/ }; do
+                        case " $* " in
+                            *" ${fail_container} "*) return 1 ;;
+                        esac
+                    done
                     ;;
             esac
             case "$*" in
@@ -326,6 +340,20 @@ assert_eq "repeated add leaves one persisted row" "1" \
     "$(awk 'END { print NR }' "$config_file")"
 assert_eq "repeated add re-converges one exact firewall slot" "2" \
     "$(count_log_matches '/usr/local/bin/start-host-connection-allow 192.168.65.254 17777')"
+
+# Boxes from a pre-Host-connection image lack the baked-in helpers; connect
+# injects both from the repo copy before exec'ing them (issue 15).
+export BOXA_CONNECT_TEST_HELPERS_MISSING=true
+inject_output="$(run_boxa connect host 17777 --name keep-awake --from source)"
+assert_contains "old-image add still reports Host target" \
+    "Connected: boxa-source -> host:17777" "$inject_output"
+assert_eq "old-image add copies start helper into place" "1" \
+    "$(count_log_matches "cp $BOXA_DIR/scripts/start-host-connection-allow.sh boxa-source:/usr/local/bin/start-host-connection-allow")"
+assert_eq "old-image add copies stop helper into place" "1" \
+    "$(count_log_matches "cp $BOXA_DIR/scripts/stop-host-connection-allow.sh boxa-source:/usr/local/bin/stop-host-connection-allow")"
+assert_eq "old-image add fixes helper ownership and mode" "1" \
+    "$(count_log_matches 'chown root:root /usr/local/bin/start-host-connection-allow')"
+export BOXA_CONNECT_TEST_HELPERS_MISSING=false
 
 export BOXA_CONNECT_IPTABLES_STATE="$_TMPROOT/iptables.state"
 : > "$BOXA_CONNECT_IPTABLES_STATE"
@@ -901,6 +929,25 @@ start_boxa_connections boxa-fourth >/dev/null
 assert_eq "removed global entry is not replayed by future box" \
     "$global_calls_before_removed_replay" "$(count_log_matches "TARGET_PORT=${global_host_port}")"
 
+# A failing box no longer aborts global removal: healthy boxes are cleaned,
+# the record stays for a retry, and a second pass finishes the job (issue 15).
+run_boxa connect host "$global_host_port" "$global_replacement_port" --name shared-hook --all >/dev/null
+export BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_CONTAINERS=boxa-second
+partial_rm_teardowns_before="$(count_log_matches "/usr/local/bin/stop-host-connection-allow 192.168.65.254 ${global_host_port}")"
+partial_rm_output="$(run_boxa connect rm host "$global_host_port" --all 2>&1 || true)"
+assert_contains "partial global rm names the failing box" \
+    "Failed to remove global Host connection in boxa-second." "$partial_rm_output"
+assert_contains "partial global rm advises retry" \
+    "fix the reported boxes and re-run the removal" "$partial_rm_output"
+assert_eq "partial global rm still visits every box" "3" \
+    "$(( $(count_log_matches "/usr/local/bin/stop-host-connection-allow 192.168.65.254 ${global_host_port}") - partial_rm_teardowns_before ))"
+assert_eq "partial global rm keeps persisted global row" "1" \
+    "$(awk 'END { print NR }' "$global_config_file")"
+export BOXA_CONNECT_TEST_STOP_ALLOW_FAIL_CONTAINERS=""
+run_boxa connect rm host "$global_host_port" --all >/dev/null
+assert_eq "retry after partial global rm removes the row" "0" \
+    "$(awk 'END { print NR }' "$global_config_file")"
+
 conflict_output="$(run_boxa connect host 17780 --all --from source 2>&1 || true)"
 assert_contains "--all rejects per-box --from scope" \
     "--all cannot be combined with --from." "$conflict_output"
@@ -948,7 +995,7 @@ run_uninstall() {
 
 BOXA_CONNECT_TEST_CONTAINERS=$'boxa-source\nboxa-second'
 uninstall_ufw_deletes_before="$(count_log_matches 'ufw delete allow proto tcp')"
-uninstall_container_teardowns_before="$(count_log_matches '/usr/local/bin/stop-host-connection-allow')"
+uninstall_container_teardowns_before="$(count_log_matches '/usr/local/bin/stop-host-connection-allow 192.168.65.254')"
 uninstall_output="$(run_uninstall)"
 assert_contains "uninstall uses per-box rm reporting path" \
     "Removed Host connection: boxa-source -> host:${uninstall_per_box_port}" \
@@ -968,10 +1015,10 @@ assert_eq "uninstall removes every host relay state file" "false false false" \
 assert_eq "uninstall removes every ufw Host slot" "3" \
     "$(( $(count_log_matches 'ufw delete allow proto tcp') - uninstall_ufw_deletes_before ))"
 assert_eq "uninstall tears down per-box plus global container slots" "4" \
-    "$(( $(count_log_matches '/usr/local/bin/stop-host-connection-allow') - uninstall_container_teardowns_before ))"
+    "$(( $(count_log_matches '/usr/local/bin/stop-host-connection-allow 192.168.65.254') - uninstall_container_teardowns_before ))"
 
 empty_uninstall_ufw_deletes_before="$(count_log_matches 'ufw delete allow proto tcp')"
-empty_uninstall_container_teardowns_before="$(count_log_matches '/usr/local/bin/stop-host-connection-allow')"
+empty_uninstall_container_teardowns_before="$(count_log_matches '/usr/local/bin/stop-host-connection-allow 192.168.65.254')"
 empty_uninstall_output="$(run_uninstall)"
 assert_eq "uninstall with no Host connections prints nothing extra" "" \
     "$empty_uninstall_output"
@@ -980,7 +1027,7 @@ assert_eq "uninstall with no Host connections leaves ufw unchanged" \
     "$(count_log_matches 'ufw delete allow proto tcp')"
 assert_eq "uninstall with no Host connections skips container teardown" \
     "$empty_uninstall_container_teardowns_before" \
-    "$(count_log_matches '/usr/local/bin/stop-host-connection-allow')"
+    "$(count_log_matches '/usr/local/bin/stop-host-connection-allow 192.168.65.254')"
 
 # Doctor uses the same non-mutating artifact checks, prints an idempotent
 # connect command, and adds no bytes at all when no Host records are persisted.
