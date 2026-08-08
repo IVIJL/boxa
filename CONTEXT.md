@@ -376,6 +376,18 @@ Consumed by agent-side hooks and the `boxa` skill for host/container
 branching. See ADR 0011.
 _Avoid_: identity sentinel, container marker, boxa marker file
 
+### Dev URLs
+
+**DNS degradation**:
+The state in which the local `.test` resolution path is systemically
+impossible on the host — an unmet **Environment prerequisite** such as
+WSL mirrored networking reserving port 53 — and boxa automatically
+serves dev URLs on the external domain instead, keeping the local
+preference sticky. Entered and healed solely by probing the actual
+resolution path, loudly announced on every Container start while
+active. `.test` keeps resolving inside **Containers** throughout.
+_Avoid_: external-only mode, sslip mode, broken DNS, unsupported mode
+
 ### Memory
 
 **Memory limit**:
