@@ -12,6 +12,9 @@ loopback only and continues polling every 30 seconds. Once vEthernet appears,
 the wrapper stops the daemon instance it started and restarts it with both
 loopback and vEthernet listeners. `status` and `doctor` also require the task's
 PowerShell wrapper to exist; `boxa keep-awake enable` repairs a missing wrapper.
+On WSL2, boxa functionally probes the daemon on loopback first and then on the
+default gateway. The keep-awake Host connection relays to the first target that
+returns an HTTP status response; `status` and `doctor` report that target.
 
 ```bash
 boxa keep-awake enable
@@ -65,9 +68,15 @@ keep_awake_host() {
     # Inside a box, the global Host connection listens locally.
     if [ -f /etc/boxa/identity.json ]; then
         printf '127.0.0.1'
-    # From WSL, use the Windows host's vEthernet/default-gateway address.
+    # From WSL, prefer mirrored-networking loopback when it answers, then use
+    # the Windows host's vEthernet/default-gateway address.
     elif grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
-        ip route show default | awk 'NR == 1 { print $3; exit }'
+        if curl -fsS --noproxy '*' --max-time 2 \
+            http://127.0.0.1:17777/v1/status >/dev/null 2>&1; then
+            printf '127.0.0.1'
+        else
+            ip route show default | awk 'NR == 1 { print $3; exit }'
+        fi
     # Native Linux and macOS reach their host daemon directly.
     else
         printf '127.0.0.1'
@@ -88,6 +97,7 @@ esac
 ```
 
 Resolution order for any client is: native Linux/macOS → `localhost`; WSL →
-the Windows vEthernet/default-gateway IP; boxa Container → `localhost` on the
-Host connection's local port (17777 by default). `GET /v1/status` returns the
-active holders, remaining TTLs, inhibitor state, and daemon version.
+probe `localhost`, then the Windows vEthernet/default-gateway IP; boxa Container
+→ `localhost` on the Host connection's local port (17777 by default).
+`GET /v1/status` returns the active holders, remaining TTLs, inhibitor state,
+and daemon version.

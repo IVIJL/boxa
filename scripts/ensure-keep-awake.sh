@@ -6,6 +6,8 @@ set -euo pipefail
 # binary, platform autostart, and global Host connection converge together.
 
 BOXA_DIR="${BOXA_DIR:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}"
+# shellcheck source=../lib/keep-awake-probe.sh disable=SC1091
+source "$BOXA_DIR/lib/keep-awake-probe.sh"
 KEEP_AWAKE_PORT="${BOXA_KEEP_AWAKE_PORT:-17777}"
 KEEP_AWAKE_TASK_NAME="BoxaKeepAwake"
 KEEP_AWAKE_LAUNCH_LABEL="dev.boxa.keep-awake"
@@ -15,6 +17,7 @@ KEEP_AWAKE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/boxa"
 KEEP_AWAKE_STATE_FILE="$KEEP_AWAKE_CONFIG_DIR/keep-awake.conf"
 KEEP_AWAKE_CONNECT_FILE="$KEEP_AWAKE_CONFIG_DIR/connect/_all.tsv"
 KEEP_AWAKE_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/boxa/keep-awake"
+KEEP_AWAKE_RELAY_STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/boxa/host-connections/${KEEP_AWAKE_PORT}.state"
 KEEP_AWAKE_LOG_FILE="$KEEP_AWAKE_STATE_DIR/keep-awake.log"
 KEEP_AWAKE_PLATFORM=""
 KEEP_AWAKE_INSTALL_DIR=""
@@ -169,16 +172,31 @@ keep_awake::host_connection_present() {
 }
 
 keep_awake::daemon_url() {
-    local address="127.0.0.1"
-    if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ]; then
-        address="$(ip route show default 2>/dev/null | awk 'NR == 1 { print $3; exit }')"
-        [ -n "$address" ] || address="127.0.0.1"
-    fi
-    printf 'http://%s:%s/v1/status\n' "$address" "$KEEP_AWAKE_PORT"
+    keep_awake_probe::select_target "$KEEP_AWAKE_PLATFORM" "$KEEP_AWAKE_PORT" \
+        || return 1
+    printf 'http://%s:%s/v1/status\n' \
+        "$KEEP_AWAKE_PROBE_TARGET_ADDRESS" "$KEEP_AWAKE_PORT"
 }
 
 keep_awake::daemon_status_json() {
-    curl -fsS --max-time 2 "$(keep_awake::daemon_url)" 2>/dev/null
+    keep_awake_probe::select_target "$KEEP_AWAKE_PLATFORM" "$KEEP_AWAKE_PORT" \
+        || return 1
+    keep_awake_probe::status_json
+}
+
+keep_awake::relay_target_description() {
+    local target_kind target_address
+    if [ -f "$KEEP_AWAKE_RELAY_STATE_FILE" ]; then
+        target_kind="$(awk -F '\t' 'NR == 1 { print $5 }' \
+            "$KEEP_AWAKE_RELAY_STATE_FILE")"
+        target_address="$(awk -F '\t' 'NR == 1 { print $6 }' \
+            "$KEEP_AWAKE_RELAY_STATE_FILE")"
+        if [ -n "$target_kind" ] && [ -n "$target_address" ]; then
+            printf '%s (%s)\n' "$target_kind" "$target_address"
+            return 0
+        fi
+    fi
+    keep_awake_probe::target_description
 }
 
 keep_awake::client_signal_status() {
@@ -927,11 +945,14 @@ keep_awake::disable() {
 }
 
 keep_awake::status() {
-    local status_json="" holders="[]" daemon=no autostart=no connection=no tray client_signal autostart_mode
+    local status_json="" holders="[]" daemon=no daemon_target=unreachable
+    local autostart=no connection=no tray client_signal autostart_mode
     keep_awake::init_paths || return 1
     autostart_mode="$(keep_awake::autostart_mode)"
-    if status_json="$(keep_awake::daemon_status_json)"; then
+    if keep_awake_probe::select_target "$KEEP_AWAKE_PLATFORM" "$KEEP_AWAKE_PORT"; then
         daemon=yes
+        status_json="$(keep_awake_probe::status_json)"
+        daemon_target="$(keep_awake::relay_target_description)"
         holders="$(printf '%s\n' "$status_json" \
             | sed -nE 's/.*"activeHolders":(\[[^]]*]).*/\1/p')"
         [ -n "$holders" ] || holders="[]"
@@ -954,6 +975,7 @@ keep_awake::status() {
     fi
     client_signal="$(keep_awake::client_signal_status "$daemon")"
     printf 'Daemon reachable: %s\n' "$daemon"
+    printf 'Relay target: %s\n' "$daemon_target"
     printf 'Holders: %s\n' "$holders"
     printf 'Autostart installed: %s\n' "$autostart"
     printf 'autostart: %s\n' "$autostart_mode"

@@ -43,6 +43,7 @@ export BOXA_CONNECT_TEST_MISSING_IP=false
 export BOXA_CONNECT_TEST_MISSING_SETSID=false
 export BOXA_CONNECT_TEST_INTERFACE_IPS="127.0.0.1"
 export BOXA_CONNECT_TEST_EXEC_NODE_TEARDOWN=false
+export BOXA_CONNECT_TEST_DOCTOR_KEEP_AWAKE=false
 : > "$BOXA_CONNECT_TEST_LOG"
 
 # Keep list_listening_ports_in_container's timeout path compatible with the
@@ -76,6 +77,11 @@ export -f command
 
 ip() {
     local address
+    if [ "${1:-}" = route ]; then
+        printf 'default via %s dev eth0\n' \
+            "${BOXA_CONNECT_TEST_KEEP_AWAKE_GATEWAY:-127.0.0.3}"
+        return 0
+    fi
     for address in $BOXA_CONNECT_TEST_INTERFACE_IPS; do
         printf '    inet %s/24 scope global eth0\n' "$address"
     done
@@ -384,6 +390,22 @@ export CONNECT_CONFIG_DIR="$_TMPROOT/home/.config/boxa/connect"
 export HOST_CONNECTION_STATE_DIR="$_TMPROOT/home/.local/state/boxa/host-connections"
 # shellcheck source=/dev/null
 source "$extracted"
+# The extracted docker-run helper block calls the same shared platform and
+# keep-awake probe modules that docker-run.sh sources at startup.
+# shellcheck source=../lib/host-platform.sh disable=SC1091
+source "$BOXA_DIR/lib/host-platform.sh"
+# shellcheck source=../lib/keep-awake-probe.sh disable=SC1091
+source "$BOXA_DIR/lib/keep-awake-probe.sh"
+
+wait_for_test_daemon() {
+    local address="$1" port="$2" attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        : "$attempt"
+        keep_awake_probe::status "$address" "$port" >/dev/null && return 0
+        sleep 0.02
+    done
+    return 1
+}
 
 # The in-Container teardown executes through docker in production. Run that
 # exact embedded shell against a detached socat listener with a live handler.
@@ -521,6 +543,7 @@ BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$native_child_file" \
     start_host_connection_host_side 127.0.0.2 "$native_host_port"
 native_state_file="$(host_connection_state_file "$native_host_port")"
 IFS=$'\t' read -r native_ip native_relay_pid native_subnet native_ufw_owned \
+    _native_target_kind _native_target_address \
     < "$native_state_file"
 native_relay_child_pid="$(cat "$native_child_file")"
 assert_eq "host relay mock starts a child process" "true" \
@@ -541,6 +564,7 @@ BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$changed_child_file" \
     PATH="$relay_mock_bin:$PATH" \
     start_host_connection_host_side 127.0.0.3 "$native_host_port"
 IFS=$'\t' read -r changed_ip changed_relay_pid _changed_subnet _changed_ufw_owned \
+    _changed_target_kind _changed_target_address \
     < "$native_state_file"
 changed_relay_child_pid="$(cat "$changed_child_file")"
 assert_eq "changed gateway replaces relay IP" "127.0.0.3" "$changed_ip"
@@ -568,6 +592,7 @@ BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$fallback_child_file" \
     PATH="$relay_mock_bin:$PATH" \
     start_host_connection_host_side 127.0.0.4 "$native_host_port"
 IFS=$'\t' read -r _fallback_ip fallback_relay_pid _fallback_subnet _fallback_owned \
+    _fallback_target_kind _fallback_target_address \
     < "$(host_connection_state_file "$native_host_port")"
 fallback_relay_child_pid="$(cat "$fallback_child_file")"
 stop_host_connection_host_side "$native_host_port"
@@ -577,6 +602,115 @@ assert_eq "pre-setsid teardown stops listener" "false" \
 assert_eq "pre-setsid teardown stops existing child" "false" \
     "$(kill -0 "$fallback_relay_child_pid" 2>/dev/null && echo true || echo false)"
 kill "$native_service_pid" 2>/dev/null || true
+
+# The keep-awake relay selects a functional HTTP daemon target, preferring
+# WSL loopback and falling back to the default gateway. Its persisted target
+# proves the relay command and later convergence use the probed endpoint.
+BOXA_KEEP_AWAKE_PLATFORM=wsl2
+export BOXA_KEEP_AWAKE_PLATFORM
+http_responder="$_TMPROOT/http-status-responder"
+printf '%s\n' \
+    '#!/bin/bash' \
+    "printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\n{}'" \
+    > "$http_responder"
+chmod +x "$http_responder"
+loopback_keep_awake_port=18981
+BOXA_KEEP_AWAKE_PORT="$loopback_keep_awake_port"
+export BOXA_KEEP_AWAKE_PORT
+socat "TCP-LISTEN:${loopback_keep_awake_port},bind=127.0.0.1,reuseaddr,fork" \
+    EXEC:"$http_responder" \
+    >/dev/null 2>&1 &
+loopback_daemon_pid=$!
+wait_for_test_daemon 127.0.0.1 "$loopback_keep_awake_port" || exit 1
+loopback_target_child="$_TMPROOT/mock-socat-child-loopback-target.pid"
+BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$loopback_target_child" \
+    PATH="$relay_mock_bin:$PATH" \
+    start_host_connection_host_side 127.0.0.2 "$loopback_keep_awake_port"
+IFS=$'\t' read -r _loopback_ip _loopback_pid _loopback_subnet _loopback_owned \
+    loopback_target_kind loopback_target_address \
+    < "$(host_connection_state_file "$loopback_keep_awake_port")"
+assert_eq "WSL keep-awake relay prefers responding loopback" loopback \
+    "$loopback_target_kind"
+assert_eq "WSL loopback relay records exact target" 127.0.0.1 \
+    "$loopback_target_address"
+stop_host_connection_host_side "$loopback_keep_awake_port"
+kill "$loopback_daemon_pid" 2>/dev/null || true
+
+gateway_keep_awake_port=18982
+BOXA_KEEP_AWAKE_PORT="$gateway_keep_awake_port"
+socat "TCP-LISTEN:${gateway_keep_awake_port},bind=127.0.0.3,reuseaddr,fork" \
+    EXEC:"$http_responder" \
+    >/dev/null 2>&1 &
+gateway_daemon_pid=$!
+wait_for_test_daemon 127.0.0.3 "$gateway_keep_awake_port" || exit 1
+gateway_target_child="$_TMPROOT/mock-socat-child-gateway-target.pid"
+BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$gateway_target_child" \
+    PATH="$relay_mock_bin:$PATH" \
+    start_host_connection_host_side 127.0.0.2 "$gateway_keep_awake_port"
+IFS=$'\t' read -r _gateway_ip _gateway_pid _gateway_subnet _gateway_owned \
+    gateway_target_kind gateway_target_address \
+    < "$(host_connection_state_file "$gateway_keep_awake_port")"
+assert_eq "WSL keep-awake relay falls back to responding gateway" gateway \
+    "$gateway_target_kind"
+assert_eq "WSL gateway relay records exact target" 127.0.0.3 \
+    "$gateway_target_address"
+stop_host_connection_host_side "$gateway_keep_awake_port"
+kill "$gateway_daemon_pid" 2>/dev/null || true
+
+unreachable_keep_awake_port=18983
+BOXA_KEEP_AWAKE_PORT="$unreachable_keep_awake_port"
+if unreachable_target_output="$(start_host_connection_host_side \
+        127.0.0.2 "$unreachable_keep_awake_port" 2>&1)"; then
+    unreachable_target_status=success
+else
+    unreachable_target_status=failure
+fi
+assert_eq "WSL keep-awake relay rejects unreachable candidates" failure \
+    "$unreachable_target_status"
+assert_contains "unreachable target failure names selection step and candidates" \
+    "relay target selection: daemon unreachable on loopback and gateway" \
+    "$unreachable_target_output"
+assert_contains "unreachable target failure names daemon and firewall hint" \
+    "daemon is running and Windows Firewall allows port ${unreachable_keep_awake_port}" \
+    "$unreachable_target_output"
+assert_eq "unreachable target failure leaves no relay state" false \
+    "$([ -f "$(host_connection_state_file "$unreachable_keep_awake_port")" ] \
+        && echo true || echo false)"
+
+# A TCP listener alone is insufficient for keep-awake readiness. This socat
+# wrapper accepts on the relay address but deliberately forwards nowhere, so
+# the old /dev/tcp check would pass while the HTTP probe must fail.
+dishonest_keep_awake_port=18984
+BOXA_KEEP_AWAKE_PORT="$dishonest_keep_awake_port"
+socat "TCP-LISTEN:${dishonest_keep_awake_port},bind=127.0.0.1,reuseaddr,fork" \
+    EXEC:"$http_responder" \
+    >/dev/null 2>&1 &
+dishonest_daemon_pid=$!
+wait_for_test_daemon 127.0.0.1 "$dishonest_keep_awake_port" || exit 1
+dishonest_relay_bin="$_TMPROOT/dishonest-relay-bin"
+mkdir -p "$dishonest_relay_bin"
+printf '%s\n' \
+    '#!/bin/bash' \
+    "exec /usr/bin/socat \"\$1\" TCP:127.0.0.4:1" \
+    > "$dishonest_relay_bin/socat"
+chmod +x "$dishonest_relay_bin/socat"
+if dishonest_readiness_output="$(PATH="$dishonest_relay_bin:$PATH" \
+        start_host_connection_host_side 127.0.0.2 \
+        "$dishonest_keep_awake_port" 2>&1)"; then
+    dishonest_readiness_status=success
+else
+    dishonest_readiness_status=failure
+fi
+assert_eq "keep-awake readiness rejects TCP-only relay" failure \
+    "$dishonest_readiness_status"
+assert_contains "keep-awake readiness names failed HTTP-through-relay step" \
+    "keep-awake readiness failed: daemon did not return an HTTP response through relay" \
+    "$dishonest_readiness_output"
+assert_eq "dishonest readiness leaves no relay state" false \
+    "$([ -f "$(host_connection_state_file "$dishonest_keep_awake_port")" ] \
+        && echo true || echo false)"
+kill "$dishonest_daemon_pid" 2>/dev/null || true
+unset BOXA_KEEP_AWAKE_PLATFORM BOXA_KEEP_AWAKE_PORT
 
 # A relay process that never becomes ready must fail the add path and leave no
 # durable host-side state or ufw slot behind.
@@ -729,7 +863,8 @@ BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$rm_child_file" \
     PATH="$relay_mock_bin:$PATH" \
     start_host_connection_host_side 127.0.0.2 17777
 rm_host_state_file="$(host_connection_state_file 17777)"
-IFS=$'\t' read -r _rm_ip rm_relay_pid _rm_subnet _rm_owned < "$rm_host_state_file"
+IFS=$'\t' read -r _rm_ip rm_relay_pid _rm_subnet _rm_owned \
+    _rm_target_kind _rm_target_address < "$rm_host_state_file"
 rm_relay_child_pid="$(cat "$rm_child_file")"
 rm_output="$(run_boxa connect rm host 17777 --from source)"
 assert_contains "rm reports removed Host target" \
@@ -978,10 +1113,13 @@ start_host_connection_host_side 127.0.0.2 "$uninstall_per_box_port"
 start_host_connection_host_side 127.0.0.3 "$uninstall_second_port"
 start_host_connection_host_side 127.0.0.4 "$uninstall_global_port"
 IFS=$'\t' read -r _ip uninstall_per_box_pid _subnet _owned \
+    _target_kind _target_address \
     < "$(host_connection_state_file "$uninstall_per_box_port")"
 IFS=$'\t' read -r _ip uninstall_second_pid _subnet _owned \
+    _target_kind _target_address \
     < "$(host_connection_state_file "$uninstall_second_port")"
 IFS=$'\t' read -r _ip uninstall_global_pid _subnet _owned \
+    _target_kind _target_address \
     < "$(host_connection_state_file "$uninstall_global_port")"
 
 uninstall_cli_dir="$_TMPROOT/uninstall-cli"
@@ -1041,6 +1179,9 @@ BOXA_PROVISIONING_STEPS=("stub-step|-|A")
 boxa::run_provisioning() {
     BOXA_PROVISIONING_REPAIRED=()
     BOXA_PROVISIONING_OK=("stub-step")
+    if [ "${BOXA_CONNECT_TEST_DOCTOR_KEEP_AWAKE:-false}" = true ]; then
+        BOXA_PROVISIONING_OK+=("keep-awake")
+    fi
     BOXA_PROVISIONING_SKIPPED=()
     BOXA_PROVISIONING_PREREQ_MISSING=()
     BOXA_PROVISIONING_MISSING=()
@@ -1049,6 +1190,12 @@ boxa::run_provisioning() {
 }
 boxa::prereq_remedy() { :; }
 EOF
+mkdir -p "$doctor_cli_dir/scripts"
+printf '%s\n' \
+    '#!/bin/bash' \
+    'printf "Relay target: gateway (127.0.0.3)\n"' \
+    > "$doctor_cli_dir/scripts/ensure-keep-awake.sh"
+chmod +x "$doctor_cli_dir/scripts/ensure-keep-awake.sh"
 run_doctor() {
     HOME="$_TMPROOT/home" bash "$doctor_cli_dir/docker-run.sh" doctor
 }
@@ -1059,6 +1206,12 @@ doctor_without_connections="$(run_doctor)"
 expected_doctor_without_connections=$'Running boxa doctor (repairing unconditional host provisioning)...\n\n\n=== boxa doctor summary ===\nAlready OK:\n  - stub-step\n\nHost provisioning is healthy.'
 assert_eq "doctor output with no Host connections is unchanged" \
     "$expected_doctor_without_connections" "$doctor_without_connections"
+
+BOXA_CONNECT_TEST_DOCTOR_KEEP_AWAKE=true
+doctor_keep_awake_output="$(run_doctor)"
+assert_contains "doctor reports active keep-awake relay target" \
+    "Relay target: gateway (127.0.0.3)" "$doctor_keep_awake_output"
+BOXA_CONNECT_TEST_DOCTOR_KEEP_AWAKE=false
 
 doctor_port=17790
 printf 'doctor-host\thost\t%s\t%s\n' "$doctor_port" "$doctor_port" \

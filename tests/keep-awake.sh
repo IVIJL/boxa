@@ -23,6 +23,8 @@ export KEEP_AWAKE_TEST_TRAY_SYSTEMD="$TMPROOT/tray-systemd"
 export KEEP_AWAKE_TEST_CONNECT="$XDG_CONFIG_HOME/boxa/connect/_all.tsv"
 export KEEP_AWAKE_TEST_TRAY_PROCESS=false
 export KEEP_AWAKE_TEST_CURL_HEALTHY=true
+export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=true
+export KEEP_AWAKE_TEST_GATEWAY_HEALTHY=true
 export KEEP_AWAKE_TEST_CONNECT_FAIL=false
 export KEEP_AWAKE_TEST_DOCKER_FAIL=false
 export KEEP_AWAKE_TEST_TRAY_START_FAIL=false
@@ -192,13 +194,20 @@ EOF
 
 cat > "$TMPROOT/bin/ip" <<'EOF'
 #!/usr/bin/env bash
-printf 'default via 172.30.96.1 dev eth0\n'
+printf 'default via %s dev eth0\n' "${KEEP_AWAKE_TEST_GATEWAY:-172.30.96.1}"
 EOF
 
 cat > "$TMPROOT/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
     *'/v1/busy/'*|*'/v1/idle/'*) printf 'curl %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG" ;;
+    *'/v1/status')
+        printf 'status %s\n' "${*: -1}" >> "$KEEP_AWAKE_TEST_LOG"
+        case "${*: -1}" in
+            http://127.0.0.1:*) [ "$KEEP_AWAKE_TEST_LOOPBACK_HEALTHY" = true ] || exit 7 ;;
+            *)                  [ "$KEEP_AWAKE_TEST_GATEWAY_HEALTHY" = true ] || exit 7 ;;
+        esac
+        ;;
 esac
 [ "$KEEP_AWAKE_TEST_CURL_HEALTHY" = true ] || exit 7
 printf '{"activeHolders":[{"agent":"codex","session":"test","remainingTTLSeconds":899}],"isInhibited":true,"version":"test"}\n'
@@ -623,6 +632,34 @@ rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
 export BOXA_KEEP_AWAKE_PLATFORM=wsl2
 export BOXA_KEEP_AWAKE_INSTALL_DIR="$TMPROOT/windows-install"
 "$KEEP_AWAKE" enable >/dev/null
+windows_loopback_status="$("$KEEP_AWAKE" status)"
+assert_contains "WSL status selects responding loopback first" \
+    "Relay target: loopback (127.0.0.1)" "$windows_loopback_status"
+mkdir -p "$XDG_STATE_HOME/boxa/host-connections"
+printf '127.0.0.2\t12345\t\tfalse\tgateway\t172.30.96.1\n' \
+    > "$XDG_STATE_HOME/boxa/host-connections/17777.state"
+assert_contains "WSL status reports the active relay state target" \
+    "Relay target: gateway (172.30.96.1)" "$("$KEEP_AWAKE" status)"
+rm -f "$XDG_STATE_HOME/boxa/host-connections/17777.state"
+export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=false
+printf 'candidate-probe-start\n' >> "$KEEP_AWAKE_TEST_LOG"
+windows_gateway_status="$("$KEEP_AWAKE" status)"
+assert_contains "WSL status falls back to responding gateway" \
+    "Relay target: gateway (172.30.96.1)" "$windows_gateway_status"
+assert_eq "WSL doctor probe uses gateway candidate" ok "$("$KEEP_AWAKE" probe)"
+assert_eq "WSL target probe tries loopback before gateway" \
+    $'http://127.0.0.1:17777/v1/status\nhttp://172.30.96.1:17777/v1/status' \
+    "$(awk '/^candidate-probe-start$/ { capture=1; next }
+        capture && /^status / { sub(/^status /, ""); print }' \
+        "$KEEP_AWAKE_TEST_LOG" | head -n2)"
+export KEEP_AWAKE_TEST_GATEWAY_HEALTHY=false
+windows_unreachable_status="$("$KEEP_AWAKE" status)"
+assert_contains "WSL status reports no responding candidate" \
+    "Relay target: unreachable" "$windows_unreachable_status"
+assert_eq "WSL doctor probe rejects all unreachable candidates" missing \
+    "$("$KEEP_AWAKE" probe)"
+export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=true
+export KEEP_AWAKE_TEST_GATEWAY_HEALTHY=true
 assert_eq "Windows enable creates scheduled task" true "$(file_exists "$KEEP_AWAKE_TEST_TASK")"
 assert_eq "Windows enable creates separate tray task" true \
     "$(file_exists "$KEEP_AWAKE_TEST_TRAY_TASK")"
@@ -659,7 +696,7 @@ assert_contains "Windows wrapper logs late adapter discovery" \
 assert_contains "Windows wrapper logs dual-listener restart" \
     "restarting with loopback and vEthernet listeners" "$(cat "$windows_wrapper")"
 assert_eq "Windows task does not bake in the current WSL gateway" "0" \
-    "$(grep -c '172\.30\.96\.1' "$KEEP_AWAKE_TEST_LOG" || true)"
+    "$(grep -c '172\.30\.96\.1' "$windows_wrapper" || true)"
 assert_contains "Windows Docker build targets Windows" \
     "--env GOOS=windows" "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "Windows Docker build uses GUI subsystem" \

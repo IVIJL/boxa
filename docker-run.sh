@@ -428,6 +428,11 @@ source "$BOXA_DIR/lib/https.sh"
 source "$BOXA_DIR/lib/mkcert.sh"
 # shellcheck source=lib/cert.sh
 source "$BOXA_DIR/lib/cert.sh"
+# Keep-awake relay target selection is shared with the lifecycle helper.
+# shellcheck source=lib/host-platform.sh
+source "$BOXA_DIR/lib/host-platform.sh"
+# shellcheck source=lib/keep-awake-probe.sh
+source "$BOXA_DIR/lib/keep-awake-probe.sh"
 
 # --- Helper functions --------------------------------------------------------
 
@@ -1817,6 +1822,7 @@ host_connection_ufw_rule_is_present() {
 host_connection_support_finding() {
     local source_container="$1" host_port="$2"
     local host_ip state_file state_ip relay_pid subnet ufw_owned
+    local relay_target_kind relay_target_address
 
     host_ip="$(resolve_host_connection_ip "$source_container")"
     if [ -z "$host_ip" ]; then
@@ -1832,7 +1838,11 @@ host_connection_support_finding() {
 
     state_file="$(host_connection_state_file "$host_port")"
     [ -f "$state_file" ] || return 1
-    IFS=$'\t' read -r state_ip relay_pid subnet ufw_owned < "$state_file"
+    IFS='|' read -r state_ip relay_pid subnet ufw_owned \
+        relay_target_kind relay_target_address \
+        < <(awk -F '\t' 'NR == 1 {
+            printf "%s|%s|%s|%s|%s|%s", $1, $2, $3, $4, $5, $6
+        }' "$state_file")
     : "$ufw_owned"
     if [ "$state_ip" != "$host_ip" ] \
         || ! host_connection_relay_is_alive "$relay_pid" "$state_ip" "$host_port"; then
@@ -1952,11 +1962,16 @@ host_connection_bridge_subnet() {
 
 stop_host_connection_host_side() {
     local host_port="$1" state_file host_ip relay_pid subnet ufw_owned
+    local relay_target_kind relay_target_address
     local ufw_output ufw_rc=0
 
     state_file="$(host_connection_state_file "$host_port")"
     [ -f "$state_file" ] || return 0
-    IFS=$'\t' read -r host_ip relay_pid subnet ufw_owned < "$state_file"
+    IFS='|' read -r host_ip relay_pid subnet ufw_owned \
+        relay_target_kind relay_target_address \
+        < <(awk -F '\t' 'NR == 1 {
+            printf "%s|%s|%s|%s|%s|%s", $1, $2, $3, $4, $5, $6
+        }' "$state_file")
 
     terminate_connection_process_group "$relay_pid" "$host_ip" "$host_port"
 
@@ -1983,9 +1998,12 @@ stop_host_connection_host_side() {
 start_host_connection_host_side() {
     local host_ip="$1" host_port="$2"
     local state_file old_ip="" old_pid="" old_subnet="" old_ufw_owned=false
+    local old_target_kind="" old_target_address=""
     local relay_pid="" relay_log desired_subnet="" state_subnet=""
+    local relay_target_kind=loopback relay_target_address=127.0.0.1
     local ufw_output ufw_rc=0 ufw_owned=false
-    local relay_retry relay_ready=false ownership_rc=0
+    local relay_retry relay_ready=false relay_reused=false ownership_rc=0
+    local keep_awake_port="${BOXA_KEEP_AWAKE_PORT:-17777}" platform=""
 
     state_file="$(host_connection_state_file "$host_port")"
     host_connection_ip_is_host_owned "$host_ip" || ownership_rc=$?
@@ -2003,17 +2021,41 @@ start_host_connection_host_side() {
         return 0
     fi
 
+    if [ "$host_port" = "$keep_awake_port" ]; then
+        platform="${BOXA_KEEP_AWAKE_PLATFORM:-$(host_platform::detect 2>/dev/null || true)}"
+        if ! keep_awake_probe::select_target "$platform" "$host_port"; then
+            if [ -f "$state_file" ]; then
+                stop_host_connection_host_side "$host_port" || true
+            fi
+            if [ "$platform" = wsl2 ]; then
+                echo "Host connection relay target selection: daemon unreachable on loopback and gateway. Hint: ensure the keep-awake daemon is running and Windows Firewall allows port ${host_port}." >&2
+            else
+                echo "Host connection relay target selection: daemon unreachable on loopback. Hint: ensure the keep-awake daemon is running on port ${host_port}." >&2
+            fi
+            return 1
+        fi
+        relay_target_kind="$KEEP_AWAKE_PROBE_TARGET_KIND"
+        relay_target_address="$KEEP_AWAKE_PROBE_TARGET_ADDRESS"
+    fi
+
     if ! command -v socat >/dev/null 2>&1; then
         echo "host socat not found. Install it (Debian/Ubuntu: sudo apt-get install -y socat; Fedora/RHEL: sudo dnf install -y socat; Arch: sudo pacman -S socat; macOS: brew install socat). It is required for the Host connection relay on this platform." >&2
         return 1
     fi
 
     if [ -f "$state_file" ]; then
-        IFS=$'\t' read -r old_ip old_pid old_subnet old_ufw_owned < "$state_file"
+        IFS='|' read -r old_ip old_pid old_subnet old_ufw_owned \
+            old_target_kind old_target_address \
+            < <(awk -F '\t' 'NR == 1 {
+                printf "%s|%s|%s|%s|%s|%s", $1, $2, $3, $4, $5, $6
+            }' "$state_file")
         if [ "$old_ip" = "$host_ip" ] \
+            && [ "$old_target_kind" = "$relay_target_kind" ] \
+            && [ "$old_target_address" = "$relay_target_address" ] \
             && host_connection_relay_is_alive "$old_pid" "$old_ip" "$host_port"; then
             relay_pid="$old_pid"
             ufw_owned="$old_ufw_owned"
+            relay_reused=true
         else
             stop_host_connection_host_side "$host_port" || return 1
             old_subnet=""
@@ -2026,17 +2068,23 @@ start_host_connection_host_side() {
         relay_log="$HOST_CONNECTION_STATE_DIR/${host_port}.relay.log"
         if command -v setsid >/dev/null 2>&1; then
             setsid nohup socat "TCP-LISTEN:${host_port},bind=${host_ip},fork,reuseaddr" \
-                "TCP:127.0.0.1:${host_port}" > "$relay_log" 2>&1 &
+                "TCP:${relay_target_address}:${host_port}" > "$relay_log" 2>&1 &
         else
             nohup socat "TCP-LISTEN:${host_port},bind=${host_ip},fork,reuseaddr" \
-                "TCP:127.0.0.1:${host_port}" > "$relay_log" 2>&1 &
+                "TCP:${relay_target_address}:${host_port}" > "$relay_log" 2>&1 &
         fi
         relay_pid=$!
         for relay_retry in 1 2 3 4 5 6 7 8 9 10; do
             : "$relay_retry"
-            if host_connection_relay_is_alive "$relay_pid" "$host_ip" "$host_port" \
-                && (exec 3<> "/dev/tcp/${host_ip}/${host_port}") 2>/dev/null; then
-                relay_ready=true
+            if host_connection_relay_is_alive "$relay_pid" "$host_ip" "$host_port"; then
+                if [ "$host_port" = "$keep_awake_port" ]; then
+                    keep_awake_probe::status "$host_ip" "$host_port" >/dev/null \
+                        && relay_ready=true
+                elif (exec 3<> "/dev/tcp/${host_ip}/${host_port}") 2>/dev/null; then
+                    relay_ready=true
+                fi
+            fi
+            if [ "$relay_ready" = true ]; then
                 break
             fi
             sleep 0.02
@@ -2044,9 +2092,20 @@ start_host_connection_host_side() {
         if [ "$relay_ready" = false ]; then
             terminate_connection_process_group "$relay_pid" "$host_ip" "$host_port"
             rm -f "$state_file" "${state_file}.tmp" "$relay_log"
-            echo "Host connection relay ${host_ip}:${host_port} did not become ready; cleaned up the failed relay and firewall state." >&2
+            if [ "$host_port" = "$keep_awake_port" ]; then
+                echo "Host connection keep-awake readiness failed: daemon did not return an HTTP response through relay ${host_ip}:${host_port}; cleaned up the failed relay and firewall state. Hint: ensure the daemon is running and Windows Firewall permits the selected target." >&2
+            else
+                echo "Host connection relay ${host_ip}:${host_port} did not become ready; cleaned up the failed relay and firewall state." >&2
+            fi
             return 1
         fi
+    fi
+
+    if [ "$relay_reused" = true ] && [ "$host_port" = "$keep_awake_port" ] \
+        && ! keep_awake_probe::status "$host_ip" "$host_port" >/dev/null; then
+        stop_host_connection_host_side "$host_port" || true
+        echo "Host connection keep-awake readiness failed: daemon did not return an HTTP response through relay ${host_ip}:${host_port}. Hint: ensure the daemon is running and the Windows firewall permits the selected target." >&2
+        return 1
     fi
 
     if host_connection_ufw_active; then
@@ -2082,7 +2141,9 @@ start_host_connection_host_side() {
     if [ -z "$state_subnet" ] && [ "$old_ufw_owned" = true ]; then
         state_subnet="$old_subnet"
     fi
-    printf '%s\t%s\t%s\t%s\n' "$host_ip" "$relay_pid" "$state_subnet" "$ufw_owned" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$host_ip" "$relay_pid" "$state_subnet" "$ufw_owned" \
+        "$relay_target_kind" "$relay_target_address" \
         > "${state_file}.tmp"
     mv "${state_file}.tmp" "$state_file"
 }
@@ -3872,6 +3933,11 @@ if [ "$MODE" = "doctor" ]; then
                     echo "      $(boxa::prereq_remedy "$_step")"
                 fi
             done
+        fi
+        if printf '%s\n' "${BOXA_PROVISIONING_OK[@]}" \
+            "${BOXA_PROVISIONING_REPAIRED[@]}" | grep -qx keep-awake; then
+            "$BOXA_DIR/scripts/ensure-keep-awake.sh" status 2>/dev/null \
+                | grep '^Relay target:' || true
         fi
     }
 
