@@ -3781,6 +3781,45 @@ if [ "$MODE" = "doctor" ]; then
     # shellcheck source=lib/provisioning.sh
     source "$BOXA_DIR/lib/provisioning.sh"
 
+    # Functional DNS path probing applies only on WSL2. The DNS script owns
+    # the reusable probe helpers and exposes this stable key=value report so
+    # doctor need not duplicate either platform detection or verdict logic.
+    DOCTOR_DNS_APPLICABLE=false
+    DOCTOR_DNS_STATE=""
+    DOCTOR_DNS_WSL=""
+    DOCTOR_DNS_WINDOWS=""
+    DOCTOR_DNS_CAUSE=""
+    _doctor_probe_dns_path() {
+        local key value
+        [ -x "$BOXA_DIR/scripts/dns-install.sh" ] || return 0
+        while IFS='=' read -r key value; do
+            case "$key" in
+                applicable) DOCTOR_DNS_APPLICABLE="$value" ;;
+                state)      DOCTOR_DNS_STATE="$value" ;;
+                wsl)        DOCTOR_DNS_WSL="$value" ;;
+                windows)    DOCTOR_DNS_WINDOWS="$value" ;;
+                cause)      DOCTOR_DNS_CAUSE="$value" ;;
+            esac
+        done < <("$BOXA_DIR/scripts/dns-install.sh" probe 2>/dev/null || true)
+        if [ "$DOCTOR_DNS_APPLICABLE" = "true" ] \
+            && { [ "$DOCTOR_DNS_STATE" = "wsl-broken" ] \
+                || [ "$DOCTOR_DNS_STATE" = "windows-broken" ]; }; then
+            BOXA_PROVISIONING_PREREQ_MISSING+=("dns-path")
+        fi
+    }
+
+    _doctor_print_dns_path() {
+        [ "$DOCTOR_DNS_APPLICABLE" = "true" ] || return 0
+        echo ""
+        echo "DNS path probes:"
+        printf '  WSL side:      %s\n' "$DOCTOR_DNS_WSL"
+        printf '  Windows side:  %s\n' "$DOCTOR_DNS_WINDOWS"
+        printf '  Verdict:       %s\n' "$DOCTOR_DNS_STATE"
+        if [ -n "$DOCTOR_DNS_CAUSE" ]; then
+            printf '  Cause:         %s\n' "$DOCTOR_DNS_CAUSE"
+        fi
+    }
+
     # Parse `[--fix [step…]]`.
     DOCTOR_FIX=false
     DOCTOR_FIX_STEPS=()
@@ -3823,7 +3862,15 @@ if [ "$MODE" = "doctor" ]; then
             echo "Missing prerequisites (boxa cannot fix these for you):"
             for _step in "${BOXA_PROVISIONING_PREREQ_MISSING[@]}"; do
                 echo "  - $_step"
-                echo "      $(boxa::prereq_remedy "$_step")"
+                if [ "$_step" = "dns-path" ]; then
+                    echo "      Environment prerequisite: make the WSL2 loopback DNS path reachable."
+                    echo '      In %UserProfile%\.wslconfig:'
+                    echo '        - remove networkingMode=mirrored'
+                    echo '        - set localhostForwarding=true'
+                    echo '      Then run in Windows PowerShell: wsl --shutdown'
+                else
+                    echo "      $(boxa::prereq_remedy "$_step")"
+                fi
             done
         fi
     }
@@ -3855,6 +3902,8 @@ if [ "$MODE" = "doctor" ]; then
             echo ""
             boxa::run_provisioning fix
         fi
+        _doctor_probe_dns_path
+        _doctor_print_dns_path
         _doctor_print_summary
         if [ "${#BOXA_PROVISIONING_MISSING[@]}" -gt 0 ]; then
             echo "Still not configured after --fix (the repair did not resolve these):"
@@ -3869,6 +3918,8 @@ if [ "$MODE" = "doctor" ]; then
         echo "Running boxa doctor (repairing unconditional host provisioning)..."
         echo ""
         boxa::run_provisioning default
+        _doctor_probe_dns_path
+        _doctor_print_dns_path
         _doctor_print_summary
         if [ "${#BOXA_PROVISIONING_MISSING[@]}" -gt 0 ]; then
             echo "Not configured (elective — run the command to set up):"

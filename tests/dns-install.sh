@@ -116,6 +116,74 @@ assert_eq    "success: rc 0"                  "0"       "$rc"
 assert_eq    "success: preferred=local"       "local"   "$(conf_val preferred)"
 assert_eq    "success: active_domain=test"    "test"    "$(conf_val active_domain)"
 
+# --- Functional WSL2 path probe matrix --------------------------------------
+
+probe_bin="$_TMPROOT/probe-bin"
+mkdir -p "$probe_bin"
+cat > "$probe_bin/dig" <<'EOF'
+#!/bin/sh
+[ "${TEST_DIG_RESULT:-broken}" = "ok" ] && printf '127.0.0.1\n'
+exit 0
+EOF
+cat > "$probe_bin/powershell.exe" <<'EOF'
+#!/bin/sh
+[ -z "${TEST_POWERSHELL_SLEEP:-}" ] || sleep "$TEST_POWERSHELL_SLEEP"
+exit "${TEST_POWERSHELL_RC:-2}"
+EOF
+chmod +x "$probe_bin/dig" "$probe_bin/powershell.exe"
+PATH="$probe_bin:$PATH"
+export PATH TEST_DIG_RESULT TEST_POWERSHELL_RC
+export TEST_POWERSHELL_SLEEP BOXA_DNS_INTEROP_TIMEOUT_SECONDS
+export BOXA_DNS_INTEROP_KILL_GRACE_SECONDS
+
+TEST_RESOLVER_STATE=running
+_dns::resolver_container_state() { printf '%s' "$TEST_RESOLVER_STATE"; }
+
+assert_probe_case() {
+    local label="$1" dig_result="$2" powershell_rc="$3"
+    local expected_state="$4" expected_wsl="$5" expected_windows="$6"
+    TEST_DIG_RESULT="$dig_result"
+    TEST_POWERSHELL_RC="$powershell_rc"
+    _dns::probe_paths >/dev/null
+    assert_eq "$label: verdict" "$expected_state" "$_DNS_PATH_PROBE_STATE"
+    assert_eq "$label: WSL side" "$expected_wsl" "$_DNS_WSL_PROBE_RESULT"
+    assert_eq "$label: Windows side" "$expected_windows" "$_DNS_WINDOWS_PROBE_RESULT"
+}
+
+assert_probe_case "both paths ok" ok 0 both-ok ok ok
+assert_probe_case "Windows path broken" ok 1 windows-broken ok broken
+assert_probe_case "WSL path broken" broken 0 wsl-broken broken ok
+assert_probe_case "both paths broken" broken 1 wsl-broken broken broken
+assert_probe_case "PowerShell tooling error is fail-safe" ok 2 both-ok ok unknown
+
+TEST_POWERSHELL_SLEEP=1
+BOXA_DNS_INTEROP_TIMEOUT_SECONDS=0.05
+BOXA_DNS_INTEROP_KILL_GRACE_SECONDS=0.05
+assert_probe_case "PowerShell hang is timeout-bounded" ok 0 both-ok ok unknown
+TEST_POWERSHELL_SLEEP=""
+unset BOXA_DNS_INTEROP_TIMEOUT_SECONDS BOXA_DNS_INTEROP_KILL_GRACE_SECONDS
+
+TEST_RESOLVER_STATE=stopped
+TEST_DIG_RESULT=broken
+TEST_POWERSHELL_RC=1
+_dns::probe_paths >/dev/null
+assert_eq "resolver down: verdict" "resolver-not-running" "$_DNS_PATH_PROBE_STATE"
+assert_eq "resolver down: WSL not run" "not-run" "$_DNS_WSL_PROBE_RESULT"
+assert_eq "resolver down: Windows not run" "not-run" "$_DNS_WINDOWS_PROBE_RESULT"
+
+# Configuration inspection names a cause only; it remains outside the probe
+# state matrix above.
+wslconfig_fixture="$_TMPROOT/.wslconfig"
+cat > "$wslconfig_fixture" <<'EOF'
+[wsl2]
+networkingMode=nat
+localhostForwarding=false
+EOF
+export BOXA_WSLCONFIG_FILE="$wslconfig_fixture"
+assert_eq "cause names disabled forwarding" \
+    "WSL2 localhost forwarding is disabled (localhostForwarding=false)" \
+    "$(_dns::probe_cause)"
+
 echo
 if [ "$fail_count" -eq 0 ]; then
     echo "All assertions passed."

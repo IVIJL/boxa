@@ -296,6 +296,194 @@ _dns::resolver_works() {
     return 1
 }
 
+# --- Functional WSL2 DNS path probes ----------------------------------------
+
+# Print the boxa_dns lifecycle state consumed by both status output and the
+# functional probes: running | stopped | not-created.
+_dns::resolver_container_state() {
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx boxa_dns; then
+        printf 'running'
+    elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx boxa_dns; then
+        printf 'stopped'
+    else
+        printf 'not-created'
+    fi
+}
+
+# Query the exact WSL-side path used by local .test URLs. Prints ok | broken.
+_dns::probe_wsl_path() {
+    local probe="$1"
+    if command -v dig >/dev/null 2>&1 \
+        && dig +short +time=1 +tries=1 "$probe" @127.0.0.1 2>/dev/null \
+            | grep -q '127\.0\.0\.1'; then
+        printf 'ok'
+    else
+        printf 'broken'
+    fi
+}
+
+# Query the exact Windows path used by NRPT. The PowerShell job provides the
+# timeout, so a wedged resolver cannot hold a boxa command open indefinitely.
+# Exit 1 from the encoded command is a completed/expired DNS query (broken);
+# every other PowerShell/tooling failure is unknown and must never trigger DNS
+# degradation. Prints ok | broken | unknown.
+_dns::probe_windows_path() {
+    local probe="$1"
+    if ! command -v powershell.exe >/dev/null 2>&1 \
+        || ! command -v iconv >/dev/null 2>&1 \
+        || ! command -v base64 >/dev/null 2>&1; then
+        printf 'unknown'
+        return 0
+    fi
+
+    local ps_cmd encoded rc=0 ps_pid watchdog_pid
+    local timeout_seconds="${BOXA_DNS_INTEROP_TIMEOUT_SECONDS:-5}"
+    local kill_grace_seconds="${BOXA_DNS_INTEROP_KILL_GRACE_SECONDS:-1}"
+    ps_cmd="$(cat <<PS_PROBE
+\$ErrorActionPreference = 'Stop'
+try {
+    if (-not (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)) { exit 2 }
+    \$job = Start-Job -ScriptBlock {
+        param(\$Probe)
+        try {
+            \$answer = Resolve-DnsName -Name \$Probe -Server '127.0.0.1' -DnsOnly -Type A -ErrorAction Stop
+            if (@(\$answer | Where-Object { \$_.IPAddress -eq '127.0.0.1' }).Count -gt 0) { 'ok' } else { 'broken' }
+        } catch { 'broken' }
+    } -ArgumentList '${probe}'
+    if (\$null -eq (Wait-Job -Job \$job -Timeout 3)) {
+        Stop-Job -Job \$job -ErrorAction SilentlyContinue
+        Remove-Job -Job \$job -Force -ErrorAction SilentlyContinue
+        exit 1
+    }
+    if (\$job.State -ne 'Completed') {
+        Remove-Job -Job \$job -Force -ErrorAction SilentlyContinue
+        exit 2
+    }
+    \$result = @(Receive-Job -Job \$job -ErrorAction Stop)
+    Remove-Job -Job \$job -Force -ErrorAction SilentlyContinue
+    if (\$result -contains 'ok') { exit 0 }
+    if (\$result -contains 'broken') { exit 1 }
+    exit 2
+} catch { exit 2 }
+PS_PROBE
+)"
+    encoded="$(printf '%s' "$ps_cmd" | iconv -t UTF-16LE | base64 -w0)"
+    powershell.exe -NoProfile -EncodedCommand "$encoded" >/dev/null 2>&1 &
+    ps_pid=$!
+    # The in-PowerShell job bounds the DNS query itself. This outer watchdog
+    # also bounds interop startup/tooling hangs; those map to unknown below.
+    (
+        sleep "$timeout_seconds"
+        kill "$ps_pid" 2>/dev/null || exit 0
+        sleep "$kill_grace_seconds"
+        kill -KILL "$ps_pid" 2>/dev/null || true
+    ) &
+    watchdog_pid=$!
+    wait "$ps_pid" || rc=$?
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    case "$rc" in
+        0) printf 'ok' ;;
+        1) printf 'broken' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+# Best-effort WSL configuration reader. Configuration only names a failed
+# functional probe; it never participates in the verdict. Tests may point the
+# reader at a fixture with BOXA_WSLCONFIG_FILE.
+_dns::wslconfig_value() {
+    local wanted="$1" config="${BOXA_WSLCONFIG_FILE:-}"
+    if [ -z "$config" ]; then
+        command -v cmd.exe >/dev/null 2>&1 || return 0
+        command -v wslpath >/dev/null 2>&1 || return 0
+        local windows_home
+        windows_home="$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r\n')"
+        [ -n "$windows_home" ] || return 0
+        config="$(wslpath -u "$windows_home" 2>/dev/null)/.wslconfig"
+    fi
+    [ -f "$config" ] || return 0
+    awk -v wanted="$wanted" '
+        function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+        /^[[:space:]]*\[/ {
+            section=tolower($0)
+            gsub(/[[:space:]\[\]]/, "", section)
+            next
+        }
+        section == "wsl2" && index($0, "=") {
+            key=tolower(trim(substr($0, 1, index($0, "=") - 1)))
+            value=trim(substr($0, index($0, "=") + 1))
+            sub(/[[:space:]]*[#;].*$/, "", value)
+            if (key == tolower(wanted)) { print tolower(trim(value)); exit }
+        }
+    ' "$config" 2>/dev/null
+}
+
+# Print a human explanation for a broken functional path. This is deliberately
+# best-effort and separate from `_dns::probe_paths`' decision.
+_dns::probe_cause() {
+    local networking_mode="" configured_mode="" localhost_forwarding=""
+    if command -v wslinfo >/dev/null 2>&1; then
+        networking_mode="$(wslinfo --networking-mode 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '\r\n')"
+    fi
+    configured_mode="$(_dns::wslconfig_value networkingMode)"
+    localhost_forwarding="$(_dns::wslconfig_value localhostForwarding)"
+
+    if [ "$networking_mode" = "mirrored" ] || [ "$configured_mode" = "mirrored" ]; then
+        printf 'WSL2 mirrored networking (networkingMode=mirrored) blocks loopback DNS on port 53'
+    elif [ "$localhost_forwarding" = "false" ]; then
+        printf 'WSL2 localhost forwarding is disabled (localhostForwarding=false)'
+    else
+        printf 'WSL2 loopback DNS path is unavailable (cause not identified from configuration)'
+    fi
+}
+
+# Probe both sides once and populate reusable result globals. Prints exactly
+# one verdict: both-ok | windows-broken | wsl-broken | resolver-not-running.
+# A Windows tooling failure leaves that side unknown but deliberately maps to
+# the non-degrading both-ok verdict because there is no evidence of breakage.
+_dns::probe_paths() {
+    local container_state probe
+    container_state="$(_dns::resolver_container_state)"
+    _DNS_WSL_PROBE_RESULT="not-run"
+    _DNS_WINDOWS_PROBE_RESULT="not-run"
+    _DNS_PROBE_CAUSE=""
+    if [ "$container_state" != "running" ]; then
+        _DNS_PATH_PROBE_STATE="resolver-not-running"
+        printf '%s' "$_DNS_PATH_PROBE_STATE"
+        return 0
+    fi
+
+    probe="boxa-path-probe-$$-${RANDOM}.${BOXA_LOCAL_TLD}"
+    _DNS_WSL_PROBE_RESULT="$(_dns::probe_wsl_path "$probe")"
+    _DNS_WINDOWS_PROBE_RESULT="$(_dns::probe_windows_path "$probe")"
+    if [ "$_DNS_WSL_PROBE_RESULT" = "broken" ]; then
+        _DNS_PATH_PROBE_STATE="wsl-broken"
+    elif [ "$_DNS_WINDOWS_PROBE_RESULT" = "broken" ]; then
+        _DNS_PATH_PROBE_STATE="windows-broken"
+    else
+        _DNS_PATH_PROBE_STATE="both-ok"
+    fi
+    if [ "$_DNS_PATH_PROBE_STATE" = "wsl-broken" ] \
+        || [ "$_DNS_PATH_PROBE_STATE" = "windows-broken" ]; then
+        _DNS_PROBE_CAUSE="$(_dns::probe_cause)"
+    fi
+    printf '%s' "$_DNS_PATH_PROBE_STATE"
+}
+
+# Stable key=value bridge for other boxa commands. Non-WSL2 hosts are marked
+# inapplicable and perform no DNS probes, preserving their existing behaviour.
+_dns::probe_report() {
+    if [ "$(_dns::detect_platform)" != "wsl2" ]; then
+        printf 'applicable=false\n'
+        return 0
+    fi
+    _dns::probe_paths >/dev/null
+    printf 'applicable=true\nstate=%s\nwsl=%s\nwindows=%s\ncause=%s\n' \
+        "$_DNS_PATH_PROBE_STATE" "$_DNS_WSL_PROBE_RESULT" \
+        "$_DNS_WINDOWS_PROBE_RESULT" "$_DNS_PROBE_CAUSE"
+}
+
 # --- dns.conf writer ---------------------------------------------------------
 
 # Atomically rewrite ~/.config/boxa/dns.conf, replacing the values for
@@ -1014,7 +1202,7 @@ _dns::disable_https() {
 # --- Status ------------------------------------------------------------------
 
 _dns::status() {
-    local platform
+    local platform resolver_state
     platform="$(_dns::detect_platform)"
     echo "Platform:           $platform"
     echo "Active domain:      $(boxa::route_domain)"
@@ -1038,15 +1226,25 @@ _dns::status() {
             echo "NM drop-in:         $d $([ -f "$d" ] && echo "(present)" || echo "(missing)")"
             ;;
     esac
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx boxa_dns; then
+    resolver_state="$(_dns::resolver_container_state)"
+    if [ "$resolver_state" = "running" ]; then
         echo "Resolver container: boxa_dns (running)"
-    elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx boxa_dns; then
+    elif [ "$resolver_state" = "stopped" ]; then
         echo "Resolver container: boxa_dns (stopped — starts with next boxa)"
     else
         echo "Resolver container: boxa_dns (not created — starts with next boxa)"
     fi
     echo
-    if _dns::resolver_works; then
+    if [ "$platform" = "wsl2" ]; then
+        _dns::probe_paths >/dev/null
+        echo "DNS path probes:"
+        printf '  WSL side:      %s\n' "$_DNS_WSL_PROBE_RESULT"
+        printf '  Windows side:  %s\n' "$_DNS_WINDOWS_PROBE_RESULT"
+        printf '  Verdict:       %s\n' "$_DNS_PATH_PROBE_STATE"
+        if [ -n "$_DNS_PROBE_CAUSE" ]; then
+            printf '  Cause:         %s\n' "$_DNS_PROBE_CAUSE"
+        fi
+    elif _dns::resolver_works; then
         _ok "Verification: *.${BOXA_LOCAL_TLD} resolves to 127.0.0.1."
     elif [ "$(boxa::route_domain)" = "$BOXA_LOCAL_TLD" ]; then
         _warn "Verification: *.${BOXA_LOCAL_TLD} does NOT currently resolve to 127.0.0.1. Ensure boxa_dns is running ('boxa <project>')."
@@ -1224,7 +1422,7 @@ main() {
     local mode_pref="auto"
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            install|status|uninstall|purge-ca) action="$1" ;;
+            install|status|uninstall|purge-ca|probe) action="$1" ;;
             --local)          mode_pref="local" ;;
             --external)       mode_pref="external" ;;
             --auto)           mode_pref="auto" ;;
@@ -1256,6 +1454,7 @@ main() {
             _dns::install_ca || true
             ;;
         status)         _dns::status        || rc=$? ;;
+        probe)          _dns::probe_report  || rc=$? ;;
         uninstall)      _dns::uninstall     || rc=$? ;;
         purge-ca)       _dns::purge_ca      || rc=$? ;;
         enable-https|disable-https)
