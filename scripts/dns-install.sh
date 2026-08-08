@@ -665,8 +665,23 @@ _dns::auto_transition() {
             ;;
         both-ok)
             if [ "$active" != "$BOXA_LOCAL_TLD" ]; then
-                _dns::write_mode local "$BOXA_LOCAL_TLD" "$provider"
-                _ok ".test DNS restored — boxa switched back automatically."
+                # A fresh incompatible/inconclusive install deliberately has
+                # neither host artifact. Recovery therefore cannot be only a
+                # dns.conf flip: whichever normal bootstrap first proves both
+                # paths healthy must run the same WSL2 provisioning writers as
+                # dns-install/update/doctor. This may prompt once for sudo/UAC,
+                # at the first moment those artifacts are demonstrably useful.
+                _dns::prime_sudo
+                if _dns::install_wsl2; then
+                    _dns::write_mode local "$BOXA_LOCAL_TLD" "$provider"
+                    _ok ".test DNS restored — boxa installed the host DNS artifacts and switched back automatically."
+                else
+                    # Do not advertise .test when provisioning produced no
+                    # usable host side. The writers already emitted the precise
+                    # warnings; keep the sticky degraded state loud and retry on
+                    # a later bootstrap or explicit provisioning entry point.
+                    _dns::degraded_banner "" "$external_domain"
+                fi
             fi
             ;;
         resolver-not-running)
@@ -738,6 +753,24 @@ _dns::install() {
         return 0
     fi
 
+    # A real host listener is a DURABLE reason to live on sslip.io and must be
+    # checked before WSL2's fresh-install probe bootstrap. Otherwise the
+    # attempted boxa_dns bind itself fails, the probe becomes inconclusive, and
+    # the heal-later state incorrectly masks a conflict that cannot self-heal.
+    # boxa_dns itself is excluded by the predicate, so an existing healthy local
+    # installation still proceeds to the functional path probe below.
+    if _dns::port_53_held_by_other; then
+        _warn "Port 53 is in use by another process — local mode would conflict."
+        if [ "$mode_pref" = "local" ]; then
+            _fail "--local requested but port 53 is busy. Aborting."
+            return 1
+        fi
+        _info "Falling back to external mode."
+        _dns::write_mode external "$DEFAULT_EXTERNAL_DOMAIN" "$DEFAULT_EXTERNAL_PROVIDER"
+        _ok "External mode active."
+        return 0
+    fi
+
     # On WSL2 the functional path is the only compatibility signal. A
     # conclusive failure means both host artifacts would be dead
     # configuration, so do not write the resolved drop-in or enter the
@@ -774,20 +807,6 @@ _dns::install() {
             _dns::degraded_banner
             return 0
         fi
-    fi
-
-    # Port 53 conflict is likewise DURABLE (another resolver owns the port);
-    # external is the correct steady state, not a degraded one.
-    if _dns::port_53_held_by_other; then
-        _warn "Port 53 is in use by another process — local mode would conflict."
-        if [ "$mode_pref" = "local" ]; then
-            _fail "--local requested but port 53 is busy. Aborting."
-            return 1
-        fi
-        _info "Falling back to external mode."
-        _dns::write_mode external "$DEFAULT_EXTERNAL_DOMAIN" "$DEFAULT_EXTERNAL_PROVIDER"
-        _ok "External mode active."
-        return 0
     fi
 
     local setup_rc=0

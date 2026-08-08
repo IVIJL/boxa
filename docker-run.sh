@@ -751,12 +751,13 @@ ensure_dns_runtime_config() {
 # container entirely), so its presence — running or stopped — is a safe
 # tell that the user was on local mode before the file vanished.
 #
-# Does NOT auto-invoke `boxa dns-install`: that path writes host
-# resolver files and prompts for sudo / UAC, neither of which belongs
-# mid-`boxa <project>` invocation. Active repair of a missing host
-# resolver drop-in lives in the `boxa update` flow instead, where the
-# user has already opted into an interactive session — see
-# `_boxa::resolver_drop_in_missing` and its call site.
+# Does NOT auto-invoke `boxa dns-install` merely because metadata vanished:
+# that would write host resolver files and prompt for sudo / UAC without proof
+# they are useful. General repair of a missing host drop-in lives in the
+# interactive `boxa update`/doctor flows. The narrower WSL2 heal-later case is
+# owned by `dns-install.sh auto-transition`: after bootstrap proves both paths
+# healthy, it provisions the deliberately skipped artifacts before advertising
+# .test again.
 ensure_dns_meta_config() {
     local conf="$HOME/.config/boxa/dns.conf"
     [ -f "$conf" ] && return 0
@@ -780,9 +781,10 @@ EOF
 # per-platform resolver drop-in is gone — wiped by an OS upgrade, a system
 # reinstall, or a stray `dns-install uninstall`. In this state the resolver
 # container still runs and external (sslip.io) URLs still work, but the
-# browser cannot resolve `*.test`, and `bootstrap_dns`'s self-heal can't
-# repair it without prompting for sudo mid-`boxa <project>`. The fix lives
-# in the `boxa update` flow, which is already interactive.
+# browser cannot resolve `*.test`. General repair lives in the interactive
+# `boxa update`/doctor flows. On WSL2, bootstrap has one proof-driven exception:
+# auto-transition provisions artifacts skipped by a fresh degraded install once
+# both functional paths pass, accepting the then-useful sudo/UAC prompt.
 #
 # Also fires for the degraded state `dns-install --auto` leaves behind
 # (preferred=local + external active_domain), whether resolver setup failed or

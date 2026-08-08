@@ -220,6 +220,30 @@ assert_eq "WSL fresh bootstrap inconclusive: resolved drop-in skipped" \
 assert_eq "WSL fresh bootstrap inconclusive: NRPT skipped" \
     "missing" "$([ -e "$wsl_artifacts/nrpt" ] && printf present || printf missing)"
 
+# A genuine external port-53 owner is a durable conflict, even when it also
+# prevents the fresh-install resolver bootstrap from producing a conclusive
+# probe. Detect it before attempting boxa_dns and settle into external mode.
+reset_conf
+TEST_INSTALL_STATE="resolver-not-running"
+TEST_INSTALL_WSL="not-run"
+TEST_INSTALL_WINDOWS="not-run"
+fresh_conflict_start_marker="$_TMPROOT/fresh-conflict-resolver-started"
+rm -f "$fresh_conflict_start_marker"
+_dns::start_probe_resolver() {
+    touch "$fresh_conflict_start_marker"
+    return 1
+}
+_dns::port_53_held_by_other() { return 0; }
+out="$(_dns::install auto 2>&1)"; rc=$?
+assert_eq "WSL fresh port conflict: rc 0" "0" "$rc"
+assert_eq "WSL fresh port conflict: resolver bootstrap skipped" \
+    "missing" "$([ -e "$fresh_conflict_start_marker" ] && printf present || printf missing)"
+assert_eq "WSL fresh port conflict: preferred settles external" \
+    "external" "$(conf_val preferred)"
+assert_match "WSL fresh port conflict: calm durable fallback" "$out" \
+    'External mode active'
+_dns::port_53_held_by_other() { return 1; }
+
 # Existing artifacts are deliberately left untouched when a later probe
 # fails; none of the uninstall helpers belongs to this transition path.
 TEST_INSTALL_STATE="windows-broken"
@@ -428,10 +452,28 @@ assert_match "auto-degrade: banner repeats" "$out_repeat" \
     '^.*\.test DNS is degraded:'
 
 TEST_AUTO_STATE="both-ok"
+rm -f "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt"
+_dns::port_53_held_by_other() { return 1; }
+_dns::install_linux_resolved() { touch "$wsl_artifacts/resolved"; }
+_dns::install_wsl2_nrpt() { touch "$wsl_artifacts/nrpt"; }
 out="$(_dns::auto_transition 2>&1)"
 assert_eq "auto-heal: preferred stays local" "local" "$(conf_val preferred)"
 assert_eq "auto-heal: active domain flips local" "test" "$(conf_val active_domain)"
+assert_eq "auto-heal: plain-up path installs resolved drop-in" \
+    "present" "$([ -e "$wsl_artifacts/resolved" ] && printf present || printf missing)"
+assert_eq "auto-heal: plain-up path installs NRPT" \
+    "present" "$([ -e "$wsl_artifacts/nrpt" ] && printf present || printf missing)"
 assert_match "auto-heal: restored confirmation" "$out" '\.test DNS restored'
+
+reset_conf
+seed_mode local 127.0.0.1.sslip.io
+_dns::install_linux_resolved() { return 1; }
+_dns::install_wsl2_nrpt() { return 1; }
+out="$(_dns::auto_transition 2>&1)"
+assert_eq "auto-heal provisioning failure: remains external" \
+    "127.0.0.1.sslip.io" "$(conf_val active_domain)"
+assert_match "auto-heal provisioning failure: remains visibly degraded" "$out" \
+    '\.test host resolver was NOT set up'
 
 reset_conf
 seed_mode external 127.0.0.1.sslip.io
