@@ -10,6 +10,8 @@ BOXA_DIR="${BOXA_DIR:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}"
 source "$BOXA_DIR/lib/keep-awake-probe.sh"
 KEEP_AWAKE_PORT="${BOXA_KEEP_AWAKE_PORT:-17777}"
 KEEP_AWAKE_TASK_NAME="BoxaKeepAwake"
+KEEP_AWAKE_FIREWALL_RULE_NAME="BoxaKeepAwakeWSL"
+KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME="Boxa Keep-Awake (WSL)"
 KEEP_AWAKE_LAUNCH_LABEL="dev.boxa.keep-awake"
 KEEP_AWAKE_TRAY_TASK_NAME="BoxaKeepAwakeTray"
 KEEP_AWAKE_TRAY_LAUNCH_LABEL="dev.boxa.keep-awake-tray"
@@ -133,6 +135,95 @@ keep_awake::init_windows_paths() {
     KEEP_AWAKE_WINDOWS_WRAPPER="${windows_local_appdata}\\Boxa\\start-keep-awake.ps1"
     KEEP_AWAKE_TRAY_FILE="$KEEP_AWAKE_INSTALL_DIR/keep-awake-tray.ps1"
     KEEP_AWAKE_WINDOWS_TRAY_FILE="${windows_local_appdata}\\Boxa\\keep-awake-tray.ps1"
+}
+
+keep_awake::firewall_rule_present() {
+    [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] || return 1
+    powershell.exe -NoProfile -NonInteractive -Command \
+        "if (Get-NetFirewallRule -Name '$KEEP_AWAKE_FIREWALL_RULE_NAME' -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" \
+        >/dev/null 2>&1
+}
+
+keep_awake::run_elevated_powershell() {
+    local inner="$1" encoded_inner outer encoded_outer rc=0
+    command -v iconv >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 \
+        || return 127
+    encoded_inner="$(printf '%s' "$inner" | iconv -t UTF-16LE | base64 -w0)"
+    outer="try { \$p = Start-Process powershell -Verb RunAs -Wait -PassThru -ErrorAction Stop -ArgumentList '-NoProfile','-EncodedCommand','${encoded_inner}'; exit \$p.ExitCode } catch [System.ComponentModel.Win32Exception] { if (\$_.Exception.NativeErrorCode -eq 1223) { exit 3 } exit 1 } catch { exit 1 }"
+    encoded_outer="$(printf '%s' "$outer" | iconv -t UTF-16LE | base64 -w0)"
+    powershell.exe -NoProfile -EncodedCommand "$encoded_outer" >/dev/null 2>&1 || rc=$?
+    return "$rc"
+}
+
+keep_awake::ensure_firewall_rule() {
+    local ps_cmd rc=0
+    [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] || return 0
+    keep_awake::firewall_rule_present && return 0
+    ps_cmd="$(cat <<EOF
+\$ErrorActionPreference = 'Stop'
+if (-not (Get-NetFirewallRule -Name '$KEEP_AWAKE_FIREWALL_RULE_NAME' -ErrorAction SilentlyContinue)) {
+    \$interfaces = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { \$_.InterfaceAlias -like 'vEthernet (WSL*' } |
+        Select-Object -ExpandProperty InterfaceAlias -Unique)
+    if (\$interfaces.Count -eq 0) { exit 4 }
+    New-NetFirewallRule -Name '$KEEP_AWAKE_FIREWALL_RULE_NAME' -DisplayName '$KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME' -Description 'Allow Boxa keep-awake from the WSL virtual subnet.' -Enabled True -Profile Any -Direction Inbound -Action Allow -Protocol TCP -LocalPort '$KEEP_AWAKE_PORT' -InterfaceAlias \$interfaces -RemoteAddress LocalSubnet | Out-Null
+}
+EOF
+)"
+    printf 'keep-awake: installing Windows firewall rule "%s" (UAC will prompt).\n' \
+        "$KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME" >&2
+    keep_awake::run_elevated_powershell "$ps_cmd" || rc=$?
+    if [ "$rc" -eq 0 ] && keep_awake::firewall_rule_present; then
+        return 0
+    fi
+    case "$rc" in
+        3)
+            printf 'keep-awake: WARNING: Windows firewall elevation was declined; the WSL NAT path to TCP port %s stays blocked. Mirrored networking/loopback keeps working.\n' \
+                "$KEEP_AWAKE_PORT" >&2
+            ;;
+        4)
+            printf 'keep-awake: WARNING: the WSL vEthernet interface was not found; Windows firewall rule "%s" was not created and the NAT path stays blocked.\n' \
+                "$KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME" >&2
+            ;;
+        127)
+            printf 'keep-awake: WARNING: iconv/base64 are unavailable; Windows firewall rule "%s" was not created and the NAT path stays blocked.\n' \
+                "$KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME" >&2
+            ;;
+        *)
+            printf 'keep-awake: WARNING: Windows firewall rule "%s" could not be created (exit %s); the WSL NAT path stays blocked. Mirrored networking/loopback keeps working.\n' \
+                "$KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME" "$rc" >&2
+            ;;
+    esac
+    return 1
+}
+
+keep_awake::remove_firewall_rule() {
+    local ps_cmd rc=0
+    [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] || return 0
+    keep_awake::firewall_rule_present || return 0
+    ps_cmd="\$ErrorActionPreference = 'Stop'; Get-NetFirewallRule -Name '$KEEP_AWAKE_FIREWALL_RULE_NAME' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"
+    printf 'keep-awake: removing Windows firewall rule "%s" (UAC will prompt).\n' \
+        "$KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME" >&2
+    keep_awake::run_elevated_powershell "$ps_cmd" || rc=$?
+    if [ "$rc" -eq 0 ] && ! keep_awake::firewall_rule_present; then
+        return 0
+    fi
+    printf 'keep-awake: WARNING: Windows firewall rule "%s" could not be removed (exit %s); remove it manually if it remains.\n' \
+        "$KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME" "$rc" >&2
+    return 1
+}
+
+keep_awake::daemon_running() {
+    case "$KEEP_AWAKE_PLATFORM" in
+        wsl2)
+            powershell.exe -NoProfile -NonInteractive -Command \
+                "if (Get-CimInstance Win32_Process -Filter \"Name='keep-awake.exe'\" -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" \
+                >/dev/null 2>&1
+            ;;
+        *)
+            [ -x "$KEEP_AWAKE_BINARY" ] && pgrep -f "$KEEP_AWAKE_BINARY" >/dev/null 2>&1
+            ;;
+    esac
 }
 
 keep_awake::state_field() {
@@ -800,6 +891,7 @@ keep_awake::remove_host_connection() {
 
 keep_awake::rollback() {
     keep_awake::remove_host_connection >/dev/null 2>&1 || true
+    keep_awake::remove_firewall_rule >/dev/null 2>&1 || true
     keep_awake::tray::remove >/dev/null 2>&1 || true
     keep_awake::remove_autostart
     keep_awake::stop_direct
@@ -818,6 +910,7 @@ keep_awake::wait_until_reachable() {
 
 keep_awake::enable() {
     local autostart_mode=system tmp_dir="" built_binary=""
+    local firewall_rule_ready=true daemon_reachable=true
     if [ "$#" -gt 0 ]; then
         if [ "$#" -ne 2 ] || [ "$1" != --autostart ]; then
             printf 'keep-awake enable: expected --autostart <system|terminal|none>\n' >&2
@@ -864,10 +957,19 @@ keep_awake::enable() {
             return 1
         fi
     fi
+    if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] \
+        && ! keep_awake::ensure_firewall_rule; then
+        firewall_rule_ready=false
+    fi
     if ! keep_awake::wait_until_reachable; then
-        keep_awake::rollback
-        printf 'keep-awake: daemon did not become reachable; rolled back.\n' >&2
-        return 1
+        if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] && [ "$firewall_rule_ready" = false ]; then
+            daemon_reachable=false
+            printf 'keep-awake: WARNING: daemon reachability could not be verified while the Windows firewall rule is absent; enable will continue so mirrored/loopback operation remains available.\n' >&2
+        else
+            keep_awake::rollback
+            printf 'keep-awake: daemon did not become reachable; rolled back.\n' >&2
+            return 1
+        fi
     fi
     # A connection failure (typically one stale box refusing the firewall
     # slot) must NOT tear down a working daemon: keep everything installed,
@@ -904,6 +1006,11 @@ keep_awake::enable() {
     if [ "$host_connection_active" = false ]; then
         printf 'keep-awake: Host connection failed in at least one box; daemon, autostart, and tray stay installed.\n' >&2
         printf 'keep-awake: fix the reported boxes, then re-run "boxa keep-awake enable" to retry the connection.\n' >&2
+        if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] \
+            && [ "$firewall_rule_ready" = false ] \
+            && [ "$daemon_reachable" = false ]; then
+            return 0
+        fi
         return 1
     fi
 }
@@ -922,6 +1029,7 @@ keep_awake::teardown() {
     if ! $keep_connection; then
         keep_awake::remove_host_connection || rc=1
     fi
+    keep_awake::remove_firewall_rule || true
     keep_awake::tray::remove || rc=1
     keep_awake::remove_autostart
     keep_awake::stop_direct
@@ -946,7 +1054,7 @@ keep_awake::disable() {
 
 keep_awake::status() {
     local status_json="" holders="[]" daemon=no daemon_target=unreachable
-    local autostart=no connection=no tray client_signal autostart_mode
+    local autostart=no connection=no tray client_signal autostart_mode firewall_rule
     keep_awake::init_paths || return 1
     autostart_mode="$(keep_awake::autostart_mode)"
     if keep_awake_probe::select_target "$KEEP_AWAKE_PLATFORM" "$KEEP_AWAKE_PORT"; then
@@ -980,8 +1088,29 @@ keep_awake::status() {
     printf 'Autostart installed: %s\n' "$autostart"
     printf 'autostart: %s\n' "$autostart_mode"
     printf 'Host connection present: %s\n' "$connection"
+    if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ]; then
+        if keep_awake::firewall_rule_present; then
+            firewall_rule="present ($KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME)"
+        else
+            firewall_rule="absent ($KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME)"
+        fi
+        printf 'Windows firewall rule: %s\n' "$firewall_rule"
+        if [ "$daemon" = no ] && ! keep_awake::firewall_rule_present \
+            && keep_awake::daemon_running; then
+            printf 'Diagnosis: gateway target unreachable while the daemon runs; missing Windows firewall rule "%s" is the likely cause.\n' \
+                "$KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME"
+        fi
+    fi
     printf 'Client signal: %s\n' "$client_signal"
     printf 'Tray: %s\n' "$tray"
+}
+
+keep_awake::doctor() {
+    keep_awake::init_paths || return 0
+    [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] || return 0
+    [ "$(keep_awake::state_field enabled 2>/dev/null || true)" = true ] || return 0
+    keep_awake::status \
+        | grep -E '^(Relay target:|Windows firewall rule:|Diagnosis:)'
 }
 
 keep_awake::offer() {
@@ -1027,6 +1156,7 @@ case "$command_name" in
     enable)      keep_awake::enable "$@" ;;
     disable)     keep_awake::disable ;;
     status)      keep_awake::status ;;
+    doctor)      keep_awake::doctor ;;
     teardown)    keep_awake::teardown "$@" ;;
     go-prereq)   keep_awake::go_prereq ;;
     go-remedy)   keep_awake::go_remedy; printf '\n' ;;

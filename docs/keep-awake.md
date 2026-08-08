@@ -14,7 +14,12 @@ loopback and vEthernet listeners. `status` and `doctor` also require the task's
 PowerShell wrapper to exist; `boxa keep-awake enable` repairs a missing wrapper.
 On WSL2, boxa functionally probes the daemon on loopback first and then on the
 default gateway. The keep-awake Host connection relays to the first target that
-returns an HTTP status response; `status` and `doctor` report that target.
+returns an HTTP status response. Enablement also requests elevation to install
+the `Boxa Keep-Awake (WSL)` Windows firewall rule, limited to TCP port 17777,
+the WSL vEthernet interface, and remote addresses on its local subnet. Declining
+UAC leaves mirrored/loopback operation available but the NAT gateway path
+blocked; enablement continues and `status` / `doctor` identify the missing rule
+as the likely cause. Disable and uninstall remove the rule best effort.
 
 ```bash
 boxa keep-awake enable

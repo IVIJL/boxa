@@ -22,6 +22,9 @@ export KEEP_AWAKE_TEST_SYSTEMD="$TMPROOT/systemd"
 export KEEP_AWAKE_TEST_TRAY_SYSTEMD="$TMPROOT/tray-systemd"
 export KEEP_AWAKE_TEST_CONNECT="$XDG_CONFIG_HOME/boxa/connect/_all.tsv"
 export KEEP_AWAKE_TEST_TRAY_PROCESS=false
+export KEEP_AWAKE_TEST_DAEMON_PROCESS=false
+export KEEP_AWAKE_TEST_FIREWALL_ELEVATION=success
+export KEEP_AWAKE_TEST_FIREWALL_RULE="$TMPROOT/firewall-rule"
 export KEEP_AWAKE_TEST_CURL_HEALTHY=true
 export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=true
 export KEEP_AWAKE_TEST_GATEWAY_HEALTHY=true
@@ -165,6 +168,31 @@ EOF
 
 cat > "$TMPROOT/bin/powershell.exe" <<'EOF'
 #!/usr/bin/env bash
+if [[ "$*" == *Get-NetFirewallRule* ]]; then
+    [ -f "$KEEP_AWAKE_TEST_FIREWALL_RULE" ]
+    exit
+fi
+if [ "${1:-}" = -NoProfile ] && [ "${2:-}" = -EncodedCommand ]; then
+    outer="$(printf '%s' "${3:-}" | base64 -d | iconv -f UTF-16LE)"
+    inner_encoded="$(printf '%s' "$outer" \
+        | sed -n "s/.*'-EncodedCommand','\([^']*\)'.*/\1/p")"
+    inner="$(printf '%s' "$inner_encoded" | base64 -d | iconv -f UTF-16LE)"
+    printf 'firewall %s\n' "$inner" >> "$KEEP_AWAKE_TEST_LOG"
+    case "$KEEP_AWAKE_TEST_FIREWALL_ELEVATION" in
+        decline) exit 3 ;;
+        fail)    exit 1 ;;
+    esac
+    if [[ "$inner" == *New-NetFirewallRule* ]]; then
+        : > "$KEEP_AWAKE_TEST_FIREWALL_RULE"
+    elif [[ "$inner" == *Remove-NetFirewallRule* ]]; then
+        rm -f "$KEEP_AWAKE_TEST_FIREWALL_RULE"
+    fi
+    exit 0
+fi
+if [[ "$*" == *"Name='keep-awake.exe'"* ]]; then
+    [ "$KEEP_AWAKE_TEST_DAEMON_PROCESS" = true ]
+    exit
+fi
 if [[ "$*" == *Get-ScheduledTask* ]]; then
     [ -f "$KEEP_AWAKE_TEST_TRAY_TASK" ]
     exit
@@ -632,9 +660,26 @@ rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
 export BOXA_KEEP_AWAKE_PLATFORM=wsl2
 export BOXA_KEEP_AWAKE_INSTALL_DIR="$TMPROOT/windows-install"
 "$KEEP_AWAKE" enable >/dev/null
+assert_eq "Windows enable creates firewall rule" true \
+    "$(file_exists "$KEEP_AWAKE_TEST_FIREWALL_RULE")"
+assert_contains "Windows firewall rule is TCP-only" "-Protocol TCP" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "Windows firewall rule uses the keep-awake port" "-LocalPort '17777'" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "Windows firewall rule is limited to WSL interfaces" \
+    "-InterfaceAlias \$interfaces" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "Windows firewall rule is limited to the interface subnet" \
+    "-RemoteAddress LocalSubnet" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+firewall_creates_before="$(grep -c 'New-NetFirewallRule' "$KEEP_AWAKE_TEST_LOG")"
+"$KEEP_AWAKE" enable >/dev/null
+assert_eq "repeated Windows enable does not duplicate firewall rule" \
+    "$firewall_creates_before" "$(grep -c 'New-NetFirewallRule' "$KEEP_AWAKE_TEST_LOG")"
 windows_loopback_status="$("$KEEP_AWAKE" status)"
 assert_contains "WSL status selects responding loopback first" \
     "Relay target: loopback (127.0.0.1)" "$windows_loopback_status"
+assert_contains "WSL status reports firewall rule name and presence" \
+    "Windows firewall rule: present (Boxa Keep-Awake (WSL))" \
+    "$windows_loopback_status"
 mkdir -p "$XDG_STATE_HOME/boxa/host-connections"
 printf '127.0.0.2\t12345\t\tfalse\tgateway\t172.30.96.1\n' \
     > "$XDG_STATE_HOME/boxa/host-connections/17777.state"
@@ -716,6 +761,84 @@ assert_eq "Windows disable deletes tray task" false \
     "$(file_exists "$KEEP_AWAKE_TEST_TRAY_TASK")"
 assert_eq "Windows disable removes runtime gateway wrapper" false "$(file_exists "$windows_wrapper")"
 assert_eq "Windows disable removes tray script" false "$(file_exists "$windows_tray")"
+assert_eq "Windows disable removes firewall rule" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_FIREWALL_RULE")"
+assert_contains "Windows firewall removal uses Remove-NetFirewallRule" \
+    "Remove-NetFirewallRule" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+
+# UAC cancellation is survivable even under NAT: installation remains enabled,
+# while status and doctor identify the absent Windows rule as the likely cause.
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+: > "$KEEP_AWAKE_TEST_LOG"
+export KEEP_AWAKE_TEST_FIREWALL_ELEVATION=decline
+export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=false
+export KEEP_AWAKE_TEST_GATEWAY_HEALTHY=false
+export KEEP_AWAKE_TEST_CONNECT_FAIL=true
+export KEEP_AWAKE_TEST_DAEMON_PROCESS=true
+declined_firewall_rc=0
+declined_firewall_output="$("$KEEP_AWAKE" enable 2>&1)" || declined_firewall_rc=$?
+assert_eq "declined firewall elevation keeps enable successful" 0 "$declined_firewall_rc"
+assert_contains "declined firewall elevation warns that NAT stays blocked" \
+    "WSL NAT path to TCP port 17777 stays blocked" "$declined_firewall_output"
+assert_contains "declined firewall elevation preserves mirrored loopback" \
+    "Mirrored networking/loopback keeps working" "$declined_firewall_output"
+assert_eq "declined firewall elevation creates no rule" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_FIREWALL_RULE")"
+declined_firewall_status="$("$KEEP_AWAKE" status)"
+assert_contains "status reports absent firewall rule by name" \
+    "Windows firewall rule: absent (Boxa Keep-Awake (WSL))" \
+    "$declined_firewall_status"
+assert_contains "status diagnoses absent firewall rule for running daemon" \
+    'missing Windows firewall rule "Boxa Keep-Awake (WSL)" is the likely cause' \
+    "$declined_firewall_status"
+assert_contains "doctor diagnoses absent firewall rule for running daemon" \
+    'missing Windows firewall rule "Boxa Keep-Awake (WSL)" is the likely cause' \
+    "$("$KEEP_AWAKE" doctor)"
+
+doctor_cli_dir="$TMPROOT/keep-awake-doctor-cli"
+mkdir -p "$doctor_cli_dir/lib" "$doctor_cli_dir/scripts"
+cp "$BOXA_DIR/docker-run.sh" "$doctor_cli_dir/docker-run.sh"
+cp -R "$BOXA_DIR/lib/." "$doctor_cli_dir/lib/"
+cp "$KEEP_AWAKE" "$doctor_cli_dir/scripts/ensure-keep-awake.sh"
+cat > "$doctor_cli_dir/lib/provisioning.sh" <<'EOF'
+#!/usr/bin/env bash
+BOXA_PROVISIONING_STEPS=("keep-awake|scripts/ensure-keep-awake.sh|B")
+boxa::run_provisioning() {
+    BOXA_PROVISIONING_REPAIRED=()
+    BOXA_PROVISIONING_OK=()
+    BOXA_PROVISIONING_SKIPPED=()
+    BOXA_PROVISIONING_PREREQ_MISSING=()
+    BOXA_PROVISIONING_MISSING=("keep-awake")
+    BOXA_PROVISIONING_DECLINED=()
+    BOXA_PROVISIONING_FAILED=()
+}
+boxa::prereq_remedy() { :; }
+EOF
+chmod +x "$doctor_cli_dir/docker-run.sh" \
+    "$doctor_cli_dir/scripts/ensure-keep-awake.sh"
+rm -f "$KEEP_AWAKE_TEST_CONNECT"
+boxa_doctor_output="$(BOXA_DIR="$doctor_cli_dir" \
+    bash "$doctor_cli_dir/docker-run.sh" doctor 2>&1 || true)"
+assert_contains "boxa doctor reports absent firewall rule by name" \
+    "Windows firewall rule: absent (Boxa Keep-Awake (WSL))" \
+    "$boxa_doctor_output"
+assert_contains "boxa doctor names absent firewall rule as likely cause" \
+    'missing Windows firewall rule "Boxa Keep-Awake (WSL)" is the likely cause' \
+    "$boxa_doctor_output"
+export KEEP_AWAKE_TEST_FIREWALL_ELEVATION=success
+export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=true
+export KEEP_AWAKE_TEST_GATEWAY_HEALTHY=true
+export KEEP_AWAKE_TEST_CONNECT_FAIL=false
+export KEEP_AWAKE_TEST_DAEMON_PROCESS=false
+"$KEEP_AWAKE" disable >/dev/null
+
+# Uninstall teardown owns the same best-effort elevated firewall cleanup.
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+"$KEEP_AWAKE" enable >/dev/null
+"$KEEP_AWAKE" teardown --keep-connection --remove-state >/dev/null
+assert_eq "Windows uninstall teardown removes firewall rule" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_FIREWALL_RULE")"
+rm -f "$KEEP_AWAKE_TEST_CONNECT"
 
 rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
 : > "$KEEP_AWAKE_TEST_LOG"

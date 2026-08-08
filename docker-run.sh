@@ -3937,7 +3937,9 @@ if [ "$MODE" = "doctor" ]; then
         if printf '%s\n' "${BOXA_PROVISIONING_OK[@]}" \
             "${BOXA_PROVISIONING_REPAIRED[@]}" | grep -qx keep-awake; then
             "$BOXA_DIR/scripts/ensure-keep-awake.sh" status 2>/dev/null \
-                | grep '^Relay target:' || true
+                | grep -E '^(Relay target:|Windows firewall rule:|Diagnosis:)' || true
+        elif printf '%s\n' "${BOXA_PROVISIONING_MISSING[@]}" | grep -qx keep-awake; then
+            "$BOXA_DIR/scripts/ensure-keep-awake.sh" doctor 2>/dev/null || true
         fi
     }
 
