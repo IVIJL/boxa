@@ -223,16 +223,18 @@ _dns::install_linux_nm() {
 # curl) and the Windows host needs an NRPT rule (for browser + native Windows
 # tools). Both ultimately route to 127.0.0.1:53 inside WSL2 via WSL2
 # localhost forwarding. Either side may fail independently; we keep what
-# worked and warn loudly about the rest. Returns 0 when both sides are
-# configured, 1 when neither is configured, and 2 for a partial setup. Normal
-# install accepts rc=2 as "local mode is at least partially functional";
-# automatic recovery requires rc=0 before advertising .test again.
+# worked and warn loudly about the rest. Returns 0 when all applicable sides
+# are configured, 1 when nothing applicable is configured, and 2 for a partial
+# setup. Normal install accepts rc=2 as "local mode is at least partially
+# functional"; automatic recovery requires rc=0 before advertising .test
+# again.
 _dns::install_wsl2() {
-    local linux_ok=0 windows_ok=0
+    local linux_applicable=0 linux_ok=0 windows_ok=0
     _DNS_WSL2_INSTALL_FAILURE=""
 
     if command -v systemctl >/dev/null 2>&1 \
         && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        linux_applicable=1
         if _dns::install_linux_resolved; then
             linux_ok=1
         fi
@@ -246,6 +248,14 @@ _dns::install_wsl2() {
         fi
     else
         _warn "powershell.exe not found — cannot configure Windows NRPT. Run from a WSL2 distro with Windows interop enabled."
+    fi
+
+    if [ "$linux_applicable" -eq 0 ]; then
+        if [ "$windows_ok" -eq 1 ]; then
+            return 0
+        fi
+        _DNS_WSL2_INSTALL_FAILURE="Windows NRPT setup failed"
+        return 1
     fi
 
     if [ "$linux_ok" -eq 1 ] && [ "$windows_ok" -eq 1 ]; then

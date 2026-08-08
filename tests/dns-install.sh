@@ -135,7 +135,7 @@ wsl_uninstall_log="$_TMPROOT/wsl-uninstall.log"
 mkdir -p "$wsl_bin" "$wsl_artifacts"
 cat > "$wsl_bin/systemctl" <<'EOF'
 #!/bin/sh
-exit 0
+[ "${TEST_SYSTEMCTL_ACTIVE:-1}" = "1" ]
 EOF
 cat > "$wsl_bin/powershell.exe" <<'EOF'
 #!/bin/sh
@@ -144,6 +144,7 @@ EOF
 chmod +x "$wsl_bin/systemctl" "$wsl_bin/powershell.exe"
 PATH="$wsl_bin:$PATH"
 export PATH
+export TEST_SYSTEMCTL_ACTIVE=1
 
 TEST_INSTALL_STATE="windows-broken"
 TEST_INSTALL_WSL="ok"
@@ -177,6 +178,14 @@ _dns::install_linux_resolved() { return 1; }
 _dns::install_wsl2_nrpt() { touch "$wsl_artifacts/nrpt"; }
 _dns::install_wsl2 >/dev/null 2>&1; rc=$?
 assert_eq "WSL provisioning partial: Windows-only returns partial" "2" "$rc"
+
+rm -f "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt"
+TEST_SYSTEMCTL_ACTIVE=0
+_dns::install_linux_resolved() { return 1; }
+_dns::install_wsl2_nrpt() { touch "$wsl_artifacts/nrpt"; }
+_dns::install_wsl2 >/dev/null 2>&1; rc=$?
+assert_eq "WSL provisioning NRPT-only: inapplicable resolved side returns success" "0" "$rc"
+TEST_SYSTEMCTL_ACTIVE=1
 
 reset_conf
 TEST_INSTALL_STATE="both-ok"
