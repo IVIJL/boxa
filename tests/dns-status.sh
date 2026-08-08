@@ -323,6 +323,67 @@ else
     printf 'PASS  ports: healthy local mode has no reminder\n'
 fi
 
+# --- Case 8: doctor late-installs artifacts after the path heals ------------
+
+doctor_heal_dir="$_TMPROOT/doctor-heal-cli"
+mkdir -p "$doctor_heal_dir/lib" "$doctor_heal_dir/scripts" \
+    "$doctor_heal_dir/bin" "$doctor_heal_dir/home/.config/boxa"
+cp "$BOXA_DIR/docker-run.sh" "$doctor_heal_dir/docker-run.sh"
+cp -R "$BOXA_DIR/lib/." "$doctor_heal_dir/lib/"
+cat > "$doctor_heal_dir/lib/provisioning.sh" <<'EOF'
+#!/bin/bash
+BOXA_PROVISIONING_STEPS=("stub-step|-|A")
+boxa::run_provisioning() {
+    BOXA_PROVISIONING_REPAIRED=()
+    BOXA_PROVISIONING_OK=("stub-step")
+    BOXA_PROVISIONING_FAILED=()
+    BOXA_PROVISIONING_SKIPPED=()
+    BOXA_PROVISIONING_MISSING=()
+    BOXA_PROVISIONING_DECLINED=()
+    BOXA_PROVISIONING_PREREQ_MISSING=()
+}
+boxa::prereq_remedy() { printf 'unused'; }
+EOF
+cat > "$doctor_heal_dir/scripts/dns-install.sh" <<'EOF'
+#!/bin/bash
+if [ "${1:-}" = "install" ]; then
+    printf '%s\n' "$*" >> "$TEST_DNS_INSTALL_LOG"
+    exit 0
+fi
+cat <<'REPORT'
+applicable=true
+state=both-ok
+wsl=ok
+windows=ok
+cause=
+REPORT
+EOF
+cat > "$doctor_heal_dir/bin/docker" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat > "$doctor_heal_dir/bin/setsid" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$doctor_heal_dir/docker-run.sh" \
+    "$doctor_heal_dir/scripts/dns-install.sh" \
+    "$doctor_heal_dir/bin/docker" "$doctor_heal_dir/bin/setsid"
+
+cat > "$doctor_heal_dir/home/.config/boxa/dns.conf" <<'EOF'
+preferred=local
+active_domain=127.0.0.1.sslip.io
+external_provider=sslip.io
+EOF
+doctor_heal_log="$doctor_heal_dir/dns-install.log"
+TEST_DNS_INSTALL_LOG="$doctor_heal_log" \
+    BOXA_DNS_CONF="$doctor_heal_dir/home/.config/boxa/dns.conf" \
+    HOME="$doctor_heal_dir/home" PATH="$doctor_heal_dir/bin:$PATH" \
+    bash "$doctor_heal_dir/docker-run.sh" doctor >/dev/null 2>&1
+doctor_heal_calls="$(cat "$doctor_heal_log" 2>/dev/null || true)"
+assert_match "doctor heal: missing DNS artifacts invoke local install" \
+    "$doctor_heal_calls" '^install --local$'
+
 # --- Summary -----------------------------------------------------------------
 
 if [ "$fail_count" -eq 0 ]; then

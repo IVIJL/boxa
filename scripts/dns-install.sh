@@ -489,6 +489,18 @@ _dns::probe_report() {
         "$_DNS_WINDOWS_PROBE_RESULT" "$_DNS_PROBE_CAUSE"
 }
 
+# Return success only for a conclusive functional-path failure. A missing probe
+# tool makes the observation inconclusive even when the other side reported a
+# failure, so provisioning continues exactly as before in that case.
+_dns::probe_is_broken() {
+    case "${_DNS_PATH_PROBE_STATE:-}" in
+        windows-broken|wsl-broken) ;;
+        *) return 1 ;;
+    esac
+    [ "${_DNS_WSL_PROBE_RESULT:-unknown}" != "unknown" ] \
+        && [ "${_DNS_WINDOWS_PROBE_RESULT:-unknown}" != "unknown" ]
+}
+
 # --- dns.conf writer ---------------------------------------------------------
 
 # Atomically rewrite ~/.config/boxa/dns.conf, replacing the values for
@@ -579,8 +591,9 @@ _dns::auto_transition() {
 
     # Any tooling uncertainty makes the overall observation inconclusive,
     # even if the other side reported broken in the same probe pass.
-    if [ "${_DNS_WSL_PROBE_RESULT:-unknown}" = "unknown" ] \
-        || [ "${_DNS_WINDOWS_PROBE_RESULT:-unknown}" = "unknown" ]; then
+    if ! _dns::probe_is_broken \
+        && { [ "${_DNS_WSL_PROBE_RESULT:-unknown}" = "unknown" ] \
+            || [ "${_DNS_WINDOWS_PROBE_RESULT:-unknown}" = "unknown" ]; }; then
         [ "$active" = "$BOXA_LOCAL_TLD" ] \
             || _dns::degraded_banner "$cause" "$external_domain"
         return 0
@@ -665,6 +678,25 @@ _dns::install() {
         _dns::write_mode external "$DEFAULT_EXTERNAL_DOMAIN" "$DEFAULT_EXTERNAL_PROVIDER"
         _ok "External mode active. URLs: <port>.<project>.${DEFAULT_EXTERNAL_DOMAIN}"
         return 0
+    fi
+
+    # On WSL2 the functional path is the only compatibility signal. A
+    # conclusive failure means both host artifacts would be dead
+    # configuration, so do not write the resolved drop-in or enter the
+    # elevated NRPT installer. Keep the local preference sticky, advertise
+    # the working external URLs, and report success: certificates are
+    # provisioned by main after this function returns in either mode.
+    if [ "$platform" = "wsl2" ]; then
+        _dns::probe_paths >/dev/null
+        if _dns::probe_is_broken; then
+            local provider external_domain
+            provider="$(boxa::external_provider)"
+            external_domain="127.0.0.1.${provider}"
+            _dns::write_mode local "$external_domain" "$provider"
+            _dns::degraded_banner "${_DNS_PROBE_CAUSE:-$(_dns::probe_cause)}" \
+                "$external_domain"
+            return 0
+        fi
     fi
 
     # Port 53 conflict is likewise DURABLE (another resolver owns the port);

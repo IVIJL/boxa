@@ -116,7 +116,97 @@ assert_eq    "success: rc 0"                  "0"       "$rc"
 assert_eq    "success: preferred=local"       "local"   "$(conf_val preferred)"
 assert_eq    "success: active_domain=test"    "test"    "$(conf_val active_domain)"
 
+# --- WSL2 artifact provisioning follows the functional probe ----------------
+
+wsl_bin="$_TMPROOT/wsl-bin"
+wsl_artifacts="$_TMPROOT/wsl-artifacts"
+wsl_uninstall_log="$_TMPROOT/wsl-uninstall.log"
+mkdir -p "$wsl_bin" "$wsl_artifacts"
+cat > "$wsl_bin/systemctl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat > "$wsl_bin/powershell.exe" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$wsl_bin/systemctl" "$wsl_bin/powershell.exe"
+PATH="$wsl_bin:$PATH"
+export PATH
+
+TEST_INSTALL_STATE="windows-broken"
+TEST_INSTALL_WSL="ok"
+TEST_INSTALL_WINDOWS="broken"
+TEST_INSTALL_CA_MARKER="$_TMPROOT/ca-installed"
+_dns::detect_platform() { printf 'wsl2\n'; }
+_dns::probe_paths() {
+    _DNS_PATH_PROBE_STATE="$TEST_INSTALL_STATE"
+    _DNS_WSL_PROBE_RESULT="$TEST_INSTALL_WSL"
+    _DNS_WINDOWS_PROBE_RESULT="$TEST_INSTALL_WINDOWS"
+    _DNS_PROBE_CAUSE="WSL2 mirrored networking (networkingMode=mirrored) blocks loopback DNS on port 53"
+}
+_dns::install_linux_resolved() { touch "$wsl_artifacts/resolved"; }
+_dns::install_wsl2_nrpt() { touch "$wsl_artifacts/nrpt"; }
+_dns::uninstall_resolved_drop_in() { printf 'resolved\n' >> "$wsl_uninstall_log"; }
+_dns::uninstall_wsl2_nrpt() { printf 'nrpt\n' >> "$wsl_uninstall_log"; }
+_dns::prime_sudo() { :; }
+_dns::install_ca() { touch "$TEST_INSTALL_CA_MARKER"; }
+
+reset_conf
+rm -f "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt" \
+    "$wsl_uninstall_log" "$TEST_INSTALL_CA_MARKER"
+out="$(main install --auto 2>&1)"; rc=$?
+assert_eq "WSL broken fresh: rc 0" "0" "$rc"
+assert_eq "WSL broken fresh: preferred stays local" \
+    "local" "$(conf_val preferred)"
+assert_eq "WSL broken fresh: active domain is external" \
+    "127.0.0.1.sslip.io" "$(conf_val active_domain)"
+assert_match "WSL broken fresh: degradation banner" "$out" \
+    '\.test DNS is degraded:.*mirrored networking'
+assert_eq "WSL broken fresh: resolved drop-in skipped" \
+    "missing" "$([ -e "$wsl_artifacts/resolved" ] && printf present || printf missing)"
+assert_eq "WSL broken fresh: NRPT skipped" \
+    "missing" "$([ -e "$wsl_artifacts/nrpt" ] && printf present || printf missing)"
+assert_eq "WSL broken fresh: CA still provisioned" \
+    "present" "$([ -e "$TEST_INSTALL_CA_MARKER" ] && printf present || printf missing)"
+
+# Existing artifacts are deliberately left untouched when a later probe
+# fails; none of the uninstall helpers belongs to this transition path.
+touch "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt"
+_dns::install auto >/dev/null 2>&1
+assert_eq "WSL degrade-later: resolved drop-in remains" \
+    "present" "$([ -e "$wsl_artifacts/resolved" ] && printf present || printf missing)"
+assert_eq "WSL degrade-later: NRPT remains" \
+    "present" "$([ -e "$wsl_artifacts/nrpt" ] && printf present || printf missing)"
+assert_eq "WSL degrade-later: no uninstall helper called" \
+    "missing" "$([ -e "$wsl_uninstall_log" ] && printf present || printf missing)"
+
+# A later passing probe enters both normal installers. Their writes are
+# naturally idempotent here just as the real drop-in rewrite and NRPT
+# existence guard are; a repeated run leaves the same artifact set.
+rm -f "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt"
+TEST_INSTALL_STATE="both-ok"
+TEST_INSTALL_WSL="ok"
+TEST_INSTALL_WINDOWS="ok"
+_dns::install auto >/dev/null 2>&1
+assert_eq "WSL heal-later: resolved drop-in installed" \
+    "present" "$([ -e "$wsl_artifacts/resolved" ] && printf present || printf missing)"
+assert_eq "WSL heal-later: NRPT installed" \
+    "present" "$([ -e "$wsl_artifacts/nrpt" ] && printf present || printf missing)"
+assert_eq "WSL heal-later: active domain returns local" \
+    "test" "$(conf_val active_domain)"
+wsl_artifacts_before="$(cksum "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt")"
+_dns::install auto >/dev/null 2>&1
+wsl_artifacts_after="$(cksum "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt")"
+assert_eq "WSL heal-later: repeated install is idempotent" \
+    "$wsl_artifacts_before" "$wsl_artifacts_after"
+
 # --- Functional WSL2 path probe matrix --------------------------------------
+
+# Restore the real probe functions after the install-specific overrides above.
+# shellcheck source=../scripts/dns-install.sh disable=SC1091
+source "$BOXA_DIR/scripts/dns-install.sh"
+set +e +u +o pipefail
 
 probe_bin="$_TMPROOT/probe-bin"
 mkdir -p "$probe_bin"

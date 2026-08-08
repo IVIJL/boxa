@@ -784,11 +784,11 @@ EOF
 # repair it without prompting for sudo mid-`boxa <project>`. The fix lives
 # in the `boxa update` flow, which is already interactive.
 #
-# Also fires for the degraded state a failed `dns-install --auto` leaves
-# behind (preferred=local + external active_domain): there the install never
-# completed, so the retry is short-circuited in before the platform probes —
-# crucially so WSL2 NRPT-only degraded installs aren't missed by the Linux
-# drop-in checks below.
+# Also fires for the degraded state `dns-install --auto` leaves behind
+# (preferred=local + external active_domain), whether resolver setup failed or
+# a conclusive WSL2 path probe intentionally skipped both dead artifacts. This
+# short-circuits before the platform checks so the normal provisioning entry
+# points retry once the functional path heals.
 #
 # Returns 0 when self-heal is needed, 1 otherwise. The predicate keys off
 # *the live runtime* rather than `_dns::detect_platform`: we check for the
@@ -815,11 +815,10 @@ _boxa::resolver_drop_in_missing() {
         return 1
     fi
 
-    # Degraded state: preferred=local but advertising the external fallback
-    # because a prior resolver setup FAILED. Nothing landed on disk on ANY
-    # platform — and on a WSL2 NRPT-only setup the Linux drop-in checks below
-    # would wrongly report "nothing missing" and skip the retry the degraded
-    # banner promised. Flag it for self-heal here, before any platform probe.
+    # Degraded state: preferred=local but advertising the external fallback.
+    # Flag it for self-heal before platform-specific artifact checks; on WSL2
+    # dns-install's functional probe decides whether retrying may write either
+    # artifact, and returns success without touching them while still broken.
     if [ "$domain" != "$BOXA_LOCAL_TLD" ]; then
         return 0
     fi
@@ -860,9 +859,10 @@ _boxa::resolver_drop_in_missing() {
 # predicate returns false and nothing further runs.
 #
 # `--local` (not `--auto`) so a port-53 conflict or sudo failure surfaces as
-# an error instead of silently rewriting dns.conf to external mode. The
-# predicate already gated on the user being in local mode; honour that on
-# failure too.
+# an error instead of silently rewriting dns.conf to user-selected external
+# mode. A conclusive WSL2 path failure is different: dns-install preserves the
+# sticky local preference, keeps the degraded external domain active, and
+# returns success without writing artifacts.
 _boxa::self_heal_resolver_drop_in() {
     _boxa::resolver_drop_in_missing || return 0
     echo ""
@@ -3923,6 +3923,12 @@ if [ "$MODE" = "doctor" ]; then
                 fi ;;
         esac
     done
+
+    # DNS host artifacts are unconditional once a sticky local preference is
+    # present. The shared dns-install path probes WSL2 before writing either
+    # artifact, so doctor repairs skipped artifacts only after the functional
+    # path heals and never removes or re-prompts for them while it is broken.
+    _boxa::self_heal_resolver_drop_in
 
     _doctor_print_summary() {
         echo ""
