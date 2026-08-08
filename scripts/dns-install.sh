@@ -310,11 +310,15 @@ _dns::resolver_container_state() {
     fi
 }
 
-# Query the exact WSL-side path used by local .test URLs. Prints ok | broken.
+# Query the exact WSL-side path used by local .test URLs. Prints
+# ok | broken | unknown; missing tooling is never evidence of degradation.
 _dns::probe_wsl_path() {
     local probe="$1"
-    if command -v dig >/dev/null 2>&1 \
-        && dig +short +time=1 +tries=1 "$probe" @127.0.0.1 2>/dev/null \
+    if ! command -v dig >/dev/null 2>&1; then
+        printf 'unknown'
+        return 0
+    fi
+    if dig +short +time=1 +tries=1 "$probe" @127.0.0.1 2>/dev/null \
             | grep -q '127\.0\.0\.1'; then
         printf 'ok'
     else
@@ -440,8 +444,9 @@ _dns::probe_cause() {
 
 # Probe both sides once and populate reusable result globals. Prints exactly
 # one verdict: both-ok | windows-broken | wsl-broken | resolver-not-running.
-# A Windows tooling failure leaves that side unknown but deliberately maps to
-# the non-degrading both-ok verdict because there is no evidence of breakage.
+# A probe tooling failure leaves that side unknown but deliberately maps to the
+# non-degrading both-ok verdict when the other path is healthy because there is
+# no evidence of breakage.
 _dns::probe_paths() {
     local container_state probe
     container_state="$(_dns::resolver_container_state)"
@@ -532,12 +537,73 @@ _dns::write_mode() {
 # *working* sslip.io fallback meanwhile and self-heal retries the resolver on
 # the next `boxa update`.
 _dns::degraded_banner() {
+    local cause="${1:-}"
+    local external_domain="${2:-$DEFAULT_EXTERNAL_DOMAIN}"
+    if [ -n "$cause" ]; then
+        echo >&2
+        printf "${RED}%s${NC}\n" "==> .test DNS is degraded: $cause." >&2
+        printf "${YELLOW}%s${NC}\n" \
+            "    This is a system limitation, not a boxa bug: this WSL2 mode systemically cannot carry loopback DNS on port 53." \
+            "    Use the external URL form: https://<port>.<project>.${external_domain}" \
+            "    .test keeps working inside Containers, and HTTPS works on both domains." \
+            '    Recovery: in %UserProfile%\.wslconfig, remove networkingMode=mirrored and set localhostForwarding=true.' \
+            '    Then run in Windows PowerShell: wsl --shutdown' \
+            "    Start boxa again; boxa will switch back to .test automatically when DNS is restored." >&2
+        return 0
+    fi
+
     echo >&2
     printf "${RED}%s${NC}\n" "==> .test host resolver was NOT set up." >&2
     printf "${YELLOW}%s${NC}\n" \
         "    Boxa URLs use the sslip.io fallback for now: <port>.<project>.${DEFAULT_EXTERNAL_DOMAIN}" \
         "    To get the shorter .test URLs working, re-run:  boxa dns-install --local" \
         "    (boxa update retries this automatically once the resolver drop-in is missing)." >&2
+}
+
+# Reconcile the sticky local preference with the functional WSL2 DNS path.
+# Called after the resolver bootstrap on every Container start. Probe/tooling
+# uncertainty and a stopped resolver are observation-only: neither may change
+# the advertised domain. An already degraded state stays loud on every start,
+# including those inconclusive cases.
+_dns::auto_transition() {
+    [ "$(_dns::detect_platform)" = "wsl2" ] || return 0
+    [ "$(boxa::dns_preferred)" = "local" ] || return 0
+
+    local active state cause provider external_domain
+    active="$(boxa::route_domain)"
+    provider="$(boxa::external_provider)"
+    external_domain="127.0.0.1.${provider}"
+    _dns::probe_paths >/dev/null
+    state="$_DNS_PATH_PROBE_STATE"
+    cause="${_DNS_PROBE_CAUSE:-$(_dns::probe_cause)}"
+
+    # Any tooling uncertainty makes the overall observation inconclusive,
+    # even if the other side reported broken in the same probe pass.
+    if [ "${_DNS_WSL_PROBE_RESULT:-unknown}" = "unknown" ] \
+        || [ "${_DNS_WINDOWS_PROBE_RESULT:-unknown}" = "unknown" ]; then
+        [ "$active" = "$BOXA_LOCAL_TLD" ] \
+            || _dns::degraded_banner "$cause" "$external_domain"
+        return 0
+    fi
+
+    case "$state" in
+        windows-broken|wsl-broken)
+            if [ "$active" = "$BOXA_LOCAL_TLD" ]; then
+                _dns::write_mode local "$external_domain" "$provider"
+            fi
+            _dns::degraded_banner "$cause" "$external_domain"
+            ;;
+        both-ok)
+            if [ "$active" != "$BOXA_LOCAL_TLD" ]; then
+                _dns::write_mode local "$BOXA_LOCAL_TLD" "$provider"
+                _ok ".test DNS restored — boxa switched back automatically."
+            fi
+            ;;
+        resolver-not-running)
+            [ "$active" = "$BOXA_LOCAL_TLD" ] \
+                || _dns::degraded_banner "$cause" "$external_domain"
+            ;;
+    esac
 }
 
 # Prime a single sudo session before the resolver write and the CA install
@@ -1422,7 +1488,7 @@ main() {
     local mode_pref="auto"
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            install|status|uninstall|purge-ca|probe) action="$1" ;;
+            install|status|uninstall|purge-ca|probe|auto-transition) action="$1" ;;
             --local)          mode_pref="local" ;;
             --external)       mode_pref="external" ;;
             --auto)           mode_pref="auto" ;;
@@ -1455,6 +1521,7 @@ main() {
             ;;
         status)         _dns::status        || rc=$? ;;
         probe)          _dns::probe_report  || rc=$? ;;
+        auto-transition) _dns::auto_transition || rc=$? ;;
         uninstall)      _dns::uninstall     || rc=$? ;;
         purge-ca)       _dns::purge_ca      || rc=$? ;;
         enable-https|disable-https)

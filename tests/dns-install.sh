@@ -166,7 +166,8 @@ unset BOXA_DNS_INTEROP_TIMEOUT_SECONDS BOXA_DNS_INTEROP_KILL_GRACE_SECONDS
 TEST_RESOLVER_STATE=stopped
 TEST_DIG_RESULT=broken
 TEST_POWERSHELL_RC=1
-_dns::probe_paths >/dev/null
+run_probe_paths() { _dns::probe_paths; }
+run_probe_paths >/dev/null
 assert_eq "resolver down: verdict" "resolver-not-running" "$_DNS_PATH_PROBE_STATE"
 assert_eq "resolver down: WSL not run" "not-run" "$_DNS_WSL_PROBE_RESULT"
 assert_eq "resolver down: Windows not run" "not-run" "$_DNS_WINDOWS_PROBE_RESULT"
@@ -183,6 +184,90 @@ export BOXA_WSLCONFIG_FILE="$wslconfig_fixture"
 assert_eq "cause names disabled forwarding" \
     "WSL2 localhost forwarding is disabled (localhostForwarding=false)" \
     "$(_dns::probe_cause)"
+
+# --- Automatic degradation transitions -------------------------------------
+
+seed_mode() {
+    _dns::write_mode "$1" "$2" "${3:-sslip.io}"
+}
+
+TEST_AUTO_STATE="both-ok"
+TEST_AUTO_WSL="ok"
+TEST_AUTO_WINDOWS="ok"
+TEST_AUTO_CAUSE="WSL2 mirrored networking (networkingMode=mirrored) blocks loopback DNS on port 53"
+_dns::detect_platform() { printf 'wsl2\n'; }
+_dns::probe_paths() {
+    _DNS_PATH_PROBE_STATE="$TEST_AUTO_STATE"
+    _DNS_WSL_PROBE_RESULT="$TEST_AUTO_WSL"
+    _DNS_WINDOWS_PROBE_RESULT="$TEST_AUTO_WINDOWS"
+    _DNS_PROBE_CAUSE="$TEST_AUTO_CAUSE"
+}
+
+reset_conf
+seed_mode local test
+TEST_AUTO_STATE="windows-broken"
+out="$(_dns::auto_transition 2>&1)"
+assert_eq "auto-degrade: preferred stays local" "local" "$(conf_val preferred)"
+assert_eq "auto-degrade: active domain flips external" \
+    "127.0.0.1.sslip.io" "$(conf_val active_domain)"
+assert_match "auto-degrade: names cause" "$out" 'mirrored networking'
+assert_match "auto-degrade: says system limitation, not bug" "$out" \
+    'system limitation, not a boxa bug'
+assert_match "auto-degrade: gives external URL form" "$out" \
+    'https://<port>\.<project>\.127\.0\.0\.1\.sslip\.io'
+assert_match "auto-degrade: keeps Container .test" "$out" \
+    '\.test keeps working inside Containers'
+assert_match "auto-degrade: promises automatic recovery" "$out" \
+    'switch back to \.test automatically'
+
+out_repeat="$(_dns::auto_transition 2>&1)"
+assert_match "auto-degrade: banner repeats" "$out_repeat" \
+    '^.*\.test DNS is degraded:'
+
+TEST_AUTO_STATE="both-ok"
+out="$(_dns::auto_transition 2>&1)"
+assert_eq "auto-heal: preferred stays local" "local" "$(conf_val preferred)"
+assert_eq "auto-heal: active domain flips local" "test" "$(conf_val active_domain)"
+assert_match "auto-heal: restored confirmation" "$out" '\.test DNS restored'
+
+reset_conf
+seed_mode external 127.0.0.1.sslip.io
+TEST_AUTO_STATE="windows-broken"
+_dns::auto_transition >/dev/null 2>&1
+assert_eq "user external: preferred untouched" "external" "$(conf_val preferred)"
+assert_eq "user external: active domain untouched" \
+    "127.0.0.1.sslip.io" "$(conf_val active_domain)"
+
+reset_conf
+seed_mode local 127.0.0.1.sslip.io
+TEST_AUTO_STATE="resolver-not-running"
+_dns::auto_transition >/dev/null 2>&1
+assert_eq "resolver down: no transition" \
+    "127.0.0.1.sslip.io" "$(conf_val active_domain)"
+
+TEST_AUTO_STATE="both-ok"
+TEST_AUTO_WINDOWS="unknown"
+_dns::auto_transition >/dev/null 2>&1
+assert_eq "tooling failure: no transition" \
+    "127.0.0.1.sslip.io" "$(conf_val active_domain)"
+
+reset_conf
+seed_mode local test
+TEST_AUTO_STATE="wsl-broken"
+TEST_AUTO_WSL="broken"
+_dns::auto_transition >/dev/null 2>&1
+assert_eq "partial tooling failure: no degrade transition" \
+    "test" "$(conf_val active_domain)"
+TEST_AUTO_WSL="ok"
+TEST_AUTO_WINDOWS="ok"
+
+reset_conf
+seed_mode local 127.0.0.1.sslip.io
+_dns::detect_platform() { printf 'unsupported\n'; }
+TEST_AUTO_STATE="both-ok"
+_dns::auto_transition >/dev/null 2>&1
+assert_eq "non-WSL: no transition" \
+    "127.0.0.1.sslip.io" "$(conf_val active_domain)"
 
 echo
 if [ "$fail_count" -eq 0 ]; then

@@ -269,6 +269,60 @@ else
     fail_count=$((fail_count + 1))
 fi
 
+# --- Case 7: up wiring and degraded port reminders --------------------------
+
+bootstrap_body="$(sed -n '/^bootstrap_dns() {/,/^}/p' "$BOXA_DIR/docker-run.sh")"
+assert_match "up: transition runs after resolver bootstrap" "$bootstrap_body" \
+    '_boxa::bootstrap_dns_resolver.*'
+assert_match "up: invokes automatic DNS transition" "$bootstrap_body" \
+    'dns-install\.sh" auto-transition'
+
+ports_home="$doctor_dir/ports-home"
+ports_routes="$ports_home/.config/boxa/traefik/dynamic"
+ports_conf="$ports_home/.config/boxa/dns.conf"
+mkdir -p "$ports_routes"
+touch "$ports_routes/boxa-demo-3000.yml"
+
+write_ports_mode() {
+    local preferred="$1" active_domain="$2"
+    mkdir -p "$(dirname "$ports_conf")"
+    printf 'preferred=%s\nactive_domain=%s\nexternal_provider=sslip.io\n' \
+        "$preferred" "$active_domain" > "$ports_conf"
+}
+
+run_mocked_ports() {
+    HOME="$ports_home" BOXA_DNS_CONF="$ports_conf" PATH="$doctor_dir/bin:$PATH" \
+        bash "$doctor_dir/docker-run.sh" ports --all 2>&1
+}
+
+write_ports_mode local 127.0.0.1.sslip.io
+out="$(run_mocked_ports)"
+assert_match "ports: degraded reminder" "$out" \
+    "DNS degradation active.*boxa dns-status"
+
+port_out="$(HOME="$ports_home" BOXA_DNS_CONF="$ports_conf" PATH="$doctor_dir/bin:$PATH" \
+    bash "$doctor_dir/docker-run.sh" port 3001 2>&1)"
+assert_match "port: degraded reminder" "$port_out" \
+    "DNS degradation active.*boxa dns-status"
+
+write_ports_mode external 127.0.0.1.sslip.io
+out="$(run_mocked_ports)"
+if grep -q 'DNS degradation active' <<< "$out"; then
+    printf 'FAIL  ports: user external mode has no reminder\n'
+    fail_count=$((fail_count + 1))
+else
+    printf 'PASS  ports: user external mode has no reminder\n'
+fi
+
+write_ports_mode local test
+out="$(run_mocked_ports)"
+if grep -q 'DNS degradation active' <<< "$out"; then
+    printf 'FAIL  ports: healthy local mode has no reminder\n'
+    fail_count=$((fail_count + 1))
+else
+    printf 'PASS  ports: healthy local mode has no reminder\n'
+fi
+
 # --- Summary -----------------------------------------------------------------
 
 if [ "$fail_count" -eq 0 ]; then

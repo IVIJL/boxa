@@ -885,7 +885,7 @@ _boxa::self_heal_resolver_drop_in() {
 # `docker run` implicit-pull an unrelated `ivijl/boxa:latest` from a
 # registry. The user's own container creation later in this script still
 # fails-loud at its own image-inspect guard.
-bootstrap_dns() {
+_boxa::bootstrap_dns_resolver() {
     # Phase 4 self-heal: ensure_dns_meta_config runs first because it can
     # flip the active mode (when dns.conf was missing and we infer local
     # from container presence), which then affects the route_domain guard.
@@ -919,6 +919,28 @@ bootstrap_dns() {
             --entrypoint dnsmasq \
             "$IMAGE" \
             --keep-in-foreground --conf-file=/etc/boxa-dns.conf
+    fi
+}
+
+# Probe the functional WSL2 DNS path after every resolver bootstrap and let
+# dns-install.sh own the sticky-preference transition. Reset the naming cache
+# because the helper runs in a child process and may have rewritten dns.conf.
+bootstrap_dns() {
+    _boxa::bootstrap_dns_resolver
+    if [ -x "$BOXA_DIR/scripts/dns-install.sh" ]; then
+        "$BOXA_DIR/scripts/dns-install.sh" auto-transition || true
+        boxa::reset_dns_cache
+    fi
+}
+
+_boxa::dns_degradation_reminder() {
+    local machine_output="${1:-false}"
+    [ "$(boxa::dns_preferred)" = "local" ] || return 0
+    [ "$(boxa::route_domain)" != "$BOXA_LOCAL_TLD" ] || return 0
+    if [ "$machine_output" = true ]; then
+        echo "DNS degradation active — run 'boxa dns-status' for cause and recovery steps." >&2
+    else
+        echo "DNS degradation active — run 'boxa dns-status' for cause and recovery steps."
     fi
 }
 
@@ -4150,6 +4172,7 @@ if [ "$MODE" = "port" ]; then
     running=$(docker ps --filter "name=^boxa-" --format '{{.Names}}' | filter_user_containers)
     if [ -z "$running" ]; then
         echo "Port saved to default-ports.conf. No running containers."
+        _boxa::dns_degradation_reminder
         exit 0
     fi
 
@@ -4167,6 +4190,7 @@ if [ "$MODE" = "port" ]; then
         local_project="${container#boxa-}"
         echo "  ${scheme}://$(boxa::route_host_display "$local_project" "$PORT_NUM") → ${container}:${PORT_NUM}"
     done <<< "$running"
+    _boxa::dns_degradation_reminder
     exit 0
 fi
 
@@ -4188,6 +4212,7 @@ if [ "$MODE" = "ports" ]; then
 
     if [ ! -d "$TRAEFIK_CONFIG_DIR" ] || [ -z "$(ls -A "$TRAEFIK_CONFIG_DIR" 2>/dev/null)" ]; then
         [ "$PORTS_MACHINE" = false ] && echo "No active port routes."
+        _boxa::dns_degradation_reminder "$PORTS_MACHINE"
         exit 0
     fi
 
@@ -4206,6 +4231,7 @@ if [ "$MODE" = "ports" ]; then
 
     if [ "${#PORTS_BY_CONTAINER[@]}" -eq 0 ]; then
         [ "$PORTS_MACHINE" = false ] && echo "No active port routes."
+        _boxa::dns_degradation_reminder "$PORTS_MACHINE"
         exit 0
     fi
 
@@ -4306,6 +4332,7 @@ if [ "$MODE" = "ports" ]; then
             echo "No active port routes."
         fi
     fi
+    _boxa::dns_degradation_reminder "$PORTS_MACHINE"
     exit 0
 fi
 
