@@ -203,6 +203,23 @@ assert_eq "WSL fresh resolver down: resolved drop-in skipped after broken verdic
 assert_eq "WSL fresh resolver down: NRPT skipped after broken verdict" \
     "missing" "$([ -e "$wsl_artifacts/nrpt" ] && printf present || printf missing)"
 
+# When the image is not available yet, resolver bootstrap is inconclusive. A
+# fresh install must fail safe: advertise the external domain but leave both
+# dead host artifacts for a later conclusive self-heal pass.
+reset_conf
+rm -f "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt"
+TEST_INSTALL_STATE="resolver-not-running"
+TEST_INSTALL_WSL="not-run"
+TEST_INSTALL_WINDOWS="not-run"
+_dns::start_probe_resolver() { return 1; }
+_dns::install auto >/dev/null 2>&1
+assert_eq "WSL fresh bootstrap inconclusive: active domain is external" \
+    "127.0.0.1.sslip.io" "$(conf_val active_domain)"
+assert_eq "WSL fresh bootstrap inconclusive: resolved drop-in skipped" \
+    "missing" "$([ -e "$wsl_artifacts/resolved" ] && printf present || printf missing)"
+assert_eq "WSL fresh bootstrap inconclusive: NRPT skipped" \
+    "missing" "$([ -e "$wsl_artifacts/nrpt" ] && printf present || printf missing)"
+
 # Existing artifacts are deliberately left untouched when a later probe
 # fails; none of the uninstall helpers belongs to this transition path.
 TEST_INSTALL_STATE="windows-broken"
@@ -240,6 +257,66 @@ assert_eq "WSL heal-later: repeated install is idempotent" \
 # --- Functional WSL2 path probe matrix --------------------------------------
 
 # Restore the real probe functions after the install-specific overrides above.
+# shellcheck source=../scripts/dns-install.sh disable=SC1091
+source "$BOXA_DIR/scripts/dns-install.sh"
+set +e +u +o pipefail
+
+# Resolver lifecycle commands return before dnsmasq is necessarily ready.
+# Exercise both start paths with a probe that succeeds on its third attempt.
+start_probe_count="$_TMPROOT/start-probe-count"
+start_docker_log="$_TMPROOT/start-docker.log"
+TEST_START_RESOLVER_MODE="start"
+docker() {
+    printf '%s\n' "$*" >> "$start_docker_log"
+    case "$1:$2" in
+        image:inspect|network:inspect) return 0 ;;
+        ps:-a)
+            [ "$TEST_START_RESOLVER_MODE" = "start" ] && printf 'container-id\n'
+            ;;
+        ps:--format) return 0 ;;
+        start:boxa_dns|run:-d) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+_dns::probe_wsl_path() {
+    local count=0
+    [ ! -f "$start_probe_count" ] || read -r count < "$start_probe_count"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$start_probe_count"
+    if [ "$count" -ge 3 ]; then
+        printf 'ok'
+    else
+        printf 'broken'
+    fi
+}
+export BOXA_DNS_RESOLVER_READY_TIMEOUT_SECONDS=2
+export BOXA_DNS_RESOLVER_READY_POLL_SECONDS=0.01
+
+HOME="$_TMPROOT/start-home"
+export HOME
+mkdir -p "$HOME"
+rm -f "$start_probe_count" "$start_docker_log"
+_dns::start_probe_resolver >/dev/null 2>&1
+assert_eq "resolver readiness after docker start: retries until ready" \
+    "3" "$(cat "$start_probe_count" 2>/dev/null)"
+
+TEST_START_RESOLVER_MODE="run"
+rm -f "$start_probe_count" "$start_docker_log"
+_dns::start_probe_resolver >/dev/null 2>&1
+assert_eq "resolver readiness after docker run: retries until ready" \
+    "3" "$(cat "$start_probe_count" 2>/dev/null)"
+
+# Timeout is deliberately non-fatal: the caller must continue to the real
+# two-sided probe, which owns the broken/unknown verdict.
+_dns::probe_wsl_path() { printf 'broken'; }
+BOXA_DNS_RESOLVER_READY_TIMEOUT_SECONDS=0
+_dns::start_probe_resolver >/dev/null 2>&1
+assert_eq "resolver readiness timeout: bootstrap still succeeds" "0" "$?"
+unset BOXA_DNS_RESOLVER_READY_TIMEOUT_SECONDS BOXA_DNS_RESOLVER_READY_POLL_SECONDS
+HOME="$_TMPROOT"
+export HOME
+
+# Restore the real WSL path probe after the readiness-specific override.
 # shellcheck source=../scripts/dns-install.sh disable=SC1091
 source "$BOXA_DIR/scripts/dns-install.sh"
 set +e +u +o pipefail

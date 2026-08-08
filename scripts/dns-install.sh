@@ -316,6 +316,22 @@ _dns::resolver_container_state() {
 # path before deciding whether the host artifacts would be useful. This is the
 # same container shape as docker-run.sh's normal bootstrap; failure stays
 # inconclusive and therefore cannot be mistaken for DNS degradation.
+_dns::wait_for_probe_resolver() {
+    local timeout_seconds="${BOXA_DNS_RESOLVER_READY_TIMEOUT_SECONDS:-3}"
+    local poll_seconds="${BOXA_DNS_RESOLVER_READY_POLL_SECONDS:-0.2}"
+    local deadline result
+    deadline=$((SECONDS + timeout_seconds))
+
+    while true; do
+        result="$(_dns::probe_wsl_path "boxa-ready-probe-$$-${RANDOM}.${BOXA_LOCAL_TLD}")"
+        case "$result" in
+            ok|unknown) return 0 ;;
+        esac
+        [ "$SECONDS" -lt "$deadline" ] || return 1
+        sleep "$poll_seconds"
+    done
+}
+
 _dns::start_probe_resolver() {
     local config_dir="$HOME/.config/$CLI_NAME/dns"
     local template="$BOXA_DIR/config/dns/boxa.conf"
@@ -332,10 +348,7 @@ _dns::start_probe_resolver() {
     if docker ps -a --filter "name=^boxa_dns$" --filter "status=exited" \
             --format '{{.ID}}' | grep -q .; then
         docker start boxa_dns >/dev/null
-        return 0
-    fi
-
-    if ! docker ps --format '{{.Names}}' | grep -qx boxa_dns; then
+    elif ! docker ps --format '{{.Names}}' | grep -qx boxa_dns; then
         docker run -d --name boxa_dns --pull=never --restart unless-stopped \
             --network devproxy \
             -u root \
@@ -346,6 +359,12 @@ _dns::start_probe_resolver() {
             "$BRAND_IMAGE" \
             --keep-in-foreground --conf-file=/etc/boxa-dns.conf >/dev/null
     fi
+
+    # Docker reports the container running before dnsmasq has necessarily
+    # bound port 53. Bound the readiness wait, then let the full probe own the
+    # eventual broken/unknown verdict even when startup remains slow.
+    _dns::wait_for_probe_resolver || true
+    return 0
 }
 
 # Query the exact WSL-side path used by local .test URLs. Prints
@@ -693,8 +712,9 @@ _dns::prime_sudo() {
 #                         spuriously.
 _dns::install() {
     local mode_pref="${1:-auto}"
-    local platform
+    local platform fresh_install=false
     platform="$(_dns::detect_platform)"
+    [ -f "$DNS_CONF_FILE" ] || fresh_install=true
     _info "Detected platform: $platform"
     _info "Preferred mode:    $mode_pref"
 
@@ -737,6 +757,21 @@ _dns::install() {
             _dns::write_mode local "$external_domain" "$provider"
             _dns::degraded_banner "${_DNS_PROBE_CAUSE:-$(_dns::probe_cause)}" \
                 "$external_domain"
+            return 0
+        fi
+        # A fresh install has no harmless pre-existing artifacts to preserve.
+        # If bootstrap or either probe side is inconclusive, fail safe: keep
+        # the local intent for self-heal but do not add NRPT/drop-in until a
+        # later provisioning pass observes both functional paths working.
+        if [ "$fresh_install" = true ] \
+            && { [ "$_DNS_PATH_PROBE_STATE" != "both-ok" ] \
+                || [ "${_DNS_WSL_PROBE_RESULT:-unknown}" != "ok" ] \
+                || [ "${_DNS_WINDOWS_PROBE_RESULT:-unknown}" != "ok" ]; }; then
+            local provider external_domain
+            provider="$(boxa::external_provider)"
+            external_domain="127.0.0.1.${provider}"
+            _dns::write_mode local "$external_domain" "$provider"
+            _dns::degraded_banner
             return 0
         fi
     fi
