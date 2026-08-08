@@ -31,6 +31,8 @@ source "$BOXA_DIR/lib/mkcert.sh"
 source "$BOXA_DIR/lib/https.sh"
 # shellcheck source-path=SCRIPTDIR source=../lib/cert.sh disable=SC1091
 source "$BOXA_DIR/lib/cert.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/brand.sh disable=SC1091
+source "$BOXA_DIR/lib/brand.sh"
 
 DNS_CONF_FILE="${BOXA_DNS_CONF:-$HOME/.config/boxa/dns.conf}"
 DEFAULT_EXTERNAL_DOMAIN="127.0.0.1.sslip.io"
@@ -307,6 +309,42 @@ _dns::resolver_container_state() {
         printf 'stopped'
     else
         printf 'not-created'
+    fi
+}
+
+# Start the shared resolver so a fresh WSL2 install can probe the functional
+# path before deciding whether the host artifacts would be useful. This is the
+# same container shape as docker-run.sh's normal bootstrap; failure stays
+# inconclusive and therefore cannot be mistaken for DNS degradation.
+_dns::start_probe_resolver() {
+    local config_dir="$HOME/.config/$CLI_NAME/dns"
+    local template="$BOXA_DIR/config/dns/boxa.conf"
+    local runtime="$config_dir/boxa.conf"
+
+    docker image inspect "$BRAND_IMAGE" >/dev/null 2>&1 || return 1
+    docker network inspect devproxy >/dev/null 2>&1 \
+        || docker network create devproxy >/dev/null
+    mkdir -p "$config_dir"
+    if [ ! -f "$runtime" ] || ! cmp -s "$template" "$runtime"; then
+        cat "$template" > "$runtime"
+    fi
+
+    if docker ps -a --filter "name=^boxa_dns$" --filter "status=exited" \
+            --format '{{.ID}}' | grep -q .; then
+        docker start boxa_dns >/dev/null
+        return 0
+    fi
+
+    if ! docker ps --format '{{.Names}}' | grep -qx boxa_dns; then
+        docker run -d --name boxa_dns --pull=never --restart unless-stopped \
+            --network devproxy \
+            -u root \
+            -p 127.0.0.1:53:53/udp \
+            -p 127.0.0.1:53:53/tcp \
+            -v "$runtime:/etc/boxa-dns.conf:ro" \
+            --entrypoint dnsmasq \
+            "$BRAND_IMAGE" \
+            --keep-in-foreground --conf-file=/etc/boxa-dns.conf >/dev/null
     fi
 }
 
@@ -688,6 +726,10 @@ _dns::install() {
     # provisioned by main after this function returns in either mode.
     if [ "$platform" = "wsl2" ]; then
         _dns::probe_paths >/dev/null
+        if [ "$_DNS_PATH_PROBE_STATE" = "resolver-not-running" ] \
+            && _dns::start_probe_resolver; then
+            _dns::probe_paths >/dev/null
+        fi
         if _dns::probe_is_broken; then
             local provider external_domain
             provider="$(boxa::external_provider)"

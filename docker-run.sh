@@ -872,9 +872,11 @@ _boxa::self_heal_resolver_drop_in() {
     fi
 }
 
-# Start the boxa_dns dnsmasq container in local mode (active_domain=test).
-# Skipped in external mode — sslip.io needs no host-side resolver. Mirrors
-# bootstrap_traefik: lazy network create, restart-if-exited, run-if-missing.
+# Start the boxa_dns dnsmasq container whenever local DNS is preferred. A DNS
+# degradation advertises the external domain but keeps this resolver alive so
+# the functional probe can observe recovery and heal back to .test. A user-
+# selected external preference still skips it. Mirrors bootstrap_traefik: lazy
+# network create, restart-if-exited, run-if-missing.
 #
 # Runs dnsmasq as root inside the container so it can bind the privileged
 # port 53; the host-side port mapping stays loopback-only per ADR 0007.
@@ -887,11 +889,11 @@ _boxa::self_heal_resolver_drop_in() {
 # fails-loud at its own image-inspect guard.
 _boxa::bootstrap_dns_resolver() {
     # Phase 4 self-heal: ensure_dns_meta_config runs first because it can
-    # flip the active mode (when dns.conf was missing and we infer local
-    # from container presence), which then affects the route_domain guard.
+    # restore the sticky preference when dns.conf was missing and we infer
+    # local mode from container presence.
     ensure_dns_meta_config
 
-    [ "$(boxa::route_domain)" = "$BOXA_LOCAL_TLD" ] || return 0
+    [ "$(boxa::dns_preferred)" != "external" ] || return 0
 
     if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
         echo "WARNING: boxa_dns not started — image $IMAGE not built locally." >&2

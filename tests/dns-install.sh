@@ -170,8 +170,44 @@ assert_eq "WSL broken fresh: NRPT skipped" \
 assert_eq "WSL broken fresh: CA still provisioned" \
     "present" "$([ -e "$TEST_INSTALL_CA_MARKER" ] && printf present || printf missing)"
 
+# A genuinely fresh install has no resolver container yet. The installer must
+# start it and repeat the functional probe before deciding whether either host
+# artifact is useful.
+reset_conf
+rm -f "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt"
+TEST_INSTALL_STATE="resolver-not-running"
+TEST_INSTALL_WSL="not-run"
+TEST_INSTALL_WINDOWS="not-run"
+TEST_INSTALL_PROBE_CALLS=0
+TEST_INSTALL_RESOLVER_STARTS=0
+_dns::probe_paths() {
+    TEST_INSTALL_PROBE_CALLS=$((TEST_INSTALL_PROBE_CALLS + 1))
+    _DNS_PATH_PROBE_STATE="$TEST_INSTALL_STATE"
+    _DNS_WSL_PROBE_RESULT="$TEST_INSTALL_WSL"
+    _DNS_WINDOWS_PROBE_RESULT="$TEST_INSTALL_WINDOWS"
+    _DNS_PROBE_CAUSE="WSL2 mirrored networking (networkingMode=mirrored) blocks loopback DNS on port 53"
+}
+_dns::start_probe_resolver() {
+    TEST_INSTALL_RESOLVER_STARTS=$((TEST_INSTALL_RESOLVER_STARTS + 1))
+    TEST_INSTALL_STATE="windows-broken"
+    TEST_INSTALL_WSL="ok"
+    TEST_INSTALL_WINDOWS="broken"
+}
+_dns::install auto >/dev/null 2>&1
+assert_eq "WSL fresh resolver down: resolver started for probe" \
+    "1" "$TEST_INSTALL_RESOLVER_STARTS"
+assert_eq "WSL fresh resolver down: functional probe repeated" \
+    "2" "$TEST_INSTALL_PROBE_CALLS"
+assert_eq "WSL fresh resolver down: resolved drop-in skipped after broken verdict" \
+    "missing" "$([ -e "$wsl_artifacts/resolved" ] && printf present || printf missing)"
+assert_eq "WSL fresh resolver down: NRPT skipped after broken verdict" \
+    "missing" "$([ -e "$wsl_artifacts/nrpt" ] && printf present || printf missing)"
+
 # Existing artifacts are deliberately left untouched when a later probe
 # fails; none of the uninstall helpers belongs to this transition path.
+TEST_INSTALL_STATE="windows-broken"
+TEST_INSTALL_WSL="ok"
+TEST_INSTALL_WINDOWS="broken"
 touch "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt"
 _dns::install auto >/dev/null 2>&1
 assert_eq "WSL degrade-later: resolved drop-in remains" \

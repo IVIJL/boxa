@@ -277,6 +277,20 @@ assert_match "up: transition runs after resolver bootstrap" "$bootstrap_body" \
 assert_match "up: invokes automatic DNS transition" "$bootstrap_body" \
     'dns-install\.sh" auto-transition'
 
+# Sticky-local degradation still needs the resolver running so the following
+# auto-transition probe can observe recovery and heal back to .test.
+bootstrap_resolver_body="$(sed -n '/^_boxa::bootstrap_dns_resolver() {/,/^}/p' \
+    "$BOXA_DIR/docker-run.sh")"
+assert_match "up degraded: resolver bootstrap follows sticky preference" \
+    "$bootstrap_resolver_body" 'boxa::dns_preferred.*external'
+if grep -q 'boxa::route_domain.*BOXA_LOCAL_TLD.*return 0' \
+        <<< "$bootstrap_resolver_body"; then
+    printf 'FAIL  up degraded: external active domain does not block resolver bootstrap\n'
+    fail_count=$((fail_count + 1))
+else
+    printf 'PASS  up degraded: external active domain does not block resolver bootstrap\n'
+fi
+
 ports_home="$doctor_dir/ports-home"
 ports_routes="$ports_home/.config/boxa/traefik/dynamic"
 ports_conf="$ports_home/.config/boxa/dns.conf"
