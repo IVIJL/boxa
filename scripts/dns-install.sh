@@ -223,11 +223,13 @@ _dns::install_linux_nm() {
 # curl) and the Windows host needs an NRPT rule (for browser + native Windows
 # tools). Both ultimately route to 127.0.0.1:53 inside WSL2 via WSL2
 # localhost forwarding. Either side may fail independently; we keep what
-# worked and warn loudly about the rest. Returns success if at least one
-# side is configured (callers treat that as "local mode is at least
-# partially functional").
+# worked and warn loudly about the rest. Returns 0 when both sides are
+# configured, 1 when neither is configured, and 2 for a partial setup. Normal
+# install accepts rc=2 as "local mode is at least partially functional";
+# automatic recovery requires rc=0 before advertising .test again.
 _dns::install_wsl2() {
     local linux_ok=0 windows_ok=0
+    _DNS_WSL2_INSTALL_FAILURE=""
 
     if command -v systemctl >/dev/null 2>&1 \
         && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
@@ -246,9 +248,17 @@ _dns::install_wsl2() {
         _warn "powershell.exe not found — cannot configure Windows NRPT. Run from a WSL2 distro with Windows interop enabled."
     fi
 
-    if [ "$linux_ok" -eq 0 ] && [ "$windows_ok" -eq 0 ]; then
+    if [ "$linux_ok" -eq 1 ] && [ "$windows_ok" -eq 1 ]; then
+        return 0
+    elif [ "$linux_ok" -eq 0 ] && [ "$windows_ok" -eq 0 ]; then
+        _DNS_WSL2_INSTALL_FAILURE="WSL2-side systemd-resolved and Windows NRPT setup failed"
         return 1
+    elif [ "$linux_ok" -eq 0 ]; then
+        _DNS_WSL2_INSTALL_FAILURE="WSL2-side systemd-resolved setup failed"
+    else
+        _DNS_WSL2_INSTALL_FAILURE="Windows NRPT setup failed"
     fi
+    return 2
 }
 
 # Encode the NRPT-add script as UTF-16LE base64 so the elevated PowerShell
@@ -608,6 +618,7 @@ _dns::write_mode() {
 _dns::degraded_banner() {
     local cause="${1:-}"
     local external_domain="${2:-$DEFAULT_EXTERNAL_DOMAIN}"
+    local provisioning_failure="${3:-}"
     if [ -n "$cause" ]; then
         echo >&2
         printf "${RED}%s${NC}\n" "==> .test DNS is degraded: $cause." >&2
@@ -622,7 +633,12 @@ _dns::degraded_banner() {
     fi
 
     echo >&2
-    printf "${RED}%s${NC}\n" "==> .test host resolver was NOT set up." >&2
+    if [ -n "$provisioning_failure" ]; then
+        printf "${RED}%s${NC}\n" \
+            "==> .test host resolver was NOT set up completely: ${provisioning_failure}." >&2
+    else
+        printf "${RED}%s${NC}\n" "==> .test host resolver was NOT set up." >&2
+    fi
     printf "${YELLOW}%s${NC}\n" \
         "    Boxa URLs use the sslip.io fallback for now: <port>.<project>.${DEFAULT_EXTERNAL_DOMAIN}" \
         "    To get the shorter .test URLs working, re-run:  boxa dns-install --local" \
@@ -638,7 +654,7 @@ _dns::auto_transition() {
     [ "$(_dns::detect_platform)" = "wsl2" ] || return 0
     [ "$(boxa::dns_preferred)" = "local" ] || return 0
 
-    local active state cause provider external_domain
+    local active state cause provider external_domain install_rc
     active="$(boxa::route_domain)"
     provider="$(boxa::external_provider)"
     external_domain="127.0.0.1.${provider}"
@@ -672,16 +688,21 @@ _dns::auto_transition() {
                 # dns-install/update/doctor. This may prompt once for sudo/UAC,
                 # at the first moment those artifacts are demonstrably useful.
                 _dns::prime_sudo
-                if _dns::install_wsl2; then
-                    _dns::write_mode local "$BOXA_LOCAL_TLD" "$provider"
-                    _ok ".test DNS restored — boxa installed the host DNS artifacts and switched back automatically."
-                else
-                    # Do not advertise .test when provisioning produced no
-                    # usable host side. The writers already emitted the precise
-                    # warnings; keep the sticky degraded state loud and retry on
-                    # a later bootstrap or explicit provisioning entry point.
-                    _dns::degraded_banner "" "$external_domain"
-                fi
+                install_rc=0
+                _dns::install_wsl2 || install_rc=$?
+                case "$install_rc" in
+                    0)
+                        _dns::write_mode local "$BOXA_LOCAL_TLD" "$provider"
+                        _ok ".test DNS restored — boxa installed the host DNS artifacts and switched back automatically."
+                        ;;
+                    1|2)
+                        # Do not advertise .test until both host sides are
+                        # provisioned. The writers emitted their precise WARNs;
+                        # repeat the failed side in the persistent loud banner.
+                        _dns::degraded_banner "" "$external_domain" \
+                            "${_DNS_WSL2_INSTALL_FAILURE:-WSL2 host provisioning failed}"
+                        ;;
+                esac
             fi
             ;;
         resolver-not-running)
@@ -816,6 +837,13 @@ _dns::install() {
         linux-nm)       _dns::install_linux_nm       || setup_rc=$? ;;
         wsl2)           _dns::install_wsl2           || setup_rc=$? ;;
     esac
+
+    # Fresh/manual WSL2 provisioning has always supported NRPT-only or
+    # resolved-only local mode. Preserve that contract while exposing the
+    # partial result to stricter callers such as automatic recovery.
+    if [ "$platform" = "wsl2" ] && [ "$setup_rc" -eq 2 ]; then
+        setup_rc=0
+    fi
 
     if [ "$setup_rc" -ne 0 ]; then
         if [ "$mode_pref" = "local" ]; then

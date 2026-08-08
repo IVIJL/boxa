@@ -55,6 +55,17 @@ assert_match() {
     fi
 }
 
+assert_no_match() {
+    local label="$1" haystack="$2" pattern="$3"
+    if grep -qE "$pattern" <<< "$haystack"; then
+        printf 'FAIL  %s\n      unexpected pattern: %q\n      output:\n%s\n' \
+            "$label" "$pattern" "$haystack"
+        fail_count=$((fail_count + 1))
+    else
+        printf 'PASS  %s\n' "$label"
+    fi
+}
+
 conf_val() {
     # Echo the value of key $1 from the dns.conf under test (empty if absent).
     [ -f "$BOXA_DNS_CONF" ] || return 0
@@ -151,6 +162,37 @@ _dns::uninstall_resolved_drop_in() { printf 'resolved\n' >> "$wsl_uninstall_log"
 _dns::uninstall_wsl2_nrpt() { printf 'nrpt\n' >> "$wsl_uninstall_log"; }
 _dns::prime_sudo() { :; }
 _dns::install_ca() { touch "$TEST_INSTALL_CA_MARKER"; }
+
+# The two WSL2 host writers fail independently. Preserve that distinction so
+# recovery orchestration cannot mistake a half-installed resolver for a full
+# restoration.
+rm -f "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt"
+_dns::install_linux_resolved() { touch "$wsl_artifacts/resolved"; }
+_dns::install_wsl2_nrpt() { return 1; }
+_dns::install_wsl2 >/dev/null 2>&1; rc=$?
+assert_eq "WSL provisioning partial: Linux-only returns partial" "2" "$rc"
+
+rm -f "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt"
+_dns::install_linux_resolved() { return 1; }
+_dns::install_wsl2_nrpt() { touch "$wsl_artifacts/nrpt"; }
+_dns::install_wsl2 >/dev/null 2>&1; rc=$?
+assert_eq "WSL provisioning partial: Windows-only returns partial" "2" "$rc"
+
+reset_conf
+TEST_INSTALL_STATE="both-ok"
+TEST_INSTALL_WSL="ok"
+TEST_INSTALL_WINDOWS="ok"
+_dns::install local >/dev/null 2>&1; rc=$?
+assert_eq "WSL provisioning partial: fresh --local still succeeds" "0" "$rc"
+assert_eq "WSL provisioning partial: fresh --local stays local" \
+    "test" "$(conf_val active_domain)"
+
+_dns::install_linux_resolved() { touch "$wsl_artifacts/resolved"; }
+_dns::install_wsl2_nrpt() { touch "$wsl_artifacts/nrpt"; }
+
+TEST_INSTALL_STATE="windows-broken"
+TEST_INSTALL_WSL="ok"
+TEST_INSTALL_WINDOWS="broken"
 
 reset_conf
 rm -f "$wsl_artifacts/resolved" "$wsl_artifacts/nrpt" \
@@ -474,6 +516,18 @@ assert_eq "auto-heal provisioning failure: remains external" \
     "127.0.0.1.sslip.io" "$(conf_val active_domain)"
 assert_match "auto-heal provisioning failure: remains visibly degraded" "$out" \
     '\.test host resolver was NOT set up'
+
+reset_conf
+seed_mode local 127.0.0.1.sslip.io
+_dns::install_linux_resolved() { touch "$wsl_artifacts/resolved"; }
+_dns::install_wsl2_nrpt() { return 1; }
+out="$(_dns::auto_transition 2>&1)"
+assert_eq "auto-heal partial provisioning: remains external" \
+    "127.0.0.1.sslip.io" "$(conf_val active_domain)"
+assert_no_match "auto-heal partial provisioning: no restored confirmation" \
+    "$out" '\.test DNS restored'
+assert_match "auto-heal partial provisioning: banner names Windows side" \
+    "$out" 'Windows NRPT setup failed'
 
 reset_conf
 seed_mode external 127.0.0.1.sslip.io
