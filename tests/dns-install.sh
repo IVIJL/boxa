@@ -441,6 +441,15 @@ assert_probe_case "PowerShell hang is timeout-bounded" ok 0 both-ok ok unknown
 TEST_POWERSHELL_SLEEP=""
 unset BOXA_DNS_INTEROP_TIMEOUT_SECONDS BOXA_DNS_INTEROP_KILL_GRACE_SECONDS
 
+# A fast interop answer must return immediately: the watchdog must not hold the
+# probe's command-substitution pipe open until its timeout expires.
+BOXA_DNS_INTEROP_TIMEOUT_SECONDS=5
+probe_started="$EPOCHREALTIME"
+assert_probe_case "fast interop answer does not wait for the watchdog" ok 0 both-ok ok ok
+probe_elapsed="$(awk -v a="$probe_started" -v b="$EPOCHREALTIME" 'BEGIN { print (b - a < 2) ? "prompt" : "stalled" }')"
+assert_eq "fast interop answer: probe returns promptly" prompt "$probe_elapsed"
+unset BOXA_DNS_INTEROP_TIMEOUT_SECONDS
+
 TEST_RESOLVER_STATE=stopped
 TEST_DIG_RESULT=broken
 TEST_POWERSHELL_RC=1

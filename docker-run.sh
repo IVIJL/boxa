@@ -3961,6 +3961,8 @@ if [ "$MODE" = "doctor" ]; then
                     echo '        - remove networkingMode=mirrored'
                     echo '        - set localhostForwarding=true'
                     echo '      Then run in Windows PowerShell: wsl --shutdown'
+                    echo '      Still degraded afterwards? Reboot Windows — a service started by'
+                    echo '      the old mode (Internet Connection Sharing) can keep holding port 53.'
                 else
                     echo "      $(boxa::prereq_remedy "$_step")"
                 fi

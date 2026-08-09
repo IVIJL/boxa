@@ -453,12 +453,15 @@ PS_PROBE
     ps_pid=$!
     # The in-PowerShell job bounds the DNS query itself. This outer watchdog
     # also bounds interop startup/tooling hangs; those map to unknown below.
+    # Its output must go to /dev/null: callers read this function through a
+    # command substitution, and a watchdog (or its orphaned `sleep`) holding
+    # that pipe open would stall every probe for the full timeout.
     (
         sleep "$timeout_seconds"
         kill "$ps_pid" 2>/dev/null || exit 0
         sleep "$kill_grace_seconds"
         kill -KILL "$ps_pid" 2>/dev/null || true
-    ) &
+    ) >/dev/null 2>&1 &
     watchdog_pid=$!
     wait "$ps_pid" || rc=$?
     kill "$watchdog_pid" 2>/dev/null || true
@@ -638,6 +641,7 @@ _dns::degraded_banner() {
             "    .test keeps working inside Containers, and HTTPS works on both domains." \
             '    Recovery: in %UserProfile%\.wslconfig, remove networkingMode=mirrored and set localhostForwarding=true.' \
             '    Then run in Windows PowerShell: wsl --shutdown' \
+            '    Still degraded afterwards? Reboot Windows — a service started by the old mode (Internet Connection Sharing) can keep holding port 53 until then.' \
             "    Start boxa again; boxa will switch back to .test automatically when DNS is restored." >&2
         return 0
     fi
