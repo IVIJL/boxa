@@ -84,6 +84,14 @@ assert_contains "fallback prints overview line" \
 assert_contains "fallback prints standard footer" \
     "Run 'boxa <command> --help' for details." "$fallback_help"
 
+stop_help="$(run_boxa help stop)"
+assert_contains "stop help documents non-interactive all" \
+    "boxa stop --all [--reason TOKEN]" "$stop_help"
+assert_contains "stop help documents preserved project state" \
+    "preserves volumes, routes, and HTTPS artifacts" "$stop_help"
+assert_contains "stop help documents closeout notification" \
+    "raises a Closeout notification" "$stop_help"
+
 overview_help="$(run_boxa help)"
 assert_contains "overview advertises command help" \
     "Run 'boxa <command> --help' for details." "$overview_help"

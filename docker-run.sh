@@ -40,7 +40,9 @@ Containers:
   boxa mem set --global <size>   Set the durable global Memory limit
   boxa mem unset [project|path]  Remove durable per-project Memory limits
   boxa mem unset --global       Remove the durable global Memory limits
-  boxa stop [name] [--clean]     Stop container (--clean removes volumes)
+  boxa stop [name] [--clean]     Stop one container (--clean removes volumes)
+  boxa stop --all [--reason TOKEN]
+                                   Stop every boxa Container without cleanup
   boxa remove [name]             Remove project data (volumes)
 
 Ports & connect:
@@ -319,7 +321,17 @@ Examples:
 EOF
             ;;
         ls)             printf 'boxa ls                        List running containers\n' ;;
-        stop)           printf 'boxa stop [name] [--clean]     Stop container (--clean removes volumes)\n' ;;
+        stop)
+            cat <<'EOF'
+Usage:
+  boxa stop [project] [--clean]
+  boxa stop --all [--reason TOKEN]
+
+Stop one boxa Container, or stop every boxa Container non-interactively with
+--all. The all-Container path preserves volumes, routes, and HTTPS artifacts.
+--reason tags that run and raises a Closeout notification when it completes.
+EOF
+            ;;
         remove)         printf 'boxa remove [name]             Remove project data (volumes)\n' ;;
         port)           printf 'boxa port <port>               Expose port via Traefik\n' ;;
         connections)    printf 'boxa connections               List cross-boxa and Host TCP forwards\n' ;;
@@ -2586,9 +2598,10 @@ connection_record_local_port_conflicts() {
         "$config_file"
 }
 
-# Gracefully stop a boxa container — close allow-for window first, then
-# inner DinD containers, then the container itself.
-graceful_stop_container() {
+# Prepare a boxa container for shutdown — close allow-for and Agent-browser
+# state first, then stop inner DinD containers while the outer container is
+# still reachable. The caller owns the outer `docker stop` invocation.
+prepare_container_for_stop() {
     local name="$1"
 
     # Close any live allow-for window BEFORE docker stop. Three reasons this
@@ -2630,6 +2643,13 @@ graceful_stop_container() {
             fi
         fi
     ' 2>/dev/null || true
+}
+
+# Gracefully stop one boxa container. The all-Container path calls the same
+# preparation helper per container, then batches the outer stops.
+graceful_stop_container() {
+    local name="$1"
+    prepare_container_for_stop "$name"
     docker stop -t 15 "$name" > /dev/null 2>&1 || true
 }
 
@@ -3258,6 +3278,8 @@ _boxa::sweep_invocation_resource_limits "$@"
 # --- Subcommand parsing ------------------------------------------------------
 
 CLEAN_VOLUMES=false
+STOP_ALL=false
+STOP_REASON=""
 SSH_CONFIG_MOUNT=false
 CLI_MEMORY=
 CLI_MEMORY_SWAP=
@@ -3351,13 +3373,51 @@ case "${1:-}" in
              fi
              ;;
     stop)    MODE="stop";    shift; PROJECT_FILTER=""
-             # Parse --clean flag and optional project name (any order)
-             for arg in "$@"; do
-                 case "$arg" in
-                     --clean) CLEAN_VOLUMES=true ;;
-                     *)       PROJECT_FILTER="$arg" ;;
+             # Parse flags and optional project name (any order).
+             while [ "$#" -gt 0 ]; do
+                 case "$1" in
+                     --clean)
+                         CLEAN_VOLUMES=true
+                         shift
+                         ;;
+                     --all)
+                         STOP_ALL=true
+                         shift
+                         ;;
+                     --reason)
+                         if [ "$#" -lt 2 ] || [[ "$2" == --* ]]; then
+                             echo "--reason requires a token." >&2
+                             exit 1
+                         fi
+                         STOP_REASON="$2"
+                         shift 2
+                         ;;
+                     -* )
+                         echo "Unknown flag for stop: $1" >&2
+                         exit 1
+                         ;;
+                     *)
+                         if [ -n "$PROJECT_FILTER" ]; then
+                             echo "Unexpected positional for stop: $1" >&2
+                             exit 1
+                         fi
+                         PROJECT_FILTER="$1"
+                         shift
+                         ;;
                  esac
              done
+             if [ "$STOP_ALL" = true ] && [ -n "$PROJECT_FILTER" ]; then
+                 echo "boxa stop --all does not accept a project name." >&2
+                 exit 1
+             fi
+             if [ "$STOP_ALL" = true ] && [ "$CLEAN_VOLUMES" = true ]; then
+                 echo "boxa stop --all does not support --clean." >&2
+                 exit 1
+             fi
+             if [ "$STOP_ALL" != true ] && [ -n "$STOP_REASON" ]; then
+                 echo "boxa stop --reason requires --all." >&2
+                 exit 1
+             fi
              ;;
     remove)  MODE="remove";  shift; PROJECT_FILTER="${1:-}" ;;
     port)    MODE="port";    shift; PORT_NUM="${1:-}" ;;
@@ -4792,6 +4852,50 @@ if [ "$MODE" = "stop" ]; then
             docker volume rm "$(boxa::volume_name "$proj" "$suffix")" > /dev/null 2>&1 || true
         done
     }
+
+    if [ "$STOP_ALL" = true ]; then
+        stop_container_output=$(
+            docker ps -a --filter "name=^boxa-" --format '{{.Names}}' \
+                | filter_user_containers
+        )
+        stop_containers=()
+        if [ -n "$stop_container_output" ]; then
+            mapfile -t stop_containers <<< "$stop_container_output"
+        fi
+
+        if [ "${#stop_containers[@]}" -gt 0 ]; then
+            for name in "${stop_containers[@]}"; do
+                prepare_container_for_stop "$name"
+            done
+
+            docker stop -t 15 "${stop_containers[@]}" > /dev/null
+
+            stopped_projects=()
+            for name in "${stop_containers[@]}"; do
+                _boxa::remove_container_after_oom_sweep "$name"
+                stopped_projects+=("${name#boxa-}")
+                echo "Stopped:$name"
+            done
+        else
+            stopped_projects=()
+        fi
+
+        stop_traefik_if_idle
+        stop_dns_if_idle
+
+        if [ -n "$STOP_REASON" ] && [ "${#stopped_projects[@]}" -gt 0 ] \
+            && [ -x "$BOXA_DIR/scripts/deliver-allow-for-notification.sh" ]; then
+            stopped_list="${stopped_projects[0]}"
+            for project in "${stopped_projects[@]:1}"; do
+                stopped_list+=", $project"
+            done
+            "$BOXA_DIR/scripts/deliver-allow-for-notification.sh" --notification \
+                "Boxa closeout: $STOP_REASON" \
+                "Boxes $stopped_list stopped before sleep/shutdown" \
+                "/var/log/boxa" >/dev/null 2>&1 || true
+        fi
+        exit 0
+    fi
 
     if [ -n "$PROJECT_FILTER" ]; then
         boxa::names_from_token "$PROJECT_FILTER"
