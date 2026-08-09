@@ -152,6 +152,7 @@ type wedgedSessionRunner struct {
 	mu      sync.Mutex
 	calls   int
 	timeout time.Duration
+	err     error
 	started chan struct{}
 	release chan struct{}
 }
@@ -167,7 +168,7 @@ func (r *wedgedSessionRunner) Run(_ context.Context, timeout time.Duration) erro
 	r.mu.Unlock()
 	r.started <- struct{}{}
 	<-r.release
-	return nil
+	return r.err
 }
 
 func (r *wedgedSessionRunner) callCount() int {
@@ -353,9 +354,10 @@ func TestIdlePredictedStopSuppressesResumeNotification(t *testing.T) {
 func TestSuspendDuringPredictionStopDoesNotRecordRunningBoxes(t *testing.T) {
 	coordination := newHookCoordinator()
 	runner := newWedgedSessionRunner()
+	hooks := newFakeSessionHooks("alpha")
 	state := &memorySuspendStateStore{}
 	watch := newSessionWatch(
-		newFakeSessionSource(), newFakeSessionHooks("alpha"), state,
+		newFakeSessionSource(), hooks, state,
 		coordinatedHookRunner{runner: runner, coordination: coordination}, time.Minute, nil,
 	)
 	watch.coordination = coordination
@@ -378,12 +380,105 @@ func TestSuspendDuringPredictionStopDoesNotRecordRunningBoxes(t *testing.T) {
 		close(runner.release)
 		t.Fatal("suspend handler blocked on the stop-hook coordinator")
 	}
-	if _, err := state.Load(); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("state after suspend during stop hook Load error = %v, want not exist", err)
+	persisted, err := state.Load()
+	if err != nil || !persisted.StopInFlight || len(persisted.Boxes) != 0 {
+		t.Fatalf("state after suspend during stop hook = %+v, %v; want in-flight marker", persisted, err)
+	}
+	hooks.mu.Lock()
+	runningCalls := hooks.runningCalls
+	hooks.mu.Unlock()
+	if runningCalls != 0 {
+		t.Fatalf("running-box queries at suspend = %d, want 0", runningCalls)
 	}
 
 	close(runner.release)
 	<-hookDone
+}
+
+func TestResumeAfterInFlightStopFailureQueriesAndNotifiesThenClears(t *testing.T) {
+	coordination := newHookCoordinator()
+	runner := newWedgedSessionRunner()
+	runner.err = errors.New("stop failed")
+	hooks := newFakeSessionHooks("alpha", "beta")
+	state := &memorySuspendStateStore{}
+	watch := newSessionWatch(
+		newFakeSessionSource(), hooks, state,
+		coordinatedHookRunner{runner: runner, coordination: coordination}, time.Minute, nil,
+	)
+	watch.coordination = coordination
+
+	hookResult := make(chan error, 1)
+	go func() {
+		hookResult <- watch.runner.Run(context.Background(), time.Minute)
+	}()
+	<-runner.started
+	watch.handleSuspend(context.Background())
+	close(runner.release)
+	if err := <-hookResult; err == nil {
+		t.Fatal("in-flight stop hook succeeded, want failure")
+	}
+
+	watch.handleResume(context.Background())
+	select {
+	case <-hooks.notified:
+	case <-time.After(time.Second):
+		t.Fatal("resume notification did not run")
+	}
+	watch.resumeHooks.Wait()
+	if _, err := state.Load(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state after resume Load error = %v, want not exist", err)
+	}
+	hooks.mu.Lock()
+	runningCalls := hooks.runningCalls
+	queryTimeout := hooks.queryTimeout
+	notification := append([]string(nil), hooks.notifications[0]...)
+	hooks.mu.Unlock()
+	if runningCalls != 1 || queryTimeout != resumeHookTimeout {
+		t.Fatalf("resume queries = %d with timeout %s, want 1 with %s", runningCalls, queryTimeout, resumeHookTimeout)
+	}
+	if !reflect.DeepEqual(notification, []string{"alpha", "beta"}) {
+		t.Fatalf("notification = %v, want alpha and beta", notification)
+	}
+}
+
+func TestResumeAfterInFlightStopSuccessQueriesAndClearsSilently(t *testing.T) {
+	coordination := newHookCoordinator()
+	runner := newWedgedSessionRunner()
+	hooks := newFakeSessionHooks()
+	state := &memorySuspendStateStore{}
+	watch := newSessionWatch(
+		newFakeSessionSource(), hooks, state,
+		coordinatedHookRunner{runner: runner, coordination: coordination}, time.Minute, nil,
+	)
+	watch.coordination = coordination
+
+	hookResult := make(chan error, 1)
+	go func() {
+		hookResult <- watch.runner.Run(context.Background(), time.Minute)
+	}()
+	<-runner.started
+	watch.handleSuspend(context.Background())
+	close(runner.release)
+	if err := <-hookResult; err != nil {
+		t.Fatalf("in-flight stop hook returned %v", err)
+	}
+
+	watch.handleResume(context.Background())
+	waitFor(t, func() bool {
+		_, err := state.Load()
+		return errors.Is(err, os.ErrNotExist)
+	})
+	watch.resumeHooks.Wait()
+	hooks.mu.Lock()
+	runningCalls := hooks.runningCalls
+	queryTimeout := hooks.queryTimeout
+	hooks.mu.Unlock()
+	if runningCalls != 1 || queryTimeout != resumeHookTimeout {
+		t.Fatalf("resume queries = %d with timeout %s, want 1 with %s", runningCalls, queryTimeout, resumeHookTimeout)
+	}
+	if hooks.notificationCount() != 0 {
+		t.Fatalf("notifications = %d, want 0", hooks.notificationCount())
+	}
 }
 
 func TestSuspendQueryFailurePreservesExistingState(t *testing.T) {

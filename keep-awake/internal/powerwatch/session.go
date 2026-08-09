@@ -40,8 +40,9 @@ type boxSessionHooks interface {
 }
 
 type suspendState struct {
-	SuspendedAt time.Time `json:"suspended_at"`
-	Boxes       []string  `json:"boxes"`
+	SuspendedAt  time.Time `json:"suspended_at"`
+	Boxes        []string  `json:"boxes"`
+	StopInFlight bool      `json:"stop_in_flight,omitempty"`
 }
 
 type suspendStateStore interface {
@@ -237,6 +238,10 @@ func (w *sessionWatch) handleShutdown(ctx context.Context) {
 func (w *sessionWatch) handleSuspend(ctx context.Context) {
 	if w.coordination != nil {
 		if !w.coordination.TryAcquire() {
+			state := suspendState{SuspendedAt: w.now().UTC(), StopInFlight: true}
+			if err := w.state.Save(state); err != nil {
+				w.logf("persist suspend state: %v", err)
+			}
 			return
 		}
 		w.coordination.release()
@@ -264,6 +269,34 @@ func (w *sessionWatch) handleResume(ctx context.Context) {
 	}
 	if err != nil {
 		w.resumeMu.Unlock()
+		return
+	}
+	if state.StopInFlight {
+		w.resumeInProgress = true
+		w.resumeHooks.Add(1)
+		w.resumeMu.Unlock()
+		go func() {
+			defer w.resumeHooks.Done()
+			defer func() {
+				w.resumeMu.Lock()
+				w.resumeInProgress = false
+				w.resumeMu.Unlock()
+			}()
+			boxes, queryErr := w.hooks.RunningBoxes(ctx, resumeHookTimeout)
+			if queryErr != nil {
+				w.logf("query running boxes at resume: %v", queryErr)
+				return
+			}
+			if len(boxes) > 0 {
+				if notifyErr := w.hooks.NotifySlept(ctx, boxes, resumeHookTimeout); notifyErr != nil {
+					w.logf("raise slept-with-boxes notification: %v", notifyErr)
+					return
+				}
+			}
+			if clearErr := w.state.Clear(state); clearErr != nil {
+				w.logf("clear suspend state: %v", clearErr)
+			}
+		}()
 		return
 	}
 	if len(state.Boxes) == 0 {
