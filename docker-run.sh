@@ -2050,6 +2050,26 @@ start_host_connection_host_side() {
     if [ "$host_port" = "$keep_awake_port" ]; then
         platform="${BOXA_KEEP_AWAKE_PLATFORM:-$(host_platform::detect 2>/dev/null || true)}"
         if ! keep_awake_probe::select_target "$platform" "$host_port"; then
+            # An unreachable daemon on WSL2 is the one moment the Windows
+            # firewall rule matters, so heal it here rather than on every start:
+            # hosts whose probe succeeds never reach this branch. The helper
+            # declines unless the rule is genuinely missing and the daemon is
+            # genuinely running, and a healed rule earns exactly one retry.
+            # The helper's own interop calls are unbounded, and wedged Windows
+            # interop must not turn a bounded relay failure into a start that
+            # never finishes. The bound is generous because the elevation
+            # dialog it may raise is paced by the user clicking it.
+            local heal_timeout="${BOXA_KEEP_AWAKE_HEAL_TIMEOUT_SECONDS:-120}"
+            local -a heal_cmd=("$BOXA_DIR/scripts/ensure-keep-awake.sh" heal-firewall)
+            command -v timeout >/dev/null 2>&1 \
+                && heal_cmd=(timeout "$heal_timeout" "${heal_cmd[@]}")
+            if [ "$platform" = wsl2 ] \
+                && [ -x "$BOXA_DIR/scripts/ensure-keep-awake.sh" ] \
+                && "${heal_cmd[@]}"; then
+                keep_awake_probe::select_target "$platform" "$host_port" || true
+            fi
+        fi
+        if [ -z "$KEEP_AWAKE_PROBE_TARGET_ADDRESS" ]; then
             if [ -f "$state_file" ]; then
                 stop_host_connection_host_side "$host_port" || true
             fi

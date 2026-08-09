@@ -8,6 +8,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOXA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BOXA="$BOXA_DIR/docker-run.sh"
 _TMPROOT="$(mktemp -d)"
+# This suite drives the real relay and doctor helpers against mock daemons
+# while reading the developer's own keep-awake state. Every unreachable-daemon
+# case would otherwise reach the Windows firewall self-heal and raise a UAC
+# dialog mid-run, so the opt-out covers the whole file.
+export BOXA_KEEP_AWAKE_SKIP_FIREWALL_HEAL=1
 cleanup() {
     local pid_file pid
     for pid_file in "$_TMPROOT"/mock-socat-child-*.pid; do
@@ -859,6 +864,14 @@ BOXA_CONNECT_TEST_FORWARD_PORTS=""
 # the row. With no persisted row, a later replay performs no Docker calls.
 BOXA_CONNECT_TEST_HOST_IP="192.168.65.254"
 rm_child_file="$_TMPROOT/mock-socat-child-rm.pid"
+# 17777 is the keep-awake port, so starting this relay runs the daemon target
+# probe against the stubbed gateway. Without a daemon answering there, target
+# selection fails, no relay is ever started, and the teardown assertions below
+# silently measure nothing.
+socat "TCP-LISTEN:17777,bind=127.0.0.3,reuseaddr,fork" EXEC:"$http_responder" \
+    >/dev/null 2>&1 &
+rm_daemon_pid=$!
+wait_for_test_daemon 127.0.0.3 17777 || exit 1
 BOXA_CONNECT_TEST_SOCAT_CHILD_FILE="$rm_child_file" \
     PATH="$relay_mock_bin:$PATH" \
     start_host_connection_host_side 127.0.0.2 17777
@@ -882,6 +895,7 @@ assert_eq "rm removes native-Docker host state" "false" \
 assert_eq "rm removes exact native-Docker ufw slot" "1" \
     "$(count_log_matches 'ufw delete allow proto tcp from 172.18.0.0/24 to 127.0.0.2 port 17777')"
 assert_eq "rm drops persisted row" "0" "$(awk 'END { print NR }' "$config_file")"
+kill "$rm_daemon_pid" 2>/dev/null || true
 
 calls_before_empty_replay="$(awk 'END { print NR }' "$BOXA_CONNECT_TEST_LOG")"
 start_boxa_connections boxa-source >/dev/null

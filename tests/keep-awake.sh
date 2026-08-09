@@ -228,7 +228,13 @@ EOF
 cat > "$TMPROOT/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
-    *'/v1/busy/'*|*'/v1/idle/'*) printf 'curl %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG" ;;
+    *'/v1/busy/'*|*'/v1/idle/'*)
+        printf 'curl %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
+        case "${*: -1}" in
+            http://127.0.0.1:*) [ "$KEEP_AWAKE_TEST_LOOPBACK_HEALTHY" = true ] || exit 7 ;;
+            *)                  [ "$KEEP_AWAKE_TEST_GATEWAY_HEALTHY" = true ] || exit 7 ;;
+        esac
+        ;;
     *'/v1/status')
         printf 'status %s\n' "${*: -1}" >> "$KEEP_AWAKE_TEST_LOG"
         case "${*: -1}" in
@@ -289,7 +295,54 @@ assert_contains "busy hook calls versioned Host connection endpoint" \
     "http://127.0.0.1:17777/v1/busy/claude?ttl=900&session=sample-project" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "busy hook caps curl at one second" \
-    "curl -fsS -m 1" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+    "-m 1" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_eq "reachable loopback stops before the gateway" 1 \
+    "$(grep -c '/v1/busy/' "$KEEP_AWAKE_TEST_LOG")"
+
+# On a WSL2 NAT host the daemon is a Windows process behind the default
+# gateway; a loopback-only hook would signal nothing at all there. The platform
+# fixtures keep these cases decidable on any machine.
+hook_fixtures="$TMPROOT/hook-platform"
+mkdir -p "$hook_fixtures"
+: > "$hook_fixtures/WSLInterop"
+printf 'Linux version 6.8.0-generic (gcc 13)\n' > "$hook_fixtures/version-linux"
+printf '{"project":"sample"}\n' > "$hook_fixtures/identity.json"
+export BOXA_WSL_INTEROP_FILE="$hook_fixtures/WSLInterop"
+export BOXA_PROC_VERSION_FILE="$hook_fixtures/version-linux"
+export BOXA_CONTAINER_IDENTITY_FILE="$hook_fixtures/absent-identity.json"
+
+: > "$KEEP_AWAKE_TEST_LOG"
+export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=false
+BOXA_PROJECT_NAME=sample-project "$agent_awake" busy
+assert_contains "unreachable loopback falls back to the gateway on a WSL2 host" \
+    "http://172.30.96.1:17777/v1/busy/claude?ttl=900&session=sample-project" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+
+# Off a WSL2 host the default gateway is an unrelated machine: signalling it
+# would leak the project name and stall every Claude event on a timeout.
+: > "$KEEP_AWAKE_TEST_LOG"
+BOXA_WSL_INTEROP_FILE="$hook_fixtures/absent-interop" \
+    BOXA_PROJECT_NAME=sample-project "$agent_awake" busy
+assert_eq "native Linux never signals the default gateway" 0 \
+    "$(grep -c '172.30.96.1' "$KEEP_AWAKE_TEST_LOG")"
+
+# A custom-kernel WSL2 host has no interop binfmt entry but still needs the
+# Windows gateway, so /proc/version remains a valid fallback signal.
+: > "$KEEP_AWAKE_TEST_LOG"
+printf 'Linux version 6.6.0-custom (Microsoft@WSL2)\n' \
+    > "$hook_fixtures/version-wsl"
+BOXA_WSL_INTEROP_FILE="$hook_fixtures/absent-interop" \
+    BOXA_PROC_VERSION_FILE="$hook_fixtures/version-wsl" \
+    BOXA_PROJECT_NAME=sample-project "$agent_awake" busy
+assert_contains "custom-kernel WSL2 still reaches the gateway" \
+    "http://172.30.96.1:17777/v1/busy/claude" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+: > "$KEEP_AWAKE_TEST_LOG"
+BOXA_CONTAINER_IDENTITY_FILE="$hook_fixtures/identity.json" \
+    BOXA_PROJECT_NAME=sample-project "$agent_awake" busy
+assert_eq "a Container never signals its bridge gateway" 0 \
+    "$(grep -c '172.30.96.1' "$KEEP_AWAKE_TEST_LOG")"
+export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=true
 : > "$KEEP_AWAKE_TEST_LOG"
 env -u BOXA_PROJECT_NAME "$agent_awake" idle
 assert_contains "idle hook uses the default session" \
@@ -337,6 +390,69 @@ assert_eq "settings migration adds one pre-tool heartbeat" 1 \
 assert_eq "settings migration adds one stop release" 1 \
     "$(jq '[.hooks.Stop[] | select(.hooks == [{"type":"command","command":"~/.claude/hooks/agent-awake.sh idle"}])] | length' \
         "$claude_target/settings.json")"
+
+# An already-seeded hook from an older boxa must be refreshed, or a fixed
+# signal path never reaches users who installed before the fix.
+run_agent_awake_migration() {
+    BOXA_CLAUDE_DEFAULTS="$claude_defaults" BOXA_CLAUDE_TARGET="$claude_target" \
+        bash -c 'source "$1"; migrate_agent_awake_hooks' \
+        _ "$BOXA_DIR/scripts/setup-claude.sh"
+}
+# Byte-for-byte the hook boxa shipped before the ownership marker existed: the
+# loopback-only signal path that stopped reaching the daemon on WSL2 NAT hosts.
+cat > "$claude_target/hooks/agent-awake.sh" <<'LEGACY_HOOK'
+#!/bin/sh
+# Signal boxa's host keep-awake daemon; silently no-op when it is unavailable.
+
+action="${1:-busy}"
+session="${BOXA_PROJECT_NAME:-default}"
+
+case "$action" in
+    idle)
+        url="http://127.0.0.1:17777/v1/idle/claude?session=$session"
+        ;;
+    *)
+        url="http://127.0.0.1:17777/v1/busy/claude?ttl=900&session=$session"
+        ;;
+esac
+
+curl -fsS -m 1 "$url" >/dev/null 2>&1 || true
+exit 0
+LEGACY_HOOK
+run_agent_awake_migration
+assert_eq "settings migration refreshes the shipped legacy hook" same \
+    "$(cmp -s "$claude_defaults/hooks/agent-awake.sh" \
+        "$claude_target/hooks/agent-awake.sh" && printf same || printf stale)"
+# A user's own edit of that legacy hook keeps its descriptive header but is no
+# longer byte-identical, so boxa must not claim ownership of it.
+printf '#!/bin/sh\n# Signal boxa%s host keep-awake daemon; with my own tweak.\nexit 0\n' \
+    "'s" > "$claude_target/hooks/agent-awake.sh"
+run_agent_awake_migration
+assert_contains "settings migration leaves a customized legacy hook alone" \
+    "my own tweak" "$(cat "$claude_target/hooks/agent-awake.sh")"
+printf '#!/bin/sh\n# my own signal hook\nexit 0\n' \
+    > "$claude_target/hooks/agent-awake.sh"
+run_agent_awake_migration
+assert_contains "settings migration leaves a user-owned hook alone" \
+    "my own signal hook" "$(cat "$claude_target/hooks/agent-awake.sh")"
+
+# A symlinked hook points at a file boxa does not manage — typically the user's
+# dotfiles repo. Writing through the link would silently edit that file.
+linked_hook_source="$claude_target/dotfiles-agent-awake.sh"
+cp "$claude_defaults/hooks/agent-awake.sh" "$linked_hook_source"
+printf '# my dotfiles copy\n' >> "$linked_hook_source"
+ln -sf "$linked_hook_source" "$claude_target/hooks/agent-awake.sh"
+run_agent_awake_migration
+assert_contains "settings migration never writes through a symlinked hook" \
+    "my dotfiles copy" "$(cat "$linked_hook_source")"
+assert_eq "settings migration keeps the hook symlink itself" true \
+    "$([ -L "$claude_target/hooks/agent-awake.sh" ] && echo true || echo false)"
+rm -f "$claude_target/hooks/agent-awake.sh"
+run_agent_awake_migration
+assert_eq "settings migration reseeds a real file after the link is gone" false \
+    "$([ -L "$claude_target/hooks/agent-awake.sh" ] && echo true || echo false)"
+assert_eq "reseeded hook stays executable" true \
+    "$([ -x "$claude_target/hooks/agent-awake.sh" ] && echo true || echo false)"
 
 # Managed defaults retain notify hooks while wiring all keep-awake events.
 assert_eq "managed defaults preserve success notify hook" 1 \
@@ -703,6 +819,32 @@ assert_contains "WSL status reports no responding candidate" \
     "Relay target: unreachable" "$windows_unreachable_status"
 assert_eq "WSL doctor probe rejects all unreachable candidates" missing \
     "$("$KEEP_AWAKE" probe)"
+
+# heal-firewall is the self-heal seam for an unreachable daemon: it refuses
+# every situation in which elevating would be pointless, so a plain start never
+# pays for it.
+assert_eq "heal-firewall declines while the rule is present" declined \
+    "$("$KEEP_AWAKE" heal-firewall >/dev/null 2>&1 && printf healed || printf declined)"
+rm -f "$KEEP_AWAKE_TEST_FIREWALL_RULE"
+export KEEP_AWAKE_TEST_DAEMON_PROCESS=false
+heal_elevations_before="$(grep -c 'New-NetFirewallRule' "$KEEP_AWAKE_TEST_LOG")"
+assert_eq "heal-firewall declines while the daemon is not running" declined \
+    "$("$KEEP_AWAKE" heal-firewall >/dev/null 2>&1 && printf healed || printf declined)"
+assert_eq "heal-firewall does not elevate for a stopped daemon" \
+    "$heal_elevations_before" \
+    "$(grep -c 'New-NetFirewallRule' "$KEEP_AWAKE_TEST_LOG")"
+export KEEP_AWAKE_TEST_DAEMON_PROCESS=true
+assert_eq "heal-firewall installs the rule a running daemon needs" healed \
+    "$("$KEEP_AWAKE" heal-firewall >/dev/null 2>&1 && printf healed || printf declined)"
+assert_eq "heal-firewall leaves the rule in place" true \
+    "$(file_exists "$KEEP_AWAKE_TEST_FIREWALL_RULE")"
+rm -f "$KEEP_AWAKE_TEST_FIREWALL_RULE"
+assert_eq "heal-firewall honours the harness opt-out" declined \
+    "$(BOXA_KEEP_AWAKE_SKIP_FIREWALL_HEAL=1 "$KEEP_AWAKE" heal-firewall \
+        >/dev/null 2>&1 && printf healed || printf declined)"
+assert_eq "opt-out heal creates no rule" false \
+    "$(file_exists "$KEEP_AWAKE_TEST_FIREWALL_RULE")"
+"$KEEP_AWAKE" heal-firewall >/dev/null 2>&1 || true
 export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=true
 export KEEP_AWAKE_TEST_GATEWAY_HEALTHY=true
 assert_eq "Windows enable creates scheduled task" true "$(file_exists "$KEEP_AWAKE_TEST_TASK")"

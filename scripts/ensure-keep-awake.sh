@@ -197,6 +197,27 @@ EOF
     return 1
 }
 
+# Self-heal seam for callers that have already found the daemon unreachable.
+# Deliberately does nothing on its own initiative: an unreachable daemon is the
+# only situation in which the rule matters, so healthy hosts never pay for the
+# interop calls below and never see an unprompted UAC dialog. Requires evidence
+# that the daemon really is running — elevating to unblock a port nothing
+# listens on would prompt the user for nothing.
+keep_awake::heal_firewall_rule() {
+    # Harnesses that exercise the relay against mock daemons run against the
+    # real user state; this opt-out keeps them from raising a UAC dialog on the
+    # developer's machine.
+    [ -z "${BOXA_KEEP_AWAKE_SKIP_FIREWALL_HEAL:-}" ] || return 1
+    keep_awake::init_paths || return 1
+    [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] || return 1
+    [ "$(keep_awake::state_field enabled 2>/dev/null || true)" = true ] || return 1
+    keep_awake::firewall_rule_present && return 1
+    keep_awake::daemon_running || return 1
+    keep_awake::ensure_firewall_rule || return 1
+    printf 'keep-awake: installed the missing Windows firewall rule "%s"; retrying the daemon.\n' \
+        "$KEEP_AWAKE_FIREWALL_RULE_DISPLAY_NAME" >&2
+}
+
 keep_awake::remove_firewall_rule() {
     local ps_cmd rc=0
     [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] || return 0
@@ -1157,6 +1178,7 @@ case "$command_name" in
     disable)     keep_awake::disable ;;
     status)      keep_awake::status ;;
     doctor)      keep_awake::doctor ;;
+    heal-firewall) keep_awake::heal_firewall_rule ;;
     teardown)    keep_awake::teardown "$@" ;;
     go-prereq)   keep_awake::go_prereq ;;
     go-remedy)   keep_awake::go_remedy; printf '\n' ;;

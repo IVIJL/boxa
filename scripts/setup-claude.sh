@@ -99,6 +99,23 @@ migrate_enable_all_project_mcp_servers() {
     fi
 }
 
+# Decide whether boxa may replace an already-installed hook. Two ways to
+# qualify: the file announces itself as boxa-owned, or it is byte-for-byte a
+# hook boxa shipped before that marker existed. Matching on the descriptive
+# header instead would capture files a user customized while keeping the
+# comment — that header never promised boxa would overwrite them.
+KEEP_AWAKE_HOOK_LEGACY_SHA256=\
+11d3a8ed19e58e1cd48467e553d43f66763e7353edc8642513dfa01c82753e71
+
+keep_awake_hook_is_boxa_owned() {
+    local file="$1" digest
+    grep -q 'boxa-owned: replaced by boxa on update' "$file" 2>/dev/null \
+        && return 0
+    command -v sha256sum >/dev/null 2>&1 || return 1
+    digest="$(sha256sum < "$file" 2>/dev/null | cut -d' ' -f1)"
+    [ "$digest" = "$KEEP_AWAKE_HOOK_LEGACY_SHA256" ]
+}
+
 # Every-start. Add boxa's keep-awake client hook to existing shared Claude
 # config without replacing unrelated user hooks or settings. Re-running is a
 # no-op once all three exact entries are present.
@@ -107,10 +124,34 @@ migrate_agent_awake_hooks() {
     local status=0
 
     mkdir -p "$TARGET/hooks" "$migration_dir"
-    if [ -f "$DEFAULTS/hooks/agent-awake.sh" ] \
-        && [ ! -f "$TARGET/hooks/agent-awake.sh" ]; then
-        cp "$DEFAULTS/hooks/agent-awake.sh" "$TARGET/hooks/agent-awake.sh"
-        seeded=$((seeded+1))
+    if [ -f "$DEFAULTS/hooks/agent-awake.sh" ]; then
+        # Seed a missing hook, and refresh an outdated one that is still
+        # boxa's — an already-seeded copy would otherwise keep an old signal
+        # path forever (the loopback-only version silently stopped signalling
+        # on WSL2 NAT hosts). A copy the user made their own loses the marker
+        # and is left untouched.
+        #
+        # A symlinked hook is left alone whatever it points at: writing through
+        # it would edit a file somewhere else entirely — typically the user's
+        # own dotfiles repository — which is never what a boxa refresh should
+        # touch. Regular files are replaced through a temporary file so a
+        # concurrent Claude event never reads a half-written hook.
+        local installed="$TARGET/hooks/agent-awake.sh" staged
+        if [ ! -e "$installed" ] && [ ! -L "$installed" ]; then
+            cp "$DEFAULTS/hooks/agent-awake.sh" "$installed"
+            seeded=$((seeded+1))
+        elif [ ! -L "$installed" ] && [ -f "$installed" ] \
+            && keep_awake_hook_is_boxa_owned "$installed" \
+            && ! cmp -s "$DEFAULTS/hooks/agent-awake.sh" "$installed"; then
+            if staged="$(mktemp "$TARGET/hooks/agent-awake.sh.XXXXXX")" \
+                && cp "$DEFAULTS/hooks/agent-awake.sh" "$staged" \
+                && chmod 0755 "$staged" \
+                && mv -f "$staged" "$installed"; then
+                seeded=$((seeded+1))
+            else
+                rm -f "${staged:-}"
+            fi
+        fi
     fi
     [ -e "$TARGET/settings.json" ] || return 0
 
