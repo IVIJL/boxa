@@ -344,7 +344,9 @@ assert_eq "a Container never signals its bridge gateway" 0 \
     "$(grep -c '172.30.96.1' "$KEEP_AWAKE_TEST_LOG")"
 export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=true
 : > "$KEEP_AWAKE_TEST_LOG"
-env -u BOXA_PROJECT_NAME "$agent_awake" idle
+# A failing ps keeps the idle path deterministic: with a real ps the hook
+# sees whatever shell-snapshot children the invoking agent session has live.
+env -u BOXA_PROJECT_NAME BOXA_PS_COMMAND=false "$agent_awake" idle
 assert_contains "idle hook uses the default session" \
     "http://127.0.0.1:17777/v1/idle/claude?session=default" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
