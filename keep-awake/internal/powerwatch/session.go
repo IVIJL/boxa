@@ -39,27 +39,6 @@ type boxSessionHooks interface {
 	NotifySlept(context.Context, []string, time.Duration) error
 }
 
-type coordinatedSessionHooks struct {
-	hooks        boxSessionHooks
-	coordination *hookCoordinator
-}
-
-func (h coordinatedSessionHooks) RunningBoxes(ctx context.Context, timeout time.Duration) ([]string, error) {
-	var boxes []string
-	err := h.coordination.run(ctx, timeout, func(runCtx context.Context, remaining time.Duration) error {
-		var err error
-		boxes, err = h.hooks.RunningBoxes(runCtx, remaining)
-		return err
-	})
-	return boxes, err
-}
-
-func (h coordinatedSessionHooks) NotifySlept(ctx context.Context, boxes []string, timeout time.Duration) error {
-	return h.coordination.run(ctx, timeout, func(runCtx context.Context, remaining time.Duration) error {
-		return h.hooks.NotifySlept(runCtx, boxes, remaining)
-	})
-}
-
 type suspendState struct {
 	SuspendedAt time.Time `json:"suspended_at"`
 	Boxes       []string  `json:"boxes"`
@@ -137,9 +116,11 @@ type sessionWatch struct {
 	logger      *log.Logger
 	now         func() time.Time
 
-	mu              sync.Mutex
-	shutdownHandled bool
-	resumeHooks     sync.WaitGroup
+	shutdownMu       sync.Mutex
+	shutdownHandled  bool
+	resumeMu         sync.Mutex
+	resumeInProgress bool
+	resumeHooks      sync.WaitGroup
 }
 
 func newSessionWatch(source sessionEventSource, hooks boxSessionHooks, state suspendStateStore, runner hookRunner, hookTimeout time.Duration, logger *log.Logger) *sessionWatch {
@@ -167,9 +148,9 @@ func (w *sessionWatch) handle(ctx context.Context, event sessionEvent) {
 	case sessionShutdownQuery, sessionShutdownEnd:
 		w.handleShutdown(ctx)
 	case sessionShutdownCancelled:
-		w.mu.Lock()
+		w.shutdownMu.Lock()
 		w.shutdownHandled = false
-		w.mu.Unlock()
+		w.shutdownMu.Unlock()
 	case sessionSuspend:
 		w.handleSuspend(ctx)
 	case sessionResume:
@@ -178,13 +159,13 @@ func (w *sessionWatch) handle(ctx context.Context, event sessionEvent) {
 }
 
 func (w *sessionWatch) handleShutdown(ctx context.Context) {
-	w.mu.Lock()
+	w.shutdownMu.Lock()
 	if w.shutdownHandled {
-		w.mu.Unlock()
+		w.shutdownMu.Unlock()
 		return
 	}
 	w.shutdownHandled = true
-	w.mu.Unlock()
+	w.shutdownMu.Unlock()
 
 	blocked := false
 	if err := w.source.CreateShutdownBlockReason(); err != nil {
@@ -235,9 +216,6 @@ func (w *sessionWatch) handleSuspend(ctx context.Context) {
 	boxes, err := w.hooks.RunningBoxes(ctx, suspendQueryTimeout)
 	if err != nil {
 		w.logf("query running boxes at suspend: %v", err)
-		if clearErr := w.state.Clear(); clearErr != nil {
-			w.logf("clear stale suspend state: %v", clearErr)
-		}
 		return
 	}
 	state := suspendState{SuspendedAt: w.now().UTC(), Boxes: boxes}
@@ -247,28 +225,47 @@ func (w *sessionWatch) handleSuspend(ctx context.Context) {
 }
 
 func (w *sessionWatch) handleResume(ctx context.Context) {
+	w.resumeMu.Lock()
+	if w.resumeInProgress {
+		w.resumeMu.Unlock()
+		return
+	}
 	state, err := w.state.Load()
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		w.logf("read suspend state: %v", err)
 	}
-	if err != nil || len(state.Boxes) == 0 {
+	if err != nil {
+		w.resumeMu.Unlock()
+		return
+	}
+	if len(state.Boxes) == 0 {
 		if clearErr := w.state.Clear(); clearErr != nil {
 			w.logf("clear suspend state: %v", clearErr)
 		}
+		w.resumeMu.Unlock()
 		return
 	}
 
 	boxes := append([]string(nil), state.Boxes...)
+	w.resumeInProgress = true
 	w.resumeHooks.Add(1)
+	w.resumeMu.Unlock()
 	go func() {
 		defer w.resumeHooks.Done()
 		if err := w.hooks.NotifySlept(ctx, boxes, resumeHookTimeout); err != nil {
 			w.logf("raise slept-with-boxes notification: %v", err)
+			w.resumeMu.Lock()
+			w.resumeInProgress = false
+			w.resumeMu.Unlock()
 			return
 		}
+		w.resumeMu.Lock()
+		defer w.resumeMu.Unlock()
 		if err := w.state.Clear(); err != nil {
 			w.logf("clear suspend state: %v", err)
+			return
 		}
+		w.resumeInProgress = false
 	}()
 }
 

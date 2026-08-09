@@ -126,7 +126,7 @@ func TestPowerEventsRunHookAndReleaseDelayLock(t *testing.T) {
 	}
 }
 
-func TestPredictionHookAndSessionStateQueryAreCoordinated(t *testing.T) {
+func TestPredictionHookDoesNotBlockSessionStateQuery(t *testing.T) {
 	coordination := newHookCoordinator()
 	runner := &blockingRunner{started: make(chan struct{}), release: make(chan struct{})}
 	prediction := newPredictionWatch(
@@ -135,7 +135,7 @@ func TestPredictionHookAndSessionStateQueryAreCoordinated(t *testing.T) {
 	)
 	hooks := &signalingSessionHooks{running: make(chan struct{})}
 	session := newSessionWatch(
-		newFakeSessionSource(), coordinatedSessionHooks{hooks: hooks, coordination: coordination},
+		newFakeSessionSource(), hooks,
 		&memorySuspendStateStore{}, &fakeRunner{}, time.Minute, nil,
 	)
 
@@ -152,8 +152,9 @@ func TestPredictionHookAndSessionStateQueryAreCoordinated(t *testing.T) {
 	}()
 	select {
 	case <-hooks.running:
-		t.Fatal("session queried state while prediction hook was in flight")
-	default:
+	case <-time.After(100 * time.Millisecond):
+		close(runner.release)
+		t.Fatal("session state query was blocked by prediction hook")
 	}
 	close(runner.release)
 	<-predictionDone

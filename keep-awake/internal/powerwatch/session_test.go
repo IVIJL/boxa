@@ -75,6 +75,7 @@ type fakeSessionHooks struct {
 	notifyTimeout time.Duration
 	notifyErr     error
 	notified      chan struct{}
+	notifyRelease <-chan struct{}
 }
 
 func newFakeSessionHooks(boxes ...string) *fakeSessionHooks {
@@ -94,8 +95,12 @@ func (h *fakeSessionHooks) NotifySlept(_ context.Context, boxes []string, timeou
 	h.notifications = append(h.notifications, append([]string(nil), boxes...))
 	h.notifyTimeout = timeout
 	err := h.notifyErr
+	release := h.notifyRelease
 	h.mu.Unlock()
 	h.notified <- struct{}{}
+	if release != nil {
+		<-release
+	}
 	return err
 }
 
@@ -338,23 +343,80 @@ func TestIdlePredictedStopSuppressesResumeNotification(t *testing.T) {
 	<-done
 }
 
-func TestSuspendQueryFailureClearsStaleState(t *testing.T) {
+func TestSuspendQueryFailurePreservesExistingState(t *testing.T) {
 	source := newFakeSessionSource()
 	hooks := newFakeSessionHooks("stale")
-	hooks.runningErr = errors.New("WSL unavailable")
+	hooks.runningErr = context.DeadlineExceeded
 	state := &memorySuspendStateStore{state: suspendState{Boxes: []string{"stale"}}, exists: true}
 	watch := newSessionWatch(source, hooks, state, &fakeRunner{}, time.Minute, nil)
 	cancel, done := runSessionWatch(watch)
 
 	source.emit(sessionSuspend)
-	source.emit(sessionResume)
-	time.Sleep(20 * time.Millisecond)
-	if hooks.notificationCount() != 0 {
-		t.Fatalf("notifications = %d, want 0 after failed query", hooks.notificationCount())
+	persisted, err := state.Load()
+	if err != nil || !reflect.DeepEqual(persisted.Boxes, []string{"stale"}) {
+		t.Fatalf("state after failed query = %+v, %v; want stale state preserved", persisted, err)
 	}
 
 	cancel()
 	<-done
+}
+
+func TestShutdownIsNotBlockedByWedgedResumeNotification(t *testing.T) {
+	coordination := newHookCoordinator()
+	notifyRelease := make(chan struct{})
+	hooks := newFakeSessionHooks()
+	hooks.notifyRelease = notifyRelease
+	state := &memorySuspendStateStore{state: suspendState{Boxes: []string{"alpha"}}, exists: true}
+	runner := newWedgedSessionRunner()
+	watch := newSessionWatch(
+		newFakeSessionSource(), hooks, state,
+		coordinatedHookRunner{runner: runner, coordination: coordination}, 500*time.Millisecond, nil,
+	)
+
+	watch.handleResume(context.Background())
+	<-hooks.notified
+	shutdownDone := make(chan struct{})
+	go func() {
+		watch.handleShutdown(context.Background())
+		close(shutdownDone)
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(100 * time.Millisecond):
+		close(notifyRelease)
+		t.Fatal("shutdown hook was blocked by resume notification")
+	}
+	close(runner.release)
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown handler did not finish")
+	}
+	close(notifyRelease)
+	watch.resumeHooks.Wait()
+}
+
+func TestQuickSuccessiveResumeEventsNotifyOnce(t *testing.T) {
+	notifyRelease := make(chan struct{})
+	hooks := newFakeSessionHooks()
+	hooks.notifyRelease = notifyRelease
+	state := &memorySuspendStateStore{state: suspendState{Boxes: []string{"alpha"}}, exists: true}
+	watch := newSessionWatch(newFakeSessionSource(), hooks, state, &fakeRunner{}, time.Minute, nil)
+
+	watch.handleResume(context.Background())
+	<-hooks.notified
+	watch.handleResume(context.Background())
+	select {
+	case <-hooks.notified:
+		close(notifyRelease)
+		t.Fatal("second resume event started a duplicate notification")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(notifyRelease)
+	watch.resumeHooks.Wait()
+	if hooks.notificationCount() != 1 {
+		t.Fatalf("notifications = %d, want 1", hooks.notificationCount())
+	}
 }
 
 func TestFileSuspendStateLifecycle(t *testing.T) {
