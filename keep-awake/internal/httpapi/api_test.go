@@ -11,6 +11,7 @@ import (
 
 	"github.com/IVIJL/boxa/keep-awake/internal/awake"
 	"github.com/IVIJL/boxa/keep-awake/internal/inhibit"
+	"github.com/IVIJL/boxa/keep-awake/internal/powerwatch"
 )
 
 type fakeClock struct {
@@ -35,15 +36,29 @@ type decodedStatus struct {
 		Session             string `json:"session"`
 		RemainingTTLSeconds int64  `json:"remainingTTLSeconds"`
 	} `json:"activeHolders"`
-	IsInhibited bool   `json:"isInhibited"`
-	Version     string `json:"version"`
+	IsInhibited bool `json:"isInhibited"`
+	PowerWatch  struct {
+		Active                 bool   `json:"active"`
+		StopBudgetSeconds      int64  `json:"stopBudgetSeconds"`
+		InhibitDelayMaxSeconds int64  `json:"inhibitDelayMaxSeconds"`
+		Hint                   string `json:"hint"`
+	} `json:"powerWatch"`
+	Version string `json:"version"`
 }
 
 func newTestAPI() (*API, *fakeClock, *inhibit.Fake) {
 	clock := &fakeClock{now: time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)}
 	fake := &inhibit.Fake{}
 	manager := awake.NewManager(awake.NewRegistry(clock), fake)
-	return New(manager, 15*time.Minute, "test-version", nil), clock, fake
+	powerStatus := func() powerwatch.Status {
+		return powerwatch.Status{
+			Active:          true,
+			StopBudget:      time.Minute,
+			InhibitDelayMax: 5 * time.Second,
+			Hint:            "raise InhibitDelayMaxSec in logind.conf",
+		}
+	}
+	return New(manager, powerStatus, 15*time.Minute, "test-version", nil), clock, fake
 }
 
 func request(t *testing.T, handler http.Handler, method, target string) *httptest.ResponseRecorder {
@@ -75,6 +90,10 @@ func TestBusyStatusAndTTLExpiry(t *testing.T) {
 	status := getStatus(t, api)
 	if !status.IsInhibited || status.Version != "test-version" || len(status.ActiveHolders) != 1 {
 		t.Fatalf("unexpected busy status: %+v", status)
+	}
+	if !status.PowerWatch.Active || status.PowerWatch.StopBudgetSeconds != 60 ||
+		status.PowerWatch.InhibitDelayMaxSeconds != 5 || !strings.Contains(status.PowerWatch.Hint, "InhibitDelayMaxSec") {
+		t.Fatalf("unexpected power-watch status: %+v", status.PowerWatch)
 	}
 	holder := status.ActiveHolders[0]
 	if holder.Agent != "codex" || holder.Session != "box-a" || holder.RemainingTTLSeconds != 10 {

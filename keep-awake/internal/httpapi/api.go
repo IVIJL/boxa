@@ -11,19 +11,21 @@ import (
 	"unicode"
 
 	"github.com/IVIJL/boxa/keep-awake/internal/awake"
+	"github.com/IVIJL/boxa/keep-awake/internal/powerwatch"
 )
 
 const statusPath = "/v1/status"
 
 type API struct {
 	manager    *awake.Manager
+	powerWatch func() powerwatch.Status
 	defaultTTL time.Duration
 	version    string
 	logger     *log.Logger
 }
 
-func New(manager *awake.Manager, defaultTTL time.Duration, version string, logger *log.Logger) *API {
-	return &API{manager: manager, defaultTTL: defaultTTL, version: version, logger: logger}
+func New(manager *awake.Manager, powerWatch func() powerwatch.Status, defaultTTL time.Duration, version string, logger *log.Logger) *API {
+	return &API{manager: manager, powerWatch: powerWatch, defaultTTL: defaultTTL, version: version, logger: logger}
 }
 
 type holderResponse struct {
@@ -33,9 +35,18 @@ type holderResponse struct {
 }
 
 type statusResponse struct {
-	ActiveHolders []holderResponse `json:"activeHolders"`
-	IsInhibited   bool             `json:"isInhibited"`
-	Version       string           `json:"version"`
+	ActiveHolders []holderResponse   `json:"activeHolders"`
+	IsInhibited   bool               `json:"isInhibited"`
+	PowerWatch    powerWatchResponse `json:"powerWatch"`
+	Version       string             `json:"version"`
+}
+
+type powerWatchResponse struct {
+	Active                 bool   `json:"active"`
+	StopBudgetSeconds      int64  `json:"stopBudgetSeconds"`
+	InhibitDelayMaxSeconds int64  `json:"inhibitDelayMaxSeconds,omitempty"`
+	InhibitDelayMaxError   string `json:"inhibitDelayMaxError,omitempty"`
+	Hint                   string `json:"hint,omitempty"`
 }
 
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -69,11 +80,23 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 			RemainingTTLSeconds: remainingSeconds,
 		})
 	}
+	powerStatus := a.powerWatch()
 	writeJSON(w, http.StatusOK, statusResponse{
 		ActiveHolders: holders,
 		IsInhibited:   status.Inhibited,
-		Version:       a.version,
+		PowerWatch: powerWatchResponse{
+			Active:                 powerStatus.Active,
+			StopBudgetSeconds:      durationSeconds(powerStatus.StopBudget),
+			InhibitDelayMaxSeconds: durationSeconds(powerStatus.InhibitDelayMax),
+			InhibitDelayMaxError:   powerStatus.InhibitDelayMaxError,
+			Hint:                   powerStatus.Hint,
+		},
+		Version: a.version,
 	})
+}
+
+func durationSeconds(duration time.Duration) int64 {
+	return int64((duration + time.Second - 1) / time.Second)
 }
 
 func (a *API) busy(w http.ResponseWriter, r *http.Request, agent string) {

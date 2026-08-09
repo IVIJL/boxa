@@ -107,4 +107,25 @@ Resolution order for any client is: native Linux/macOS → `localhost`; WSL →
 probe `localhost`, then the Windows vEthernet/default-gateway IP; boxa Container
 → `localhost` on the Host connection's local port (17777 by default).
 `GET /v1/status` returns the active holders, remaining TTLs, inhibitor state,
-and daemon version.
+**Power-watch** state, and daemon version.
+
+## Pre-sleep stop
+
+On native Linux, **Power-watch** starts with the **Keep-awake daemon** and
+holds a systemd-logind delay inhibitor for sleep and shutdown. When logind
+announces either transition, Power-watch runs
+`boxa stop --all --reason presleep` regardless of any held Awake leases, then
+releases the delay inhibitor so the transition can continue. Its output is
+written to the daemon log. macOS and Windows Power-watch implementations are
+currently no-ops.
+
+The command and its one-minute stop budget can be overridden with the daemon
+flags `-power-watch-command` and `-power-watch-timeout`. A hanging command is
+terminated when that budget or logind's shorter effective delay expires.
+
+logind commonly defaults `InhibitDelayMaxSec` to only a few seconds. If the
+configured stop budget is longer, raise `InhibitDelayMaxSec` in
+`/etc/systemd/logind.conf` and restart logind (normally by rebooting) so Boxa
+has enough time to stop every Container cleanly. `/v1/status` reports the
+effective delay, stop budget, Power-watch activity, and a hint when the delay
+is shorter than the budget.

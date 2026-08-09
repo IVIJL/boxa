@@ -19,6 +19,7 @@ import (
 	"github.com/IVIJL/boxa/keep-awake/internal/httpapi"
 	"github.com/IVIJL/boxa/keep-awake/internal/inhibit"
 	"github.com/IVIJL/boxa/keep-awake/internal/netlisten"
+	"github.com/IVIJL/boxa/keep-awake/internal/powerwatch"
 )
 
 var version = "dev"
@@ -37,6 +38,8 @@ type config struct {
 	listenUnsafe bool
 	defaultTTL   time.Duration
 	logFile      string
+	powerCommand string
+	powerTimeout time.Duration
 }
 
 func main() { os.Exit(realMain()) }
@@ -48,6 +51,8 @@ func realMain() (exitCode int) {
 	flag.BoolVar(&cfg.listenUnsafe, "listen-unsafe", false, "WARNING: allow -listen-address to bind non-loopback interfaces, including LAN-facing ones")
 	flag.DurationVar(&cfg.defaultTTL, "default-ttl", 15*time.Minute, "lease TTL when the request omits ttl")
 	flag.StringVar(&cfg.logFile, "log-file", "keep-awake.log", "append-only daemon and crash log")
+	flag.StringVar(&cfg.powerCommand, "power-watch-command", powerwatch.DefaultCommand, "host command run before sleep or shutdown")
+	flag.DurationVar(&cfg.powerTimeout, "power-watch-timeout", time.Minute, "maximum pre-sleep stop duration")
 	flag.Parse()
 
 	logFile, err := os.OpenFile(cfg.logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -66,6 +71,14 @@ func realMain() (exitCode int) {
 
 	if cfg.defaultTTL <= 0 {
 		logger.Printf("default TTL must be positive")
+		return 2
+	}
+	if strings.TrimSpace(cfg.powerCommand) == "" {
+		logger.Printf("power-watch command must not be empty")
+		return 2
+	}
+	if cfg.powerTimeout <= 0 {
+		logger.Printf("power-watch timeout must be positive")
 		return 2
 	}
 	if cfg.port < 1 || cfg.port > 65535 {
@@ -98,13 +111,14 @@ func run(ctx context.Context, cfg config, addresses []string, listeners []net.Li
 	defer cancelRun()
 	registry := awake.NewRegistry(awake.RealClock{})
 	manager := awake.NewManager(registry, inhibit.New())
+	powerWatch := powerwatch.New(cfg.powerCommand, cfg.powerTimeout, logger.Writer(), logger)
 	defer func() {
 		if err := manager.Close(); err != nil {
 			logger.Printf("release sleep inhibitor: %v", err)
 		}
 	}()
 
-	handler := httpapi.New(manager, cfg.defaultTTL, version, logger)
+	handler := httpapi.New(manager, powerWatch.Status, cfg.defaultTTL, version, logger)
 	server := &http.Server{
 		Handler:           handler,
 		ErrorLog:          logger,
@@ -118,6 +132,13 @@ func run(ctx context.Context, cfg config, addresses []string, listeners []net.Li
 		manager.Run(runCtx, time.Second, func(err error) {
 			logger.Printf("reconcile sleep inhibitor: %v", err)
 		})
+	}()
+	powerWatchDone := make(chan struct{})
+	go func() {
+		defer close(powerWatchDone)
+		if err := powerWatch.Run(runCtx); err != nil {
+			logger.Printf("power-watch stopped: %v", err)
+		}
 	}()
 
 	serveErrors := make(chan error, len(listeners))
@@ -139,6 +160,7 @@ func run(ctx context.Context, cfg config, addresses []string, listeners []net.Li
 	}
 	cancelRun()
 	<-managerDone
+	<-powerWatchDone
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
