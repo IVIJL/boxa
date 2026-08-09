@@ -111,9 +111,10 @@ func (h *fakeSessionHooks) notificationCount() int {
 }
 
 type memorySuspendStateStore struct {
-	mu     sync.Mutex
-	state  suspendState
-	exists bool
+	mu       sync.Mutex
+	state    suspendState
+	exists   bool
+	clearErr error
 }
 
 func (s *memorySuspendStateStore) Save(state suspendState) error {
@@ -133,9 +134,15 @@ func (s *memorySuspendStateStore) Load() (suspendState, error) {
 	return s.state, nil
 }
 
-func (s *memorySuspendStateStore) Clear() error {
+func (s *memorySuspendStateStore) Clear(expected suspendState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.clearErr != nil {
+		return s.clearErr
+	}
+	if !s.state.SuspendedAt.Equal(expected.SuspendedAt) {
+		return nil
+	}
 	s.state = suspendState{}
 	s.exists = false
 	return nil
@@ -343,6 +350,42 @@ func TestIdlePredictedStopSuppressesResumeNotification(t *testing.T) {
 	<-done
 }
 
+func TestSuspendDuringPredictionStopDoesNotRecordRunningBoxes(t *testing.T) {
+	coordination := newHookCoordinator()
+	runner := newWedgedSessionRunner()
+	state := &memorySuspendStateStore{}
+	watch := newSessionWatch(
+		newFakeSessionSource(), newFakeSessionHooks("alpha"), state,
+		coordinatedHookRunner{runner: runner, coordination: coordination}, time.Minute, nil,
+	)
+	watch.coordination = coordination
+
+	hookDone := make(chan struct{})
+	go func() {
+		_ = watch.runner.Run(context.Background(), time.Minute)
+		close(hookDone)
+	}()
+	<-runner.started
+
+	suspendDone := make(chan struct{})
+	go func() {
+		watch.handleSuspend(context.Background())
+		close(suspendDone)
+	}()
+	select {
+	case <-suspendDone:
+	case <-time.After(100 * time.Millisecond):
+		close(runner.release)
+		t.Fatal("suspend handler blocked on the stop-hook coordinator")
+	}
+	if _, err := state.Load(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state after suspend during stop hook Load error = %v, want not exist", err)
+	}
+
+	close(runner.release)
+	<-hookDone
+}
+
 func TestSuspendQueryFailurePreservesExistingState(t *testing.T) {
 	source := newFakeSessionSource()
 	hooks := newFakeSessionHooks("stale")
@@ -419,6 +462,54 @@ func TestQuickSuccessiveResumeEventsNotifyOnce(t *testing.T) {
 	}
 }
 
+func TestResumeClearPreservesNewSuspendState(t *testing.T) {
+	notifyRelease := make(chan struct{})
+	hooks := newFakeSessionHooks()
+	hooks.notifyRelease = notifyRelease
+	oldState := suspendState{SuspendedAt: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC), Boxes: []string{"alpha"}}
+	newState := suspendState{SuspendedAt: time.Date(2026, 8, 9, 11, 0, 0, 0, time.UTC), Boxes: []string{"beta"}}
+	state := &memorySuspendStateStore{state: oldState, exists: true}
+	watch := newSessionWatch(newFakeSessionSource(), hooks, state, &fakeRunner{}, time.Minute, nil)
+
+	watch.handleResume(context.Background())
+	<-hooks.notified
+	if err := state.Save(newState); err != nil {
+		t.Fatalf("Save returned %v", err)
+	}
+	close(notifyRelease)
+	watch.resumeHooks.Wait()
+
+	got, err := state.Load()
+	if err != nil || !reflect.DeepEqual(got, newState) {
+		t.Fatalf("state after old notification completed = %+v, %v; want new state preserved", got, err)
+	}
+}
+
+func TestResumeClearFailureAllowsLaterResume(t *testing.T) {
+	hooks := newFakeSessionHooks()
+	state := &memorySuspendStateStore{
+		state:    suspendState{SuspendedAt: time.Now(), Boxes: []string{"alpha"}},
+		exists:   true,
+		clearErr: errors.New("clear unavailable"),
+	}
+	watch := newSessionWatch(newFakeSessionSource(), hooks, state, &fakeRunner{}, time.Minute, nil)
+
+	watch.handleResume(context.Background())
+	<-hooks.notified
+	watch.resumeHooks.Wait()
+	watch.handleResume(context.Background())
+	select {
+	case <-hooks.notified:
+	case <-time.After(time.Second):
+		t.Fatal("resume after clear failure was ignored")
+	}
+	watch.resumeHooks.Wait()
+
+	if hooks.notificationCount() != 2 {
+		t.Fatalf("notifications = %d, want 2", hooks.notificationCount())
+	}
+}
+
 func TestFileSuspendStateLifecycle(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "suspend.json")
 	store, err := newFileSuspendStateStore(path)
@@ -436,8 +527,19 @@ func TestFileSuspendStateLifecycle(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("loaded state = %+v, want %+v", got, want)
 	}
-	if err := store.Clear(); err != nil {
+	newer := suspendState{SuspendedAt: want.SuspendedAt.Add(time.Minute), Boxes: []string{"beta"}}
+	if err := store.Save(newer); err != nil {
+		t.Fatalf("second Save returned %v", err)
+	}
+	if err := store.Clear(want); err != nil {
 		t.Fatalf("Clear returned %v", err)
+	}
+	got, err = store.Load()
+	if err != nil || !reflect.DeepEqual(got, newer) {
+		t.Fatalf("state after mismatched Clear = %+v, %v; want newer state preserved", got, err)
+	}
+	if err := store.Clear(newer); err != nil {
+		t.Fatalf("matching Clear returned %v", err)
 	}
 	if _, err := store.Load(); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Load after Clear error = %v, want not exist", err)

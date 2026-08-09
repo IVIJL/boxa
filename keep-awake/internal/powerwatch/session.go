@@ -47,14 +47,17 @@ type suspendState struct {
 type suspendStateStore interface {
 	Save(suspendState) error
 	Load() (suspendState, error)
-	Clear() error
+	Clear(suspendState) error
 }
 
 type fileSuspendStateStore struct {
 	path string
+	mu   sync.Mutex
 }
 
-func (s fileSuspendStateStore) Save(state suspendState) error {
+func (s *fileSuspendStateStore) Save(state suspendState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
@@ -79,15 +82,21 @@ func (s fileSuspendStateStore) Save(state suspendState) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	// os.Rename cannot replace an existing file on Windows. A stale state is
-	// safe to remove because Save is the only writer and resume always clears.
+	// os.Rename cannot replace an existing file on Windows. The old state is
+	// safe to remove because Save holds the store lock until it is replaced.
 	if err := os.Remove(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return os.Rename(temporaryPath, s.path)
 }
 
-func (s fileSuspendStateStore) Load() (suspendState, error) {
+func (s *fileSuspendStateStore) Load() (suspendState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.load()
+}
+
+func (s *fileSuspendStateStore) load() (suspendState, error) {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		return suspendState{}, err
@@ -99,8 +108,20 @@ func (s fileSuspendStateStore) Load() (suspendState, error) {
 	return state, nil
 }
 
-func (s fileSuspendStateStore) Clear() error {
-	err := os.Remove(s.path)
+func (s *fileSuspendStateStore) Clear(expected suspendState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := s.load()
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !current.SuspendedAt.Equal(expected.SuspendedAt) {
+		return nil
+	}
+	err = os.Remove(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -108,13 +129,14 @@ func (s fileSuspendStateStore) Clear() error {
 }
 
 type sessionWatch struct {
-	source      sessionEventSource
-	hooks       boxSessionHooks
-	state       suspendStateStore
-	runner      hookRunner
-	hookTimeout time.Duration
-	logger      *log.Logger
-	now         func() time.Time
+	source       sessionEventSource
+	hooks        boxSessionHooks
+	state        suspendStateStore
+	runner       hookRunner
+	coordination *hookCoordinator
+	hookTimeout  time.Duration
+	logger       *log.Logger
+	now          func() time.Time
 
 	shutdownMu       sync.Mutex
 	shutdownHandled  bool
@@ -213,6 +235,12 @@ func (w *sessionWatch) handleShutdown(ctx context.Context) {
 }
 
 func (w *sessionWatch) handleSuspend(ctx context.Context) {
+	if w.coordination != nil {
+		if !w.coordination.TryAcquire() {
+			return
+		}
+		w.coordination.release()
+	}
 	boxes, err := w.hooks.RunningBoxes(ctx, suspendQueryTimeout)
 	if err != nil {
 		w.logf("query running boxes at suspend: %v", err)
@@ -239,7 +267,7 @@ func (w *sessionWatch) handleResume(ctx context.Context) {
 		return
 	}
 	if len(state.Boxes) == 0 {
-		if clearErr := w.state.Clear(); clearErr != nil {
+		if clearErr := w.state.Clear(state); clearErr != nil {
 			w.logf("clear suspend state: %v", clearErr)
 		}
 		w.resumeMu.Unlock()
@@ -252,20 +280,18 @@ func (w *sessionWatch) handleResume(ctx context.Context) {
 	w.resumeMu.Unlock()
 	go func() {
 		defer w.resumeHooks.Done()
-		if err := w.hooks.NotifySlept(ctx, boxes, resumeHookTimeout); err != nil {
-			w.logf("raise slept-with-boxes notification: %v", err)
+		defer func() {
 			w.resumeMu.Lock()
 			w.resumeInProgress = false
 			w.resumeMu.Unlock()
+		}()
+		if err := w.hooks.NotifySlept(ctx, boxes, resumeHookTimeout); err != nil {
+			w.logf("raise slept-with-boxes notification: %v", err)
 			return
 		}
-		w.resumeMu.Lock()
-		defer w.resumeMu.Unlock()
-		if err := w.state.Clear(); err != nil {
+		if err := w.state.Clear(state); err != nil {
 			w.logf("clear suspend state: %v", err)
-			return
 		}
-		w.resumeInProgress = false
 	}()
 }
 
@@ -279,5 +305,5 @@ func newFileSuspendStateStore(path string) (suspendStateStore, error) {
 	if path == "" {
 		return nil, fmt.Errorf("suspend state path is empty")
 	}
-	return fileSuspendStateStore{path: path}, nil
+	return &fileSuspendStateStore{path: path}, nil
 }

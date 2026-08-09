@@ -53,6 +53,19 @@ func newHookCoordinator() *hookCoordinator {
 	return coordination
 }
 
+func (c *hookCoordinator) TryAcquire() bool {
+	select {
+	case <-c.permit:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *hookCoordinator) release() {
+	c.permit <- struct{}{}
+}
+
 func (c *hookCoordinator) run(ctx context.Context, timeout time.Duration, run func(context.Context, time.Duration) error) error {
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -61,7 +74,7 @@ func (c *hookCoordinator) run(ctx context.Context, timeout time.Duration, run fu
 		return fmt.Errorf("power-watch coordination timed out after %s: %w", timeout, runCtx.Err())
 	case <-c.permit:
 	}
-	defer func() { c.permit <- struct{}{} }()
+	defer c.release()
 
 	deadline, _ := runCtx.Deadline()
 	remaining := time.Until(deadline)
