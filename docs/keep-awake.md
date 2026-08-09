@@ -1,10 +1,10 @@
 # Keep-awake
 
-`boxa keep-awake` optionally runs a small host daemon that blocks idle sleep
-only while one or more coding agents hold live leases. Enablement builds the
-daemon from `keep-awake/` in a pinned golang Docker container, falling back to
-the host's local Go toolchain, then installs user autostart and creates a
-port-17777 Host connection trusted by every present and future box.
+`boxa keep-awake` optionally runs the **Keep-awake daemon**, which blocks idle
+sleep only while one or more coding agents hold **Awake leases**. Enablement
+builds the daemon from `keep-awake/` in a pinned golang Docker container,
+falling back to the host's local Go toolchain, then installs user autostart and
+creates a port-17777 Host connection trusted by every present and future box.
 
 On WSL2, the scheduled task resolves the Windows vEthernet adapter when it
 starts. If the adapter is still absent after 60 seconds, keep-awake starts on
@@ -47,19 +47,20 @@ The installer offers this elective once. A decline is remembered; plain
 `boxa doctor` reports it without changing the choice. Enable it later with
 `boxa keep-awake enable` or `boxa doctor --fix keep-awake`.
 
-## Built-in activity hook
+## Activity hook
 
-Boxa's managed Claude config includes `agent-awake.sh` in every Container. It
-refreshes a 15-minute lease on `UserPromptSubmit` and `PreToolUse`, and releases
-the same project-scoped lease on `Stop`. The hook calls the Host connection on
-local port 17777 with a one-second timeout and always exits successfully, so it
-is a silent fast no-op until `boxa keep-awake enable` makes the daemon
-reachable. Existing Claude configs receive the hook and settings entries
-additively during Container setup.
+Boxa's managed Claude config includes the **Activity hook**, `agent-awake.sh`,
+in every Container. It refreshes a 15-minute **Awake lease** on
+`UserPromptSubmit` and `PreToolUse`, and releases the same project-scoped lease
+on `Stop`. The hook calls the Host connection on local port 17777 with a
+one-second timeout and always exits successfully, so it is a silent fast no-op
+until `boxa keep-awake enable` makes the daemon reachable. Existing Claude
+configs receive the hook and settings entries additively during Container
+setup.
 
-Third-party agents can implement the same activity/stop protocol. The daemon's
-default TTL is 15 minutes, so a missed stop event cannot hold the machine awake
-forever:
+Third-party agents can implement the same activity/stop protocol. The
+**Keep-awake daemon** gives each **Awake lease** a default TTL of 15 minutes, so
+a missed stop event cannot hold the machine awake forever:
 
 ```bash
 #!/usr/bin/env bash
@@ -82,7 +83,7 @@ keep_awake_host() {
         else
             ip route show default | awk 'NR == 1 { print $3; exit }'
         fi
-    # Native Linux and macOS reach their host daemon directly.
+    # Native Linux and macOS reach the Keep-awake daemon directly.
     else
         printf '127.0.0.1'
     fi

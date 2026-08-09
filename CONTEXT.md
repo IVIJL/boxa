@@ -57,13 +57,43 @@ Source of truth for status queries.
 **Closeout notification**:
 The desktop notification the host-side deliver script raises when an
 **Allow-for window** or an **Agent-browser session**/**network window**
-closes. Carries a click action that opens the run's log (the **Harvest
-log** or the agent-browser summary/proxy log). The notification is a
-convenience pointer; the log file on disk is the canonical record and is
-always written even if no notification backend is available. The click
-action is platform-native: a protocol-activated toast on WSL2, a
-`notify-send` default action on Linux, none on macOS.
+closes, or that reports the outcome of a **Pre-sleep stop**. For a window or
+session closeout, it carries a click action that opens the run's log (the
+**Harvest log** or the agent-browser summary/proxy log). The notification is a
+convenience pointer; that log file is the canonical record and is always
+written even if no notification backend is available. The click action is
+platform-native: a protocol-activated toast on WSL2, a `notify-send` default
+action on Linux, none on macOS.
 _Avoid_: toast (Windows-specific), popup, alert
+
+### Keep-awake
+
+**Keep-awake daemon**:
+The host-side process that holds the operating system awake while coding
+agents work and owns **Awake leases** and **Power-watch**.
+_Avoid_: host daemon, awake daemon, sleep blocker
+
+**Awake lease**:
+A TTL-bounded busy claim, identified by agent and session, that an agent holds
+through the keep-awake HTTP API while it is working.
+_Avoid_: live lease, keep-awake claim, inhibitor lease
+
+**Activity hook**:
+The Claude hook that translates agent activity into **Awake lease** signals.
+On Stop, its shell-aware behaviour keeps the lease busy while a background
+shell is still running and otherwise releases it.
+_Avoid_: agent-awake hook, keep-awake hook
+
+**Power-watch**:
+The **Keep-awake daemon** component that stops boxes before the system sleeps
+or shuts down.
+_Avoid_: power watcher, sleep watcher, shutdown watcher
+
+**Pre-sleep stop**:
+The `boxa stop --all --reason presleep` run that **Power-watch** triggers
+before sleep or shutdown. Its outcome reaches the user through a **Closeout
+notification**.
+_Avoid_: presleep hook, sleep stop, shutdown stop
 
 ### Agent-browser
 
