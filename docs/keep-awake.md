@@ -51,12 +51,13 @@ The installer offers this elective once. A decline is remembered; plain
 
 Boxa's managed Claude config includes the **Activity hook**, `agent-awake.sh`,
 in every Container. It refreshes a 15-minute **Awake lease** on
-`UserPromptSubmit` and `PreToolUse`, and releases the same project-scoped lease
-on `Stop`. The hook calls the Host connection on local port 17777 with a
-one-second timeout and always exits successfully, so it is a silent fast no-op
-until `boxa keep-awake enable` makes the daemon reachable. Existing Claude
-configs receive the hook and settings entries additively during Container
-setup.
+`UserPromptSubmit` and `PreToolUse`. On `Stop`, it releases the same
+project-scoped lease unless the owning Claude process still has a live
+background shell-snapshot child, in which case it refreshes the lease instead.
+The hook calls the Host connection on local port 17777 with a one-second timeout
+and always exits successfully, so it is a silent fast no-op until the daemon is
+made reachable with `boxa keep-awake enable`. Existing Claude configs receive
+the hook and settings entries additively during Container setup.
 
 Third-party agents can implement the same activity/stop protocol. The
 **Keep-awake daemon** gives each **Awake lease** a default TTL of 15 minutes, so

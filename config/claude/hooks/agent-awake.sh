@@ -17,6 +17,57 @@ action="${1:-busy}"
 session="${BOXA_PROJECT_NAME:-default}"
 port="${BOXA_KEEP_AWAKE_PORT:-17777}"
 
+# A Stop may arrive while Claude's run_in_background shell is still working.
+# Take one process snapshot, find this hook's owning claude ancestor, and keep
+# the normal lease while another direct child has the shell-snapshot signature.
+# Any missing or malformed process-tree data deliberately leaves Stop as idle.
+if [ "$action" = idle ]; then
+    ps_command="${BOXA_PS_COMMAND:-ps}"
+    processes=$(BOXA_AGENT_AWAKE_HOOK_PID=$$ \
+        "$ps_command" -eo pid=,ppid=,comm=,args= 2>/dev/null) || processes=""
+    detection=$(printf '%s\n' "$processes" | awk -v hook_pid="$$" '
+        NF {
+            if ($1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $1 in parent) {
+                invalid = 1
+                next
+            }
+            parent[$1] = $2
+            command[$1] = $3
+            snapshot[$1] = index($0, "shell-snapshots/snapshot-") != 0
+            process_count++
+        }
+        END {
+            if (invalid || !(hook_pid in parent))
+                exit 1
+
+            pid = hook_pid
+            for (walked = 0; walked <= process_count; walked++) {
+                excluded[pid] = 1
+                name = command[pid]
+                sub(/^.*\//, "", name)
+                if (name == "claude") {
+                    owner = pid
+                    break
+                }
+                if (!(pid in parent) || parent[pid] == 0 || parent[pid] == pid)
+                    exit 1
+                pid = parent[pid]
+            }
+            if (owner == "")
+                exit 1
+
+            for (pid in parent) {
+                if (parent[pid] == owner && snapshot[pid] && !(pid in excluded)) {
+                    print "busy"
+                    exit
+                }
+            }
+            print "idle"
+        }
+    ' 2>/dev/null) || detection=""
+    [ "$detection" = busy ] && action=busy
+fi
+
 case "$action" in
     idle) path="/v1/idle/claude?session=$session" ;;
     *)    path="/v1/busy/claude?ttl=900&session=$session" ;;

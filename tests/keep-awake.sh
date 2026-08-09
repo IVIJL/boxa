@@ -355,6 +355,60 @@ assert_eq "unreachable daemon leaves hook successful" pass \
     "$($agent_awake busy >/dev/null 2>&1 && printf pass || printf fail)"
 export KEEP_AWAKE_TEST_CURL_HEALTHY=true
 
+# Stop keeps the lease while a shell-snapshot child of the owning Claude is
+# alive. The ps stub substitutes the hook PID into otherwise static trees, so
+# no real background process is involved in these checks.
+cat > "$TMPROOT/bin/agent-awake-ps" <<'EOF'
+#!/usr/bin/env bash
+hook_pid="${BOXA_AGENT_AWAKE_HOOK_PID:?}"
+case "${KEEP_AWAKE_TEST_PROCESS_TREE:-absent}" in
+    background)
+        printf '%s\n' \
+            '100 1 claude /usr/bin/claude' \
+            "$hook_pid 100 agent-awake.sh agent-awake.sh idle" \
+            '200 100 zsh zsh -c source ~/.claude/shell-snapshots/snapshot-zsh-bg.sh'
+        ;;
+    absent)
+        printf '%s\n' \
+            '100 1 claude /usr/bin/claude' \
+            "$hook_pid 100 agent-awake.sh agent-awake.sh idle"
+        ;;
+    self)
+        printf '%s\n' \
+            '100 1 claude /usr/bin/claude' \
+            '300 100 zsh zsh -c source ~/.claude/shell-snapshots/snapshot-zsh-hook.sh' \
+            "$hook_pid 300 agent-awake.sh agent-awake.sh idle"
+        ;;
+    failure)
+        exit 1
+        ;;
+esac
+EOF
+chmod +x "$TMPROOT/bin/agent-awake-ps"
+export BOXA_PS_COMMAND="$TMPROOT/bin/agent-awake-ps"
+
+: > "$KEEP_AWAKE_TEST_LOG"
+env -u BOXA_PROJECT_NAME KEEP_AWAKE_TEST_PROCESS_TREE=background "$agent_awake" idle
+assert_contains "Stop stays busy while a background shell-snapshot child runs" \
+    "/v1/busy/claude?ttl=900&session=default" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+
+: > "$KEEP_AWAKE_TEST_LOG"
+env -u BOXA_PROJECT_NAME KEEP_AWAKE_TEST_PROCESS_TREE=absent "$agent_awake" idle
+assert_contains "Stop becomes idle without background shell-snapshot children" \
+    "/v1/idle/claude?session=default" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+
+: > "$KEEP_AWAKE_TEST_LOG"
+env -u BOXA_PROJECT_NAME KEEP_AWAKE_TEST_PROCESS_TREE=self "$agent_awake" idle
+assert_contains "Stop excludes its own shell-snapshot process chain" \
+    "/v1/idle/claude?session=default" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+
+: > "$KEEP_AWAKE_TEST_LOG"
+env -u BOXA_PROJECT_NAME KEEP_AWAKE_TEST_PROCESS_TREE=failure "$agent_awake" idle
+assert_contains "Stop falls back to idle when process detection fails" \
+    "/v1/idle/claude?session=default" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+unset BOXA_PS_COMMAND
+
 # Existing shared settings are merged rather than replaced. Calling the
 # migration twice must leave one exact entry per event and preserve custom data.
 claude_defaults="$BOXA_DIR/config/claude"
