@@ -2645,10 +2645,12 @@ prepare_container_for_stop() {
             inner=$(docker ps --format "{{.ID}} {{.Names}}" 2>/dev/null)
             if [ -n "$inner" ]; then
                 echo "Stopping inner containers..."
+                ids=()
                 while read -r cid cname; do
                     echo "  Stopping: $cname ($cid)"
-                    docker stop -t 30 "$cid" >/dev/null 2>&1 || true
+                    ids+=("$cid")
                 done <<< "$inner"
+                docker stop -t 30 "${ids[@]}" >/dev/null 2>&1 || true
             fi
         fi
     ' 2>/dev/null || true
@@ -4873,8 +4875,13 @@ if [ "$MODE" = "stop" ]; then
         fi
 
         if [ "${#stop_containers[@]}" -gt 0 ]; then
+            prepare_pids=()
             for name in "${stop_containers[@]}"; do
-                prepare_container_for_stop "$name"
+                prepare_container_for_stop "$name" &
+                prepare_pids+=("$!")
+            done
+            for prepare_pid in "${prepare_pids[@]}"; do
+                wait "$prepare_pid"
             done
 
             docker stop -t 15 "${stop_containers[@]}" > /dev/null
