@@ -378,6 +378,15 @@ EOF
 SSH_WARNING=""
 BOXA_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
+# Private, low-latency WSL bridge for the Windows Power-watch hidden window.
+# Dispatch before module loading, invocation sweeps, and the main parser:
+# suspend gives us only a tiny read-only window, and this plumbing must never
+# acquire unrelated work.
+if [ "${1:-}" = "__power-watch-windows" ]; then
+    shift
+    exec "$BOXA_DIR/scripts/power-watch-windows.sh" "$@"
+fi
+
 # Brand module — single source of truth for CLI_NAME and the values derived
 # from it (image tag, shared-infra container names, …). Sourced first so the
 # derived assignments below read from it; a rename touches lib/brand.sh only.

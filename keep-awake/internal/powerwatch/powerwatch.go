@@ -83,6 +83,7 @@ type Watch struct {
 	logger  *log.Logger
 	status  Status
 	predict *predictionWatch
+	session *sessionWatch
 }
 
 func New(command string, timeout time.Duration, output io.Writer, logger *log.Logger) *Watch {
@@ -95,6 +96,7 @@ func NewWithAwakeLeases(command string, timeout time.Duration, output io.Writer,
 	runner := commandRunner{command: command, output: output}
 	watch := newWatch(newPlatformSource(), runner, timeout, logger)
 	watch.predict = newPlatformPrediction(runner, timeout, logger, leases)
+	watch.session = newPlatformSessionWatch(runner, timeout, logger)
 	return watch
 }
 
@@ -109,10 +111,31 @@ func newWatch(source eventSource, runner hookRunner, timeout time.Duration, logg
 }
 
 func (w *Watch) Run(ctx context.Context) error {
+	if w.predict != nil && w.session != nil {
+		w.setActive(true)
+		defer w.setActive(false)
+		runCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		done := make(chan error, 2)
+		go func() { done <- w.predict.Run(runCtx) }()
+		go func() { done <- w.session.Run(runCtx) }()
+		firstErr := <-done
+		cancel()
+		secondErr := <-done
+		if firstErr != nil {
+			return firstErr
+		}
+		return secondErr
+	}
 	if w.predict != nil {
 		w.setActive(true)
 		defer w.setActive(false)
 		return w.predict.Run(ctx)
+	}
+	if w.session != nil {
+		w.setActive(true)
+		defer w.setActive(false)
+		return w.session.Run(ctx)
 	}
 	if w.source == nil {
 		<-ctx.Done()

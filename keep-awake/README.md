@@ -31,8 +31,9 @@ keep-awake -listen-unsafe -listen-address 192.168.65.1 -listen-address 172.17.0.
 Only loopback addresses are accepted unless `-listen-unsafe` explicitly opts
 into non-loopback interfaces, which may include LAN-facing ones. Only literal
 IP addresses are accepted and wildcard addresses (`0.0.0.0` and `::`) are
-always rejected. Binding the port is the single-instance guard. The only disk
-write is the append-only `keep-awake.log`, configurable with `-log-file`.
+always rejected. Binding the port is the single-instance guard. The disk writes
+are the append-only `keep-awake.log`, configurable with `-log-file`, and, on
+Windows, a small suspend-state file that is cleared after resume.
 
 Linux uses a managed `systemd-inhibit --what=idle:sleep` process, macOS uses a
 managed `caffeinate -i` process, and Windows uses `SetThreadExecutionState` on
@@ -40,4 +41,7 @@ a dedicated OS thread.
 
 Power-watch stops boxes before native Linux sleep/shutdown events. On Windows
 it predicts idle sleep from the active power-plan timeout and user idle time,
-then stops boxes about one minute before the deadline when no lease is held.
+then stops boxes about one minute before the deadline when no lease is held. A
+hidden-window message pump also runs a bounded stop during shutdown and records
+actually running boxes during manual sleep so resume can raise a Closeout
+notification without restarting or healing anything.

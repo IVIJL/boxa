@@ -123,7 +123,21 @@ checks near its deadline. With no Awake lease held, it runs the same Pre-sleep
 stop about one minute before predicted idle sleep. Prediction is suspended
 while any lease is held, re-arms when the last lease drops, and does not repeat
 after a stop until user activity resets the idle clock. A never-sleep plan
-disables prediction. macOS Power-watch is currently a no-op.
+disables prediction.
+
+The Windows daemon also owns a hidden top-level window and Win32 message pump
+on a dedicated OS thread. During shutdown/restart it publishes the shutdown
+block reason `Stopping boxa containers…`, starts the Pre-sleep stop, and clears
+the reason after completion or a hard ten-second maximum. During manual sleep
+it uses a 1.5-second-bounded WSL query to atomically record the box names that
+are actually running in `%LocalAppData%\Boxa\keep-awake-suspend.json`; it does
+not attempt a stop in the suspend notification window. On resume it clears the
+state and, when the recorded list is non-empty, dispatches a Closeout
+notification through `scripts/deliver-allow-for-notification.sh`. An earlier
+idle-predicted stop leaves the suspend-time list empty, so resume does not raise
+a redundant notification. Resume never restarts or heals Containers.
+
+macOS Power-watch is currently a no-op.
 
 The command and its one-minute stop budget can be overridden with the daemon
 flags `-power-watch-command` and `-power-watch-timeout`. On Windows the default
@@ -137,3 +151,25 @@ configured stop budget is longer, raise `InhibitDelayMaxSec` in
 has enough time to stop every Container cleanly. `/v1/status` reports the
 effective delay, stop budget, Power-watch activity, and a hint when the delay
 is shorter than the budget.
+
+### Windows manual verification
+
+These checks require a real Windows host with Boxa installed through WSL:
+
+1. Start two boxes, choose Start → Shut down, and confirm the `Stopping boxa
+   containers…` reason appears when stopping is slow; after the next boot,
+   verify both boxes were stopped.
+2. Run the daemon once with a deliberately wedged `-power-watch-command` and a
+   short `-power-watch-timeout`; shut down and confirm Windows continues no
+   later than that timeout and the block reason disappears.
+3. Start two named boxes, sleep from the lid or power menu, then resume and
+   confirm one Closeout notification names both boxes and neither box was
+   automatically restarted or healed.
+4. Repeat manual sleep with no running boxes and confirm resume raises no
+   slept-with-boxes notification.
+5. Configure a short idle-sleep timeout, let idle prediction stop the boxes,
+   and allow sleep to follow; confirm the Pre-sleep stop notification is the
+   only notification and resume adds no slept-with-boxes notification.
+6. Stop and restart the daemon, then inspect its log for window-class cleanup
+   or registration errors and repeat one sleep/resume cycle to confirm the new
+   message pump receives events.

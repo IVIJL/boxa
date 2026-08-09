@@ -15,6 +15,8 @@ func newPlatformPrediction(hookRunner, time.Duration, *log.Logger, AwakeLeaseSou
 	return nil
 }
 
+func newPlatformSessionWatch(hookRunner, time.Duration, *log.Logger) *sessionWatch { return nil }
+
 func newCommand(ctx context.Context, command string) (*exec.Cmd, error) {
 	return exec.CommandContext(ctx, "sh", "-c", command), nil
 }
