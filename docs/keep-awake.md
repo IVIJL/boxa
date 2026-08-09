@@ -137,6 +137,15 @@ notification through `scripts/deliver-allow-for-notification.sh`. An earlier
 idle-predicted stop leaves the suspend-time list empty, so resume does not raise
 a redundant notification. Resume never restarts or heals Containers.
 
+Closeout delivery around sleep is deliberately best-effort. When suspend lands
+while a Pre-sleep stop is already in flight, resume re-queries the actually
+running boxes and notifies only if any survived. If that stop fails *after*
+stopping every box but *before* its own Closeout goes out, the resume query
+finds nothing and no notice is raised — the boxes were still stopped cleanly
+before sleep, so nothing was lost but an informational message. Guarding that
+compound window would need a cross-process delivery receipt between `boxa stop`
+and the daemon, which is out of proportion to the message it would save.
+
 macOS Power-watch is currently a no-op.
 
 The command and its one-minute stop budget can be overridden with the daemon
