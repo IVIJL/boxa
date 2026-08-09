@@ -93,6 +93,47 @@ func TestManagerRunExpiresWithoutIdleOrStatusRequest(t *testing.T) {
 	}
 }
 
+func TestManagerSignalsOnlyAwakeLeaseBoundaryTransitions(t *testing.T) {
+	manager := NewManager(NewRegistry(&fakeClock{}), &inhibit.Fake{})
+	changes := manager.AwakeLeaseChanges()
+	if err := manager.Busy("codex", "box-a", time.Minute); err != nil {
+		t.Fatalf("first Busy: %v", err)
+	}
+	assertLeaseChange(t, changes, true)
+	if !manager.AwakeLeaseHeld() {
+		t.Fatal("first Busy did not report a held lease")
+	}
+	if err := manager.Busy("codex", "box-b", time.Minute); err != nil {
+		t.Fatalf("second Busy: %v", err)
+	}
+	assertLeaseChange(t, changes, false)
+	if err := manager.Idle("codex", "box-a"); err != nil {
+		t.Fatalf("first Idle: %v", err)
+	}
+	assertLeaseChange(t, changes, false)
+	if err := manager.Idle("codex", "box-b"); err != nil {
+		t.Fatalf("last Idle: %v", err)
+	}
+	assertLeaseChange(t, changes, true)
+	if manager.AwakeLeaseHeld() {
+		t.Fatal("last Idle still reports a held lease")
+	}
+}
+
+func assertLeaseChange(t *testing.T, changes <-chan struct{}, want bool) {
+	t.Helper()
+	select {
+	case <-changes:
+		if !want {
+			t.Fatal("unexpected awake lease transition")
+		}
+	default:
+		if want {
+			t.Fatal("missing awake lease transition")
+		}
+	}
+}
+
 type assertionError string
 
 func (e assertionError) Error() string { return string(e) }

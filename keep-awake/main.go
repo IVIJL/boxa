@@ -111,7 +111,7 @@ func run(ctx context.Context, cfg config, addresses []string, listeners []net.Li
 	defer cancelRun()
 	registry := awake.NewRegistry(awake.RealClock{})
 	manager := awake.NewManager(registry, inhibit.New())
-	powerWatch := powerwatch.New(cfg.powerCommand, cfg.powerTimeout, logger.Writer(), logger)
+	powerWatch := powerwatch.NewWithAwakeLeases(cfg.powerCommand, cfg.powerTimeout, logger.Writer(), logger, manager)
 	defer func() {
 		if err := manager.Close(); err != nil {
 			logger.Printf("release sleep inhibitor: %v", err)

@@ -570,16 +570,18 @@ keep_awake::powershell_literal() {
 }
 
 keep_awake::write_windows_wrapper() {
-    local binary_literal log_literal tray_literal
+    local binary_literal log_literal tray_literal distro_literal
     binary_literal="$(keep_awake::powershell_literal "$KEEP_AWAKE_WINDOWS_BINARY")"
     log_literal="$(keep_awake::powershell_literal "$KEEP_AWAKE_WINDOWS_LOG")"
     tray_literal="$(keep_awake::powershell_literal "$KEEP_AWAKE_WINDOWS_TRAY_FILE")"
+    distro_literal="$(keep_awake::powershell_literal "${WSL_DISTRO_NAME:-}")"
 
     if ! cat > "$KEEP_AWAKE_WRAPPER" <<EOF
 param([string]\$TrayFollow = '')
 \$binary = '$binary_literal'
 \$logFile = '$log_literal'
 \$trayFile = '$tray_literal'
+\$env:BOXA_WSL_DISTRO = '$distro_literal'
 # Terminal mode: the wezterm snippet passes -TrayFollow so the tray starts
 # with the terminal and exits with it; the system-mode scheduled task path
 # omits it and keeps its own tray task.

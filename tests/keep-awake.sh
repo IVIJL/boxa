@@ -831,6 +831,7 @@ mv "$TMPROOT/bin/swiftc.mock" "$TMPROOT/bin/swiftc"
 rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
 export BOXA_KEEP_AWAKE_PLATFORM=wsl2
 export BOXA_KEEP_AWAKE_INSTALL_DIR="$TMPROOT/windows-install"
+export WSL_DISTRO_NAME=Ubuntu-Boxa-Test
 "$KEEP_AWAKE" enable >/dev/null
 assert_eq "Windows enable creates firewall rule" true \
     "$(file_exists "$KEEP_AWAKE_TEST_FIREWALL_RULE")"
@@ -922,6 +923,8 @@ assert_contains "Windows status reports tray separately" "Tray: running" \
     "$("$KEEP_AWAKE" status)"
 windows_wrapper="$TMPROOT/windows-install/start-keep-awake.ps1"
 assert_eq "Windows task installs runtime gateway wrapper" true "$(file_exists "$windows_wrapper")"
+assert_contains "Windows wrapper passes the installing WSL distribution" \
+    "\$env:BOXA_WSL_DISTRO = 'Ubuntu-Boxa-Test'" "$(cat "$windows_wrapper")"
 assert_contains "Windows wrapper resolves vEthernet address at each start" \
     "Get-NetIPAddress -AddressFamily IPv4" "$(cat "$windows_wrapper")"
 assert_contains "Windows wrapper retries while vEthernet is unavailable" \

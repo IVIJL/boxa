@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"sync"
@@ -35,6 +36,14 @@ type logindLock struct {
 }
 
 func newPlatformSource() eventSource { return &logindSource{} }
+
+func newPlatformPrediction(hookRunner, time.Duration, *log.Logger, AwakeLeaseSource) *predictionWatch {
+	return nil
+}
+
+func newCommand(ctx context.Context, command string) (*exec.Cmd, error) {
+	return exec.CommandContext(ctx, "sh", "-c", command), nil
+}
 
 func configureCommand(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

@@ -116,12 +116,20 @@ holds a systemd-logind delay inhibitor for sleep and shutdown. When logind
 announces either transition, Power-watch runs
 `boxa stop --all --reason presleep` regardless of any held Awake leases, then
 releases the delay inhibitor so the transition can continue. Its output is
-written to the daemon log. macOS and Windows Power-watch implementations are
-currently no-ops.
+written to the daemon log.
+
+On Windows, Power-watch reads the active AC/DC idle-sleep timeout and schedules
+checks near its deadline. With no Awake lease held, it runs the same Pre-sleep
+stop about one minute before predicted idle sleep. Prediction is suspended
+while any lease is held, re-arms when the last lease drops, and does not repeat
+after a stop until user activity resets the idle clock. A never-sleep plan
+disables prediction. macOS Power-watch is currently a no-op.
 
 The command and its one-minute stop budget can be overridden with the daemon
-flags `-power-watch-command` and `-power-watch-timeout`. A hanging command is
-terminated when that budget or logind's shorter effective delay expires.
+flags `-power-watch-command` and `-power-watch-timeout`. On Windows the default
+is invoked in the WSL distribution that installed the daemon. A hanging
+command is terminated when that budget or logind's shorter effective delay
+expires.
 
 logind commonly defaults `InhibitDelayMaxSec` to only a few seconds. If the
 configured stop budget is longer, raise `InhibitDelayMaxSec` in

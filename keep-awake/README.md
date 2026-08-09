@@ -37,3 +37,7 @@ write is the append-only `keep-awake.log`, configurable with `-log-file`.
 Linux uses a managed `systemd-inhibit --what=idle:sleep` process, macOS uses a
 managed `caffeinate -i` process, and Windows uses `SetThreadExecutionState` on
 a dedicated OS thread.
+
+Power-watch stops boxes before native Linux sleep/shutdown events. On Windows
+it predicts idle sleep from the active power-plan timeout and user idle time,
+then stops boxes about one minute before the deadline when no lease is held.

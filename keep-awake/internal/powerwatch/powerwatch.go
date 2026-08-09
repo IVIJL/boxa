@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os/exec"
 	"sync"
 	"time"
 )
@@ -44,6 +43,13 @@ type hookRunner interface {
 	Run(context.Context, time.Duration) error
 }
 
+// AwakeLeaseSource reports whether idle sleep is currently inhibited and
+// signals transitions so Windows prediction can suspend and resume promptly.
+type AwakeLeaseSource interface {
+	AwakeLeaseHeld() bool
+	AwakeLeaseChanges() <-chan struct{}
+}
+
 type commandRunner struct {
 	command string
 	output  io.Writer
@@ -53,7 +59,10 @@ func (r commandRunner) Run(ctx context.Context, timeout time.Duration) error {
 	hookCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(hookCtx, "sh", "-c", r.command)
+	cmd, err := newCommand(hookCtx, r.command)
+	if err != nil {
+		return err
+	}
 	configureCommand(cmd)
 	cmd.Stdout = r.output
 	cmd.Stderr = r.output
@@ -73,10 +82,20 @@ type Watch struct {
 	timeout time.Duration
 	logger  *log.Logger
 	status  Status
+	predict *predictionWatch
 }
 
 func New(command string, timeout time.Duration, output io.Writer, logger *log.Logger) *Watch {
-	return newWatch(newPlatformSource(), commandRunner{command: command, output: output}, timeout, logger)
+	return NewWithAwakeLeases(command, timeout, output, logger, nil)
+}
+
+// NewWithAwakeLeases adds the lease state used by Windows idle prediction.
+// Event-driven platforms ignore leases and retain their existing behaviour.
+func NewWithAwakeLeases(command string, timeout time.Duration, output io.Writer, logger *log.Logger, leases AwakeLeaseSource) *Watch {
+	runner := commandRunner{command: command, output: output}
+	watch := newWatch(newPlatformSource(), runner, timeout, logger)
+	watch.predict = newPlatformPrediction(runner, timeout, logger, leases)
+	return watch
 }
 
 func newWatch(source eventSource, runner hookRunner, timeout time.Duration, logger *log.Logger) *Watch {
@@ -90,6 +109,11 @@ func newWatch(source eventSource, runner hookRunner, timeout time.Duration, logg
 }
 
 func (w *Watch) Run(ctx context.Context) error {
+	if w.predict != nil {
+		w.setActive(true)
+		defer w.setActive(false)
+		return w.predict.Run(ctx)
+	}
 	if w.source == nil {
 		<-ctx.Done()
 		return nil
