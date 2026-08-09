@@ -43,6 +43,43 @@ type hookRunner interface {
 	Run(context.Context, time.Duration) error
 }
 
+type hookCoordinator struct {
+	permit chan struct{}
+}
+
+func newHookCoordinator() *hookCoordinator {
+	coordination := &hookCoordinator{permit: make(chan struct{}, 1)}
+	coordination.permit <- struct{}{}
+	return coordination
+}
+
+func (c *hookCoordinator) run(ctx context.Context, timeout time.Duration, run func(context.Context, time.Duration) error) error {
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	select {
+	case <-runCtx.Done():
+		return fmt.Errorf("power-watch coordination timed out after %s: %w", timeout, runCtx.Err())
+	case <-c.permit:
+	}
+	defer func() { c.permit <- struct{}{} }()
+
+	deadline, _ := runCtx.Deadline()
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return fmt.Errorf("power-watch coordination timed out after %s: %w", timeout, context.DeadlineExceeded)
+	}
+	return run(runCtx, remaining)
+}
+
+type coordinatedHookRunner struct {
+	runner       hookRunner
+	coordination *hookCoordinator
+}
+
+func (r coordinatedHookRunner) Run(ctx context.Context, timeout time.Duration) error {
+	return r.coordination.run(ctx, timeout, r.runner.Run)
+}
+
 // AwakeLeaseSource reports whether idle sleep is currently inhibited and
 // signals transitions so Windows prediction can suspend and resume promptly.
 type AwakeLeaseSource interface {
@@ -94,9 +131,11 @@ func New(command string, timeout time.Duration, output io.Writer, logger *log.Lo
 // Event-driven platforms ignore leases and retain their existing behaviour.
 func NewWithAwakeLeases(command string, timeout time.Duration, output io.Writer, logger *log.Logger, leases AwakeLeaseSource) *Watch {
 	runner := commandRunner{command: command, output: output}
-	watch := newWatch(newPlatformSource(), runner, timeout, logger)
-	watch.predict = newPlatformPrediction(runner, timeout, logger, leases)
-	watch.session = newPlatformSessionWatch(runner, timeout, logger)
+	coordination := newHookCoordinator()
+	coordinatedRunner := coordinatedHookRunner{runner: runner, coordination: coordination}
+	watch := newWatch(newPlatformSource(), coordinatedRunner, timeout, logger)
+	watch.predict = newPlatformPrediction(coordinatedRunner, timeout, logger, leases)
+	watch.session = newPlatformSessionWatch(coordinatedRunner, timeout, logger, coordination)
 	return watch
 }
 

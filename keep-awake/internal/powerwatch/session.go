@@ -39,6 +39,27 @@ type boxSessionHooks interface {
 	NotifySlept(context.Context, []string, time.Duration) error
 }
 
+type coordinatedSessionHooks struct {
+	hooks        boxSessionHooks
+	coordination *hookCoordinator
+}
+
+func (h coordinatedSessionHooks) RunningBoxes(ctx context.Context, timeout time.Duration) ([]string, error) {
+	var boxes []string
+	err := h.coordination.run(ctx, timeout, func(runCtx context.Context, remaining time.Duration) error {
+		var err error
+		boxes, err = h.hooks.RunningBoxes(runCtx, remaining)
+		return err
+	})
+	return boxes, err
+}
+
+func (h coordinatedSessionHooks) NotifySlept(ctx context.Context, boxes []string, timeout time.Duration) error {
+	return h.coordination.run(ctx, timeout, func(runCtx context.Context, remaining time.Duration) error {
+		return h.hooks.NotifySlept(runCtx, boxes, remaining)
+	})
+}
+
 type suspendState struct {
 	SuspendedAt time.Time `json:"suspended_at"`
 	Boxes       []string  `json:"boxes"`
@@ -230,10 +251,10 @@ func (w *sessionWatch) handleResume(ctx context.Context) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		w.logf("read suspend state: %v", err)
 	}
-	if clearErr := w.state.Clear(); clearErr != nil {
-		w.logf("clear suspend state: %v", clearErr)
-	}
 	if err != nil || len(state.Boxes) == 0 {
+		if clearErr := w.state.Clear(); clearErr != nil {
+			w.logf("clear suspend state: %v", clearErr)
+		}
 		return
 	}
 
@@ -243,6 +264,10 @@ func (w *sessionWatch) handleResume(ctx context.Context) {
 		defer w.resumeHooks.Done()
 		if err := w.hooks.NotifySlept(ctx, boxes, resumeHookTimeout); err != nil {
 			w.logf("raise slept-with-boxes notification: %v", err)
+			return
+		}
+		if err := w.state.Clear(); err != nil {
+			w.logf("clear suspend state: %v", err)
 		}
 	}()
 }

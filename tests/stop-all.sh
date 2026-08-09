@@ -56,6 +56,14 @@ STUB
 
 cat > "$TEST_BOXA_DIR/scripts/closeout-agent-browser-on-stop.sh" <<'STUB'
 #!/bin/bash
+if [ "${BOXA_STOP_TEST_PREP_BARRIER:-}" = true ]; then
+    printf 'begin:%s\n' "$1" >> "$BOXA_STOP_TEST_PREP_LOG"
+    : > "$BOXA_STOP_TEST_PREP_DIR/$1"
+    while [ "$(find "$BOXA_STOP_TEST_PREP_DIR" -type f | wc -l)" -lt 2 ]; do
+        sleep 0.01
+    done
+    printf 'end:%s\n' "$1" >> "$BOXA_STOP_TEST_PREP_LOG"
+fi
 printf '%s\n' "$1" >> "$BOXA_STOP_TEST_CLOSEOUT_LOG"
 STUB
 
@@ -75,6 +83,8 @@ export BOXA_STOP_TEST_DOCKER_LOG="$_TMPROOT/docker.log"
 export BOXA_STOP_TEST_STOPPED="$_TMPROOT/stopped"
 export BOXA_STOP_TEST_CLOSEOUT_LOG="$_TMPROOT/closeout.log"
 export BOXA_STOP_TEST_NOTIFICATION_LOG="$_TMPROOT/notification.log"
+export BOXA_STOP_TEST_PREP_DIR="$_TMPROOT/prep"
+export BOXA_STOP_TEST_PREP_LOG="$_TMPROOT/prep.log"
 
 fail_count=0
 
@@ -85,8 +95,12 @@ run_boxa() {
 
 reset_case() {
     rm -f "$BOXA_STOP_TEST_DOCKER_LOG" "$BOXA_STOP_TEST_STOPPED" \
-        "$BOXA_STOP_TEST_CLOSEOUT_LOG" "$BOXA_STOP_TEST_NOTIFICATION_LOG"
-    unset BOXA_STOP_TEST_EMPTY BOXA_STOP_TEST_FAIL_BATCH BOXA_STOP_TEST_FAIL_LIST
+        "$BOXA_STOP_TEST_CLOSEOUT_LOG" "$BOXA_STOP_TEST_NOTIFICATION_LOG" \
+        "$BOXA_STOP_TEST_PREP_LOG"
+    rm -rf "$BOXA_STOP_TEST_PREP_DIR"
+    mkdir -p "$BOXA_STOP_TEST_PREP_DIR"
+    unset BOXA_STOP_TEST_EMPTY BOXA_STOP_TEST_FAIL_BATCH BOXA_STOP_TEST_FAIL_LIST \
+        BOXA_STOP_TEST_PREP_BARRIER
 }
 
 line_count() {
@@ -116,6 +130,14 @@ assert_contains() {
         fail_count=$((fail_count + 1))
     fi
 }
+
+reset_case
+export BOXA_STOP_TEST_PREP_BARRIER=true
+run_boxa stop --all >/dev/null 2>&1
+parallel_rc=$?
+assert_eq "parallel Container prep completes" "0" "$parallel_rc"
+assert_eq "both Container preparations start before either finishes" "2" \
+    "$(sed -n '/^end:/q; /^begin:/p' "$BOXA_STOP_TEST_PREP_LOG" | wc -l)"
 
 reset_case
 mkdir -p "$_TMPROOT/home/.config/boxa/traefik/dynamic" \

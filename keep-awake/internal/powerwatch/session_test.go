@@ -73,6 +73,7 @@ type fakeSessionHooks struct {
 	queryTimeout  time.Duration
 	notifications [][]string
 	notifyTimeout time.Duration
+	notifyErr     error
 	notified      chan struct{}
 }
 
@@ -92,9 +93,10 @@ func (h *fakeSessionHooks) NotifySlept(_ context.Context, boxes []string, timeou
 	h.mu.Lock()
 	h.notifications = append(h.notifications, append([]string(nil), boxes...))
 	h.notifyTimeout = timeout
+	err := h.notifyErr
 	h.mu.Unlock()
 	h.notified <- struct{}{}
-	return nil
+	return err
 }
 
 func (h *fakeSessionHooks) notificationCount() int {
@@ -252,6 +254,37 @@ func TestSuspendPersistsActualBoxesAndResumeNotifiesThenClears(t *testing.T) {
 	if !reflect.DeepEqual(notification, []string{"alpha", "beta"}) || notifyTimeout != resumeHookTimeout {
 		t.Fatalf("notification = %v with timeout %s", notification, notifyTimeout)
 	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned %v", err)
+	}
+}
+
+func TestResumePreservesStateUntilNotificationSucceeds(t *testing.T) {
+	source := newFakeSessionSource()
+	hooks := newFakeSessionHooks("alpha")
+	hooks.notifyErr = errors.New("notification unavailable")
+	state := &memorySuspendStateStore{}
+	watch := newSessionWatch(source, hooks, state, &fakeRunner{}, time.Minute, nil)
+	cancel, done := runSessionWatch(watch)
+
+	source.emit(sessionSuspend)
+	source.emit(sessionResume)
+	<-hooks.notified
+	if persisted, err := state.Load(); err != nil || !reflect.DeepEqual(persisted.Boxes, []string{"alpha"}) {
+		t.Fatalf("state after failed notification = %+v, %v; want alpha preserved", persisted, err)
+	}
+
+	hooks.mu.Lock()
+	hooks.notifyErr = nil
+	hooks.mu.Unlock()
+	source.emit(sessionResume)
+	<-hooks.notified
+	waitFor(t, func() bool {
+		_, err := state.Load()
+		return errors.Is(err, os.ErrNotExist)
+	})
 
 	cancel()
 	if err := <-done; err != nil {

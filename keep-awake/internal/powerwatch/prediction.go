@@ -10,6 +10,7 @@ const (
 	settingsRefreshInterval = 5 * time.Minute
 	earlyCheckLead          = 2 * time.Minute
 	finalCheckLead          = time.Minute
+	hookRetryInterval       = 5 * time.Second
 )
 
 type idleTimeSource interface {
@@ -154,7 +155,10 @@ func (w *predictionWatch) nextTimer(ctx context.Context) predictionTimer {
 	remaining := w.timeout - idle
 	if remaining <= finalCheckLead {
 		if !w.awakeLeaseHeld() {
-			w.runHook(ctx, idle)
+			if w.runHook(ctx, idle) {
+				return nil
+			}
+			return w.scheduler.NewTimer(hookRetryInterval)
 		}
 		return nil
 	}
@@ -165,15 +169,19 @@ func (w *predictionWatch) nextTimer(ctx context.Context) predictionTimer {
 	return w.scheduler.NewTimer(remaining - lead)
 }
 
-func (w *predictionWatch) runHook(ctx context.Context, idle time.Duration) {
+func (w *predictionWatch) runHook(ctx context.Context, idle time.Duration) bool {
 	if w.logger != nil {
 		w.logger.Printf("power-watch predicts idle sleep within %s; running pre-sleep stop with %s budget", finalCheckLead, w.hookTimeout)
 	}
-	if err := w.runner.Run(ctx, w.hookTimeout); err != nil && w.logger != nil {
-		w.logger.Printf("power-watch pre-sleep stop: %v", err)
+	if err := w.runner.Run(ctx, w.hookTimeout); err != nil {
+		if w.logger != nil {
+			w.logger.Printf("power-watch pre-sleep stop: %v", err)
+		}
+		return false
 	}
 	w.firedIdle = idle
 	w.waitingForActivity = true
+	return true
 }
 
 func (w *predictionWatch) awakeLeaseHeld() bool {

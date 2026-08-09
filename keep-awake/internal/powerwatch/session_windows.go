@@ -88,7 +88,7 @@ type windowsSessionHooks struct {
 	distro string
 }
 
-func newPlatformSessionWatch(runner hookRunner, timeout time.Duration, logger *log.Logger) *sessionWatch {
+func newPlatformSessionWatch(runner hookRunner, timeout time.Duration, logger *log.Logger, coordination *hookCoordinator) *sessionWatch {
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		if logger != nil {
@@ -104,7 +104,11 @@ func newPlatformSessionWatch(runner hookRunner, timeout time.Duration, logger *l
 		return nil
 	}
 	hooks := windowsSessionHooks{distro: strings.TrimSpace(os.Getenv(wslDistroEnvironment))}
-	return newSessionWatch(&windowsSessionSource{}, hooks, state, runner, timeout, logger)
+	return newSessionWatch(
+		&windowsSessionSource{},
+		coordinatedSessionHooks{hooks: hooks, coordination: coordination},
+		state, runner, timeout, logger,
+	)
 }
 
 func (s *windowsSessionSource) Run(ctx context.Context, handle func(sessionEvent)) (runErr error) {

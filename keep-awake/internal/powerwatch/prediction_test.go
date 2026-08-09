@@ -275,6 +275,32 @@ func TestPredictionRearmsOnlyAfterActivityReset(t *testing.T) {
 	<-done
 }
 
+func TestPredictionRetriesAfterHookFailure(t *testing.T) {
+	idle := &fakeIdleSource{idle: 9 * time.Minute}
+	scheduler := &fakePredictionScheduler{}
+	runner := &fakeRunner{err: errors.New("stop failed")}
+	watch := newPredictionWatch(idle, &fakeTimeoutSource{timeout: 10 * time.Minute}, scheduler, runner, nil, time.Minute, nil)
+	cancel, done := runPredictionWatch(watch)
+
+	waitFor(t, func() bool { return runner.CallCount() == 1 })
+	waitFor(t, func() bool { return scheduler.hasActive(hookRetryInterval) })
+	if watch.waitingForActivity {
+		t.Fatal("failed hook suppressed retry until activity")
+	}
+	runner.mu.Lock()
+	runner.err = nil
+	runner.mu.Unlock()
+	if !scheduler.fire(hookRetryInterval) {
+		t.Fatal("hook retry timer was not active")
+	}
+	waitFor(t, func() bool { return runner.CallCount() == 2 })
+	cancel()
+	<-done
+	if !watch.waitingForActivity {
+		t.Fatal("successful retry did not wait for activity")
+	}
+}
+
 func TestPredictionNeverSleepAndSettingsFailuresDisableWithOneLog(t *testing.T) {
 	settings := &fakeTimeoutSource{err: errors.New("powercfg failed")}
 	scheduler := &fakePredictionScheduler{}

@@ -31,6 +31,30 @@ type fakeRunner struct {
 	err   error
 }
 
+type blockingRunner struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingRunner) Run(context.Context, time.Duration) error {
+	close(r.started)
+	<-r.release
+	return nil
+}
+
+type signalingSessionHooks struct {
+	running chan struct{}
+}
+
+func (h *signalingSessionHooks) RunningBoxes(context.Context, time.Duration) ([]string, error) {
+	close(h.running)
+	return nil, nil
+}
+
+func (*signalingSessionHooks) NotifySlept(context.Context, []string, time.Duration) error {
+	return nil
+}
+
 func newFakeSource(delayMax time.Duration) *fakeSource {
 	return &fakeSource{events: make(chan Event, 4), delayMax: delayMax}
 }
@@ -100,6 +124,41 @@ func TestPowerEventsRunHookAndReleaseDelayLock(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPredictionHookAndSessionStateQueryAreCoordinated(t *testing.T) {
+	coordination := newHookCoordinator()
+	runner := &blockingRunner{started: make(chan struct{}), release: make(chan struct{})}
+	prediction := newPredictionWatch(
+		&fakeIdleSource{}, &fakeTimeoutSource{}, &fakePredictionScheduler{},
+		coordinatedHookRunner{runner: runner, coordination: coordination}, nil, time.Minute, nil,
+	)
+	hooks := &signalingSessionHooks{running: make(chan struct{})}
+	session := newSessionWatch(
+		newFakeSessionSource(), coordinatedSessionHooks{hooks: hooks, coordination: coordination},
+		&memorySuspendStateStore{}, &fakeRunner{}, time.Minute, nil,
+	)
+
+	predictionDone := make(chan struct{})
+	go func() {
+		prediction.runHook(context.Background(), 9*time.Minute)
+		close(predictionDone)
+	}()
+	<-runner.started
+	suspendDone := make(chan struct{})
+	go func() {
+		session.handleSuspend(context.Background())
+		close(suspendDone)
+	}()
+	select {
+	case <-hooks.running:
+		t.Fatal("session queried state while prediction hook was in flight")
+	default:
+	}
+	close(runner.release)
+	<-predictionDone
+	<-hooks.running
+	<-suspendDone
 }
 
 func TestHookFailureIsLoggedAndReleasesDelayLock(t *testing.T) {
