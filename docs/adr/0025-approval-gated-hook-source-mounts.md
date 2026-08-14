@@ -67,9 +67,15 @@ a symlink in an agent-writable location cannot be repointed at a host
 secret after its approval; the mount exposes the canonical file at the
 location where the hook's own spelling resolves in the container.
 
-The token grep is deleted. Plain env passthrough of the notification
-variables the seeded default hooks consume stays, matching the
-`localEnv` forwarding the devcontainer variants already do.
+The token grep is deleted, and so are the provider-specific env
+passthrough (with the matching `localEnv` forwarding in the devcontainer
+variants) and the seeded notify hooks themselves: they were the author's
+personal setup leaked into the defaults — without his notification
+config, and with no sounds shipped at all, a fresh install got hooks
+that only wrote a log line on every Stop/Notification event. Anyone who
+wants notifications brings their own hook; whatever config file it
+sources is mounted by this mechanism. No notification service is
+hardwired anywhere in the repo.
 
 ## Consequences
 
@@ -81,6 +87,11 @@ variables the seeded default hooks consume stays, matching the
   can write hooks.
 - Secrets inline in hook files keep working with no prompt (they travel
   with the ADR 0002 mount), so the deleted grep loses no capability.
+- Installed notify-hook copies still byte-for-byte a shipped version are
+  retired on start (sha256-gated file delete + exact-entry unwire, the
+  interaction-hook pattern). A customized copy keeps its file and wiring
+  — its owner just migrates credentials themselves, since the env
+  passthrough is gone.
 - Mounts are fixed at container start; approving a path or adding a new
   `source` line takes effect on the next start.
 - Static resolution knowingly skips exotic constructions (command

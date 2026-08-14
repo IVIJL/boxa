@@ -261,43 +261,59 @@ migrate_agent_awake_hooks() {
     fi
 }
 
-# Every-start, idempotent. Retire the Interaction hook: it fired on every
-# UserPromptSubmit and guessed at "waiting for approval" with keyword
-# heuristics that never matched real prompts; the Notification-event question
-# hook covers that need properly. Only a copy that is still byte-for-byte the
-# one boxa shipped is retired — a customized copy is the user's now and keeps
-# both its file and its settings.json wiring; boxa merely stops shipping it.
-INTERACTION_NOTIFY_SHIPPED_SHA256=\
-77d89bae948dde90e2f5f2b5ec13661c221f9842276d4941a310615e3ece0724
+# Every-start, idempotent. Retirement machinery for hooks boxa used to seed
+# but no longer ships. Only a copy that is still byte-for-byte one of the
+# shipped versions is retired (file deleted, its exact settings entry
+# unwired) — a customized or symlinked copy is the user's now and keeps both
+# its file and its wiring; boxa merely stops shipping it.
 
-# Delete $1 only while it is still byte-for-byte the shipped hook — rechecked
-# at the moment of deletion, because the shared tree is agent-writable and a
-# copy customized after the initial checksum must survive.
-remove_shipped_interaction_notify() {
-    local f="$1" digest
+# hook_digest_matches <file> <sha256>... — file is byte-for-byte one of the
+# shipped versions.
+hook_digest_matches() {
+    local f="$1" digest sha
+    shift
+    digest="$(sha256sum < "$f" 2>/dev/null | cut -d' ' -f1)"
+    for sha in "$@"; do
+        [ "$digest" = "$sha" ] && return 0
+    done
+    return 1
+}
+
+# Delete $1 only while it is still a shipped copy — rechecked at the moment
+# of deletion, because the shared tree is agent-writable and a copy
+# customized after the initial checksum must survive.
+remove_shipped_hook() {
+    local f="$1"
+    shift
     [ -L "$f" ] && return 0
     [ -f "$f" ] || return 0
-    digest="$(sha256sum < "$f" 2>/dev/null | cut -d' ' -f1)"
-    [ "$digest" = "$INTERACTION_NOTIFY_SHIPPED_SHA256" ] || return 0
+    hook_digest_matches "$f" "$@" || return 0
     rm -f -- "$f"
 }
 
-migrate_remove_interaction_notify() {
-    local installed="$TARGET/hooks/interaction_notify.sh" digest status=0
+# retire_seeded_hook <name> <event> <sha256>... — unwire the hook's exact
+# seeded settings entry from <event> (empty <event> = boxa never wired it)
+# and delete the shipped file. A missing file with wiring still present is a
+# dangling entry from a manual delete — unwired the same way.
+retire_seeded_hook() {
+    local name="$1" event="$2" installed status=0
     local migration_dir="$TARGET/.boxa-migrations" delete_file=false
+    shift 2
+    installed="$TARGET/hooks/$name"
 
     [ -L "$installed" ] && return 0    # symlink → user-managed, leave alone
     if [ -f "$installed" ]; then
         command -v sha256sum >/dev/null 2>&1 || return 0
-        digest="$(sha256sum < "$installed" 2>/dev/null | cut -d' ' -f1)"
-        [ "$digest" = "$INTERACTION_NOTIFY_SHIPPED_SHA256" ] || return 0
+        hook_digest_matches "$installed" "$@" || return 0
         delete_file=true
     fi
-    # A missing file with wiring still present is a dangling entry from a
-    # manual delete — unwire it the same way.
-    if [ ! -e "$TARGET/settings.json" ]; then
+    if [ -z "$event" ] || [ ! -e "$TARGET/settings.json" ]; then
         if [ "$delete_file" = true ]; then
-            remove_shipped_interaction_notify "$installed"
+            # Never wired by boxa (or no settings at all): delete the
+            # shipped file unless the user wired it up themselves.
+            if ! grep -qF "$name" "$TARGET/settings.json" 2>/dev/null; then
+                remove_shipped_hook "$installed" "$@"
+            fi
         fi
         return 0
     fi
@@ -311,25 +327,32 @@ migrate_remove_interaction_notify() {
         tmp=$(mktemp "$TARGET/settings.json.XXXXXX") || exit 3
         cp -- "$TARGET/settings.json" "$source" || exit 3
         jq -e . "$source" >/dev/null 2>&1 || exit 2
-        if ! jq '
-            # Both command spellings: the seeded default used the container-
-            # absolute path; tolerate a tilde-form copy of the same entry.
+        # Both command spellings: the seeded defaults used the container-
+        # absolute path; tolerate a tilde-form copy of the same entry.
+        # shellcheck disable=SC2088  # the tilde-form spelling is a literal
+        if ! jq --arg ev "$event" \
+              --arg cmda "/home/node/.claude/hooks/$name" \
+              --arg cmdb "~/.claude/hooks/$name" '
             if (type == "object")
                and ((.hooks // {}) | type == "object")
-               and (((.hooks // {}).UserPromptSubmit // []) | type == "array")
-               and ((((.hooks // {}).UserPromptSubmit // []) | length) > 0)
+               and (((.hooks // {})[$ev] // []) | type == "array")
+               and ((((.hooks // {})[$ev] // []) | length) > 0)
             then
-              .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit // []) | map(
-                  if (has("hooks") and ((.hooks // []) | type == "array")) then
-                      .hooks = ((.hooks // []) | map(select(
-                          ((.type? == "command") and (
-                              (.command? == "/home/node/.claude/hooks/interaction_notify.sh")
-                              or (.command? == "~/.claude/hooks/interaction_notify.sh")
-                          )) | not)))
-                  else . end)
-                | map(select((has("hooks") | not) or ((.hooks | length) > 0))))
-              | if ((.hooks.UserPromptSubmit | length) == 0)
-                then .hooks |= del(.UserPromptSubmit) else . end
+              # Exact-entry removal: only a group that still has the seeded
+              # shape ({"hooks":[{type,command}]} — no matcher, no timeout,
+              # no extra commands) belongs to boxa and may be taken back.
+              .hooks[$ev] = ((.hooks[$ev] // []) | map(select(
+                  (
+                    ((keys_unsorted | sort) == ["hooks"])
+                    and ((.hooks | type) == "array")
+                    and ((.hooks | length) == 1)
+                    and ((.hooks[0] | type) == "object")
+                    and ((.hooks[0] | keys_unsorted | sort) == ["command", "type"])
+                    and (.hooks[0].type == "command")
+                    and ((.hooks[0].command == $cmda) or (.hooks[0].command == $cmdb))
+                  ) | not)))
+              | if ((.hooks[$ev] | length) == 0)
+                then .hooks |= del(.[$ev]) else . end
             else . end
         ' "$source" > "$tmp"; then
             exit 3
@@ -345,33 +368,61 @@ migrate_remove_interaction_notify() {
         # file deleted meanwhile leaves dangling wiring, which unwiring
         # handles correctly.
         if [ "$delete_file" = true ] && [ -e "$installed" ]; then
-            if [ -L "$installed" ] \
-                || [ "$(sha256sum < "$installed" 2>/dev/null | cut -d' ' -f1)" \
-                     != "$INTERACTION_NOTIFY_SHIPPED_SHA256" ]; then
+            if [ -L "$installed" ] || ! hook_digest_matches "$installed" "$@"; then
                 exit 4
             fi
         fi
         mv "$tmp" "$TARGET/settings.json"
         tmp=""
         exit 0
-    ) 9>"$migration_dir/interaction-notify.lock" || status=$?
+    ) 9>"$migration_dir/retire-${name%.sh}.lock" || status=$?
 
     if [ "$status" -eq 0 ]; then
         if [ "$delete_file" = true ]; then
             # An unchanged copy may still be wired in a way the jq filter
             # does not match (moved to another event, custom arguments) —
             # that wiring is the user's; keep its file.
-            if ! grep -q 'interaction_notify\.sh' "$TARGET/settings.json" 2>/dev/null; then
-                remove_shipped_interaction_notify "$installed"
+            if ! grep -qF "$name" "$TARGET/settings.json" 2>/dev/null; then
+                remove_shipped_hook "$installed" "$@"
             fi
         fi
     elif [ "$status" -eq 2 ]; then
-        WARNINGS+=("Interaction hook retirement skipped — $TARGET/settings.json is not valid JSON")
+        WARNINGS+=("Hook retirement of $name skipped — $TARGET/settings.json is not valid JSON")
     elif [ "$status" -eq 4 ]; then
         : # concurrent settings write — retried on next start, file kept until then
     else
-        WARNINGS+=("Interaction hook retirement failed")
+        WARNINGS+=("Hook retirement of $name failed")
     fi
+}
+
+# The Interaction hook fired on every UserPromptSubmit and guessed at
+# "waiting for approval" with keyword heuristics that never matched real
+# prompts; the Notification event covers that need properly.
+INTERACTION_NOTIFY_SHIPPED_SHA256=\
+77d89bae948dde90e2f5f2b5ec13661c221f9842276d4941a310615e3ece0724
+
+migrate_remove_interaction_notify() {
+    retire_seeded_hook interaction_notify.sh UserPromptSubmit \
+        "$INTERACTION_NOTIFY_SHIPPED_SHA256"
+}
+
+# The notify hooks (sounds + push message) were personal setup that leaked
+# into the seeded defaults: without the author's notification config — and
+# with no sounds shipped at all — a fresh install got hooks that only wrote
+# a log line on every Stop/Notification event. Anyone who wants
+# notifications brings their own hook; ADR 0025 mounts whatever config file
+# it sources. Two shas per hook: the ntfy-era shipped bytes and the brief
+# provider-agnostic rewrite that never reached a released image.
+migrate_retire_notify_hooks() {
+    retire_seeded_hook success_notify.sh Stop \
+        49249fbe20e6978299999a9c323d0715383e6c794944fc37bff3d9ebdd4c94b1 \
+        e07bafb3149d86c4543da34c90245b2052d5b9fd9d351ea54d8189d72124f0e6
+    retire_seeded_hook question_notify.sh Notification \
+        684936017125a96aa0f1c6039aa6b234d678fcb705bcf66228419ed2c98c030a \
+        db0fdabcf5890be21b0b8cdb4a44f5afafa02e93b4c25af2468346fbb4e97db8
+    retire_seeded_hook check_error.sh "" \
+        7d3ad64eea66af9d503b9ff555bb41a9a70fd953264bb359b74ccc3fbf893be5 \
+        ce31b3cddc56fa5b25d87e2a58edae99f738e057264a4cc47a53466639710f60
 }
 
 # Every-start. Backwards-compat alias /workspace/<name> -> host project path
@@ -514,6 +565,7 @@ main() {
     migrate_enable_all_project_mcp_servers
     migrate_agent_awake_hooks
     migrate_remove_interaction_notify
+    migrate_retire_notify_hooks
     make_workspace_symlink     # before pretrust (logical order, not strict dep)
     pretrust_workspace_paths
     ensure_npm_global_path     # must precede bootstrap_codex (shared parent dir)

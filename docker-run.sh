@@ -5973,19 +5973,6 @@ if [ "$(uname -s 2>/dev/null || echo Unknown)" = "Darwin" ] \
     echo -e "\033[1;33m==> macOS: host Claude login is NOT shared into containers. Run 'boxa claude-token' once to authenticate the container fleet.\033[0m" >&2
 fi
 
-# Notification env passthrough. The seeded default hooks read NTFY_URL and
-# NTFY_TOKEN from the environment (and the devcontainer variants forward the
-# same names via localEnv), so honour them when the host shell exports them.
-# Hooks that keep credentials in a file instead are covered by the hook
-# source-file mounts below.
-if [ -n "${NTFY_TOKEN:-}" ]; then
-    DOCKER_ARGS+=(-e "NTFY_TOKEN=$NTFY_TOKEN")
-fi
-
-if [ -n "${NTFY_URL:-}" ]; then
-    DOCKER_ARGS+=(-e "NTFY_URL=$NTFY_URL")
-fi
-
 # --- Hook source-file mounts (approval-gated) --------------------------------
 # ~/.claude and ~/.codex are bind-mounted, so hook scripts and anything stored
 # next to them travel into containers by themselves. But a hook that `source`s

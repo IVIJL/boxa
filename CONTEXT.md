@@ -413,7 +413,9 @@ machine-local credentials env file). Discovered by static resolution of
 the hook's source statements and created only after a per-path approval
 persisted in `~/.config/boxa/hook-mounts.conf` — host-side state no
 container can write, because the shared trees themselves are
-agent-writable. See ADR 0025.
+agent-writable. Notification hooks are user-brought (boxa seeds none and
+hardwires no service); this mount is how their config files reach
+containers. See ADR 0025.
 _Avoid_: hook env mount, secret mount, hook config mount
 
 ### Dev URLs

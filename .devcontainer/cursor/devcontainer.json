@@ -46,7 +46,6 @@
     "NODE_OPTIONS": "--max-old-space-size=4096",
     "CLAUDE_CONFIG_DIR": "/home/node/.claude",
     "TZ": "${localEnv:TZ:Europe/Prague}",
-    "NTFY_TOKEN": "${localEnv:NTFY_TOKEN}",
     "BOXA_PROJECT_HOST_PATH": "${localWorkspaceFolder}",
     "BOXA_PROJECT_NAME": "${localWorkspaceFolderBasename}"
   },

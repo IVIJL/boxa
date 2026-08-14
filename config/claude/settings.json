@@ -8,14 +8,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/node/.claude/hooks/success_notify.sh"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
             "command": "~/.claude/hooks/agent-awake.sh idle"
           }
         ]
@@ -37,16 +29,6 @@
           {
             "type": "command",
             "command": "~/.claude/hooks/agent-awake.sh busy"
-          }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/node/.claude/hooks/question_notify.sh"
           }
         ]
       }

@@ -510,10 +510,14 @@ assert_eq "settings migration reseeds a real file after the link is gone" false 
 assert_eq "reseeded hook stays executable" true \
     "$([ -x "$claude_target/hooks/agent-awake.sh" ] && echo true || echo false)"
 
-# Managed defaults retain notify hooks while wiring all keep-awake events.
-assert_eq "managed defaults preserve success notify hook" 1 \
-    "$(jq '[.hooks.Stop[]?.hooks[]? | select(.command == "/home/node/.claude/hooks/success_notify.sh")] | length' \
+# Managed defaults ship no notify hooks (user-brought, ADR 0025) while
+# wiring all keep-awake events.
+assert_eq "managed defaults no longer ship notify hook wiring" 0 \
+    "$(jq '[.hooks[][]?.hooks[]? | select(.command | test("(success_notify|question_notify|check_error)"))] | length' \
         "$BOXA_DIR/config/claude/settings.json")"
+assert_eq "managed defaults no longer ship notify hook files" 0 \
+    "$(find "$BOXA_DIR/config/claude/hooks" \
+        \( -name 'success_notify.sh' -o -name 'question_notify.sh' -o -name 'check_error.sh' \) | wc -l)"
 assert_eq "managed defaults no longer ship the interaction hook" 0 \
     "$(jq '[.hooks[][]?.hooks[]? | select(.command | endswith("/interaction_notify.sh"))] | length' \
         "$BOXA_DIR/config/claude/settings.json")"
@@ -569,6 +573,69 @@ run_interaction_retirement
 assert_eq "dangling interaction wiring is removed once the file is gone" 0 \
     "$(jq '[.hooks[][]?.hooks[]? | select(.command | endswith("/interaction_notify.sh"))] | length' \
         "$claude_target/settings.json")"
+
+# The retired notify hooks are unwired and deleted only while the file is
+# still byte-for-byte a copy boxa shipped; a customized copy — or a shipped
+# copy the user wired up themselves — is the user's and stays untouched.
+run_notify_retirement() {
+    BOXA_CLAUDE_DEFAULTS="$claude_defaults" BOXA_CLAUDE_TARGET="$claude_target" \
+        bash -c 'source "$1"; migrate_retire_notify_hooks' \
+        _ "$BOXA_DIR/scripts/setup-claude.sh"
+}
+cp "$BOXA_DIR/tests/fixtures/claude-hooks/success_notify_ntfy_shipped.sh" \
+    "$claude_target/hooks/success_notify.sh"
+cp "$BOXA_DIR/tests/fixtures/claude-hooks/question_notify_ntfy_shipped.sh" \
+    "$claude_target/hooks/question_notify.sh"
+printf '# my custom tweak\n' >> "$claude_target/hooks/question_notify.sh"
+cp "$BOXA_DIR/tests/fixtures/claude-hooks/check_error_ntfy_shipped.sh" \
+    "$claude_target/hooks/check_error.sh"
+cat > "$claude_target/settings.json" <<'EOF'
+{
+  "hooks": {
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "/home/node/.claude/hooks/success_notify.sh"}]},
+      {"hooks": [{"type": "command", "command": "~/.claude/hooks/agent-awake.sh idle"}]}
+    ],
+    "Notification": [
+      {"hooks": [{"type": "command", "command": "/home/node/.claude/hooks/question_notify.sh"}]}
+    ]
+  }
+}
+EOF
+run_notify_retirement
+assert_eq "notify retirement deletes the shipped success copy" false \
+    "$(file_exists "$claude_target/hooks/success_notify.sh")"
+assert_eq "notify retirement unwires the success entry, keeps agent-awake" \
+    '["~/.claude/hooks/agent-awake.sh idle"]' \
+    "$(jq -c '[.hooks.Stop[]?.hooks[]?.command]' "$claude_target/settings.json")"
+assert_eq "customized question hook keeps its file" true \
+    "$(file_exists "$claude_target/hooks/question_notify.sh")"
+assert_eq "customized question hook keeps its wiring" \
+    '["/home/node/.claude/hooks/question_notify.sh"]' \
+    "$(jq -c '[.hooks.Notification[]?.hooks[]?.command]' "$claude_target/settings.json")"
+assert_eq "unwired check_error shipped copy is deleted" false \
+    "$(file_exists "$claude_target/hooks/check_error.sh")"
+cp "$BOXA_DIR/tests/fixtures/claude-hooks/check_error_ntfy_shipped.sh" \
+    "$claude_target/hooks/check_error.sh"
+jq '.hooks.PostToolUse = [{"hooks": [{"type": "command", "command": "/home/node/.claude/hooks/check_error.sh"}]}]' \
+    "$claude_target/settings.json" > "$claude_target/settings.json.tmp" \
+    && mv "$claude_target/settings.json.tmp" "$claude_target/settings.json"
+run_notify_retirement
+assert_eq "user-wired check_error shipped copy is kept" true \
+    "$(file_exists "$claude_target/hooks/check_error.sh")"
+# An entry the user extended (matcher/timeout/extra command) is no longer
+# the seeded shape — wiring and file both stay.
+cp "$BOXA_DIR/tests/fixtures/claude-hooks/success_notify_ntfy_shipped.sh" \
+    "$claude_target/hooks/success_notify.sh"
+jq '.hooks.Stop += [{"matcher": "custom", "hooks": [{"type": "command", "command": "/home/node/.claude/hooks/success_notify.sh"}]}]' \
+    "$claude_target/settings.json" > "$claude_target/settings.json.tmp" \
+    && mv "$claude_target/settings.json.tmp" "$claude_target/settings.json"
+run_notify_retirement
+assert_eq "customized wiring of a shipped copy survives retirement" 1 \
+    "$(jq '[.hooks.Stop[]? | select(.matcher? == "custom")] | length' \
+        "$claude_target/settings.json")"
+assert_eq "its shipped file survives too" true \
+    "$(file_exists "$claude_target/hooks/success_notify.sh")"
 
 # The fresh-install offer records a decline once without needing Go.
 decline_output="$(printf 'n\n' | "$KEEP_AWAKE" offer --interactive)"
