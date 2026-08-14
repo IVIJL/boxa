@@ -11,11 +11,7 @@ import (
 
 func newPlatformSource() eventSource { return nil }
 
-func newPlatformPrediction(hookRunner, time.Duration, *log.Logger, AwakeLeaseSource) *predictionWatch {
-	return nil
-}
-
-func newPlatformSessionWatch(hookRunner, time.Duration, *log.Logger, *hookCoordinator) *sessionWatch {
+func newPlatformSessionWatch(hookRunner, time.Duration, *log.Logger) *sessionWatch {
 	return nil
 }
 

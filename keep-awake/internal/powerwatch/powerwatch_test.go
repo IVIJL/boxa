@@ -31,30 +31,6 @@ type fakeRunner struct {
 	err   error
 }
 
-type blockingRunner struct {
-	started chan struct{}
-	release chan struct{}
-}
-
-func (r *blockingRunner) Run(context.Context, time.Duration) error {
-	close(r.started)
-	<-r.release
-	return nil
-}
-
-type signalingSessionHooks struct {
-	running chan struct{}
-}
-
-func (h *signalingSessionHooks) RunningBoxes(context.Context, time.Duration) ([]string, error) {
-	close(h.running)
-	return nil, nil
-}
-
-func (*signalingSessionHooks) NotifySlept(context.Context, []string, time.Duration) error {
-	return nil
-}
-
 func newFakeSource(delayMax time.Duration) *fakeSource {
 	return &fakeSource{events: make(chan Event, 4), delayMax: delayMax}
 }
@@ -104,62 +80,22 @@ func (r *fakeRunner) CallCount() int {
 	return r.calls
 }
 
-func TestPowerEventsRunHookAndReleaseDelayLock(t *testing.T) {
-	for _, event := range []Event{PrepareForSleep, PrepareForShutdown} {
-		t.Run(event.String(), func(t *testing.T) {
-			source := newFakeSource(time.Minute)
-			runner := &fakeRunner{}
-			watch := newWatch(source, runner, time.Minute, nil)
-			cancel, done := runWatch(t, watch)
+func TestShutdownRunsHookAndReleasesDelayLock(t *testing.T) {
+	source := newFakeSource(time.Minute)
+	runner := &fakeRunner{}
+	watch := newWatch(source, runner, time.Minute, nil)
+	cancel, done := runWatch(t, watch)
 
-			source.events <- event
-			waitFor(t, func() bool { return source.ReleaseCalls() == 1 })
-			if runner.CallCount() != 1 {
-				t.Fatalf("hook calls = %d, want 1", runner.CallCount())
-			}
-
-			cancel()
-			if err := <-done; err != nil {
-				t.Fatalf("Run returned %v", err)
-			}
-		})
+	source.events <- PrepareForShutdown
+	waitFor(t, func() bool { return source.ReleaseCalls() == 1 })
+	if runner.CallCount() != 1 {
+		t.Fatalf("hook calls = %d, want 1", runner.CallCount())
 	}
-}
 
-func TestPredictionHookDoesNotBlockSessionStateQuery(t *testing.T) {
-	coordination := newHookCoordinator()
-	runner := &blockingRunner{started: make(chan struct{}), release: make(chan struct{})}
-	prediction := newPredictionWatch(
-		&fakeIdleSource{}, &fakeTimeoutSource{}, &fakePredictionScheduler{},
-		coordinatedHookRunner{runner: runner, coordination: coordination}, nil, time.Minute, nil,
-	)
-	hooks := &signalingSessionHooks{running: make(chan struct{})}
-	session := newSessionWatch(
-		newFakeSessionSource(), hooks,
-		&memorySuspendStateStore{}, &fakeRunner{}, time.Minute, nil,
-	)
-
-	predictionDone := make(chan struct{})
-	go func() {
-		prediction.runHook(context.Background(), 9*time.Minute)
-		close(predictionDone)
-	}()
-	<-runner.started
-	suspendDone := make(chan struct{})
-	go func() {
-		session.handleSuspend(context.Background())
-		close(suspendDone)
-	}()
-	select {
-	case <-hooks.running:
-	case <-time.After(100 * time.Millisecond):
-		close(runner.release)
-		t.Fatal("session state query was blocked by prediction hook")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned %v", err)
 	}
-	close(runner.release)
-	<-predictionDone
-	<-hooks.running
-	<-suspendDone
 }
 
 func TestHookFailureIsLoggedAndReleasesDelayLock(t *testing.T) {
@@ -169,7 +105,7 @@ func TestHookFailureIsLoggedAndReleasesDelayLock(t *testing.T) {
 	watch := newWatch(source, runner, time.Minute, log.New(&output, "", 0))
 	cancel, done := runWatch(t, watch)
 
-	source.events <- PrepareForSleep
+	source.events <- PrepareForShutdown
 	waitFor(t, func() bool { return source.ReleaseCalls() == 1 })
 	if !strings.Contains(output.String(), "stop failed") {
 		t.Fatalf("log = %q, want hook failure", output.String())
@@ -208,14 +144,14 @@ func TestHookTimeoutIsEnforcedAndReleasesDelayLock(t *testing.T) {
 	}
 }
 
-func TestResumeReacquiresDelayLock(t *testing.T) {
+func TestCancelledShutdownReacquiresDelayLock(t *testing.T) {
 	source := newFakeSource(time.Minute)
 	watch := newWatch(source, &fakeRunner{}, time.Minute, nil)
 	cancel, done := runWatch(t, watch)
 
-	source.events <- PrepareForSleep
+	source.events <- PrepareForShutdown
 	waitFor(t, func() bool { return source.ReleaseCalls() == 1 })
-	source.events <- resumeFromSleep
+	source.events <- shutdownCancelled
 	waitFor(t, func() bool { return watch.Status().Active })
 
 	source.mu.Lock()

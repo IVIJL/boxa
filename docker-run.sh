@@ -231,18 +231,19 @@ EOF
             ;;
         keep-awake)
             cat <<'EOF'
-Usage: boxa keep-awake <enable|disable|status> [options]
+Usage: boxa keep-awake <enable|refresh|disable|status> [options]
 
 Manage the optional host daemon that prevents idle sleep while coding agents
 hold active leases. Enable builds it from the checked-out Go source in a
 pinned golang Docker container (with local Go as fallback), installs platform
-system autostart by default, starts it, and creates a global Host connection on
-port 17777. Use enable --autostart <system|terminal|none> to choose startup.
+system autostart by default, starts it, and creates a global Host connection on port
+17777. Use enable --autostart <system|terminal|none> to choose startup.
 Disable reverses those changes; status reports every component.
 
 Commands:
   enable [--autostart <system|terminal|none>]
            Build, install, start, and expose keep-awake to every box
+  refresh  Rebuild the enabled daemon and restart it in place
   disable  Stop and remove keep-awake, autostart, and its Host connection
   status   Report daemon reachability, holders, autostart, and Host connection
 EOF
@@ -377,15 +378,6 @@ EOF
 
 SSH_WARNING=""
 BOXA_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-
-# Private, low-latency WSL bridge for the Windows Power-watch hidden window.
-# Dispatch before module loading, invocation sweeps, and the main parser:
-# suspend gives us only a tiny read-only window, and this plumbing must never
-# acquire unrelated work.
-if [ "${1:-}" = "__power-watch-windows" ]; then
-    shift
-    exec "$BOXA_DIR/scripts/power-watch-windows.sh" "$@"
-fi
 
 # Brand module — single source of truth for CLI_NAME and the values derived
 # from it (image tag, shared-infra container names, …). Sourced first so the
@@ -2664,6 +2656,27 @@ graceful_stop_container() {
     docker stop -t 15 "$name" > /dev/null 2>&1 || true
 }
 
+# Prepare Containers concurrently, then stop the outer layer in one Docker
+# call. Shutdown budgets apply to the whole fleet, so both all-Container entry
+# points must share this batched path rather than spending one timeout per box.
+# Failures propagate: `stop --all` runs unattended (pre-sleep Closeout), so a
+# Container that refused to stop must surface as a non-zero exit. Interactive
+# callers opt out with `|| true` — see the "* Stop all" branch.
+stop_containers_batched() {
+    local -a containers=("$@") prepare_pids=()
+    local name prepare_pid
+
+    [ "${#containers[@]}" -gt 0 ] || return 0
+    for name in "${containers[@]}"; do
+        prepare_container_for_stop "$name" &
+        prepare_pids+=("$!")
+    done
+    for prepare_pid in "${prepare_pids[@]}"; do
+        wait "$prepare_pid"
+    done
+    docker stop -t 15 "${containers[@]}" > /dev/null
+}
+
 stop_traefik_if_idle() {
     local remaining
     remaining=$(docker ps --filter "name=^boxa-" --format '{{.Names}}' | filter_user_containers)
@@ -3660,12 +3673,13 @@ fi
 
 if [ "$MODE" = "keep-awake" ]; then
     keep_awake_command="${KEEP_AWAKE_ARGS[0]:-}"
-    if [[ "$keep_awake_command" != enable && "$keep_awake_command" != disable && "$keep_awake_command" != status ]] \
+    if [[ "$keep_awake_command" != enable && "$keep_awake_command" != refresh \
+        && "$keep_awake_command" != disable && "$keep_awake_command" != status ]] \
         || { [ "$keep_awake_command" != enable ] && [ "${#KEEP_AWAKE_ARGS[@]}" -ne 1 ]; } \
         || { [ "$keep_awake_command" = enable ] \
             && [ "${#KEEP_AWAKE_ARGS[@]}" -ne 1 ] \
             && [ "${#KEEP_AWAKE_ARGS[@]}" -ne 3 ]; }; then
-        echo "Usage: boxa keep-awake <enable|disable|status> [options]" >&2
+        echo "Usage: boxa keep-awake <enable|refresh|disable|status> [options]" >&2
         exit 2
     fi
     exec "$BOXA_DIR/scripts/ensure-keep-awake.sh" "${KEEP_AWAKE_ARGS[@]}"
@@ -3837,6 +3851,7 @@ if [ "$MODE" = "update" ]; then
         # exit 1 with git's message captured into $pull_output and then thrown
         # away, printing nothing. `|| pull_rc=$?` keeps us alive so the error
         # always reaches the user.
+        update_prev_head="$(git -C "$BOXA_DIR" rev-parse HEAD)"
         pull_rc=0
         pull_output=$(git -C "$BOXA_DIR" pull --ff-only origin main 2>&1) || pull_rc=$?
         echo "$pull_output"
@@ -3849,7 +3864,20 @@ if [ "$MODE" = "update" ]; then
         fi
         if ! echo "$pull_output" | grep -q "Already up to date"; then
             echo "Re-running with updated script..."
-            BOXA_UPDATE_PULLED=1 exec "$BOXA_DIR/docker-run.sh" update "$@"
+            BOXA_UPDATE_PULLED=1 BOXA_UPDATE_PREV_HEAD="$update_prev_head" \
+                exec "$BOXA_DIR/docker-run.sh" update "$@"
+        fi
+    fi
+
+    # The daemon is elective, but an enabled installation must follow source
+    # changes from the pull. The pre-pull revision crosses the re-exec boundary
+    # so unrelated updates retain the fast no-build path.
+    if [ "${BOXA_UPDATE_PULLED:-}" = "1" ] && [ -n "${BOXA_UPDATE_PREV_HEAD:-}" ]; then
+        keep_awake_changes="$(git -C "$BOXA_DIR" diff --name-only \
+            "$BOXA_UPDATE_PREV_HEAD..HEAD" -- \
+            keep-awake scripts/ensure-keep-awake.sh)"
+        if [ -n "$keep_awake_changes" ]; then
+            "$BOXA_DIR/scripts/ensure-keep-awake.sh" refresh
         fi
     fi
 
@@ -4875,16 +4903,7 @@ if [ "$MODE" = "stop" ]; then
         fi
 
         if [ "${#stop_containers[@]}" -gt 0 ]; then
-            prepare_pids=()
-            for name in "${stop_containers[@]}"; do
-                prepare_container_for_stop "$name" &
-                prepare_pids+=("$!")
-            done
-            for prepare_pid in "${prepare_pids[@]}"; do
-                wait "$prepare_pid"
-            done
-
-            docker stop -t 15 "${stop_containers[@]}" > /dev/null
+            stop_containers_batched "${stop_containers[@]}"
 
             stopped_projects=()
             for name in "${stop_containers[@]}"; do
@@ -4907,7 +4926,7 @@ if [ "$MODE" = "stop" ]; then
             done
             "$BOXA_DIR/scripts/deliver-allow-for-notification.sh" --notification \
                 "Boxa closeout: $STOP_REASON" \
-                "Boxes $stopped_list stopped before sleep/shutdown" \
+                "Boxes $stopped_list stopped before shutdown" \
                 "/var/log/boxa" >/dev/null 2>&1 || true
         fi
         exit 0
@@ -4936,9 +4955,22 @@ if [ "$MODE" = "stop" ]; then
     # No argument or container not found → interactive selection
     selected=$(pick_container "Stop container: " "with_all") || exit 1
     if [ "$selected" = "* Stop all" ]; then
-        docker ps -a --filter "name=^boxa-" --format '{{.Names}}' | filter_user_containers | while IFS= read -r c; do
+        interactive_container_output=$(
+            docker ps -a --filter "name=^boxa-" --format '{{.Names}}' \
+                | filter_user_containers
+        )
+        interactive_containers=()
+        if [ -n "$interactive_container_output" ]; then
+            mapfile -t interactive_containers <<< "$interactive_container_output"
+        fi
+        # Best-effort: a Container that vanished mid-selection or refused to
+        # stop must not abort the cleanup that follows (OOM sweep removal,
+        # --clean data removal, idle Traefik/DNS shutdown). This mirrors the
+        # pre-batching loop, which used graceful_stop_container and ignored
+        # individual stop failures. Explicit `stop --all` keeps propagating.
+        stop_containers_batched "${interactive_containers[@]}" || true
+        for c in "${interactive_containers[@]}"; do
             proj="${c#boxa-}"
-            graceful_stop_container "$c"
             _boxa::remove_container_after_oom_sweep "$c"
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$proj"

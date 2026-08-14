@@ -50,7 +50,9 @@ done
 
 keep_awake_help="$(run_boxa help keep-awake)"
 assert_contains "keep-awake help documents lifecycle commands" \
-    "Usage: boxa keep-awake <enable|disable|status>" "$keep_awake_help"
+    "Usage: boxa keep-awake <enable|refresh|disable|status>" "$keep_awake_help"
+assert_contains "keep-awake help documents refresh" \
+    "refresh  Rebuild the enabled daemon" "$keep_awake_help"
 assert_contains "keep-awake help documents global Host connection" \
     "creates a global Host connection on port" "$keep_awake_help"
 

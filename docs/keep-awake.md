@@ -24,8 +24,15 @@ as the likely cause. Disable and uninstall remove the rule best effort.
 ```bash
 boxa keep-awake enable
 boxa keep-awake status
+boxa keep-awake refresh
 boxa keep-awake disable
 ```
+
+`refresh` is a silent no-op when keep-awake is not enabled. Otherwise it
+rebuilds and replaces only the daemon binary, then restarts the existing
+service without prompts, elevation, or changes to autostart, firewall, and
+Host connection setup. `boxa update` runs this refresh automatically when its
+pulled commit range changes `keep-awake/` or `scripts/ensure-keep-awake.sh`.
 
 ## Start with your terminal instead of the system
 
@@ -109,50 +116,31 @@ probe `localhost`, then the Windows vEthernet/default-gateway IP; boxa Container
 `GET /v1/status` returns the active holders, remaining TTLs, inhibitor state,
 **Power-watch** state, and daemon version.
 
-## Pre-sleep stop
+## Pre-shutdown stop
 
 On native Linux, **Power-watch** starts with the **Keep-awake daemon** and
-holds a systemd-logind delay inhibitor for sleep and shutdown. When logind
-announces either transition, Power-watch runs
+holds a systemd-logind delay inhibitor for shutdown. When logind announces a
+shutdown or poweroff transition, Power-watch runs
 `boxa stop --all --reason presleep` regardless of any held Awake leases, then
 releases the delay inhibitor so the transition can continue. Its output is
-written to the daemon log.
+written to the daemon log. Power-watch does not subscribe to sleep events, so
+manual or idle sleep leaves boxes running and they remain available after
+resume.
 
-On Windows, Power-watch reads the active AC/DC idle-sleep timeout and schedules
-checks near its deadline. With no Awake lease held, it runs the same Pre-sleep
-stop about one minute before predicted idle sleep. Prediction is suspended
-while any lease is held, re-arms when the last lease drops, and does not repeat
-after a stop until user activity resets the idle clock. A never-sleep plan
-disables prediction.
-
-The Windows daemon also owns a hidden top-level window and Win32 message pump
-on a dedicated OS thread. During shutdown/restart it publishes the shutdown
-block reason `Stopping boxa containers…`, starts the Pre-sleep stop, and clears
-the reason after completion or a hard ten-second maximum. During manual sleep
-it uses a 1.5-second-bounded WSL query to atomically record the box names that
-are actually running in `%LocalAppData%\Boxa\keep-awake-suspend.json`; it does
-not attempt a stop in the suspend notification window. On resume it clears the
-state and, when the recorded list is non-empty, dispatches a Closeout
-notification through `scripts/deliver-allow-for-notification.sh`. An earlier
-idle-predicted stop leaves the suspend-time list empty, so resume does not raise
-a redundant notification. Resume never restarts or heals Containers.
-
-Closeout delivery around sleep is deliberately best-effort. When suspend lands
-while a Pre-sleep stop is already in flight, resume re-queries the actually
-running boxes and notifies only if any survived. If that stop fails *after*
-stopping every box but *before* its own Closeout goes out, the resume query
-finds nothing and no notice is raised — the boxes were still stopped cleanly
-before sleep, so nothing was lost but an informational message. Guarding that
-compound window would need a cross-process delivery receipt between `boxa stop`
-and the daemon, which is out of proportion to the message it would save.
+The Windows daemon owns a hidden top-level window and Win32 message pump on a
+dedicated OS thread. During shutdown/restart it publishes the shutdown block
+reason `Stopping boxa containers…`, starts the Pre-shutdown stop, and clears
+the reason after completion or a hard 45-second maximum. It does not listen for
+suspend/resume messages and performs no idle-sleep prediction, so sleep likewise
+leaves boxes untouched.
 
 macOS Power-watch is currently a no-op.
 
 The command and its one-minute stop budget can be overridden with the daemon
 flags `-power-watch-command` and `-power-watch-timeout`. On Windows the default
-is invoked in the WSL distribution that installed the daemon. A hanging
-command is terminated when that budget or logind's shorter effective delay
-expires.
+is invoked in the WSL distribution that installed the daemon, and the effective
+budget is capped at 45 seconds. A hanging command is terminated when that
+budget or logind's shorter effective delay expires.
 
 logind commonly defaults `InhibitDelayMaxSec` to only a few seconds. If the
 configured stop budget is longer, raise `InhibitDelayMaxSec` in
@@ -172,13 +160,7 @@ These checks require a real Windows host with Boxa installed through WSL:
    short `-power-watch-timeout`; shut down and confirm Windows continues no
    later than that timeout and the block reason disappears.
 3. Start two named boxes, sleep from the lid or power menu, then resume and
-   confirm one Closeout notification names both boxes and neither box was
-   automatically restarted or healed.
-4. Repeat manual sleep with no running boxes and confirm resume raises no
-   slept-with-boxes notification.
-5. Configure a short idle-sleep timeout, let idle prediction stop the boxes,
-   and allow sleep to follow; confirm the Pre-sleep stop notification is the
-   only notification and resume adds no slept-with-boxes notification.
-6. Stop and restart the daemon, then inspect its log for window-class cleanup
-   or registration errors and repeat one sleep/resume cycle to confirm the new
-   message pump receives events.
+   confirm both boxes stayed running and no sleep-related Closeout notification
+   appeared.
+4. Stop and restart the daemon, inspect its log for window-class cleanup or
+   registration errors, then repeat the shutdown check.

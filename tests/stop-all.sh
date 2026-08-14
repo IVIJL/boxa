@@ -49,6 +49,11 @@ case "${1:-}" in
                 exit 1
             fi
             : > "$BOXA_STOP_TEST_STOPPED"
+            # Partial failure: the batch stopped, but one Container vanished
+            # mid-run, so docker itself still exits non-zero.
+            if [ "${BOXA_STOP_TEST_FAIL_PARTIAL:-}" = true ]; then
+                exit 1
+            fi
         fi
         ;;
 esac
@@ -100,7 +105,7 @@ reset_case() {
     rm -rf "$BOXA_STOP_TEST_PREP_DIR"
     mkdir -p "$BOXA_STOP_TEST_PREP_DIR"
     unset BOXA_STOP_TEST_EMPTY BOXA_STOP_TEST_FAIL_BATCH BOXA_STOP_TEST_FAIL_LIST \
-        BOXA_STOP_TEST_PREP_BARRIER
+        BOXA_STOP_TEST_FAIL_PARTIAL BOXA_STOP_TEST_PREP_BARRIER
 }
 
 line_count() {
@@ -138,6 +143,19 @@ parallel_rc=$?
 assert_eq "parallel Container prep completes" "0" "$parallel_rc"
 assert_eq "both Container preparations start before either finishes" "2" \
     "$(sed -n '/^end:/q; /^begin:/p' "$BOXA_STOP_TEST_PREP_LOG" | wc -l)"
+
+reset_case
+export BOXA_STOP_TEST_PREP_BARRIER=true
+export BOXA_PICKER_FZF=0
+export BOXA_PICKER_TEST_CHOICE=a
+run_boxa stop >/dev/null 2>&1
+interactive_parallel_rc=$?
+assert_eq "interactive Stop all completes" "0" "$interactive_parallel_rc"
+assert_eq "interactive Stop all preparations run concurrently" "2" \
+    "$(sed -n '/^end:/q; /^begin:/p' "$BOXA_STOP_TEST_PREP_LOG" | wc -l)"
+assert_eq "interactive Stop all batches the outer stop" "1" \
+    "$(line_count '^stop -t 15 boxa-alpha boxa-beta$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+unset BOXA_PICKER_FZF BOXA_PICKER_TEST_CHOICE
 
 reset_case
 mkdir -p "$_TMPROOT/home/.config/boxa/traefik/dynamic" \
@@ -179,7 +197,7 @@ reason_output="$(run_boxa stop --reason presleep --all 2>&1)"
 reason_rc=$?
 assert_eq "--reason parses before --all" "0" "$reason_rc"
 assert_contains "reasoned stop still completes" "Stopped:boxa-beta" "$reason_output"
-expected_notification=$'--notification\tBoxa closeout: presleep\tBoxes alpha, beta stopped before sleep/shutdown\t/var/log/boxa'
+expected_notification=$'--notification\tBoxa closeout: presleep\tBoxes alpha, beta stopped before shutdown\t/var/log/boxa'
 actual_notification="$(sed -n '1p' "$BOXA_STOP_TEST_NOTIFICATION_LOG")"
 assert_eq "--reason triggers the Closeout notification" \
     "$expected_notification" "$actual_notification"
@@ -201,12 +219,69 @@ assert_contains "--all cleanup rejection is clear" \
     "boxa stop --all does not support --clean." "$clean_output"
 
 reset_case
+mkdir -p "$_TMPROOT/home/.config/boxa/traefik/dynamic" \
+    "$_TMPROOT/home/.config/boxa/certs"
+interactive_route="$_TMPROOT/home/.config/boxa/traefik/dynamic/boxa-alpha-3000.yml"
+interactive_tls="$_TMPROOT/home/.config/boxa/traefik/dynamic/alpha-tls.yml"
+interactive_cert="$_TMPROOT/home/.config/boxa/certs/alpha.pem"
+: > "$interactive_route"
+: > "$interactive_tls"
+: > "$interactive_cert"
+export BOXA_PICKER_FZF=0
+export BOXA_PICKER_TEST_CHOICE=a
+interactive_clean_output="$(run_boxa stop --clean 2>&1)"
+interactive_clean_rc=$?
+assert_eq "interactive Stop all keeps --clean semantics" "0" "$interactive_clean_rc"
+assert_contains "interactive clean reports removed data" \
+    "Stopped + data removed:boxa-alpha" "$interactive_clean_output"
+assert_eq "interactive clean removes project volumes" true \
+    "$([ "$(line_count '^volume rm ' "$BOXA_STOP_TEST_DOCKER_LOG")" -gt 0 ] && printf true || printf false)"
+assert_eq "interactive clean removes route YAMLs" missing \
+    "$([ -f "$interactive_route" ] && printf present || printf missing)"
+assert_eq "interactive clean removes HTTPS route artifacts" missing \
+    "$([ -f "$interactive_tls" ] && printf present || printf missing)"
+assert_eq "interactive clean removes HTTPS certificates" missing \
+    "$([ -f "$interactive_cert" ] && printf present || printf missing)"
+unset BOXA_PICKER_FZF BOXA_PICKER_TEST_CHOICE
+
+reset_case
 export BOXA_STOP_TEST_FAIL_BATCH=true
 run_boxa stop --all >/dev/null 2>&1
 failure_rc=$?
 assert_eq "docker stop failure exits non-zero" "1" "$failure_rc"
 assert_eq "failed stop does not send a completion notification" "0" \
     "$(line_count '.' "$BOXA_STOP_TEST_NOTIFICATION_LOG")"
+
+reset_case
+mkdir -p "$_TMPROOT/home/.config/boxa/traefik/dynamic" \
+    "$_TMPROOT/home/.config/boxa/certs"
+partial_route="$_TMPROOT/home/.config/boxa/traefik/dynamic/boxa-alpha-3000.yml"
+partial_cert="$_TMPROOT/home/.config/boxa/certs/alpha.pem"
+: > "$partial_route"
+: > "$partial_cert"
+export BOXA_STOP_TEST_FAIL_PARTIAL=true
+export BOXA_PICKER_FZF=0
+export BOXA_PICKER_TEST_CHOICE=a
+partial_output="$(run_boxa stop --clean 2>&1)"
+partial_rc=$?
+assert_eq "interactive Stop all survives a failed docker stop" "0" "$partial_rc"
+assert_contains "failed interactive stop still cleans the first Container" \
+    "Stopped + data removed:boxa-alpha" "$partial_output"
+assert_contains "failed interactive stop still cleans the second Container" \
+    "Stopped + data removed:boxa-beta" "$partial_output"
+assert_eq "failed interactive stop still removes swept Containers" "2" \
+    "$(line_count '^rm boxa-' "$BOXA_STOP_TEST_DOCKER_LOG")"
+assert_eq "failed interactive stop still removes project volumes" true \
+    "$([ "$(line_count '^volume rm ' "$BOXA_STOP_TEST_DOCKER_LOG")" -gt 0 ] && printf true || printf false)"
+assert_eq "failed interactive stop still removes route YAMLs" missing \
+    "$([ -f "$partial_route" ] && printf present || printf missing)"
+assert_eq "failed interactive stop still removes HTTPS certificates" missing \
+    "$([ -f "$partial_cert" ] && printf present || printf missing)"
+assert_eq "failed interactive stop still stops idle Traefik" "1" \
+    "$(line_count '^stop boxa_traefik$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+assert_eq "failed interactive stop still stops idle DNS" "1" \
+    "$(line_count '^stop boxa_dns$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+unset BOXA_PICKER_FZF BOXA_PICKER_TEST_CHOICE
 
 reset_case
 export BOXA_STOP_TEST_EMPTY=true

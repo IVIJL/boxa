@@ -7,11 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"runtime"
-	"sort"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -23,11 +19,6 @@ const (
 	wmClose           = 0x0010
 	wmQueryEndSession = 0x0011
 	wmEndSession      = 0x0016
-	wmPowerBroadcast  = 0x0218
-
-	pbtAPMSuspend         = 0x0004
-	pbtAPMResumeSuspend   = 0x0007
-	pbtAPMResumeAutomatic = 0x0012
 )
 
 var (
@@ -84,33 +75,8 @@ type windowsSessionSource struct {
 	blocked bool
 }
 
-type windowsSessionHooks struct {
-	distro string
-}
-
-func newPlatformSessionWatch(runner hookRunner, timeout time.Duration, logger *log.Logger, coordination *hookCoordinator) *sessionWatch {
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		if logger != nil {
-			logger.Printf("resolve Windows suspend state directory, using temporary directory: %v", err)
-		}
-		cacheDir = os.TempDir()
-	}
-	state, err := newFileSuspendStateStore(filepath.Join(cacheDir, "Boxa", "keep-awake-suspend.json"))
-	if err != nil {
-		if logger != nil {
-			logger.Printf("configure Windows suspend state: %v", err)
-		}
-		return nil
-	}
-	hooks := windowsSessionHooks{distro: strings.TrimSpace(os.Getenv(wslDistroEnvironment))}
-	watch := newSessionWatch(
-		&windowsSessionSource{},
-		hooks,
-		state, runner, timeout, logger,
-	)
-	watch.coordination = coordination
-	return watch
+func newPlatformSessionWatch(runner hookRunner, timeout time.Duration, logger *log.Logger) *sessionWatch {
+	return newSessionWatch(&windowsSessionSource{}, runner, timeout, logger)
 }
 
 func (s *windowsSessionSource) Run(ctx context.Context, handle func(sessionEvent)) (runErr error) {
@@ -229,14 +195,6 @@ func windowsWindowProc(window uintptr, message uint32, wParam, lParam uintptr) u
 				source.handle(sessionShutdownCancelled)
 			}
 			return 0
-		case wmPowerBroadcast:
-			switch wParam {
-			case pbtAPMSuspend:
-				source.handle(sessionSuspend)
-			case pbtAPMResumeSuspend, pbtAPMResumeAutomatic:
-				source.handle(sessionResume)
-			}
-			return 1
 		case wmClose:
 			destroyWindow.Call(window)
 			return 0
@@ -247,54 +205,6 @@ func windowsWindowProc(window uintptr, message uint32, wParam, lParam uintptr) u
 	}
 	result, _, _ := defWindowProcW.Call(window, uintptr(message), wParam, lParam)
 	return result
-}
-
-func (h windowsSessionHooks) RunningBoxes(ctx context.Context, timeout time.Duration) ([]string, error) {
-	if h.distro == "" {
-		return nil, fmt.Errorf("%s is not set; re-run boxa keep-awake enable", wslDistroEnvironment)
-	}
-	hookCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	output, err := exec.CommandContext(hookCtx, "wsl.exe", "-d", h.distro, "--", "boxa", "__power-watch-windows", "running").CombinedOutput()
-	if err != nil {
-		if hookCtx.Err() != nil {
-			return nil, fmt.Errorf("running-box query timed out after %s: %w", timeout, hookCtx.Err())
-		}
-		return nil, fmt.Errorf("running-box query failed: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	seen := make(map[string]struct{})
-	var boxes []string
-	for _, line := range strings.Split(strings.ReplaceAll(string(output), "\r\n", "\n"), "\n") {
-		name := strings.TrimSpace(line)
-		if name == "" {
-			continue
-		}
-		if _, duplicate := seen[name]; duplicate {
-			continue
-		}
-		seen[name] = struct{}{}
-		boxes = append(boxes, name)
-	}
-	sort.Strings(boxes)
-	return boxes, nil
-}
-
-func (h windowsSessionHooks) NotifySlept(ctx context.Context, boxes []string, timeout time.Duration) error {
-	if h.distro == "" {
-		return fmt.Errorf("%s is not set; re-run boxa keep-awake enable", wslDistroEnvironment)
-	}
-	hookCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	args := []string{"-d", h.distro, "--", "boxa", "__power-watch-windows", "notify"}
-	args = append(args, boxes...)
-	output, err := exec.CommandContext(hookCtx, "wsl.exe", args...).CombinedOutput()
-	if err != nil {
-		if hookCtx.Err() != nil {
-			return fmt.Errorf("resume notification timed out after %s: %w", timeout, hookCtx.Err())
-		}
-		return fmt.Errorf("resume notification failed: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return nil
 }
 
 func windowsCallError(name string, callErr error) error {

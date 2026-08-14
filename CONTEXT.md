@@ -57,7 +57,7 @@ Source of truth for status queries.
 **Closeout notification**:
 The desktop notification the host-side deliver script raises when an
 **Allow-for window** or an **Agent-browser session**/**network window**
-closes, or that reports the outcome of a **Pre-sleep stop**. For a window or
+closes, or that reports the outcome of a **Pre-shutdown stop**. For a window or
 session closeout, it carries a click action that opens the run's log (the
 **Harvest log** or the agent-browser summary/proxy log). The notification is a
 convenience pointer; that log file is the canonical record and is always
@@ -85,15 +85,15 @@ shell is still running and otherwise releases it.
 _Avoid_: agent-awake hook, keep-awake hook
 
 **Power-watch**:
-The **Keep-awake daemon** component that stops boxes before the system sleeps
-or shuts down.
+The **Keep-awake daemon** component that stops boxes before system shutdown or
+poweroff. It deliberately ignores sleep and resume.
 _Avoid_: power watcher, sleep watcher, shutdown watcher
 
-**Pre-sleep stop**:
+**Pre-shutdown stop**:
 The `boxa stop --all --reason presleep` run that **Power-watch** triggers
-before sleep or shutdown. Its outcome reaches the user through a **Closeout
-notification**.
-_Avoid_: presleep hook, sleep stop, shutdown stop
+before shutdown or poweroff. Its outcome reaches the user through a **Closeout
+notification**; the legacy `presleep` reason token remains part of the command.
+_Avoid_: presleep hook, sleep stop
 
 ### Agent-browser
 

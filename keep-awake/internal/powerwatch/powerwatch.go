@@ -14,9 +14,7 @@ const DefaultCommand = "boxa stop --all --reason presleep"
 type Event uint8
 
 const (
-	PrepareForSleep Event = iota
-	PrepareForShutdown
-	resumeFromSleep
+	PrepareForShutdown Event = iota
 	shutdownCancelled
 )
 
@@ -41,63 +39,6 @@ type eventSource interface {
 
 type hookRunner interface {
 	Run(context.Context, time.Duration) error
-}
-
-type hookCoordinator struct {
-	permit chan struct{}
-}
-
-func newHookCoordinator() *hookCoordinator {
-	coordination := &hookCoordinator{permit: make(chan struct{}, 1)}
-	coordination.permit <- struct{}{}
-	return coordination
-}
-
-func (c *hookCoordinator) TryAcquire() bool {
-	select {
-	case <-c.permit:
-		return true
-	default:
-		return false
-	}
-}
-
-func (c *hookCoordinator) release() {
-	c.permit <- struct{}{}
-}
-
-func (c *hookCoordinator) run(ctx context.Context, timeout time.Duration, run func(context.Context, time.Duration) error) error {
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	select {
-	case <-runCtx.Done():
-		return fmt.Errorf("power-watch coordination timed out after %s: %w", timeout, runCtx.Err())
-	case <-c.permit:
-	}
-	defer c.release()
-
-	deadline, _ := runCtx.Deadline()
-	remaining := time.Until(deadline)
-	if remaining <= 0 {
-		return fmt.Errorf("power-watch coordination timed out after %s: %w", timeout, context.DeadlineExceeded)
-	}
-	return run(runCtx, remaining)
-}
-
-type coordinatedHookRunner struct {
-	runner       hookRunner
-	coordination *hookCoordinator
-}
-
-func (r coordinatedHookRunner) Run(ctx context.Context, timeout time.Duration) error {
-	return r.coordination.run(ctx, timeout, r.runner.Run)
-}
-
-// AwakeLeaseSource reports whether idle sleep is currently inhibited and
-// signals transitions so Windows prediction can suspend and resume promptly.
-type AwakeLeaseSource interface {
-	AwakeLeaseHeld() bool
-	AwakeLeaseChanges() <-chan struct{}
 }
 
 type commandRunner struct {
@@ -132,23 +73,13 @@ type Watch struct {
 	timeout time.Duration
 	logger  *log.Logger
 	status  Status
-	predict *predictionWatch
 	session *sessionWatch
 }
 
 func New(command string, timeout time.Duration, output io.Writer, logger *log.Logger) *Watch {
-	return NewWithAwakeLeases(command, timeout, output, logger, nil)
-}
-
-// NewWithAwakeLeases adds the lease state used by Windows idle prediction.
-// Event-driven platforms ignore leases and retain their existing behaviour.
-func NewWithAwakeLeases(command string, timeout time.Duration, output io.Writer, logger *log.Logger, leases AwakeLeaseSource) *Watch {
 	runner := commandRunner{command: command, output: output}
-	coordination := newHookCoordinator()
-	coordinatedRunner := coordinatedHookRunner{runner: runner, coordination: coordination}
-	watch := newWatch(newPlatformSource(), coordinatedRunner, timeout, logger)
-	watch.predict = newPlatformPrediction(coordinatedRunner, timeout, logger, leases)
-	watch.session = newPlatformSessionWatch(coordinatedRunner, timeout, logger, coordination)
+	watch := newWatch(newPlatformSource(), runner, timeout, logger)
+	watch.session = newPlatformSessionWatch(runner, timeout, logger)
 	return watch
 }
 
@@ -163,27 +94,6 @@ func newWatch(source eventSource, runner hookRunner, timeout time.Duration, logg
 }
 
 func (w *Watch) Run(ctx context.Context) error {
-	if w.predict != nil && w.session != nil {
-		w.setActive(true)
-		defer w.setActive(false)
-		runCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		done := make(chan error, 2)
-		go func() { done <- w.predict.Run(runCtx) }()
-		go func() { done <- w.session.Run(runCtx) }()
-		firstErr := <-done
-		cancel()
-		secondErr := <-done
-		if firstErr != nil {
-			return firstErr
-		}
-		return secondErr
-	}
-	if w.predict != nil {
-		w.setActive(true)
-		defer w.setActive(false)
-		return w.predict.Run(ctx)
-	}
 	if w.session != nil {
 		w.setActive(true)
 		defer w.setActive(false)
@@ -235,7 +145,7 @@ func (w *Watch) Run(ctx context.Context) error {
 				}
 				return fmt.Errorf("power event subscription closed")
 			}
-			if event == resumeFromSleep || event == shutdownCancelled {
+			if event == shutdownCancelled {
 				if lock != nil {
 					continue
 				}
@@ -265,10 +175,10 @@ func (w *Watch) runHook(ctx context.Context, event Event, delayMax time.Duration
 		budget = delayMax
 	}
 	if w.logger != nil {
-		w.logger.Printf("power-watch received %s; running pre-sleep stop with %s budget", event, budget)
+		w.logger.Printf("power-watch received %s; running pre-shutdown stop with %s budget", event, budget)
 	}
 	if err := w.runner.Run(ctx, budget); err != nil && w.logger != nil {
-		w.logger.Printf("power-watch pre-sleep stop: %v", err)
+		w.logger.Printf("power-watch pre-shutdown stop: %v", err)
 	}
 }
 
@@ -294,7 +204,7 @@ func (w *Watch) setDelayMax(delay time.Duration, err error) {
 	}
 	if delay < w.timeout {
 		w.status.Hint = fmt.Sprintf(
-			"logind InhibitDelayMaxSec is %s, shorter than the %s pre-sleep stop budget; raise InhibitDelayMaxSec in logind.conf",
+			"logind InhibitDelayMaxSec is %s, shorter than the %s pre-shutdown stop budget; raise InhibitDelayMaxSec in logind.conf",
 			delay, w.timeout,
 		)
 	}
@@ -309,12 +219,8 @@ func delayDescription(delay time.Duration, err error) string {
 
 func (e Event) String() string {
 	switch e {
-	case PrepareForSleep:
-		return "PrepareForSleep"
 	case PrepareForShutdown:
 		return "PrepareForShutdown"
-	case resumeFromSleep:
-		return "resume from sleep"
 	case shutdownCancelled:
 		return "cancelled shutdown"
 	default:

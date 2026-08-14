@@ -41,7 +41,7 @@ KEEP_AWAKE_CLAUDE_DEFAULTS="${BOXA_KEEP_AWAKE_CLAUDE_DEFAULTS:-$BOXA_DIR/config/
 
 usage() {
     cat <<'EOF'
-Usage: ensure-keep-awake.sh <offer|probe|enable|disable|status|teardown|go-prereq|go-remedy> [options]
+Usage: ensure-keep-awake.sh <offer|probe|enable|refresh|disable|status|teardown|go-prereq|go-remedy> [options]
 
 Canonical lifecycle helper for boxa's elective keep-awake daemon.
 
@@ -1038,6 +1038,79 @@ keep_awake::enable() {
     fi
 }
 
+keep_awake::refresh() {
+    local autostart_mode tmp_dir built_binary stopped_for_swap=false
+    keep_awake::init_paths || return 1
+    [ "$(keep_awake::state_field enabled 2>/dev/null || true)" = true ] || return 0
+
+    autostart_mode="$(keep_awake::autostart_mode)"
+    tmp_dir="$(mktemp -d)"
+    built_binary="$tmp_dir/$(basename "$KEEP_AWAKE_BINARY")"
+    if ! keep_awake::build_binary "$built_binary"; then
+        rm -rf "$tmp_dir"
+        printf 'keep-awake: binary refresh build failed; installed daemon was not changed.\n' >&2
+        return 1
+    fi
+
+    # Windows cannot replace a running executable. Unix can replace in place,
+    # avoiding a service-manager restart race until the new file is complete.
+    if [ "$KEEP_AWAKE_PLATFORM" = wsl2 ]; then
+        keep_awake::stop_direct
+        stopped_for_swap=true
+    fi
+    if ! mkdir -p "$KEEP_AWAKE_INSTALL_DIR" \
+        || ! install -m 0755 "$built_binary" "$KEEP_AWAKE_BINARY"; then
+        rm -rf "$tmp_dir"
+        printf 'keep-awake: refreshed binary installation failed.\n' >&2
+        # The Windows stop above already took the daemon down while the old
+        # binary is still installed untouched: restart that old binary instead
+        # of leaving the host daemon-less until someone intervenes by hand.
+        if [ "$stopped_for_swap" = true ]; then
+            case "$autostart_mode" in
+                system)
+                    schtasks.exe /Run /TN "$KEEP_AWAKE_TASK_NAME" >/dev/null 2>&1 || true
+                    ;;
+                terminal) keep_awake::start_direct || true ;;
+                none)
+                    printf 'keep-awake: the user-managed daemon was stopped for the Windows binary swap; start it again with your own mechanism.\n' >&2
+                    ;;
+            esac
+        fi
+        return 1
+    fi
+    rm -rf "$tmp_dir"
+
+    # In "none" mode the daemon belongs to the user's own start mechanism and
+    # may run with arguments boxa never chose. Taking ownership here would risk
+    # missing that process on stop and racing a competing default instance onto
+    # the port, so refresh only swaps the file and reports what is left to do.
+    case "$autostart_mode" in
+        system)
+            case "$KEEP_AWAKE_PLATFORM" in
+                linux) systemctl --user restart boxa-keep-awake.service ;;
+                macos) launchctl kickstart -k "gui/$(id -u)/$KEEP_AWAKE_LAUNCH_LABEL" ;;
+                wsl2)
+                    schtasks.exe /End /TN "$KEEP_AWAKE_TASK_NAME" >/dev/null 2>&1 || true
+                    schtasks.exe /Run /TN "$KEEP_AWAKE_TASK_NAME" >/dev/null
+                    ;;
+            esac
+            ;;
+        none)
+            if [ "$stopped_for_swap" = true ]; then
+                printf 'keep-awake: refreshed binary installed; the user-managed daemon was stopped for the Windows binary swap — start it again with your own mechanism.\n'
+            else
+                # The running process keeps the old inode until it exits; the
+                # next user-managed start picks up the refreshed binary.
+                printf 'keep-awake: refreshed binary installed; restart the user-managed daemon with your own mechanism to pick it up.\n'
+            fi
+            ;;
+        *)
+            [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] || keep_awake::stop_direct
+            keep_awake::start_direct
+            ;;
+    esac
+}
+
 keep_awake::teardown() {
     local keep_connection=false remove_state=false arg autostart_mode rc=0
     for arg in "$@"; do
@@ -1177,6 +1250,10 @@ case "$command_name" in
     offer)       keep_awake::offer "$@" ;;
     probe)       keep_awake::probe ;;
     enable)      keep_awake::enable "$@" ;;
+    refresh)
+        [ "$#" -eq 0 ] || { printf 'keep-awake refresh: no options expected\n' >&2; exit 2; }
+        keep_awake::refresh
+        ;;
     disable)     keep_awake::disable ;;
     status)      keep_awake::status ;;
     doctor)      keep_awake::doctor ;;

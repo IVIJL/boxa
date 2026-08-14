@@ -37,11 +37,7 @@ type logindLock struct {
 
 func newPlatformSource() eventSource { return &logindSource{} }
 
-func newPlatformPrediction(hookRunner, time.Duration, *log.Logger, AwakeLeaseSource) *predictionWatch {
-	return nil
-}
-
-func newPlatformSessionWatch(hookRunner, time.Duration, *log.Logger, *hookCoordinator) *sessionWatch {
+func newPlatformSessionWatch(hookRunner, time.Duration, *log.Logger) *sessionWatch {
 	return nil
 }
 
@@ -67,14 +63,6 @@ func (s *logindSource) Subscribe(ctx context.Context) (<-chan Event, error) {
 	conn, err := dbus.ConnectSystemBus()
 	if err != nil {
 		return nil, fmt.Errorf("connect to system bus: %w", err)
-	}
-	if err := conn.AddMatchSignal(
-		dbus.WithMatchObjectPath(loginPath),
-		dbus.WithMatchInterface(managerInterface),
-		dbus.WithMatchMember("PrepareForSleep"),
-	); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("subscribe PrepareForSleep: %w", err)
 	}
 	if err := conn.AddMatchSignal(
 		dbus.WithMatchObjectPath(loginPath),
@@ -108,9 +96,9 @@ func (s *logindSource) Acquire(ctx context.Context) (delayLock, error) {
 	var fd dbus.UnixFD
 	err := conn.Object(loginDestination, loginPath).
 		CallWithContext(ctx, managerInterface+".Inhibit", 0,
-			"sleep:shutdown",
+			"shutdown",
 			"boxa-keep-awake",
-			"Stopping boxa containers before sleep or shutdown",
+			"Stopping boxa containers before shutdown",
 			"delay",
 		).Store(&fd)
 	if err != nil {
@@ -182,12 +170,6 @@ func forwardSignals(ctx context.Context, signals <-chan *dbus.Signal, events cha
 			}
 			var event Event
 			switch signal.Name {
-			case managerInterface + ".PrepareForSleep":
-				if preparing {
-					event = PrepareForSleep
-				} else {
-					event = resumeFromSleep
-				}
 			case managerInterface + ".PrepareForShutdown":
 				if preparing {
 					event = PrepareForShutdown

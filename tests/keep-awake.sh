@@ -522,6 +522,8 @@ assert_contains "offer reports later enable command" "boxa keep-awake enable" "$
 assert_eq "decline marker is remembered" "declined" "$("$KEEP_AWAKE" probe)"
 second_offer="$("$KEEP_AWAKE" offer --interactive)"
 assert_eq "decided offer does not prompt again" "" "$second_offer"
+refresh_disabled_output="$("$KEEP_AWAKE" refresh)"
+assert_eq "refresh is silent when keep-awake is not enabled" "" "$refresh_disabled_output"
 
 # With neither Docker nor Go available, enable prints the Docker-first remedy
 # and mutates no binary, autostart, or Host connection state.
@@ -596,6 +598,17 @@ assert_contains "Docker build provides a writable Go build cache" \
     "--env GOCACHE=/tmp/gocache" "$docker_build_log"
 assert_eq "Docker-built artifact is owned by the invoking user" "$(id -u)" \
     "$(stat -c %u "$TMPROOT/install/keep-awake")"
+
+: > "$KEEP_AWAKE_TEST_LOG"
+refresh_output="$("$KEEP_AWAKE" refresh)"
+assert_eq "refresh emits no elective prompt" "" "$refresh_output"
+assert_contains "refresh rebuilds the daemon binary" "docker run --rm" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "refresh restarts the existing Linux service" \
+    "systemctl --user restart boxa-keep-awake.service" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_not_contains "refresh does not recreate the Host connection" \
+    "boxa connect host" "$(cat "$KEEP_AWAKE_TEST_LOG")"
 
 status_output="$("$KEEP_AWAKE" status)"
 assert_contains "status reports reachable daemon" "Daemon reachable: yes" "$status_output"
@@ -688,6 +701,23 @@ assert_contains "none status reports selected mode" "autostart: none" "$none_sta
 assert_contains "none status explains absent tray" \
     "Tray: not installed (autostart: none)" "$none_status"
 assert_eq "none mode probes OK without system autostart" ok "$("$KEEP_AWAKE" probe)"
+
+# In none mode the daemon belongs to the user's own start mechanism, possibly
+# with custom arguments: refresh swaps the binary in place and stops there, so
+# it can never miss that process on stop nor race a default instance onto the
+# port. The running process keeps the old inode until the user restarts it.
+printf '# stale-binary-marker\n' >> "$TMPROOT/install/keep-awake"
+: > "$KEEP_AWAKE_TEST_LOG"
+none_refresh_output="$("$KEEP_AWAKE" refresh)"
+assert_contains "none refresh rebuilds the daemon binary" "docker run --rm" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_not_contains "none refresh replaces the installed binary" \
+    "stale-binary-marker" "$(cat "$TMPROOT/install/keep-awake")"
+assert_not_contains "none refresh starts no competing daemon" "daemon -port" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "none refresh asks the user to restart their own daemon" \
+    "restart the user-managed daemon with your own mechanism" \
+    "$none_refresh_output"
 "$KEEP_AWAKE" disable >/dev/null
 
 # Missing Linux tray prerequisites and tray startup failures are notices only;
@@ -1101,13 +1131,79 @@ assert_contains "Windows local Go build uses GUI subsystem" \
 "$KEEP_AWAKE" disable >/dev/null
 export KEEP_AWAKE_TEST_DOCKER_FAIL=false
 
-# Public CLI routes the three subcommands to the canonical helper and exposes
+# Windows cannot swap a running .exe, so a WSL2 refresh stops the daemon before
+# installing. A failing install must not leave the host daemon-less: the old,
+# untouched binary is started again the way its autostart mode owns it, while
+# the failure itself is still reported and non-zero.
+cat > "$TMPROOT/bin/install" <<'EOF'
+#!/usr/bin/env bash
+if [ "${KEEP_AWAKE_TEST_INSTALL_FAIL:-false}" = true ]; then
+    printf 'install-refused %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
+    exit 1
+fi
+exec /usr/bin/install "$@"
+EOF
+chmod +x "$TMPROOT/bin/install"
+export KEEP_AWAKE_TEST_INSTALL_FAIL=false
+
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+"$KEEP_AWAKE" enable >/dev/null
+: > "$KEEP_AWAKE_TEST_LOG"
+export KEEP_AWAKE_TEST_INSTALL_FAIL=true
+wsl_refresh_rc=0
+wsl_refresh_output="$("$KEEP_AWAKE" refresh 2>&1)" || wsl_refresh_rc=$?
+export KEEP_AWAKE_TEST_INSTALL_FAIL=false
+assert_eq "failed Windows refresh install keeps failing" 1 "$wsl_refresh_rc"
+assert_contains "failed Windows refresh reports the installation failure" \
+    "refreshed binary installation failed" "$wsl_refresh_output"
+assert_contains "failed Windows system refresh reruns the old scheduled task" \
+    "schtasks /Run /TN BoxaKeepAwake" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+"$KEEP_AWAKE" disable >/dev/null
+
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+"$KEEP_AWAKE" enable --autostart terminal >/dev/null
+# The wrapper is rewritten by every direct start, so its return proves the old
+# daemon was launched again after the failed swap.
+rm -f "$windows_wrapper"
+: > "$KEEP_AWAKE_TEST_LOG"
+export KEEP_AWAKE_TEST_INSTALL_FAIL=true
+wsl_terminal_refresh_rc=0
+"$KEEP_AWAKE" refresh >/dev/null 2>&1 || wsl_terminal_refresh_rc=$?
+export KEEP_AWAKE_TEST_INSTALL_FAIL=false
+assert_eq "failed Windows terminal refresh keeps failing" 1 \
+    "$wsl_terminal_refresh_rc"
+assert_eq "failed Windows terminal refresh restarts the old daemon directly" \
+    true "$(file_exists "$windows_wrapper")"
+"$KEEP_AWAKE" disable >/dev/null
+
+rm -f "$XDG_CONFIG_HOME/boxa/keep-awake.conf"
+"$KEEP_AWAKE" enable --autostart none >/dev/null
+: > "$KEEP_AWAKE_TEST_LOG"
+windows_none_refresh_output="$("$KEEP_AWAKE" refresh)"
+assert_contains "Windows none refresh reports the swap-forced stop" \
+    "stopped for the Windows binary swap" "$windows_none_refresh_output"
+assert_not_contains "Windows none refresh reruns no boxa-owned autostart" \
+    "schtasks /Run" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+: > "$KEEP_AWAKE_TEST_LOG"
+export KEEP_AWAKE_TEST_INSTALL_FAIL=true
+windows_none_refresh_rc=0
+windows_none_failure="$("$KEEP_AWAKE" refresh 2>&1)" || windows_none_refresh_rc=$?
+export KEEP_AWAKE_TEST_INSTALL_FAIL=false
+assert_eq "failed Windows none refresh keeps failing" 1 \
+    "$windows_none_refresh_rc"
+assert_contains "failed Windows none refresh leaves the restart to the user" \
+    "start it again with your own mechanism" "$windows_none_failure"
+assert_not_contains "failed Windows none refresh starts no boxa-owned daemon" \
+    "schtasks /Run" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+"$KEEP_AWAKE" disable >/dev/null
+
+# Public CLI routes the lifecycle subcommands to the canonical helper and exposes
 # dedicated help without requiring Docker.
 export BOXA_KEEP_AWAKE_PLATFORM=linux
 export BOXA_KEEP_AWAKE_INSTALL_DIR="$TMPROOT/cli-install"
 cli_help="$(bash "$BOXA_DIR/docker-run.sh" keep-awake --help)"
-assert_contains "CLI help documents enable/disable/status" \
-    "Usage: boxa keep-awake <enable|disable|status> [options]" "$cli_help"
+assert_contains "CLI help documents enable/refresh/disable/status" \
+    "Usage: boxa keep-awake <enable|refresh|disable|status> [options]" "$cli_help"
 assert_contains "CLI help documents autostart modes" \
     "--autostart <system|terminal|none>" "$cli_help"
 assert_contains "CLI help documents the Docker-first build" \
