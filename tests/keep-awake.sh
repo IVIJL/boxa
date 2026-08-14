@@ -601,7 +601,8 @@ assert_eq "Docker-built artifact is owned by the invoking user" "$(id -u)" \
 
 : > "$KEEP_AWAKE_TEST_LOG"
 refresh_output="$("$KEEP_AWAKE" refresh)"
-assert_eq "refresh emits no elective prompt" "" "$refresh_output"
+assert_eq "refresh reports success and nothing else" \
+    "keep-awake: daemon binary refreshed and restarted." "$refresh_output"
 assert_contains "refresh rebuilds the daemon binary" "docker run --rm" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "refresh restarts the existing Linux service" \

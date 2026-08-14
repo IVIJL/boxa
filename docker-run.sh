@@ -3871,13 +3871,19 @@ if [ "$MODE" = "update" ]; then
 
     # The daemon is elective, but an enabled installation must follow source
     # changes from the pull. The pre-pull revision crosses the re-exec boundary
-    # so unrelated updates retain the fast no-build path.
-    if [ "${BOXA_UPDATE_PULLED:-}" = "1" ] && [ -n "${BOXA_UPDATE_PREV_HEAD:-}" ]; then
-        keep_awake_changes="$(git -C "$BOXA_DIR" diff --name-only \
-            "$BOXA_UPDATE_PREV_HEAD..HEAD" -- \
-            keep-awake scripts/ensure-keep-awake.sh)"
-        if [ -n "$keep_awake_changes" ]; then
-            "$BOXA_DIR/scripts/ensure-keep-awake.sh" refresh
+    # so unrelated updates retain the fast no-build path. A pre-refresh script
+    # re-execs without BOXA_UPDATE_PREV_HEAD; git pull leaves ORIG_HEAD at the
+    # pre-pull revision, so fall back to it rather than skipping the refresh.
+    if [ "${BOXA_UPDATE_PULLED:-}" = "1" ]; then
+        update_prev_head="${BOXA_UPDATE_PREV_HEAD:-$(git -C "$BOXA_DIR" \
+            rev-parse -q --verify ORIG_HEAD || true)}"
+        if [ -n "$update_prev_head" ]; then
+            keep_awake_changes="$(git -C "$BOXA_DIR" diff --name-only \
+                "$update_prev_head..HEAD" -- \
+                keep-awake scripts/ensure-keep-awake.sh)"
+            if [ -n "$keep_awake_changes" ]; then
+                "$BOXA_DIR/scripts/ensure-keep-awake.sh" refresh
+            fi
         fi
     fi
 

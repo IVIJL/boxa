@@ -1094,6 +1094,7 @@ keep_awake::refresh() {
                     schtasks.exe /Run /TN "$KEEP_AWAKE_TASK_NAME" >/dev/null
                     ;;
             esac
+            printf 'keep-awake: daemon binary refreshed and restarted.\n'
             ;;
         none)
             if [ "$stopped_for_swap" = true ]; then
@@ -1107,6 +1108,7 @@ keep_awake::refresh() {
         *)
             [ "$KEEP_AWAKE_PLATFORM" = wsl2 ] || keep_awake::stop_direct
             keep_awake::start_direct
+            printf 'keep-awake: daemon binary refreshed and restarted.\n'
             ;;
     esac
 }
