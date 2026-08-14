@@ -261,6 +261,119 @@ migrate_agent_awake_hooks() {
     fi
 }
 
+# Every-start, idempotent. Retire the Interaction hook: it fired on every
+# UserPromptSubmit and guessed at "waiting for approval" with keyword
+# heuristics that never matched real prompts; the Notification-event question
+# hook covers that need properly. Only a copy that is still byte-for-byte the
+# one boxa shipped is retired — a customized copy is the user's now and keeps
+# both its file and its settings.json wiring; boxa merely stops shipping it.
+INTERACTION_NOTIFY_SHIPPED_SHA256=\
+77d89bae948dde90e2f5f2b5ec13661c221f9842276d4941a310615e3ece0724
+
+# Delete $1 only while it is still byte-for-byte the shipped hook — rechecked
+# at the moment of deletion, because the shared tree is agent-writable and a
+# copy customized after the initial checksum must survive.
+remove_shipped_interaction_notify() {
+    local f="$1" digest
+    [ -L "$f" ] && return 0
+    [ -f "$f" ] || return 0
+    digest="$(sha256sum < "$f" 2>/dev/null | cut -d' ' -f1)"
+    [ "$digest" = "$INTERACTION_NOTIFY_SHIPPED_SHA256" ] || return 0
+    rm -f -- "$f"
+}
+
+migrate_remove_interaction_notify() {
+    local installed="$TARGET/hooks/interaction_notify.sh" digest status=0
+    local migration_dir="$TARGET/.boxa-migrations" delete_file=false
+
+    [ -L "$installed" ] && return 0    # symlink → user-managed, leave alone
+    if [ -f "$installed" ]; then
+        command -v sha256sum >/dev/null 2>&1 || return 0
+        digest="$(sha256sum < "$installed" 2>/dev/null | cut -d' ' -f1)"
+        [ "$digest" = "$INTERACTION_NOTIFY_SHIPPED_SHA256" ] || return 0
+        delete_file=true
+    fi
+    # A missing file with wiring still present is a dangling entry from a
+    # manual delete — unwire it the same way.
+    if [ ! -e "$TARGET/settings.json" ]; then
+        if [ "$delete_file" = true ]; then
+            remove_shipped_interaction_notify "$installed"
+        fi
+        return 0
+    fi
+    mkdir -p "$migration_dir"
+
+    (
+        flock 9 || exit 3
+        local source="" tmp=""
+        source=$(mktemp "$TARGET/settings.json.source.XXXXXX") || exit 3
+        trap '[ -z "${source:-}" ] || rm -f "$source"; [ -z "${tmp:-}" ] || rm -f "$tmp"' EXIT
+        tmp=$(mktemp "$TARGET/settings.json.XXXXXX") || exit 3
+        cp -- "$TARGET/settings.json" "$source" || exit 3
+        jq -e . "$source" >/dev/null 2>&1 || exit 2
+        if ! jq '
+            # Both command spellings: the seeded default used the container-
+            # absolute path; tolerate a tilde-form copy of the same entry.
+            if (type == "object")
+               and ((.hooks // {}) | type == "object")
+               and (((.hooks // {}).UserPromptSubmit // []) | type == "array")
+               and ((((.hooks // {}).UserPromptSubmit // []) | length) > 0)
+            then
+              .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit // []) | map(
+                  if (has("hooks") and ((.hooks // []) | type == "array")) then
+                      .hooks = ((.hooks // []) | map(select(
+                          ((.type? == "command") and (
+                              (.command? == "/home/node/.claude/hooks/interaction_notify.sh")
+                              or (.command? == "~/.claude/hooks/interaction_notify.sh")
+                          )) | not)))
+                  else . end)
+                | map(select((has("hooks") | not) or ((.hooks | length) > 0))))
+              | if ((.hooks.UserPromptSubmit | length) == 0)
+                then .hooks |= del(.UserPromptSubmit) else . end
+            else . end
+        ' "$source" > "$tmp"; then
+            exit 3
+        fi
+        if cmp -s "$source" "$tmp"; then
+            exit 0
+        fi
+        # Claude does not share this lock; skip when the shared file moved on
+        # meanwhile — this migration runs every start and simply retries.
+        cmp -s "$source" "$TARGET/settings.json" || exit 4
+        # The tree is agent-writable: a copy customized while we rewrote
+        # settings must keep its wiring too — defer to the next start. A
+        # file deleted meanwhile leaves dangling wiring, which unwiring
+        # handles correctly.
+        if [ "$delete_file" = true ] && [ -e "$installed" ]; then
+            if [ -L "$installed" ] \
+                || [ "$(sha256sum < "$installed" 2>/dev/null | cut -d' ' -f1)" \
+                     != "$INTERACTION_NOTIFY_SHIPPED_SHA256" ]; then
+                exit 4
+            fi
+        fi
+        mv "$tmp" "$TARGET/settings.json"
+        tmp=""
+        exit 0
+    ) 9>"$migration_dir/interaction-notify.lock" || status=$?
+
+    if [ "$status" -eq 0 ]; then
+        if [ "$delete_file" = true ]; then
+            # An unchanged copy may still be wired in a way the jq filter
+            # does not match (moved to another event, custom arguments) —
+            # that wiring is the user's; keep its file.
+            if ! grep -q 'interaction_notify\.sh' "$TARGET/settings.json" 2>/dev/null; then
+                remove_shipped_interaction_notify "$installed"
+            fi
+        fi
+    elif [ "$status" -eq 2 ]; then
+        WARNINGS+=("Interaction hook retirement skipped — $TARGET/settings.json is not valid JSON")
+    elif [ "$status" -eq 4 ]; then
+        : # concurrent settings write — retried on next start, file kept until then
+    else
+        WARNINGS+=("Interaction hook retirement failed")
+    fi
+}
+
 # Every-start. Backwards-compat alias /workspace/<name> -> host project path
 # (ADR 0004). /workspace is created and chown'd to node:node in the Dockerfile,
 # so node can write here without sudo.
@@ -400,6 +513,7 @@ main() {
     seed_defaults
     migrate_enable_all_project_mcp_servers
     migrate_agent_awake_hooks
+    migrate_remove_interaction_notify
     make_workspace_symlink     # before pretrust (logical order, not strict dep)
     pretrust_workspace_paths
     ensure_npm_global_path     # must precede bootstrap_codex (shared parent dir)

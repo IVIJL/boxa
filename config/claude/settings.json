@@ -26,14 +26,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/node/.claude/hooks/interaction_notify.sh"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
             "command": "~/.claude/hooks/agent-awake.sh busy"
           }
         ]

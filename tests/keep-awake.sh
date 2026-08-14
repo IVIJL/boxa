@@ -514,12 +514,61 @@ assert_eq "reseeded hook stays executable" true \
 assert_eq "managed defaults preserve success notify hook" 1 \
     "$(jq '[.hooks.Stop[]?.hooks[]? | select(.command == "/home/node/.claude/hooks/success_notify.sh")] | length' \
         "$BOXA_DIR/config/claude/settings.json")"
-assert_eq "managed defaults preserve interaction notify hook" 1 \
-    "$(jq '[.hooks.UserPromptSubmit[]?.hooks[]? | select(.command == "/home/node/.claude/hooks/interaction_notify.sh")] | length' \
+assert_eq "managed defaults no longer ship the interaction hook" 0 \
+    "$(jq '[.hooks[][]?.hooks[]? | select(.command | endswith("/interaction_notify.sh"))] | length' \
         "$BOXA_DIR/config/claude/settings.json")"
 assert_eq "managed defaults contain all client signal entries" 3 \
     "$(jq '[.hooks[][]?.hooks[]? | select(.command | startswith("~/.claude/hooks/agent-awake.sh "))] | length' \
         "$BOXA_DIR/config/claude/settings.json")"
+
+# The retired Interaction hook is unwired and deleted only while the file is
+# still byte-for-byte the copy boxa shipped; a customized copy is the user's
+# and keeps both its file and its wiring.
+run_interaction_retirement() {
+    BOXA_CLAUDE_DEFAULTS="$claude_defaults" BOXA_CLAUDE_TARGET="$claude_target" \
+        bash -c 'source "$1"; migrate_remove_interaction_notify' \
+        _ "$BOXA_DIR/scripts/setup-claude.sh"
+}
+retired_hook="$claude_target/hooks/interaction_notify.sh"
+cp "$BOXA_DIR/tests/fixtures/claude-hooks/interaction_notify_shipped.sh" "$retired_hook"
+cat > "$claude_target/settings.json" <<'EOF'
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "/home/node/.claude/hooks/interaction_notify.sh"}]},
+      {"hooks": [{"type": "command", "command": "~/.claude/hooks/agent-awake.sh busy"}]}
+    ]
+  }
+}
+EOF
+run_interaction_retirement
+assert_eq "interaction retirement deletes the shipped copy" false \
+    "$(file_exists "$retired_hook")"
+assert_eq "interaction retirement unwires the settings entry" 0 \
+    "$(jq '[.hooks[][]?.hooks[]? | select(.command | endswith("/interaction_notify.sh"))] | length' \
+        "$claude_target/settings.json")"
+assert_eq "interaction retirement keeps the prompt heartbeat" 1 \
+    "$(jq '[.hooks.UserPromptSubmit[]?.hooks[]? | select(.command == "~/.claude/hooks/agent-awake.sh busy")] | length' \
+        "$claude_target/settings.json")"
+run_interaction_retirement
+assert_eq "interaction retirement is idempotent" 1 \
+    "$(jq '.hooks.UserPromptSubmit | length' "$claude_target/settings.json")"
+cp "$BOXA_DIR/tests/fixtures/claude-hooks/interaction_notify_shipped.sh" "$retired_hook"
+printf '# my custom tweak\n' >> "$retired_hook"
+jq '.hooks.UserPromptSubmit += [{"hooks": [{"type": "command", "command": "~/.claude/hooks/interaction_notify.sh"}]}]' \
+    "$claude_target/settings.json" > "$claude_target/settings.json.tmp" \
+    && mv "$claude_target/settings.json.tmp" "$claude_target/settings.json"
+run_interaction_retirement
+assert_eq "customized interaction hook keeps its file" true \
+    "$(file_exists "$retired_hook")"
+assert_eq "customized interaction hook keeps its wiring" 1 \
+    "$(jq '[.hooks[][]?.hooks[]? | select(.command | endswith("/interaction_notify.sh"))] | length' \
+        "$claude_target/settings.json")"
+rm -f "$retired_hook"
+run_interaction_retirement
+assert_eq "dangling interaction wiring is removed once the file is gone" 0 \
+    "$(jq '[.hooks[][]?.hooks[]? | select(.command | endswith("/interaction_notify.sh"))] | length' \
+        "$claude_target/settings.json")"
 
 # The fresh-install offer records a decline once without needing Go.
 decline_output="$(printf 'n\n' | "$KEEP_AWAKE" offer --interactive)"

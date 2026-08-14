@@ -5973,22 +5973,309 @@ if [ "$(uname -s 2>/dev/null || echo Unknown)" = "Darwin" ] \
     echo -e "\033[1;33m==> macOS: host Claude login is NOT shared into containers. Run 'boxa claude-token' once to authenticate the container fleet.\033[0m" >&2
 fi
 
-# Auto-detect NTFY_TOKEN from host's Claude hooks if not set
-if [ -z "${NTFY_TOKEN:-}" ] && [ -d "$HOME/.claude/hooks" ]; then
-    NTFY_TOKEN=$(grep -ohm1 'TOKEN="tk_[^"]*"' "$HOME/.claude/hooks/"*.sh 2>/dev/null | head -1 | cut -d'"' -f2 || true)
-fi
-
+# Notification env passthrough. The seeded default hooks read NTFY_URL and
+# NTFY_TOKEN from the environment (and the devcontainer variants forward the
+# same names via localEnv), so honour them when the host shell exports them.
+# Hooks that keep credentials in a file instead are covered by the hook
+# source-file mounts below.
 if [ -n "${NTFY_TOKEN:-}" ]; then
     DOCKER_ARGS+=(-e "NTFY_TOKEN=$NTFY_TOKEN")
 fi
 
-# Auto-detect NTFY_URL from host's Claude hooks if not set
-if [ -z "${NTFY_URL:-}" ] && [ -d "$HOME/.claude/hooks" ]; then
-    NTFY_URL=$(grep -ohm1 'NTFY_URL="https://[^"]*"' "$HOME/.claude/hooks/"*.sh 2>/dev/null | head -1 | cut -d'"' -f2 || true)
-fi
-
 if [ -n "${NTFY_URL:-}" ]; then
     DOCKER_ARGS+=(-e "NTFY_URL=$NTFY_URL")
+fi
+
+# --- Hook source-file mounts (approval-gated) --------------------------------
+# ~/.claude and ~/.codex are bind-mounted, so hook scripts and anything stored
+# next to them travel into containers by themselves. But a hook that `source`s
+# a file OUTSIDE those trees — typically a machine-local env file with
+# notification credentials — finds nothing at that path in-container and goes
+# silently dead. Discover such paths by statically resolving `source` / `.`
+# statements: parameter expansion only, command substitution is refused, so no
+# hook code ever runs on the host.
+#
+# Approval is the security boundary. ~/.claude is writable from EVERY
+# container, so an agent-edited hook could otherwise pull arbitrary host files
+# (~/.ssh keys, ~/.config/gh tokens) into the fleet on the next start. A
+# discovered path is therefore mounted read-only ONLY after an interactive
+# per-path yes/no whose answer persists in ~/.config/boxa/hook-mounts.conf —
+# host-side state that no bind mount exposes, so a container cannot
+# self-approve. A plain line is an approved path; "# <path>" is a denied one
+# that is never asked about again (and doubles as the manual escape hatch for
+# paths the static resolver cannot reach). See ADR 0025.
+
+# resolve_hook_word <word> [depth]
+# Expand $VAR / ${VAR} / ${VAR:-default} (nested) / leading ~ in a sourced
+# word without executing anything. Assignments seen earlier in the same hook
+# (HOOK_SRC_VARS) win over the host environment, mirroring how the hook would
+# resolve at runtime. Prints the result; returns 1 for anything static
+# resolution cannot honour: command substitution, pattern/offset expansions,
+# unterminated braces, runaway recursion. Set-but-empty variables take the
+# `-` default like the `:-` one — for locating a file the distinction never
+# matters, both outcomes are "not this machine's path".
+resolve_hook_word() {
+    local word="$1" depth="${2:-0}" out="" name inner op def val rest i c brace_depth
+    [ "$depth" -lt 6 ] || return 1
+    # shellcheck disable=SC2016  # matching a literal '$(' is the whole point
+    case "$word" in *'$('* | *'`'*) return 1 ;; esac
+    if [ "${word:0:1}" = "~" ]; then
+        out="$HOME"
+        word="${word:1}"
+    fi
+    while [ -n "$word" ]; do
+        c="${word:0:1}"
+        if [ "$c" != '$' ]; then
+            out+="$c"
+            word="${word:1}"
+            continue
+        fi
+        if [ "${word:1:1}" = "{" ]; then
+            rest="${word:2}"
+            brace_depth=1
+            i=0
+            while [ "$i" -lt "${#rest}" ]; do
+                c="${rest:$i:1}"
+                [ "$c" = "{" ] && brace_depth=$((brace_depth + 1))
+                if [ "$c" = "}" ]; then
+                    brace_depth=$((brace_depth - 1))
+                    [ "$brace_depth" -eq 0 ] && break
+                fi
+                i=$((i + 1))
+            done
+            [ "$brace_depth" -eq 0 ] || return 1
+            inner="${rest:0:$i}"
+            word="${rest:$((i + 1))}"
+            if [[ "$inner" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                name="$inner" op="" def=""
+            elif [[ "$inner" =~ ^([A-Za-z_][A-Za-z0-9_]*)(:?[-=])(.*)$ ]]; then
+                name="${BASH_REMATCH[1]}" op="${BASH_REMATCH[2]}" def="${BASH_REMATCH[3]}"
+            else
+                return 1
+            fi
+            val="$(lookup_hook_var "$name" "$depth")" || return 1
+            if [ -n "$val" ]; then
+                out+="$val"
+            elif [ -n "$op" ]; then
+                val="$(resolve_hook_word "$def" $((depth + 1)))" || return 1
+                out+="$val"
+            fi
+        elif [[ "${word:1}" =~ ^[A-Za-z_][A-Za-z0-9_]* ]]; then
+            name="${BASH_REMATCH[0]}"
+            word="${word:$((1 + ${#name}))}"
+            val="$(lookup_hook_var "$name" "$depth")" || return 1
+            out+="$val"
+        else
+            return 1    # positional/special parameter ($0, $?, ...) — no static value
+        fi
+    done
+    printf '%s' "$out"
+}
+
+# lookup_hook_var <name> <depth> — hook-local assignment first (resolved
+# recursively, it may itself contain expansions), host environment second.
+lookup_hook_var() {
+    local name="$1" depth="$2"
+    if [ -n "${HOOK_SRC_VARS[$name]+x}" ]; then
+        resolve_hook_word "${HOOK_SRC_VARS[$name]}" $((depth + 1))
+        return
+    fi
+    printf '%s' "${!name-}"
+}
+
+# extract_hook_word <text> — first shell word, surrounding quotes stripped.
+# Single-quoted spans are treated like double-quoted ones; a wrongly expanded
+# literal resolves to a path that does not exist and is dropped later, and an
+# existing path still sits behind the approval prompt, so the shortcut cannot
+# mount anything unseen.
+extract_hook_word() {
+    local raw="$1" out="" q="" c i
+    for ((i = 0; i < ${#raw}; i++)); do
+        c="${raw:$i:1}"
+        if [ -n "$q" ]; then
+            if [ "$c" = "$q" ]; then q=""; else out+="$c"; fi
+        elif [ "$c" = '"' ] || [ "$c" = "'" ]; then
+            q="$c"
+        elif [[ "$c" == [[:space:]\;\&\|] ]]; then
+            break    # whitespace or a shell operator ends the word
+        else
+            out+="$c"
+        fi
+    done
+    [ -z "$q" ] || return 1    # unterminated quote
+    printf '%s' "$out"
+}
+
+# discover_hook_source_files — one "<canonical>\t<resolved>" pair per line,
+# deduped, for every source statement in the hook trees that resolves to an
+# existing file OUTSIDE them. The canonical path is what approval names and
+# what is mounted; the as-resolved spelling determines the container-side
+# target (it is the path the in-container hook will look at). Non-files,
+# relative results and unresolvable expressions are skipped; the failure
+# mode is always "no mount", never a wrong one.
+discover_hook_source_files() {
+    local f line rest_line raw word resolved canonical
+    local asn_re='^[[:space:]]*((local|readonly|export)[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
+    local src_re='(^|;|&&)[[:space:]]*(source|[.])[[:space:]]+(.+)$'
+    declare -A seen=()
+    declare -A HOOK_SRC_VARS=()
+    while IFS= read -r -d '' f; do
+        # Any regular file in the hook trees may be a registered hook —
+        # extensionless executables and nested layouts included. Non-shell
+        # files are skipped by shebang; nothing here executes the file.
+        [ -f "$f" ] || continue    # drops dangling/directory symlinks
+        case "$f" in
+            *.sh) ;;
+            *) [ "$(head -c 2 -- "$f" 2>/dev/null)" = '#!' ] || continue ;;
+        esac
+        HOOK_SRC_VARS=()
+        while IFS= read -r line; do
+            # Track simple assignments so the common `cfg=...; . "$cfg"`
+            # two-step resolves. Garbage captures (compound commands after
+            # the value, test expressions) resolve to nonsense paths that
+            # the existence filter drops.
+            if [[ "$line" =~ $asn_re ]]; then
+                if raw="$(extract_hook_word "${BASH_REMATCH[4]}")"; then
+                    HOOK_SRC_VARS["${BASH_REMATCH[3]}"]="$raw"
+                fi
+                # No `continue`: `cfg=...; source "$cfg"` keeps its source
+                # statement on the same line — the `;` branch of src_re
+                # picks it up below.
+            fi
+            # A line may chain several source commands; src_re's capture
+            # includes everything after the first one, so re-matching on it
+            # walks them left to right (the remainder strictly shrinks).
+            rest_line="$line"
+            while [[ "$rest_line" =~ $src_re ]]; do
+                raw="${BASH_REMATCH[3]}"
+                rest_line="$raw"
+                word="$(extract_hook_word "$raw")" || continue
+                [ -n "$word" ] || continue
+                resolved="$(resolve_hook_word "$word")" || continue
+                case "$resolved" in /*) ;; *) continue ;; esac
+                [ -f "$resolved" ] || continue
+                # Canonicalise so the approval names the real file: a
+                # symlink in an agent-writable location (e.g. the mounted
+                # project) could otherwise be repointed at a host secret
+                # after approval. A repointed target changes the canonical
+                # path and lands back behind the prompt.
+                canonical="$(realpath "$resolved" 2>/dev/null)" || continue
+                [ -f "$canonical" ] || continue
+                case "$canonical" in
+                    "$HOME/.claude/"* | "$HOME/.codex/"*) continue ;;  # already mounted
+                esac
+                [ -n "${seen["$canonical|$resolved"]+x}" ] && continue
+                seen["$canonical|$resolved"]=1
+                printf '%s\t%s\n' "$canonical" "$resolved"
+            done
+        done < "$f"
+    done < <(find "$HOME/.claude/hooks" "$HOME/.codex/hooks" \
+                  \( -type f -o -type l \) -print0 2>/dev/null)
+}
+
+hook_mounts_conf="$HOME/.config/boxa/hook-mounts.conf"
+
+# The approval boundary (ADR 0025) holds only while no bind mount exposes
+# the conf. If the selected project contains it (the project IS ~/.config,
+# ~/.config/boxa or an ancestor), a container could self-approve arbitrary
+# host paths — disable the feature for such a start. Canonicalised for the
+# comparison: PROJECT_PATH is realpath'd, and a symlinked $HOME must not
+# slip the conf inside the project unnoticed.
+hook_mounts_conf_real="$(realpath -m -- "$hook_mounts_conf" 2>/dev/null \
+    || realpath -- "$hook_mounts_conf" 2>/dev/null \
+    || printf '%s' "$hook_mounts_conf")"
+hook_mounts_active=true
+case "$hook_mounts_conf_real" in
+    "$PROJECT_PATH" | "$PROJECT_PATH"/*)
+        hook_mounts_active=false
+        echo "==> Hook source mounts disabled: the project mount would expose $hook_mounts_conf read-write" >&2
+        ;;
+esac
+
+# add_hook_source_mount <host_source> <as_resolved_path> — one read-only
+# mount for an approved file. The source is the canonical host file; the
+# container-side target follows the hook's own spelling: under host $HOME it
+# lands at the /home/node equivalent (where the in-container hook resolves
+# ~/$HOME; a hook hardcoding the host-literal home path reaches it through
+# the entrypoint's per-entry $HOST_HOME→/home/node mirror — mounting at the
+# literal path instead would pre-create a real $HOST_HOME/<dir> and break
+# that mirror), elsewhere at the spelling itself.
+declare -A hook_mount_targets=()
+add_hook_source_mount() {
+    local src="$1" spelled="$2" target
+    case "$spelled" in
+        "$HOME"/*) target="/home/node${spelled#"$HOME"}" ;;
+        *)         target="$spelled" ;;
+    esac
+    [ -n "${hook_mount_targets[$target]+x}" ] && return 0
+    hook_mount_targets[$target]=1
+    DOCKER_ARGS+=(-v "$src:$target:ro")
+}
+
+mapfile -t hook_src_pairs < <(discover_hook_source_files)
+if [ "$hook_mounts_active" = true ] && [ "${#hook_src_pairs[@]}" -gt 0 ]; then
+    for hook_src_pair in "${hook_src_pairs[@]}"; do
+        hook_src_path="${hook_src_pair%%$'\t'*}"
+        hook_src_spelled="${hook_src_pair#*$'\t'}"
+        # Approval names the canonical file — that is what gets exposed.
+        # Conf entries are $HOME-relative so one conf keeps working across
+        # host-username changes.
+        case "$hook_src_path" in
+            "$HOME"/*) hook_src_label="~${hook_src_path#"$HOME"}" ;;
+            *)         hook_src_label="$hook_src_path" ;;
+        esac
+        if [ -f "$hook_mounts_conf" ] && grep -qxF "$hook_src_label" "$hook_mounts_conf"; then
+            :    # previously approved
+        elif [ -f "$hook_mounts_conf" ] && grep -qxF "# $hook_src_label" "$hook_mounts_conf"; then
+            continue    # previously denied — never ask again
+        elif [ -t 0 ] && [ -t 1 ]; then
+            echo -e "\033[1;33m==> A Claude/Codex hook sources a host file outside the shared config trees:\033[0m"
+            echo -e "\033[1;33m    $hook_src_label\033[0m"
+            printf 'Mount it read-only into containers so the hook keeps working there? [y/N] '
+            IFS= read -r hook_src_answer || hook_src_answer=""
+            mkdir -p "$(dirname "$hook_mounts_conf")"
+            if [ ! -f "$hook_mounts_conf" ]; then
+                printf '%s\n' \
+                    "# Host files that Claude/Codex hooks source inside containers." \
+                    "# Plain line = approved (mounted read-only), '# <path>' = denied." \
+                    > "$hook_mounts_conf"
+            fi
+            case "$hook_src_answer" in
+                [Yy]*) printf '%s\n' "$hook_src_label" >> "$hook_mounts_conf" ;;
+                *)
+                    printf '# %s\n' "$hook_src_label" >> "$hook_mounts_conf"
+                    continue
+                    ;;
+            esac
+        else
+            # Non-interactive start: never mount unapproved paths, never
+            # persist a denial the user did not make.
+            echo "==> Hook source mount pending approval: $hook_src_label — run boxa interactively once, or add that line to $hook_mounts_conf" >&2
+            continue
+        fi
+        add_hook_source_mount "$hook_src_path" "$hook_src_spelled"
+    done
+fi
+
+# Manual escape hatch (ADR 0025): approved conf lines whose source
+# expressions static resolution cannot reach (command substitution, …) are
+# mounted too — the user wrote the line on the host, which IS the approval.
+# Nonexistent paths degrade to "no mount" like everywhere else.
+if [ "$hook_mounts_active" = true ] && [ -f "$hook_mounts_conf" ]; then
+    while IFS= read -r hook_conf_line; do
+        # shellcheck disable=SC2088  # matching a literal '~/' conf entry
+        case "$hook_conf_line" in
+            '~/'*) hook_conf_path="$HOME${hook_conf_line#\~}" ;;
+            /*)    hook_conf_path="$hook_conf_line" ;;
+            *)     continue ;;    # header comments, denials, blanks
+        esac
+        [ -f "$hook_conf_path" ] || continue
+        # Only canonical paths mount: a symlink at (or under) the entry
+        # could be repointed at a host secret without a new approval. If
+        # $HOME itself contains symlinks, write the canonical path.
+        [ "$(realpath "$hook_conf_path" 2>/dev/null)" = "$hook_conf_path" ] || continue
+        add_hook_source_mount "$hook_conf_path" "$hook_conf_path"
+    done < "$hook_mounts_conf"
 fi
 
 # Chezmoi dotfiles repo. Precedence:

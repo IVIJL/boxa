@@ -406,6 +406,16 @@ Consumed by agent-side hooks and the `boxa` skill for host/container
 branching. See ADR 0011.
 _Avoid_: identity sentinel, container marker, boxa marker file
 
+**Hook source mount**:
+A read-only bind mount of a host file that a Claude/Codex hook `source`s
+from outside the shared `~/.claude` / `~/.codex` trees (typically a
+machine-local credentials env file). Discovered by static resolution of
+the hook's source statements and created only after a per-path approval
+persisted in `~/.config/boxa/hook-mounts.conf` — host-side state no
+container can write, because the shared trees themselves are
+agent-writable. See ADR 0025.
+_Avoid_: hook env mount, secret mount, hook config mount
+
 ### Dev URLs
 
 **DNS degradation**:
