@@ -1153,6 +1153,7 @@ keep_awake::disable() {
 keep_awake::status() {
     local status_json="" holders="[]" daemon=no daemon_target=unreachable
     local autostart=no connection=no tray client_signal autostart_mode firewall_rule
+    local warm_hook_armed=unknown warm_hook_alive=unknown
     keep_awake::init_paths || return 1
     autostart_mode="$(keep_awake::autostart_mode)"
     if keep_awake_probe::select_target "$KEEP_AWAKE_PLATFORM" "$KEEP_AWAKE_PORT"; then
@@ -1162,6 +1163,12 @@ keep_awake::status() {
         holders="$(printf '%s\n' "$status_json" \
             | sed -nE 's/.*"activeHolders":(\[[^]]*]).*/\1/p')"
         [ -n "$holders" ] || holders="[]"
+        warm_hook_armed="$(printf '%s\n' "$status_json" \
+            | sed -nE 's/.*"warmHookArmed":(true|false).*/\1/p')"
+        warm_hook_alive="$(printf '%s\n' "$status_json" \
+            | sed -nE 's/.*"warmHookAlive":(true|false).*/\1/p')"
+        [ -n "$warm_hook_armed" ] || warm_hook_armed=unknown
+        [ -n "$warm_hook_alive" ] || warm_hook_alive=unknown
     fi
     keep_awake::autostart_installed && autostart=yes
     keep_awake::host_connection_present && connection=yes
@@ -1183,6 +1190,7 @@ keep_awake::status() {
     printf 'Daemon reachable: %s\n' "$daemon"
     printf 'Relay target: %s\n' "$daemon_target"
     printf 'Holders: %s\n' "$holders"
+    printf 'Warm hook: armed=%s, alive=%s\n' "$warm_hook_armed" "$warm_hook_alive"
     printf 'Autostart installed: %s\n' "$autostart"
     printf 'autostart: %s\n' "$autostart_mode"
     printf 'Host connection present: %s\n' "$connection"

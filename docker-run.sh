@@ -2677,6 +2677,18 @@ stop_containers_batched() {
     docker stop -t 15 "${containers[@]}" > /dev/null
 }
 
+signal_warm_hook() {
+    local armed="$1" port="${BOXA_KEEP_AWAKE_PORT:-17777}" platform
+    platform="${BOXA_KEEP_AWAKE_PLATFORM:-$(host_platform::detect 2>/dev/null || true)}"
+    keep_awake_probe::select_target "$platform" "$port" || return 0
+    keep_awake_probe::warm_hook \
+        "$KEEP_AWAKE_PROBE_TARGET_ADDRESS" "$port" "$armed" >/dev/null 2>&1 || true
+}
+
+arm_warm_hook() {
+    signal_warm_hook true || true
+}
+
 stop_traefik_if_idle() {
     local remaining
     remaining=$(docker ps --filter "name=^boxa-" --format '{{.Names}}' | filter_user_containers)
@@ -2694,6 +2706,14 @@ stop_dns_if_idle() {
         docker stop boxa_dns > /dev/null
         docker rm boxa_dns > /dev/null
         echo "Stopped: boxa_dns (no remaining containers)"
+    fi
+}
+
+disarm_warm_hook_if_idle() {
+    local remaining
+    remaining=$(docker ps --filter "name=^boxa-" --format '{{.Names}}' | filter_user_containers)
+    if [ -z "$remaining" ]; then
+        signal_warm_hook false || true
     fi
 }
 
@@ -2996,6 +3016,7 @@ restart_exited_container() {
     if ! wait_for_boxa_ready "$name"; then
         exit 1
     fi
+    arm_warm_hook || true
     # Root-context setup (firewall, gitconfig, host-home symlink) is handled by
     # the entrypoint on every container start. Here we only run the user-mode
     # setup as node.
@@ -5020,6 +5041,7 @@ if [ "$MODE" = "stop" ]; then
 
         stop_traefik_if_idle
         stop_dns_if_idle
+        disarm_warm_hook_if_idle || true
 
         if [ -n "$STOP_REASON" ] && [ "${#stopped_projects[@]}" -gt 0 ] \
             && [ -x "$BOXA_DIR/scripts/deliver-allow-for-notification.sh" ]; then
@@ -5051,6 +5073,7 @@ if [ "$MODE" = "stop" ]; then
             fi
             stop_traefik_if_idle
             stop_dns_if_idle
+            disarm_warm_hook_if_idle || true
             exit 0
         fi
         echo "Container $name is not running." >&2
@@ -5086,6 +5109,7 @@ if [ "$MODE" = "stop" ]; then
         done
         stop_traefik_if_idle
         stop_dns_if_idle
+        disarm_warm_hook_if_idle || true
     else
         proj="${selected#boxa-}"
         graceful_stop_container "$selected"
@@ -5100,6 +5124,7 @@ if [ "$MODE" = "stop" ]; then
         fi
         stop_traefik_if_idle
         stop_dns_if_idle
+        disarm_warm_hook_if_idle || true
     fi
     exit 0
 fi
@@ -6501,6 +6526,7 @@ docker run -d --name "$CONTAINER_NAME" --stop-timeout 45 "${DOCKER_ARGS[@]}" "$I
 if ! wait_for_boxa_ready "$CONTAINER_NAME"; then
     exit 1
 fi
+arm_warm_hook || true
 
 # Apply default port routes
 apply_port_routes "$CONTAINER_NAME"

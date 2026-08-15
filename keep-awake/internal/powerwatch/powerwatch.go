@@ -24,6 +24,8 @@ type Status struct {
 	InhibitDelayMax      time.Duration
 	InhibitDelayMaxError string
 	Hint                 string
+	WarmHookArmed        bool
+	WarmHookAlive        bool
 }
 
 type delayLock interface {
@@ -192,8 +194,10 @@ func (w *Watch) runHook(ctx context.Context, event Event, delayMax time.Duration
 
 func (w *Watch) Status() Status {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.status
+	status := w.status
+	w.mu.Unlock()
+	status.WarmHookArmed, status.WarmHookAlive = w.warm.Status()
+	return status
 }
 
 func (w *Watch) setActive(active bool) {

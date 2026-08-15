@@ -82,7 +82,13 @@ func TestWarmHookDisarmClosesPipeAndReapsChild(t *testing.T) {
 	)
 	hook.Arm()
 	waitWarmHookAlive(t, hook)
+	if armed, alive := hook.Status(); !armed || !alive {
+		t.Fatalf("warm-hook status before disarm = armed:%t alive:%t", armed, alive)
+	}
 	hook.Disarm()
+	if armed, alive := hook.Status(); armed || alive {
+		t.Fatalf("warm-hook status after disarm = armed:%t alive:%t", armed, alive)
+	}
 
 	data, err := os.ReadFile(eofFile)
 	if err != nil {

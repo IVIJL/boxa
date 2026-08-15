@@ -118,7 +118,7 @@ func run(ctx context.Context, cfg config, addresses []string, listeners []net.Li
 		}
 	}()
 
-	handler := httpapi.New(manager, powerWatch.Status, cfg.defaultTTL, version, logger)
+	handler := httpapi.New(manager, powerWatch.Status, powerWatch.WarmHook(), cfg.defaultTTL, version, logger)
 	server := &http.Server{
 		Handler:           handler,
 		ErrorLog:          logger,

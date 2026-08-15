@@ -73,6 +73,17 @@ func newWarmHook(command warmHookCommand, output io.Writer, logger *log.Logger, 
 	}
 }
 
+// Status reports whether the warm hook is armed and its child is ready.
+func (h *WarmHook) Status() (armed, alive bool) {
+	if h == nil || !h.enabled {
+		return false, false
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.armed, h.alive
+}
+
 // Arm starts maintaining a warm stop helper. It is a no-op off Windows.
 func (h *WarmHook) Arm() {
 	if h == nil || !h.enabled {

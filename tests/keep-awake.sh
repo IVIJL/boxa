@@ -244,7 +244,7 @@ case "$*" in
         ;;
 esac
 [ "$KEEP_AWAKE_TEST_CURL_HEALTHY" = true ] || exit 7
-printf '{"activeHolders":[{"agent":"codex","session":"test","remainingTTLSeconds":899}],"isInhibited":true,"version":"test"}\n'
+printf '{"activeHolders":[{"agent":"codex","session":"test","remainingTTLSeconds":899}],"isInhibited":true,"powerWatch":{"warmHookArmed":true,"warmHookAlive":true},"version":"test"}\n'
 EOF
 
 cat > "$TMPROOT/bin/sleep" <<'EOF'
@@ -614,6 +614,8 @@ assert_not_contains "refresh does not recreate the Host connection" \
 status_output="$("$KEEP_AWAKE" status)"
 assert_contains "status reports reachable daemon" "Daemon reachable: yes" "$status_output"
 assert_contains "status reports active holders" '"agent":"codex"' "$status_output"
+assert_contains "status reports warm-hook state" \
+    "Warm hook: armed=true, alive=true" "$status_output"
 assert_contains "status reports autostart" "Autostart installed: yes" "$status_output"
 assert_contains "status reports system autostart mode" "autostart: system" "$status_output"
 assert_contains "status reports Host connection" "Host connection present: yes" "$status_output"

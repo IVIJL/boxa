@@ -12,6 +12,7 @@ TEST_BOXA_DIR="$_TMPROOT/boxa"
 mkdir -p "$TEST_BOXA_DIR/scripts" "$_TMPROOT/bin" "$_TMPROOT/home"
 cp "$SCRIPT_DIR/../docker-run.sh" "$TEST_BOXA_DIR/docker-run.sh"
 cp -R "$SCRIPT_DIR/../lib" "$TEST_BOXA_DIR/lib"
+cp -R "$SCRIPT_DIR/../config" "$TEST_BOXA_DIR/config"
 
 cat > "$_TMPROOT/bin/docker" <<'STUB'
 #!/bin/bash
@@ -19,6 +20,9 @@ printf '%s\n' "$*" >> "$BOXA_STOP_TEST_DOCKER_LOG"
 
 case "${1:-}" in
     ps)
+        if [ "${BOXA_STOP_TEST_UP:-}" = true ]; then
+            exit 0
+        fi
         if [[ " $* " == *" -a "* ]]; then
             if [ "${BOXA_STOP_TEST_FAIL_LIST:-}" = true ]; then
                 exit 1
@@ -27,20 +31,30 @@ case "${1:-}" in
                 printf '%s\n' boxa-alpha boxa-beta boxa_traefik boxa_dns
             fi
         elif [[ " $* " == *" name=^boxa- "* ]]; then
-            [ ! -f "$BOXA_STOP_TEST_STOPPED" ] \
-                && printf '%s\n' boxa-alpha boxa-beta \
-                || true
+            if [ ! -f "$BOXA_STOP_TEST_STOPPED" ]; then
+                printf '%s\n' boxa-alpha boxa-beta
+            elif [ "${BOXA_STOP_TEST_REMAINING:-}" = true ]; then
+                printf '%s\n' boxa-beta
+            fi
         else
             printf '%s\n' boxa_traefik boxa_dns
         fi
         ;;
     exec)
+        if [ "${BOXA_STOP_TEST_UP:-}" = true ] && [[ " $* " == *" stat -c %U /proc/1 "* ]]; then
+            printf '%s\n' node
+            exit 0
+        fi
         if [ "${2:-}" = -u ] && [ "${3:-}" = root ] \
             && [ "${5:-}" = test ] && [ "${6:-}" = -f ]; then
             exit 1
         fi
         ;;
     inspect)
+        if [ "${BOXA_STOP_TEST_UP:-}" = true ] && [[ "$*" == *".State.Status"* ]]; then
+            printf '%s\n' running
+            exit 0
+        fi
         exit 1
         ;;
     stop)
@@ -55,6 +69,20 @@ case "${1:-}" in
                 exit 1
             fi
         fi
+        ;;
+esac
+STUB
+
+cat > "$_TMPROOT/bin/curl" <<'STUB'
+#!/bin/bash
+[ "${BOXA_STOP_TEST_DAEMON_REACHABLE:-true}" = true ] || exit 7
+case "${*: -1}" in
+    */v1/status)
+        printf '%s\n' '{"powerWatch":{"warmHookArmed":false,"warmHookAlive":false}}'
+        ;;
+    */v1/warm-hook)
+        printf '%s\n' "$*" >> "$BOXA_STOP_TEST_WARM_HOOK_LOG"
+        printf '%s\n' '{"status":"ok"}'
         ;;
 esac
 STUB
@@ -79,7 +107,7 @@ printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" \
 STUB
 
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$_TMPROOT/bin/setsid"
-chmod +x "$TEST_BOXA_DIR/docker-run.sh" "$_TMPROOT/bin/docker" \
+chmod +x "$TEST_BOXA_DIR/docker-run.sh" "$_TMPROOT/bin/docker" "$_TMPROOT/bin/curl" \
     "$_TMPROOT/bin/setsid" \
     "$TEST_BOXA_DIR/scripts/closeout-agent-browser-on-stop.sh" \
     "$TEST_BOXA_DIR/scripts/deliver-allow-for-notification.sh"
@@ -90,6 +118,7 @@ export BOXA_STOP_TEST_CLOSEOUT_LOG="$_TMPROOT/closeout.log"
 export BOXA_STOP_TEST_NOTIFICATION_LOG="$_TMPROOT/notification.log"
 export BOXA_STOP_TEST_PREP_DIR="$_TMPROOT/prep"
 export BOXA_STOP_TEST_PREP_LOG="$_TMPROOT/prep.log"
+export BOXA_STOP_TEST_WARM_HOOK_LOG="$_TMPROOT/warm-hook.log"
 
 fail_count=0
 
@@ -101,11 +130,12 @@ run_boxa() {
 reset_case() {
     rm -f "$BOXA_STOP_TEST_DOCKER_LOG" "$BOXA_STOP_TEST_STOPPED" \
         "$BOXA_STOP_TEST_CLOSEOUT_LOG" "$BOXA_STOP_TEST_NOTIFICATION_LOG" \
-        "$BOXA_STOP_TEST_PREP_LOG"
+        "$BOXA_STOP_TEST_PREP_LOG" "$BOXA_STOP_TEST_WARM_HOOK_LOG"
     rm -rf "$BOXA_STOP_TEST_PREP_DIR"
     mkdir -p "$BOXA_STOP_TEST_PREP_DIR"
     unset BOXA_STOP_TEST_EMPTY BOXA_STOP_TEST_FAIL_BATCH BOXA_STOP_TEST_FAIL_LIST \
-        BOXA_STOP_TEST_FAIL_PARTIAL BOXA_STOP_TEST_PREP_BARRIER
+        BOXA_STOP_TEST_FAIL_PARTIAL BOXA_STOP_TEST_PREP_BARRIER \
+        BOXA_STOP_TEST_REMAINING BOXA_STOP_TEST_UP BOXA_STOP_TEST_DAEMON_REACHABLE
 }
 
 line_count() {
@@ -135,6 +165,31 @@ assert_contains() {
         fail_count=$((fail_count + 1))
     fi
 }
+
+reset_case
+export BOXA_STOP_TEST_UP=true
+up_project="$_TMPROOT/up-project"
+mkdir -p "$up_project"
+up_output="$(run_boxa "$up_project" 2>&1)"
+up_rc=$?
+assert_eq "fresh Container start exits successfully" "0" "$up_rc"
+if [ "$up_rc" -ne 0 ]; then
+    printf '%s\n' "$up_output"
+fi
+assert_contains "fresh Container start arms the warm hook" \
+    '-d {"armed":true}' "$(cat "$BOXA_STOP_TEST_WARM_HOOK_LOG")"
+
+reset_case
+export BOXA_STOP_TEST_UP=true
+export BOXA_STOP_TEST_DAEMON_REACHABLE=false
+unreachable_up_project="$_TMPROOT/unreachable-up-project"
+unreachable_up_errors="$_TMPROOT/unreachable-up-errors"
+mkdir -p "$unreachable_up_project"
+run_boxa "$unreachable_up_project" >/dev/null 2>"$unreachable_up_errors"
+unreachable_up_rc=$?
+assert_eq "unreachable daemon does not fail Container start" "0" "$unreachable_up_rc"
+assert_eq "unreachable daemon is silent during Container start" "" \
+    "$(cat "$unreachable_up_errors")"
 
 reset_case
 export BOXA_STOP_TEST_PREP_BARRIER=true
@@ -191,6 +246,24 @@ assert_eq "--all preserves HTTPS certificates" "present" \
     "$([ -f "$cert_artifact" ] && printf present || printf missing)"
 assert_eq "--all without reason sends no notification" "0" \
     "$(line_count '.' "$BOXA_STOP_TEST_NOTIFICATION_LOG")"
+assert_contains "last Container stop disarms the warm hook" \
+    '-d {"armed":false}' "$(cat "$BOXA_STOP_TEST_WARM_HOOK_LOG")"
+
+reset_case
+export BOXA_STOP_TEST_REMAINING=true
+run_boxa stop alpha >/dev/null 2>&1
+remaining_rc=$?
+assert_eq "single stop with a remaining Container succeeds" "0" "$remaining_rc"
+assert_eq "stop with a remaining Container does not disarm" "0" \
+    "$(line_count 'armed.*false' "$BOXA_STOP_TEST_WARM_HOOK_LOG")"
+
+reset_case
+export BOXA_STOP_TEST_DAEMON_REACHABLE=false
+unreachable_errors="$_TMPROOT/unreachable-errors"
+run_boxa stop --all >/dev/null 2>"$unreachable_errors"
+unreachable_rc=$?
+assert_eq "unreachable daemon does not fail stop" "0" "$unreachable_rc"
+assert_eq "unreachable daemon is silent" "" "$(cat "$unreachable_errors")"
 
 reset_case
 reason_output="$(run_boxa stop --reason presleep --all 2>&1)"

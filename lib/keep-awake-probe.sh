@@ -16,6 +16,14 @@ keep_awake_probe::status() {
         "http://${address}:${port}/v1/status" 2>/dev/null
 }
 
+keep_awake_probe::warm_hook() {
+    local address="$1" port="$2" armed="$3"
+    curl -fsS --noproxy '*' --max-time 2 \
+        -H 'Content-Type: application/json' \
+        -d "{\"armed\":${armed}}" \
+        "http://${address}:${port}/v1/warm-hook" 2>/dev/null
+}
+
 keep_awake_probe::select_target() {
     local platform="$1" port="$2" gateway="" kind address status_json
     local -a candidates=("loopback" "127.0.0.1")

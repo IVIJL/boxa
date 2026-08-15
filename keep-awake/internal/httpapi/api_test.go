@@ -42,9 +42,19 @@ type decodedStatus struct {
 		StopBudgetSeconds      int64  `json:"stopBudgetSeconds"`
 		InhibitDelayMaxSeconds int64  `json:"inhibitDelayMaxSeconds"`
 		Hint                   string `json:"hint"`
+		WarmHookArmed          bool   `json:"warmHookArmed"`
+		WarmHookAlive          bool   `json:"warmHookAlive"`
 	} `json:"powerWatch"`
 	Version string `json:"version"`
 }
+
+type fakeWarmHook struct {
+	armCalls    int
+	disarmCalls int
+}
+
+func (f *fakeWarmHook) Arm()    { f.armCalls++ }
+func (f *fakeWarmHook) Disarm() { f.disarmCalls++ }
 
 func newTestAPI() (*API, *fakeClock, *inhibit.Fake) {
 	clock := &fakeClock{now: time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)}
@@ -56,9 +66,11 @@ func newTestAPI() (*API, *fakeClock, *inhibit.Fake) {
 			StopBudget:      time.Minute,
 			InhibitDelayMax: 5 * time.Second,
 			Hint:            "raise InhibitDelayMaxSec in logind.conf",
+			WarmHookArmed:   true,
+			WarmHookAlive:   true,
 		}
 	}
-	return New(manager, powerStatus, 15*time.Minute, "test-version", nil), clock, fake
+	return New(manager, powerStatus, &fakeWarmHook{}, 15*time.Minute, "test-version", nil), clock, fake
 }
 
 func request(t *testing.T, handler http.Handler, method, target string) *httptest.ResponseRecorder {
@@ -92,7 +104,8 @@ func TestBusyStatusAndTTLExpiry(t *testing.T) {
 		t.Fatalf("unexpected busy status: %+v", status)
 	}
 	if !status.PowerWatch.Active || status.PowerWatch.StopBudgetSeconds != 60 ||
-		status.PowerWatch.InhibitDelayMaxSeconds != 5 || !strings.Contains(status.PowerWatch.Hint, "InhibitDelayMaxSec") {
+		status.PowerWatch.InhibitDelayMaxSeconds != 5 || !status.PowerWatch.WarmHookArmed ||
+		!status.PowerWatch.WarmHookAlive || !strings.Contains(status.PowerWatch.Hint, "InhibitDelayMaxSec") {
 		t.Fatalf("unexpected power-watch status: %+v", status.PowerWatch)
 	}
 	holder := status.ActiveHolders[0]
@@ -104,6 +117,23 @@ func TestBusyStatusAndTTLExpiry(t *testing.T) {
 	status = getStatus(t, api)
 	if status.IsInhibited || len(status.ActiveHolders) != 0 || fake.ReleaseCalls() != 1 {
 		t.Fatalf("expired status: %+v, release calls=%d", status, fake.ReleaseCalls())
+	}
+}
+
+func TestWarmHookArmAndDisarm(t *testing.T) {
+	api, _, _ := newTestAPI()
+	warmHook := api.warmHook.(*fakeWarmHook)
+
+	for _, body := range []string{`{"armed":true}`, `{"armed":false}`} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, warmHookPath, strings.NewReader(body))
+		api.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("body=%s code=%d response=%s", body, recorder.Code, recorder.Body.String())
+		}
+	}
+	if warmHook.armCalls != 1 || warmHook.disarmCalls != 1 {
+		t.Fatalf("warm-hook calls: arm=%d disarm=%d", warmHook.armCalls, warmHook.disarmCalls)
 	}
 }
 
@@ -159,6 +189,7 @@ func TestContractErrors(t *testing.T) {
 		{http.MethodGet, "/status", http.StatusNotFound, "/v1/status"},
 		{http.MethodGet, "/v2/status", http.StatusNotFound, "/v1/status"},
 		{http.MethodPost, "/v1/status", http.StatusMethodNotAllowed, "use GET"},
+		{http.MethodGet, warmHookPath, http.StatusMethodNotAllowed, "use POST"},
 		{http.MethodGet, "/v1/busy/codex?ttl=0", http.StatusBadRequest, "positive integer"},
 		{http.MethodGet, "/v1/busy/bad%2Fagent", http.StatusBadRequest, "agent"},
 		{http.MethodGet, "/v1/busy/codex?session=bad%00session", http.StatusBadRequest, "session"},
