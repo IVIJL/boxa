@@ -2878,6 +2878,86 @@ _boxa::remove_container_after_oom_sweep() {
     docker rm "$name" > /dev/null
 }
 
+# macOS only. The Claude binary lives in the shared boxa-mac-claude-bin volume
+# (ADR 0016) because the host install is Mach-O. Docker seeds a named volume
+# from the image only while the volume is EMPTY, so once it exists it masks
+# /home/node/.local/share/claude for good: every later image rebuild ships a
+# newer Claude that no Container ever sees, and repair_claude_bin keeps
+# relinking the stale version. Linux/WSL2 is unaffected — there the directory
+# is the host bind mount and tracks the host install live.
+#
+# The fix is to copy the image-baked version into the volume ourselves. The
+# helper Container mounts the volume at a DIFFERENT path so the image content
+# at the real path stays visible, and the copy is additive: versions already in
+# the volume (including a newer one produced by `claude update` in some
+# Container) are kept, so a running Container never loses the binary it is
+# executing from.
+readonly MAC_CLAUDE_BIN_VOLUME="boxa-mac-claude-bin"
+
+read -r -d '' _BOXA_MAC_CLAUDE_BIN_SYNC <<'SYNC' || true
+set -eu
+img=/home/node/.local/share/claude/versions
+vol=/mnt/boxa-claude-bin/versions
+latest() { ls -1 "$1" 2>/dev/null | grep -v '^\.' | sort -V | tail -1; }
+new=$(latest "$img")
+[ -n "$new" ] || { echo "SKIP image has no Claude version"; exit 0; }
+mkdir -p "$vol"
+cur=$(latest "$vol")
+if [ -n "$cur" ] \
+   && [ "$(printf '%s\n%s\n' "$cur" "$new" | sort -V | tail -1)" = "$cur" ]; then
+    echo "CURRENT $cur"
+    exit 0
+fi
+# Stage under a temporary name and rename: a Container starting concurrently
+# must never relink onto a half-copied 280 MB binary.
+tmp=$(mktemp "$vol/.sync.XXXXXX")
+cp "$img/$new" "$tmp"
+chmod 0755 "$tmp"
+mv -f "$tmp" "$vol/$new"
+echo "UPDATED $new"
+SYNC
+
+# Skip the probe entirely while the image has not moved since the last
+# successful sync — the volume can then only be ahead (a `claude update` inside
+# a Container), which the sync would leave alone anyway.
+_boxa::mac_claude_bin_marker() {
+    printf '%s\n' "${HOME}/.config/boxa/mac-claude-bin-image"
+}
+
+# Never fatal: a stale binary is a degraded Container, an aborted start is a
+# broken one.
+refresh_mac_claude_bin_volume() {
+    [ "$(uname -s 2>/dev/null || echo Unknown)" = "Darwin" ] || return 0
+    # A missing volume is the fresh-install path — Docker seeds it correctly
+    # from the image on first mount, and syncing here would pre-create it.
+    docker volume inspect "$MAC_CLAUDE_BIN_VOLUME" >/dev/null 2>&1 || return 0
+
+    local image_id marker out
+    image_id="$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null)" || return 0
+    [ -n "$image_id" ] || return 0
+    marker="$(_boxa::mac_claude_bin_marker)"
+    [ "$(cat "$marker" 2>/dev/null || true)" = "$image_id" ] && return 0
+
+    if ! out="$(docker run --rm --pull=never --network none \
+            --entrypoint bash \
+            -v "$MAC_CLAUDE_BIN_VOLUME:/mnt/boxa-claude-bin" \
+            "$IMAGE" -c "$_BOXA_MAC_CLAUDE_BIN_SYNC" 2>&1)"; then
+        echo "Warning: could not refresh the shared Claude binary volume" \
+             "($MAC_CLAUDE_BIN_VOLUME) — Containers keep their current version." >&2
+        [ -z "$out" ] || printf '%s\n' "$out" >&2
+        return 0
+    fi
+    case "$out" in
+        UPDATED\ *) echo "Claude binary volume updated to ${out#UPDATED }" ;;
+    esac
+    # The marker is an optimisation, not state anything depends on: an
+    # unwritable ~/.config/boxa (or a full disk) must not abort the start under
+    # the script's `set -e` after the volume was already refreshed — it just
+    # costs one more probe on the next start.
+    { mkdir -p "$(dirname "$marker")" \
+        && printf '%s\n' "$image_id" > "$marker"; } 2>/dev/null || true
+}
+
 # Restart an exited boxa container and re-run init scripts
 # Returns 1 if restart fails (stale mounts after reboot) — caller should recreate
 restart_exited_container() {
@@ -2899,6 +2979,9 @@ restart_exited_container() {
     # init-firewall on every start, so a daemon-DNS change since create is
     # picked up here without recreating the container (ADR 0015).
     write_dns_upstream_file
+    # Before start, so setup-claude.sh's relink (run right after) already sees
+    # the refreshed version instead of needing one more restart.
+    refresh_mac_claude_bin_volume
     _boxa::converge_container_resources "$name" "$project_path" \
         "$cli_memory" "$cli_memory_swap" stopped || exit 1
     if ! docker start "$name" 2>/dev/null; then
@@ -6385,6 +6468,10 @@ if docker volume inspect "boxa-codex-bin" >/dev/null 2>&1; then
         echo "Removed obsolete 'boxa-codex-bin' volume (Codex now lives in boxa-npm-global)"
     fi
 fi
+
+# macOS: advance the shared Claude binary volume to the image-baked version
+# before the mount is made (see refresh_mac_claude_bin_volume). No-op elsewhere.
+refresh_mac_claude_bin_volume
 
 echo "Mounting project: $PROJECT_PATH ($CONTAINER_NAME)"
 echo "Starting boxa..."

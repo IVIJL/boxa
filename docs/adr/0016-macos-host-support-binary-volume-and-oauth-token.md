@@ -1,10 +1,52 @@
 # ADR 0016 — macOS host support: shared binary volume + OAuth-token auth
 
-- **Status:** accepted
+- **Status:** accepted (amended 2026-08-15 — see Amendment)
 - **Date:** 2026-06-13
 - **Revises:** ADR 0002 (shared Claude config via bind mount) — for the macOS
   host case only. ADR 0002 is **not** superseded; its bind-mount model still
   governs Linux/WSL2 and most of `~/.claude` on macOS too.
+
+## Amendment (2026-08-15) — the volume must be advanced on image rebuilds
+
+The original decision leaned on "a **fresh** `boxa-mac-claude-bin` volume
+auto-populates from the image-baked Linux binary". That is true exactly once:
+Docker seeds a named volume from the image only while the volume is **empty**.
+From the second start on, the volume **masks**
+`/home/node/.local/share/claude` — so every later image rebuild ships a newer
+Claude that no Container ever sees, and `repair_claude_bin` faithfully relinks
+the stale version forever. Observed on a Mac whose Containers still ran the
+June `2.1.191` while the image carried `2.1.223`. Linux/WSL2 never had the bug:
+there the directory is the host bind mount and tracks the host install live,
+which is why the symptom was macOS-only.
+
+`claude update` inside a Container was the documented update path, but it is a
+manual chore that a rebuilt image should not require — the same
+already-populated-volume trap that `bootstrap_codex_cli` and
+`bootstrap_agent_browser_cli` handle for `boxa-npm-global`.
+
+**Amended decision:** on macOS, `docker-run.sh` advances the volume itself
+before every Container start (`refresh_mac_claude_bin_volume`, called from both
+the fresh-`docker run` path and `restart_exited_container`):
+
+- A helper Container mounts the volume at `/mnt/boxa-claude-bin` — a
+  **different** path — so the image-baked binary at the real path stays
+  visible, and copies the image version in when the volume's newest is older.
+- The copy is **additive** and staged through a temporary name: versions
+  already present are kept (a Container may be executing from one), and no
+  Container can relink onto a half-written binary.
+- A volume that is **ahead** (someone ran `claude update`) is left alone.
+- A **missing** volume is skipped — that is the fresh-install path, where
+  Docker's own seeding is already correct.
+- The probe is skipped while the image ID has not moved since the last
+  successful sync (marker: `~/.config/boxa/mac-claude-bin-image`), so the
+  steady-state cost is one `docker image inspect`.
+- Every failure is non-fatal: a stale binary is a degraded Container, an
+  aborted start is a broken one.
+
+The "binary updates are container-driven on macOS" limitation below is
+therefore relaxed: a `boxa build` (or image pull) now propagates to every
+Container on its next start, and `claude update` remains available as the
+ad-hoc path between rebuilds.
 
 ## Context
 
@@ -159,8 +201,9 @@ delivers full 1M Opus for interactive use as verified above.
 ## References
 
 - `docker-run.sh` — the `uname -s` = `Darwin` binary-mount branch
-  (`boxa-mac-claude-bin`) and the OS-gated `CLAUDE_CODE_OAUTH_TOKEN`
-  injection + macOS first-run hint.
+  (`boxa-mac-claude-bin`), `refresh_mac_claude_bin_volume` (the amendment), and
+  the OS-gated `CLAUDE_CODE_OAUTH_TOKEN` injection + macOS first-run hint.
+- `tests/mac-claude-bin.sh` — assertions for the volume sync payload.
 - `install.sh` — `setup_claude_token`'s macOS branch (skips the file path,
   points at `boxa claude-token`).
 - `scripts/setup-claude.sh` — `repair_claude_bin` (OS-agnostic relink; comment
