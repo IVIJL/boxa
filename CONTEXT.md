@@ -86,12 +86,20 @@ _Avoid_: agent-awake hook, keep-awake hook
 
 **Power-watch**:
 The **Keep-awake daemon** component that stops boxes before system shutdown or
-poweroff. It deliberately ignores sleep and resume.
+poweroff. On Windows it normally requests the stop through the **Warm hook**;
+it deliberately ignores sleep and resume.
 _Avoid_: power watcher, sleep watcher, shutdown watcher
 
+**Warm hook**:
+The Windows **Power-watch** mechanism that pre-spawns a WSL stop helper while
+boxes are running, then requests the **Pre-shutdown stop** over the helper's
+existing stdin pipe instead of starting it during shutdown.
+_Avoid_: WSL hook, pre-spawn hook, shutdown hook
+
 **Pre-shutdown stop**:
-The `boxa stop --all --reason presleep` run that **Power-watch** triggers
-before shutdown or poweroff. Its outcome reaches the user through a **Closeout
+The `boxa stop --all --reason presleep` run that **Power-watch** requests before
+shutdown or poweroff. On Windows the **Warm hook** normally executes it in its
+already-running WSL child. Its outcome reaches the user through a **Closeout
 notification**; the legacy `presleep` reason token remains part of the command.
 _Avoid_: presleep hook, sleep stop
 
