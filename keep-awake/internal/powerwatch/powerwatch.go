@@ -74,14 +74,19 @@ type Watch struct {
 	logger  *log.Logger
 	status  Status
 	session *sessionWatch
+	warm    *WarmHook
 }
 
 func New(command string, timeout time.Duration, output io.Writer, logger *log.Logger) *Watch {
 	runner := commandRunner{command: command, output: output}
+	warm := NewWarmHook(output, logger)
 	watch := newWatch(newPlatformSource(), runner, timeout, logger)
-	watch.session = newPlatformSessionWatch(runner, timeout, logger)
+	watch.warm = warm
+	watch.session = newPlatformSessionWatch(runner, warm, timeout, logger)
 	return watch
 }
+
+func (w *Watch) WarmHook() *WarmHook { return w.warm }
 
 func newWatch(source eventSource, runner hookRunner, timeout time.Duration, logger *log.Logger) *Watch {
 	return &Watch{
@@ -94,6 +99,9 @@ func newWatch(source eventSource, runner hookRunner, timeout time.Duration, logg
 }
 
 func (w *Watch) Run(ctx context.Context) error {
+	if w.warm != nil {
+		defer w.warm.Disarm()
+	}
 	if w.session != nil {
 		w.setActive(true)
 		defer w.setActive(false)

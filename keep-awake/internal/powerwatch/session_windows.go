@@ -75,8 +75,8 @@ type windowsSessionSource struct {
 	blocked bool
 }
 
-func newPlatformSessionWatch(runner hookRunner, timeout time.Duration, logger *log.Logger) *sessionWatch {
-	return newSessionWatch(&windowsSessionSource{}, runner, timeout, logger)
+func newPlatformSessionWatch(runner hookRunner, warm *WarmHook, timeout time.Duration, logger *log.Logger) *sessionWatch {
+	return newSessionWatch(&windowsSessionSource{}, runner, warm, timeout, logger)
 }
 
 func (s *windowsSessionSource) Run(ctx context.Context, handle func(sessionEvent)) (runErr error) {

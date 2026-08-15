@@ -3734,6 +3734,7 @@ case "${1:-}" in
     update)    MODE="update";    shift ;;
     doctor)    MODE="doctor";    shift; DOCTOR_ARGS=("$@") ;;
     keep-awake) MODE="keep-awake"; shift; KEEP_AWAKE_ARGS=("$@") ;;
+    __keep-awake-stop-wait) MODE="keep-awake-stop-wait"; shift ;;
     dns-install)   MODE="dns-install";   shift ;;
     dns-status)    MODE="dns-status";    shift ;;
     dns-uninstall) MODE="dns-uninstall"; shift ;;
@@ -3744,6 +3745,10 @@ case "${1:-}" in
     sync-skills) MODE="sync-skills"; shift ;;
     *)         MODE="auto" ;;
 esac
+
+if [ "$MODE" = "keep-awake-stop-wait" ]; then
+    exec "$BOXA_DIR/scripts/keep-awake-stop-wait.sh" "$@"
+fi
 
 # --- boxa ls ---------------------------------------------------------------
 

@@ -26,6 +26,7 @@ type sessionEventSource interface {
 type sessionWatch struct {
 	source      sessionEventSource
 	runner      hookRunner
+	warm        *WarmHook
 	hookTimeout time.Duration
 	logger      *log.Logger
 
@@ -33,10 +34,11 @@ type sessionWatch struct {
 	shutdownHandled bool
 }
 
-func newSessionWatch(source sessionEventSource, runner hookRunner, hookTimeout time.Duration, logger *log.Logger) *sessionWatch {
+func newSessionWatch(source sessionEventSource, runner hookRunner, warm *WarmHook, hookTimeout time.Duration, logger *log.Logger) *sessionWatch {
 	return &sessionWatch{
 		source:      source,
 		runner:      runner,
+		warm:        warm,
 		hookTimeout: hookTimeout,
 		logger:      logger,
 	}
@@ -92,6 +94,11 @@ func (w *sessionWatch) handleShutdown(ctx context.Context) {
 	defer cancel()
 	result := make(chan error, 1)
 	go func() {
+		if handled, err := w.warm.stop(hookCtx); handled {
+			result <- err
+			return
+		}
+		w.logf("power-watch warm hook was down; falling back to direct shutdown command")
 		result <- w.runner.Run(hookCtx, budget)
 	}()
 

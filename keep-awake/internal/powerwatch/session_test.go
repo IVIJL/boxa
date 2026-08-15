@@ -92,7 +92,7 @@ func (r *wedgedSessionRunner) callCount() int {
 func TestWindowsShutdownStartsHookBlocksAndReturnsAtBound(t *testing.T) {
 	source := newFakeSessionSource()
 	runner := newWedgedSessionRunner()
-	watch := newSessionWatch(source, runner, 20*time.Millisecond, nil)
+	watch := newSessionWatch(source, runner, nil, 20*time.Millisecond, nil)
 	cancel, done := runSessionWatch(watch)
 
 	startedAt := time.Now()
@@ -133,7 +133,7 @@ func TestWindowsShutdownStartsHookBlocksAndReturnsAtBound(t *testing.T) {
 func TestWindowsShutdownHookIsCappedAt45Seconds(t *testing.T) {
 	source := newFakeSessionSource()
 	runner := newWedgedSessionRunner()
-	watch := newSessionWatch(source, runner, time.Minute, nil)
+	watch := newSessionWatch(source, runner, nil, time.Minute, nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -154,7 +154,7 @@ func TestWindowsShutdownHookIsCappedAt45Seconds(t *testing.T) {
 func TestCancelledShutdownCanBeAttemptedAgain(t *testing.T) {
 	source := newFakeSessionSource()
 	runner := &fakeRunner{}
-	watch := newSessionWatch(source, runner, time.Minute, nil)
+	watch := newSessionWatch(source, runner, nil, time.Minute, nil)
 	cancel, done := runSessionWatch(watch)
 
 	source.emit(sessionShutdownQuery)
