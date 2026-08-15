@@ -932,7 +932,7 @@ keep_awake::wait_until_reachable() {
 }
 
 keep_awake::arm_warm_hook_when_reachable() {
-    local remaining=25
+    local remaining=40
     while [ "$remaining" -gt 0 ]; do
         if keep_awake_probe::select_target "$KEEP_AWAKE_PLATFORM" "$KEEP_AWAKE_PORT" \
             && keep_awake_probe::warm_hook \
@@ -940,7 +940,7 @@ keep_awake::arm_warm_hook_when_reachable() {
                 >/dev/null 2>&1; then
             return 0
         fi
-        sleep 0.2
+        sleep 2
         remaining=$((remaining - 1))
     done
     return 1
@@ -1008,6 +1008,9 @@ keep_awake::enable() {
             printf 'keep-awake: daemon did not become reachable; rolled back.\n' >&2
             return 1
         fi
+    fi
+    if docker ps --filter "name=^boxa-" --format '{{.Names}}' 2>/dev/null | grep -q .; then
+        keep_awake::arm_warm_hook_when_reachable || true
     fi
     # A connection failure (typically one stale box refusing the firewall
     # slot) must NOT tear down a working daemon: keep everything installed,
@@ -1096,9 +1099,9 @@ keep_awake::refresh() {
     rm -rf "$tmp_dir"
 
     # In "none" mode the daemon belongs to the user's own start mechanism and
-    # may run with arguments boxa never chose. Taking ownership here would risk
-    # missing that process on stop and racing a competing default instance onto
-    # the port, so refresh only swaps the file and reports what is left to do.
+    # may run with arguments boxa never chose. Unix can leave that process alone
+    # while swapping the file; Windows must stop it for the swap, then leave its
+    # custom restart to the user instead of racing a default instance onto port.
     case "$autostart_mode" in
         system)
             case "$KEEP_AWAKE_PLATFORM" in
@@ -1117,9 +1120,9 @@ keep_awake::refresh() {
                 # remains user-owned just like its arguments and lifecycle.
                 printf 'keep-awake: refreshed binary installed; the user-managed daemon was stopped for the Windows binary swap — start it again with your own mechanism.\n'
             else
-                # The running process keeps the old inode until it exits; the
-                # warm hook stays armed in memory until the next user-managed
-                # start picks up the refreshed binary.
+                # The running process keeps the old inode and its current warm
+                # hook until it exits. After the user restarts it, a later boxa
+                # lifecycle event will arm the refreshed daemon again.
                 printf 'keep-awake: refreshed binary installed; restart the user-managed daemon with your own mechanism to pick it up.\n'
             fi
             ;;

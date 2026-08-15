@@ -587,6 +587,7 @@ chmod +x "$TMPROOT/bin/docker"
 assert_eq "Docker satisfies the build prerequisite probe" pass \
     "$("$KEEP_AWAKE" go-prereq >/dev/null 2>&1 && printf pass || printf fail)"
 
+export KEEP_AWAKE_TEST_RUNNING_BOX=true
 enable_output="$("$KEEP_AWAKE" enable)"
 assert_contains "enable reports all converged components" \
     "daemon running, autostart installed, Host connection active" "$enable_output"
@@ -611,6 +612,8 @@ assert_contains "Docker build provides a writable Go build cache" \
     "--env GOCACHE=/tmp/gocache" "$docker_build_log"
 assert_eq "Docker-built artifact is owned by the invoking user" "$(id -u)" \
     "$(stat -c %u "$TMPROOT/install/keep-awake")"
+assert_contains "system enable with a running Container arms the warm hook" \
+    '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
 
 : > "$KEEP_AWAKE_TEST_LOG"
 export KEEP_AWAKE_TEST_RUNNING_BOX=true
@@ -628,12 +631,12 @@ assert_contains "refresh with a running Container re-arms the warm hook" \
     '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
 
 : > "$KEEP_AWAKE_TEST_LOG"
-export KEEP_AWAKE_TEST_STATUS_FAILURES=3
+export KEEP_AWAKE_TEST_STATUS_FAILURES=30
 "$KEEP_AWAKE" refresh >/dev/null
 export KEEP_AWAKE_TEST_STATUS_FAILURES=0
-assert_eq "refresh retries warm-hook re-arm until the daemon is reachable" 4 \
+assert_eq "refresh retries warm-hook re-arm beyond the old five-second window" 31 \
     "$(grep -c '^status ' "$KEEP_AWAKE_TEST_LOG")"
-assert_contains "refresh re-arms after delayed daemon readiness" \
+assert_contains "refresh re-arms after late daemon readiness" \
     '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
 
 : > "$KEEP_AWAKE_TEST_LOG"
@@ -712,6 +715,8 @@ assert_contains "Linux terminal snippet keeps resolved log path" \
 assert_contains "terminal mode starts daemon immediately" \
     "daemon -port 17777 -log-file $XDG_STATE_HOME/boxa/keep-awake/keep-awake.log" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "terminal enable with a running Container arms the warm hook" \
+    '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "terminal mode is persisted" "autostart=terminal" \
     "$(cat "$XDG_CONFIG_HOME/boxa/keep-awake.conf")"
 terminal_status="$("$KEEP_AWAKE" status)"
@@ -735,6 +740,8 @@ assert_not_contains "none mode prints no WezTerm snippet" "gui-startup" "$none_o
 assert_contains "none mode starts daemon immediately" \
     "daemon -port 17777 -log-file $XDG_STATE_HOME/boxa/keep-awake/keep-awake.log" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "none enable with a running Container arms the warm hook" \
+    '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "none mode is persisted" "autostart=none" \
     "$(cat "$XDG_CONFIG_HOME/boxa/keep-awake.conf")"
 none_status="$("$KEEP_AWAKE" status)"
@@ -817,7 +824,7 @@ export KEEP_AWAKE_TEST_DOCKER_FAIL=true
 fallback_output="$("$KEEP_AWAKE" enable 2>&1)"
 assert_contains "failed Docker build announces local fallback" \
     "Docker build failed; falling back to the local Go toolchain" "$fallback_output"
-build_call_order="$(sed -n '/^docker /p; /^go /p' "$KEEP_AWAKE_TEST_LOG")"
+build_call_order="$(sed -n '/^docker run /p; /^go /p' "$KEEP_AWAKE_TEST_LOG")"
 assert_eq "Docker is attempted before local Go" $'docker\ngo' \
     "$(printf '%s\n' "$build_call_order" | sed 's/ .*//')"
 assert_contains "local fallback also disables CGO" "CGO_ENABLED=0" "$build_call_order"
@@ -1228,6 +1235,8 @@ assert_contains "Windows none refresh reports the swap-forced stop" \
     "stopped for the Windows binary swap" "$windows_none_refresh_output"
 assert_not_contains "Windows none refresh reruns no boxa-owned autostart" \
     "schtasks /Run" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_not_contains "Windows none refresh has no restarted daemon to re-arm" \
+    "/v1/warm-hook" "$(cat "$KEEP_AWAKE_TEST_LOG")"
 : > "$KEEP_AWAKE_TEST_LOG"
 export KEEP_AWAKE_TEST_INSTALL_FAIL=true
 windows_none_refresh_rc=0
