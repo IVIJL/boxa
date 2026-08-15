@@ -67,6 +67,7 @@ from .classify import classify_candidate
 from .converge import converge as converge_runtime
 from .merge import MergedCandidate, merge_candidates
 from . import onboarding
+from . import seed
 from .migration import MigrationError, migrate_legacy
 from .projects import VolumeProbe, enumerate_project_targets
 from .providers import ClaudeProvider, CodexProvider
@@ -2625,6 +2626,73 @@ def main(argv: list[str]) -> int:
             sys.stderr.write("mcp.cli: onboarding-rearm takes no arguments\n")
             return 2
         onboarding.rearm()
+        return 0
+
+    if command == "seed-codex-delegate-status":
+        # One-time codex-delegate seed eligibility. The install/update shell
+        # hook reads this to decide whether to offer the seeded entry.
+        if rest:
+            sys.stderr.write(
+                "mcp.cli: seed-codex-delegate-status takes no arguments\n"
+            )
+            return 2
+        return seed.emit_status(sys.stdout)
+    if command == "seed-codex-delegate-text":
+        # Emit one seed text block: offer / followup / reminder.
+        if len(rest) != 1:
+            sys.stderr.write(
+                "mcp.cli: seed-codex-delegate-text takes exactly one of "
+                "offer|followup|reminder\n"
+            )
+            return 2
+        rc = seed.emit_text(sys.stdout, rest[0])
+        if rc is None:
+            sys.stderr.write(
+                f"mcp.cli: unknown seed text block {rest[0]!r} "
+                "(offer|followup|reminder)\n"
+            )
+            return 2
+        return rc
+    if command == "seed-codex-delegate-apply":
+        # Add the codex-delegate entry and grant agent-trusted mode. Host-only
+        # (the grant path refuses inside a Container) and gated on --yes: the
+        # shell hook passes it only after the interactive access-boundary
+        # confirmation, mirroring `catalog-mode-apply`.
+        if rest != ["--yes"]:
+            sys.stderr.write(
+                "mcp.cli: seed-codex-delegate-apply requires --yes\n"
+            )
+            return 2
+        try:
+            entry = seed.apply()
+        except (CatalogError, ValueError) as exc:
+            sys.stderr.write(f"mcp.cli: {exc}\n")
+            return 2
+        sys.stdout.write(
+            f"MCP catalog entry {entry['name']!r} is ready as "
+            f"{entry['executionMode']} ({entry['id']}).\n"
+        )
+        return 0
+    if command == "seed-codex-delegate-mark-seen":
+        # Record the seed decision (suppresses future prompts). The optional
+        # decision label is informational only.
+        decision = rest[0] if rest else seed.DECISION_NOOP
+        if len(rest) > 1:
+            sys.stderr.write(
+                "mcp.cli: seed-codex-delegate-mark-seen takes at most one "
+                "decision label\n"
+            )
+            return 2
+        seed.mark_seen(decision)
+        return 0
+    if command == "seed-codex-delegate-rearm":
+        # Clear the seed marker so the one-time offer can fire again.
+        if rest:
+            sys.stderr.write(
+                "mcp.cli: seed-codex-delegate-rearm takes no arguments\n"
+            )
+            return 2
+        seed.rearm()
         return 0
 
     sys.stderr.write(f"mcp.cli: unknown command {command!r}\n")

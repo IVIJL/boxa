@@ -4009,6 +4009,15 @@ if [ "$MODE" = "update" ]; then
         "$BOXA_DIR/scripts/ensure-mcp-onboarding.sh" --quiet-if-noop || true
     fi
 
+    # Codex-delegate seed (ADR 0021) — one-time offer to prepare the default
+    # 'codex-delegate' catalog entry (the image already bakes the Codex CLI).
+    # Same elective shape as MCP onboarding: its own applied/dismissed marker
+    # keeps steady-state updates silent, and the trust grant is only ever
+    # applied after an interactive confirmation inside the hook.
+    if [ -x "$BOXA_DIR/scripts/ensure-codex-delegate-seed.sh" ]; then
+        "$BOXA_DIR/scripts/ensure-codex-delegate-seed.sh" --quiet-if-noop || true
+    fi
+
     if [ "${BOXA_UPDATE_PULLED:-}" = "1" ]; then
         # HTTPS upgrade prompt (ADR 0008 Phase 6). Offered exactly once per
         # install: a user who declines flips `optout=true` in https.conf and

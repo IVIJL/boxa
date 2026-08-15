@@ -34,6 +34,23 @@ AGENT_TRUSTED_FIXED_ENV_KEYS = {
     "DOCKER_HOST", "SSH_AUTH_SOCK",
 }
 READINESS_SUMMARY = "requires-project"
+# The exact access boundaries shown before a mode grant. Shared by the
+# `boxa mcp mode` preview and the codex-delegate seed offer (mcp.seed) so the
+# user always confirms against one canonical wording.
+AGENT_TRUSTED_ACCESS = (
+    "Container account node",
+    "Project source read/write",
+    "node private HOME and mounted Codex state",
+    "node rootless Docker socket when present",
+    "forwarded SSH agent socket when present",
+    "declared non-secret catalog environment only",
+    "no ambient launcher environment or MCP secret-store values",
+)
+SERVICE_ISOLATED_ACCESS = (
+    "Container account boxa-mcp",
+    "Project source read/write",
+    "no node private HOME or raw Docker/SSH sockets",
+)
 DEGRADED_SECRET_ISOLATION = "degraded-secret-isolation"
 # The catalog shares the legacy profile directory, which must remain traversable
 # by the in-Container broker. The catalog FILE itself is host-only 0600.
@@ -356,6 +373,16 @@ def runtime_kind(argv: list[str]) -> str:
     return "direct"
 
 
+def is_codex_delegate_argv(argv: list[str]) -> bool:
+    """True when ``argv`` is the Codex delegation server (``codex mcp-server``)."""
+    return (
+        bool(argv)
+        and os.path.basename(argv[0]).lower() == "codex"
+        and len(argv) > 1
+        and argv[1] == "mcp-server"
+    )
+
+
 def degradation_status(entry: dict[str, Any]) -> Optional[str]:
     """Visible temporary Docker-secret limitation, without exposing key names."""
     if (
@@ -385,12 +412,39 @@ def add_entry(
         return _add_entry_locked(name, spec_argv, id_factory=id_factory)
 
 
+def add_entry_trusted(
+    name: str,
+    spec_argv: list[str],
+    *,
+    id_factory: Callable[[], uuid.UUID] = uuid.uuid4,
+) -> dict[str, Any]:
+    """Create agent-trusted with one catalog write.
+
+    A crash can never persist a half-granted entry. The caller (mcp.seed)
+    collects the interactive host confirmation.
+    """
+    if not _host_mode_command():
+        raise CatalogError("agent-trusted entries can only be created on the host")
+    with mutation_lock():
+        return _add_entry_locked(
+            name,
+            spec_argv,
+            id_factory=id_factory,
+            execution_mode="agent-trusted",
+        )
+
+
 def _add_entry_locked(
     name: str,
     spec_argv: list[str],
     *,
     id_factory: Callable[[], uuid.UUID],
+    execution_mode: str = EXECUTION_MODE,
 ) -> dict[str, Any]:
+    if execution_mode not in EXECUTION_MODES:
+        raise CatalogError(
+            "execution mode must be service-isolated or agent-trusted"
+        )
     if not name or name.strip() != name:
         raise CatalogError("catalog entry name must be non-empty without surrounding space")
     catalog = load_catalog()
@@ -404,11 +458,7 @@ def _add_entry_locked(
     merged = MergedCandidate(
         candidate=candidate, import_id=compute_import_id(candidate)
     )
-    is_codex_delegate = (
-        os.path.basename(spec.argv[0]).lower() == "codex"
-        and len(spec.argv) > 1
-        and spec.argv[1] == "mcp-server"
-    )
+    is_codex_delegate = is_codex_delegate_argv(spec.argv)
     if not is_applicable(merged) and not is_codex_delegate:
         raise CatalogError(f"cannot add {name!r}: {not_applicable_reason(merged)}")
     # Catalog data is secret-free. The later migration/secret-store slice can
@@ -429,7 +479,7 @@ def _add_entry_locked(
         "id": entry_id,
         "name": name,
         "type": "stdio",
-        "executionMode": EXECUTION_MODE,
+        "executionMode": execution_mode,
         "runtimeKind": runtime_kind(spec.argv),
         "readiness": {"summary": READINESS_SUMMARY},
         "command": {"argv": list(spec.argv)},
@@ -504,11 +554,7 @@ def definition_changes_from_spec(
     merged = MergedCandidate(
         candidate=candidate, import_id=compute_import_id(candidate)
     )
-    is_codex_delegate = (
-        os.path.basename(spec.argv[0]).lower() == "codex"
-        and len(spec.argv) > 1
-        and spec.argv[1] == "mcp-server"
-    )
+    is_codex_delegate = is_codex_delegate_argv(spec.argv)
     if not is_applicable(merged) and not is_codex_delegate:
         raise CatalogError(f"cannot update {name!r}: {not_applicable_reason(merged)}")
     inline_secret_keys = sorted(set(spec.env_values) & set(spec.secret_env_keys))
@@ -643,22 +689,10 @@ def mode_preview(token: str, mode: str) -> dict[str, Any]:
         "requestedMode": mode,
         "command": argv,
         "runtimeKind": entry["runtimeKind"],
-        "access": (
-            [
-                "Container account node",
-                "Project source read/write",
-                "node private HOME and mounted Codex state",
-                "node rootless Docker socket when present",
-                "forwarded SSH agent socket when present",
-                "declared non-secret catalog environment only",
-                "no ambient launcher environment or MCP secret-store values",
-            ]
+        "access": list(
+            AGENT_TRUSTED_ACCESS
             if mode == "agent-trusted"
-            else [
-                "Container account boxa-mcp",
-                "Project source read/write",
-                "no node private HOME or raw Docker/SSH sockets",
-            ]
+            else SERVICE_ISOLATED_ACCESS
         ),
     }
     if image:
