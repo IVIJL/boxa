@@ -20,6 +20,12 @@ printf '%s\n' "$*" >> "$BOXA_STOP_TEST_DOCKER_LOG"
 
 case "${1:-}" in
     ps)
+        if [ "${BOXA_STOP_TEST_RUNNING_ATTACH:-}" = true ]; then
+            if [[ " $* " == *" name=^boxa-up-project$ "* ]]; then
+                printf '%s\n' running-id
+            fi
+            exit 0
+        fi
         if [ "${BOXA_STOP_TEST_UP:-}" = true ]; then
             exit 0
         fi
@@ -41,6 +47,9 @@ case "${1:-}" in
         fi
         ;;
     exec)
+        if [ "${BOXA_STOP_TEST_RUNNING_ATTACH:-}" = true ]; then
+            exit 0
+        fi
         if [ "${BOXA_STOP_TEST_UP:-}" = true ] && [[ " $* " == *" stat -c %U /proc/1 "* ]]; then
             printf '%s\n' node
             exit 0
@@ -135,7 +144,8 @@ reset_case() {
     mkdir -p "$BOXA_STOP_TEST_PREP_DIR"
     unset BOXA_STOP_TEST_EMPTY BOXA_STOP_TEST_FAIL_BATCH BOXA_STOP_TEST_FAIL_LIST \
         BOXA_STOP_TEST_FAIL_PARTIAL BOXA_STOP_TEST_PREP_BARRIER \
-        BOXA_STOP_TEST_REMAINING BOXA_STOP_TEST_UP BOXA_STOP_TEST_DAEMON_REACHABLE
+        BOXA_STOP_TEST_REMAINING BOXA_STOP_TEST_UP BOXA_STOP_TEST_DAEMON_REACHABLE \
+        BOXA_STOP_TEST_RUNNING_ATTACH
 }
 
 line_count() {
@@ -177,6 +187,19 @@ if [ "$up_rc" -ne 0 ]; then
     printf '%s\n' "$up_output"
 fi
 assert_contains "fresh Container start arms the warm hook" \
+    '-d {"armed":true}' "$(cat "$BOXA_STOP_TEST_WARM_HOOK_LOG")"
+
+reset_case
+export BOXA_STOP_TEST_RUNNING_ATTACH=true
+running_project="$_TMPROOT/up-project"
+mkdir -p "$running_project"
+running_output="$(run_boxa "$running_project" 2>&1)"
+running_rc=$?
+assert_eq "attach to a running Container exits successfully" "0" "$running_rc"
+if [ "$running_rc" -ne 0 ]; then
+    printf '%s\n' "$running_output"
+fi
+assert_contains "attach to a running Container arms the warm hook" \
     '-d {"armed":true}' "$(cat "$BOXA_STOP_TEST_WARM_HOOK_LOG")"
 
 reset_case

@@ -131,7 +131,7 @@ func (a *API) setWarmHook(w http.ResponseWriter, r *http.Request) {
 	if *request.Armed {
 		a.warmHook.Arm()
 	} else {
-		a.warmHook.Disarm()
+		go a.warmHook.Disarm()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

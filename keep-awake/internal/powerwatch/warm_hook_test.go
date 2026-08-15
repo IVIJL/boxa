@@ -71,6 +71,32 @@ func TestWarmHookNoBoxesSelfDisarms(t *testing.T) {
 	}
 }
 
+func TestWarmHookDrainsOutputBeforeReapingChild(t *testing.T) {
+	hook := newWarmHook(
+		func() (*exec.Cmd, error) { return warmHookStubCommand("no-boxes-after-output", ""), nil },
+		io.Discard,
+		nil,
+		10*time.Millisecond,
+		20*time.Millisecond,
+	)
+	for range 20 {
+		child, err := hook.startChild()
+		if err != nil {
+			t.Fatalf("start warm hook: %v", err)
+		}
+		select {
+		case <-child.exited:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for warm hook child")
+		}
+		select {
+		case <-child.noBoxes:
+		default:
+			t.Fatal("warm-hook child exited before final no-boxes output was observed")
+		}
+	}
+}
+
 func TestWarmHookDisarmClosesPipeAndReapsChild(t *testing.T) {
 	eofFile := t.TempDir() + "/eof"
 	hook := newWarmHook(
@@ -154,6 +180,28 @@ func TestWindowsShutdownLogsAndFallsBackWhenWarmHookIsDown(t *testing.T) {
 	}
 }
 
+func TestWindowsShutdownLogsAndFallsBackWhenWarmHookSignalFails(t *testing.T) {
+	var output bytes.Buffer
+	hook := newWarmHook(func() (*exec.Cmd, error) { return nil, nil }, io.Discard, log.New(&output, "", 0), time.Second, time.Second)
+	hook.alive = true
+	hook.child = &warmHookChild{stdin: failingWriteCloser{}}
+	runner := &fakeRunner{}
+	watch := newSessionWatch(newFakeSessionSource(), runner, hook, time.Second, log.New(&output, "", 0))
+
+	watch.handleShutdown(context.Background())
+	if runner.CallCount() != 1 {
+		t.Fatalf("fallback calls = %d, want 1", runner.CallCount())
+	}
+	if !strings.Contains(output.String(), "signal warm hook") {
+		t.Fatalf("log = %q, want warm-hook signal failure", output.String())
+	}
+}
+
+type failingWriteCloser struct{}
+
+func (failingWriteCloser) Write([]byte) (int, error) { return 0, fmt.Errorf("broken pipe") }
+func (failingWriteCloser) Close() error              { return nil }
+
 func waitWarmHookAlive(t *testing.T, hook *WarmHook) {
 	t.Helper()
 	waitForWarmHook(t, func() bool {
@@ -193,6 +241,12 @@ func TestWarmHookStubProcess(t *testing.T) {
 	case "exit":
 		os.Exit(1)
 	case "no-boxes":
+		fmt.Println("no-boxes")
+		return
+	case "no-boxes-after-output":
+		for range 4096 {
+			fmt.Println("output")
+		}
 		fmt.Println("no-boxes")
 		return
 	case "wait-eof":

@@ -1111,6 +1111,15 @@ keep_awake::refresh() {
             printf 'keep-awake: daemon binary refreshed and restarted.\n'
             ;;
     esac
+
+    if [ "$autostart_mode" != none ] \
+        && docker ps --filter "name=^boxa-" --format '{{.Names}}' 2>/dev/null | grep -q .; then
+        if keep_awake_probe::select_target "$KEEP_AWAKE_PLATFORM" "$KEEP_AWAKE_PORT"; then
+            keep_awake_probe::warm_hook \
+                "$KEEP_AWAKE_PROBE_TARGET_ADDRESS" "$KEEP_AWAKE_PORT" true \
+                >/dev/null 2>&1 || true
+        fi
+    fi
 }
 
 keep_awake::teardown() {

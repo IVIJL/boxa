@@ -30,6 +30,7 @@ export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=true
 export KEEP_AWAKE_TEST_GATEWAY_HEALTHY=true
 export KEEP_AWAKE_TEST_CONNECT_FAIL=false
 export KEEP_AWAKE_TEST_DOCKER_FAIL=false
+export KEEP_AWAKE_TEST_RUNNING_BOX=false
 export KEEP_AWAKE_TEST_TRAY_START_FAIL=false
 mkdir -p "$HOME" "$TMPROOT/bin"
 : > "$KEEP_AWAKE_TEST_LOG"
@@ -241,6 +242,9 @@ case "$*" in
             http://127.0.0.1:*) [ "$KEEP_AWAKE_TEST_LOOPBACK_HEALTHY" = true ] || exit 7 ;;
             *)                  [ "$KEEP_AWAKE_TEST_GATEWAY_HEALTHY" = true ] || exit 7 ;;
         esac
+        ;;
+    *'/v1/warm-hook')
+        printf 'warm-hook %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
         ;;
 esac
 [ "$KEEP_AWAKE_TEST_CURL_HEALTHY" = true ] || exit 7
@@ -543,6 +547,12 @@ cat > "$TMPROOT/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf 'docker %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
 [ "$KEEP_AWAKE_TEST_DOCKER_FAIL" = false ] || exit 1
+if [ "${1:-}" = ps ]; then
+    if [ "$KEEP_AWAKE_TEST_RUNNING_BOX" = true ]; then
+        printf '%s\n' boxa-alpha
+    fi
+    exit 0
+fi
 host_output_dir=""
 container_output=""
 while [ "$#" -gt 0 ]; do
@@ -600,6 +610,7 @@ assert_eq "Docker-built artifact is owned by the invoking user" "$(id -u)" \
     "$(stat -c %u "$TMPROOT/install/keep-awake")"
 
 : > "$KEEP_AWAKE_TEST_LOG"
+export KEEP_AWAKE_TEST_RUNNING_BOX=true
 refresh_output="$("$KEEP_AWAKE" refresh)"
 assert_eq "refresh reports success and nothing else" \
     "keep-awake: daemon binary refreshed and restarted." "$refresh_output"
@@ -610,6 +621,14 @@ assert_contains "refresh restarts the existing Linux service" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_not_contains "refresh does not recreate the Host connection" \
     "boxa connect host" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "refresh with a running Container re-arms the warm hook" \
+    '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
+
+: > "$KEEP_AWAKE_TEST_LOG"
+export KEEP_AWAKE_TEST_RUNNING_BOX=false
+"$KEEP_AWAKE" refresh >/dev/null
+assert_not_contains "refresh without a running Container does not arm the warm hook" \
+    "/v1/warm-hook" "$(cat "$KEEP_AWAKE_TEST_LOG")"
 
 status_output="$("$KEEP_AWAKE" status)"
 assert_contains "status reports reachable daemon" "Daemon reachable: yes" "$status_output"
@@ -643,6 +662,13 @@ assert_eq "disable stops Linux tray unit" false \
     "$(file_exists "$KEEP_AWAKE_TEST_TRAY_SYSTEMD")"
 assert_eq "disable removes Host connection" false "$(file_exists "$KEEP_AWAKE_TEST_CONNECT")"
 assert_eq "disable records deliberate opt-out" declined "$("$KEEP_AWAKE" probe)"
+: > "$KEEP_AWAKE_TEST_LOG"
+export KEEP_AWAKE_TEST_RUNNING_BOX=true
+refresh_disabled_output="$("$KEEP_AWAKE" refresh)"
+assert_eq "disabled refresh remains a no-op with a running Container" "" \
+    "$refresh_disabled_output"
+assert_not_contains "disabled refresh does not arm the warm hook" "/v1/warm-hook" \
+    "$(cat "$KEEP_AWAKE_TEST_LOG")"
 export KEEP_AWAKE_TEST_CURL_HEALTHY=false
 disabled_status="$("$KEEP_AWAKE" status)"
 assert_contains "disabled status reports daemon down" "Daemon reachable: no" "$disabled_status"
@@ -711,6 +737,7 @@ assert_eq "none mode probes OK without system autostart" ok "$("$KEEP_AWAKE" pro
 # port. The running process keeps the old inode until the user restarts it.
 printf '# stale-binary-marker\n' >> "$TMPROOT/install/keep-awake"
 : > "$KEEP_AWAKE_TEST_LOG"
+export KEEP_AWAKE_TEST_RUNNING_BOX=true
 none_refresh_output="$("$KEEP_AWAKE" refresh)"
 assert_contains "none refresh rebuilds the daemon binary" "docker run --rm" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
@@ -718,6 +745,8 @@ assert_not_contains "none refresh replaces the installed binary" \
     "stale-binary-marker" "$(cat "$TMPROOT/install/keep-awake")"
 assert_not_contains "none refresh starts no competing daemon" "daemon -port" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_not_contains "none refresh does not arm the user-managed daemon" \
+    "/v1/warm-hook" "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "none refresh asks the user to restart their own daemon" \
     "restart the user-managed daemon with your own mechanism" \
     "$none_refresh_output"

@@ -5820,6 +5820,7 @@ if [ -d "${1:-.}" ]; then
         _boxa::converge_container_resources "$CONTAINER_NAME" "$PROJECT_PATH" \
             "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
         start_boxa_connections "$CONTAINER_NAME"
+        arm_warm_hook || true
         attach_to_container "$CONTAINER_NAME"
         # exec → script ends here
     fi
@@ -5845,6 +5846,7 @@ else
         _boxa::converge_container_resources "$CONTAINER_NAME" "" \
             "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
         start_boxa_connections "$CONTAINER_NAME"   # self-heal forwards (idempotent)
+        arm_warm_hook || true
         attach_to_container "$CONTAINER_NAME"
     elif docker ps -a --filter "name=^${CONTAINER_NAME}$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
         bootstrap_traefik
@@ -5867,6 +5869,7 @@ else
             _boxa::converge_container_resources "$selected" "" \
                 "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
             start_boxa_connections "$selected"   # self-heal forwards (idempotent)
+            arm_warm_hook || true
         fi
         attach_to_container "$selected"
     fi

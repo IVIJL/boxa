@@ -147,7 +147,8 @@ func (h *WarmHook) stop(ctx context.Context) (bool, error) {
 	_, err := io.WriteString(child.stdin, "stop\n")
 	h.mu.Unlock()
 	if err != nil {
-		return true, fmt.Errorf("signal warm hook: %w", err)
+		h.logf("signal warm hook: %v; falling back to direct shutdown command", err)
+		return false, fmt.Errorf("signal warm hook: %w", err)
 	}
 
 	select {
@@ -291,8 +292,8 @@ func (h *WarmHook) startChild() (*warmHookChild, error) {
 	}
 	go h.readChildOutput(stdout, child)
 	go func() {
-		child.exitErr = cmd.Wait()
 		<-child.outputDone
+		child.exitErr = cmd.Wait()
 		close(child.exited)
 	}()
 	return child, nil
