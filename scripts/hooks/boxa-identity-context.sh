@@ -56,6 +56,16 @@ Boundaries:
   container firewall; 'boxa allow' / 'boxa allow-for' will NOT fix
   them. Ask the user to run on host instead:
     boxa agent-browser allow-for <minutes> ${project}
+- MCP servers are host-gated per Project. If an expected MCP tool
+  (e.g. mcp__boxa-codex-delegate for Codex delegation) is missing from
+  this session, the server is not exposed here. Ask the user to run on
+  host:
+    boxa mcp status --project <path>
+  and follow what it reports — typically 'boxa mcp readiness <entry>'
+  (e.g. a missing 'codex login') or:
+    boxa mcp activate <entry> --project <path> --for claude
+  (use '--for codex' for a Codex session; the codex-delegate entry is
+  Claude-only. A new activation appears only in a NEW agent session.)
 - Dev URLs bypass both gates via built-in routes. Both forms resolve
   locally: http(s)://<port>.${project}.test and
   http(s)://<port>.${project}.127.0.0.1.sslip.io
