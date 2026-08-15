@@ -931,6 +931,21 @@ keep_awake::wait_until_reachable() {
     return 1
 }
 
+keep_awake::arm_warm_hook_when_reachable() {
+    local remaining=25
+    while [ "$remaining" -gt 0 ]; do
+        if keep_awake_probe::select_target "$KEEP_AWAKE_PLATFORM" "$KEEP_AWAKE_PORT" \
+            && keep_awake_probe::warm_hook \
+                "$KEEP_AWAKE_PROBE_TARGET_ADDRESS" "$KEEP_AWAKE_PORT" true \
+                >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.2
+        remaining=$((remaining - 1))
+    done
+    return 1
+}
+
 keep_awake::enable() {
     local autostart_mode=system tmp_dir="" built_binary=""
     local firewall_rule_ready=true daemon_reachable=true
@@ -1098,10 +1113,13 @@ keep_awake::refresh() {
             ;;
         none)
             if [ "$stopped_for_swap" = true ]; then
+                # No daemon exists to re-arm yet, and its future custom start
+                # remains user-owned just like its arguments and lifecycle.
                 printf 'keep-awake: refreshed binary installed; the user-managed daemon was stopped for the Windows binary swap — start it again with your own mechanism.\n'
             else
                 # The running process keeps the old inode until it exits; the
-                # next user-managed start picks up the refreshed binary.
+                # warm hook stays armed in memory until the next user-managed
+                # start picks up the refreshed binary.
                 printf 'keep-awake: refreshed binary installed; restart the user-managed daemon with your own mechanism to pick it up.\n'
             fi
             ;;
@@ -1114,11 +1132,7 @@ keep_awake::refresh() {
 
     if [ "$autostart_mode" != none ] \
         && docker ps --filter "name=^boxa-" --format '{{.Names}}' 2>/dev/null | grep -q .; then
-        if keep_awake_probe::select_target "$KEEP_AWAKE_PLATFORM" "$KEEP_AWAKE_PORT"; then
-            keep_awake_probe::warm_hook \
-                "$KEEP_AWAKE_PROBE_TARGET_ADDRESS" "$KEEP_AWAKE_PORT" true \
-                >/dev/null 2>&1 || true
-        fi
+        keep_awake::arm_warm_hook_when_reachable || true
     fi
 }
 

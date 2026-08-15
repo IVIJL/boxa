@@ -28,6 +28,7 @@ export KEEP_AWAKE_TEST_FIREWALL_RULE="$TMPROOT/firewall-rule"
 export KEEP_AWAKE_TEST_CURL_HEALTHY=true
 export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=true
 export KEEP_AWAKE_TEST_GATEWAY_HEALTHY=true
+export KEEP_AWAKE_TEST_STATUS_FAILURES=0
 export KEEP_AWAKE_TEST_CONNECT_FAIL=false
 export KEEP_AWAKE_TEST_DOCKER_FAIL=false
 export KEEP_AWAKE_TEST_RUNNING_BOX=false
@@ -238,6 +239,8 @@ case "$*" in
         ;;
     *'/v1/status')
         printf 'status %s\n' "${*: -1}" >> "$KEEP_AWAKE_TEST_LOG"
+        status_attempt="$(grep -c '^status ' "$KEEP_AWAKE_TEST_LOG")"
+        [ "$status_attempt" -gt "$KEEP_AWAKE_TEST_STATUS_FAILURES" ] || exit 7
         case "${*: -1}" in
             http://127.0.0.1:*) [ "$KEEP_AWAKE_TEST_LOOPBACK_HEALTHY" = true ] || exit 7 ;;
             *)                  [ "$KEEP_AWAKE_TEST_GATEWAY_HEALTHY" = true ] || exit 7 ;;
@@ -622,6 +625,15 @@ assert_contains "refresh restarts the existing Linux service" \
 assert_not_contains "refresh does not recreate the Host connection" \
     "boxa connect host" "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "refresh with a running Container re-arms the warm hook" \
+    '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
+
+: > "$KEEP_AWAKE_TEST_LOG"
+export KEEP_AWAKE_TEST_STATUS_FAILURES=3
+"$KEEP_AWAKE" refresh >/dev/null
+export KEEP_AWAKE_TEST_STATUS_FAILURES=0
+assert_eq "refresh retries warm-hook re-arm until the daemon is reachable" 4 \
+    "$(grep -c '^status ' "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "refresh re-arms after delayed daemon readiness" \
     '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
 
 : > "$KEEP_AWAKE_TEST_LOG"

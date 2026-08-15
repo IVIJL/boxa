@@ -105,16 +105,28 @@ func (h *WarmHook) Arm() {
 	go h.maintain(ctx, done)
 }
 
+// DisarmAsync synchronously marks the hook disarmed and starts child cleanup.
+func (h *WarmHook) DisarmAsync() {
+	h.beginDisarm()
+}
+
 // Disarm closes the helper's stdin and waits for the child to be reaped.
 func (h *WarmHook) Disarm() {
+	done := h.beginDisarm()
+	if done != nil {
+		<-done
+	}
+}
+
+func (h *WarmHook) beginDisarm() <-chan struct{} {
 	if h == nil || !h.enabled {
-		return
+		return nil
 	}
 
 	h.mu.Lock()
 	if !h.armed && h.loopDone == nil {
 		h.mu.Unlock()
-		return
+		return nil
 	}
 	h.armed = false
 	cancel := h.cancel
@@ -127,10 +139,7 @@ func (h *WarmHook) Disarm() {
 		_ = child.stdin.Close()
 	}
 	h.mu.Unlock()
-
-	if done != nil {
-		<-done
-	}
+	return done
 }
 
 func (h *WarmHook) stop(ctx context.Context) (bool, error) {

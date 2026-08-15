@@ -130,6 +130,37 @@ func TestWarmHookDisarmClosesPipeAndReapsChild(t *testing.T) {
 	}
 }
 
+func TestWarmHookAsyncDisarmThenArmLeavesHookArmed(t *testing.T) {
+	eofFile := t.TempDir() + "/eof"
+	hook := newWarmHook(
+		func() (*exec.Cmd, error) { return warmHookStubCommand("wait-eof", eofFile), nil },
+		io.Discard,
+		nil,
+		10*time.Millisecond,
+		20*time.Millisecond,
+	)
+	hook.Arm()
+	t.Cleanup(hook.Disarm)
+	waitWarmHookAlive(t, hook)
+	hook.mu.Lock()
+	oldLoopDone := hook.loopDone
+	hook.mu.Unlock()
+
+	hook.DisarmAsync()
+	if armed, _ := hook.Status(); armed {
+		t.Fatal("warm hook remained armed after asynchronous disarm started")
+	}
+	hook.Arm()
+	select {
+	case <-oldLoopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for old warm-hook cleanup")
+	}
+	if armed, _ := hook.Status(); !armed {
+		t.Fatal("old disarm cleanup disarmed the newly armed warm hook")
+	}
+}
+
 func TestWindowsShutdownUsesWarmHookAndWaitsForDone(t *testing.T) {
 	stopFile := t.TempDir() + "/stop"
 	hook := newWarmHook(

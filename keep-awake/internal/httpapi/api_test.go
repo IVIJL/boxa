@@ -59,7 +59,7 @@ func (f *fakeWarmHook) Arm() {
 	defer f.mu.Unlock()
 	f.armCalls++
 }
-func (f *fakeWarmHook) Disarm() {
+func (f *fakeWarmHook) DisarmAsync() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.disarmCalls++
@@ -76,9 +76,43 @@ type blockingWarmHook struct {
 }
 
 func (h *blockingWarmHook) Arm() {}
-func (h *blockingWarmHook) Disarm() {
+func (h *blockingWarmHook) DisarmAsync() {
 	close(h.started)
-	<-h.release
+	go func() { <-h.release }()
+}
+
+type orderedWarmHook struct {
+	mu             sync.Mutex
+	armed          bool
+	disarmStarted  chan struct{}
+	disarmContinue chan struct{}
+	disarmDone     chan struct{}
+}
+
+func (h *orderedWarmHook) Arm() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.armed {
+		return
+	}
+	h.armed = true
+}
+
+func (h *orderedWarmHook) DisarmAsync() {
+	h.mu.Lock()
+	h.armed = false
+	h.mu.Unlock()
+	close(h.disarmStarted)
+	go func() {
+		<-h.disarmContinue
+		close(h.disarmDone)
+	}()
+}
+
+func (h *orderedWarmHook) isArmed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.armed
 }
 
 func newTestAPI() (*API, *fakeClock, *inhibit.Fake) {
@@ -197,6 +231,45 @@ func TestWarmHookDisarmRespondsWithoutWaiting(t *testing.T) {
 		t.Fatal("warm-hook disarm blocked the HTTP response")
 	}
 	close(warmHook.release)
+}
+
+func TestWarmHookDisarmThenArmLeavesHookArmed(t *testing.T) {
+	api, _, _ := newTestAPI()
+	warmHook := &orderedWarmHook{
+		armed:          true,
+		disarmStarted:  make(chan struct{}),
+		disarmContinue: make(chan struct{}),
+		disarmDone:     make(chan struct{}),
+	}
+	api.warmHook = warmHook
+
+	recorder := httptest.NewRecorder()
+	disarmRequest := httptest.NewRequest(http.MethodPost, warmHookPath, strings.NewReader(`{"armed":false}`))
+	api.ServeHTTP(recorder, disarmRequest)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("disarm code=%d response=%s", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case <-warmHook.disarmStarted:
+	case <-time.After(time.Second):
+		t.Fatal("warm-hook disarm did not start")
+	}
+
+	recorder = httptest.NewRecorder()
+	armRequest := httptest.NewRequest(http.MethodPost, warmHookPath, strings.NewReader(`{"armed":true}`))
+	api.ServeHTTP(recorder, armRequest)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("arm code=%d response=%s", recorder.Code, recorder.Body.String())
+	}
+	close(warmHook.disarmContinue)
+	select {
+	case <-warmHook.disarmDone:
+	case <-time.After(time.Second):
+		t.Fatal("warm-hook disarm cleanup did not finish")
+	}
+	if !warmHook.isArmed() {
+		t.Fatal("warm hook is disarmed after the last request armed it")
+	}
 }
 
 func TestIdleOnlyReleasesMatchingSession(t *testing.T) {

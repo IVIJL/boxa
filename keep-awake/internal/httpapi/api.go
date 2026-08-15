@@ -22,7 +22,7 @@ const (
 
 type warmHookController interface {
 	Arm()
-	Disarm()
+	DisarmAsync()
 }
 
 type API struct {
@@ -131,7 +131,7 @@ func (a *API) setWarmHook(w http.ResponseWriter, r *http.Request) {
 	if *request.Armed {
 		a.warmHook.Arm()
 	} else {
-		go a.warmHook.Disarm()
+		a.warmHook.DisarmAsync()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
