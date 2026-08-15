@@ -137,7 +137,11 @@ Run all `boxa mcp ...` commands on the host. When operating inside a Container, 
 
 #### Delegate from Claude to trusted Codex
 
-Use this host flow when Claude should call Codex directly as an MCP server:
+Use this host flow when Claude should call Codex directly as an MCP server.
+Fresh installs and `boxa update` offer to seed the `codex-delegate` catalog
+entry (definition + host-confirmed agent-trusted grant) one time, so the
+`add`/`mode` steps below are usually already done — check `boxa mcp catalog`
+and skip straight to `readiness`/`activate`:
 
 ```sh
 cd /path/to/my-project
@@ -201,3 +205,4 @@ Short decision tree for the most-frequent symptoms.
 - **Stale agent-browser CLI behaviour** inside a Container (e.g., `connect 9222` errors after a host Chrome restart) → the auto-connect wrapper reconnects on Chrome restart since `f9e30fa`. If symptoms persist, ask the user to `boxa agent-browser stop <project> && boxa agent-browser start <project>`.
 - **MCP catalog entry exists but the agent cannot see it** → catalog membership never activates a server. Start the target Project, check `boxa mcp readiness <entry> --project <path>`, then explicitly `activate` it for the intended consumer.
 - **`codex-delegate` cannot be found as a binary** → it is only the catalog label. The executable comes from the command after `--` (`codex mcp-server`); verify the Project is running and use `boxa mcp readiness codex-delegate --project <path>`.
+- **`mcp__boxa-codex-delegate` tools are missing from the agent session** → the entry is not activated for this Project (activation is per-Project; the seeded catalog entry alone exposes nothing). Ask the user to run on the host: `boxa mcp readiness codex-delegate --project <path>` (most common gap: no `codex login` yet), then `boxa mcp activate codex-delegate --project <path> --for claude`. If the entry is missing from `boxa mcp catalog` entirely, `boxa update` offers to seed it, or use the manual `add`/`mode` recipe above. A newly activated server appears only in a NEW agent session.

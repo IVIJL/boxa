@@ -212,6 +212,16 @@ boxa mcp readiness codex-delegate --project /work/my-project
 boxa mcp activate codex-delegate --project /work/my-project --for claude
 ```
 
+Fresh installs and `boxa update` offer to seed exactly this definition and
+grant one time (`scripts/ensure-codex-delegate-seed.sh`, Python core
+`mcp.seed`): the interactive confirmation shows the same access boundary as
+the `boxa mcp mode` preview and stands in for it; a non-interactive run only
+prints the manual commands and never grants. The applied/dismissed marker
+shares `state.json` with the onboarding wizard under its own key, so a
+declined offer never re-nags. Seeding is definition-only — every Project
+still activates explicitly, and the offer stays silent once any catalog
+entry running `codex mcp-server` exists (however it was named).
+
 `codex mcp-server` delegation is deliberately Claude-only; Boxa refuses Codex
 self-activation. At launch the node-side launcher independently revalidates the
 stable ID, exact Project, activation, consumer, enabled state, execution mode,

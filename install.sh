@@ -782,6 +782,39 @@ setup_mcp_onboarding() {
     fi
 }
 
+# Delegates to scripts/ensure-codex-delegate-seed.sh — the same hook the
+# `boxa update` self-heal chain calls. On a fresh interactive install it
+# offers to seed the default 'codex-delegate' catalog entry (trusted Codex
+# delegation; the Container image already bakes the Codex CLI). Definitions
+# only — no Project activation. Non-interactive installs print the manual
+# commands instead (never a prompt, never an unconfirmed trust grant).
+
+setup_codex_delegate_seed() {
+    info "Checking codex-delegate MCP seed..."
+
+    local hook="$BOXA_DIR/scripts/ensure-codex-delegate-seed.sh"
+    if [ ! -x "$hook" ]; then
+        warn "scripts/ensure-codex-delegate-seed.sh missing or non-executable; skipping."
+        SKIPPED+=("codex-delegate seed (hook missing)")
+        return
+    fi
+
+    # A piped/`--yes` install has no usable TTY for the confirmation; force
+    # the non-interactive branch so it prints the manual commands instead of
+    # blocking on a prompt (a trust grant must never ride on --yes).
+    local hook_args=()
+    if $AUTO_YES || [ ! -t 0 ]; then
+        hook_args+=("--non-interactive")
+    fi
+
+    if "$hook" "${hook_args[@]}"; then
+        CONFIGURED+=("codex-delegate seed (activate per Project via 'boxa mcp activate')")
+    else
+        warn "codex-delegate seed check failed — run 'boxa mcp add codex-delegate -- codex mcp-server' manually later."
+        SKIPPED+=("codex-delegate seed (check failed; see warnings above)")
+    fi
+}
+
 # --- Keep-awake elective (ADR 0017 / ADR 0023) ------------------------------
 
 setup_keep_awake() {
@@ -1626,6 +1659,9 @@ main() {
 
     echo ""
     setup_mcp_onboarding
+
+    echo ""
+    setup_codex_delegate_seed
 
     echo ""
     install_command

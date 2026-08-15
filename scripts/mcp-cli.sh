@@ -99,6 +99,11 @@ Mental model and common flow:
   To reuse a prepared entry elsewhere, start that Project and activate it there.
 
 Trusted Codex delegation to Claude (run on the host):
+  Fresh installs and 'boxa update' offer to seed the 'codex-delegate' entry
+  (definition + confirmed agent-trusted grant) one time; when accepted, the
+  'add' and 'mode' steps below are already done and only per-Project
+  'readiness' + 'activate' remain.
+
   cd /path/to/my-project
   boxa up
   boxa mcp add codex-delegate -- codex mcp-server
