@@ -59,7 +59,9 @@ _picker::run() {
 
     local -a items=()
     local opt
-    for opt in "${first_options[@]}"; do
+    # ${arr[@]+...} guards: macOS ships bash 3.2, where expanding an empty
+    # array under `set -u` is an unbound-variable error (fixed in bash 4.4).
+    for opt in ${first_options[@]+"${first_options[@]}"}; do
         items+=("$opt")
     done
     while IFS= read -r line; do
@@ -68,9 +70,9 @@ _picker::run() {
     done <<< "$raw_items"
 
     if _picker::fzf_available; then
-        _picker::fzf "$mode" "$prompt" "$header" "${items[@]}"
+        _picker::fzf "$mode" "$prompt" "$header" ${items[@]+"${items[@]}"}
     else
-        _picker::fallback "$mode" "$prompt" "$header" "${#first_options[@]}" "${items[@]}"
+        _picker::fallback "$mode" "$prompt" "$header" "${#first_options[@]}" ${items[@]+"${items[@]}"}
     fi
 }
 
@@ -183,7 +185,7 @@ _picker::select() {
         IFS=',' read -ra raw <<< "$choice"
         local idx
         local -a picked=()
-        for idx in "${raw[@]}"; do
+        for idx in ${raw[@]+"${raw[@]}"}; do
             idx="${idx// /}"
             if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "$max" ]; then
                 echo "Invalid choice: $idx" >&2
