@@ -931,21 +931,6 @@ keep_awake::wait_until_reachable() {
     return 1
 }
 
-keep_awake::arm_warm_hook_when_reachable() {
-    local remaining=40
-    while [ "$remaining" -gt 0 ]; do
-        if keep_awake_probe::select_target "$KEEP_AWAKE_PLATFORM" "$KEEP_AWAKE_PORT" \
-            && keep_awake_probe::warm_hook \
-                "$KEEP_AWAKE_PROBE_TARGET_ADDRESS" "$KEEP_AWAKE_PORT" true \
-                >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 2
-        remaining=$((remaining - 1))
-    done
-    return 1
-}
-
 keep_awake::enable() {
     local autostart_mode=system tmp_dir="" built_binary=""
     local firewall_rule_ready=true daemon_reachable=true
@@ -1008,9 +993,6 @@ keep_awake::enable() {
             printf 'keep-awake: daemon did not become reachable; rolled back.\n' >&2
             return 1
         fi
-    fi
-    if docker ps --filter "name=^boxa-" --format '{{.Names}}' 2>/dev/null | grep -q .; then
-        keep_awake::arm_warm_hook_when_reachable || true
     fi
     # A connection failure (typically one stale box refusing the firewall
     # slot) must NOT tear down a working daemon: keep everything installed,
@@ -1116,13 +1098,11 @@ keep_awake::refresh() {
             ;;
         none)
             if [ "$stopped_for_swap" = true ]; then
-                # No daemon exists to re-arm yet, and its future custom start
+                # No daemon exists to restart yet, and its future custom start
                 # remains user-owned just like its arguments and lifecycle.
                 printf 'keep-awake: refreshed binary installed; the user-managed daemon was stopped for the Windows binary swap — start it again with your own mechanism.\n'
             else
-                # The running process keeps the old inode and its current warm
-                # hook until it exits. After the user restarts it, a later boxa
-                # lifecycle event will arm the refreshed daemon again.
+                # The running process keeps the old inode until it exits.
                 printf 'keep-awake: refreshed binary installed; restart the user-managed daemon with your own mechanism to pick it up.\n'
             fi
             ;;
@@ -1133,10 +1113,6 @@ keep_awake::refresh() {
             ;;
     esac
 
-    if [ "$autostart_mode" != none ] \
-        && docker ps --filter "name=^boxa-" --format '{{.Names}}' 2>/dev/null | grep -q .; then
-        keep_awake::arm_warm_hook_when_reachable || true
-    fi
 }
 
 keep_awake::teardown() {
@@ -1179,7 +1155,6 @@ keep_awake::disable() {
 keep_awake::status() {
     local status_json="" holders="[]" daemon=no daemon_target=unreachable
     local autostart=no connection=no tray client_signal autostart_mode firewall_rule
-    local warm_hook_armed=unknown warm_hook_alive=unknown
     keep_awake::init_paths || return 1
     autostart_mode="$(keep_awake::autostart_mode)"
     if keep_awake_probe::select_target "$KEEP_AWAKE_PLATFORM" "$KEEP_AWAKE_PORT"; then
@@ -1189,12 +1164,6 @@ keep_awake::status() {
         holders="$(printf '%s\n' "$status_json" \
             | sed -nE 's/.*"activeHolders":(\[[^]]*]).*/\1/p')"
         [ -n "$holders" ] || holders="[]"
-        warm_hook_armed="$(printf '%s\n' "$status_json" \
-            | sed -nE 's/.*"warmHookArmed":(true|false).*/\1/p')"
-        warm_hook_alive="$(printf '%s\n' "$status_json" \
-            | sed -nE 's/.*"warmHookAlive":(true|false).*/\1/p')"
-        [ -n "$warm_hook_armed" ] || warm_hook_armed=unknown
-        [ -n "$warm_hook_alive" ] || warm_hook_alive=unknown
     fi
     keep_awake::autostart_installed && autostart=yes
     keep_awake::host_connection_present && connection=yes
@@ -1216,7 +1185,6 @@ keep_awake::status() {
     printf 'Daemon reachable: %s\n' "$daemon"
     printf 'Relay target: %s\n' "$daemon_target"
     printf 'Holders: %s\n' "$holders"
-    printf 'Warm hook: armed=%s, alive=%s\n' "$warm_hook_armed" "$warm_hook_alive"
     printf 'Autostart installed: %s\n' "$autostart"
     printf 'autostart: %s\n' "$autostart_mode"
     printf 'Host connection present: %s\n' "$connection"

@@ -3,7 +3,6 @@ package httpapi
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -12,30 +11,19 @@ import (
 	"unicode"
 
 	"github.com/IVIJL/boxa/keep-awake/internal/awake"
-	"github.com/IVIJL/boxa/keep-awake/internal/powerwatch"
 )
 
-const (
-	statusPath   = "/v1/status"
-	warmHookPath = "/v1/warm-hook"
-)
-
-type warmHookController interface {
-	Arm()
-	DisarmAsync()
-}
+const statusPath = "/v1/status"
 
 type API struct {
 	manager    *awake.Manager
-	powerWatch func() powerwatch.Status
-	warmHook   warmHookController
 	defaultTTL time.Duration
 	version    string
 	logger     *log.Logger
 }
 
-func New(manager *awake.Manager, powerWatch func() powerwatch.Status, warmHook warmHookController, defaultTTL time.Duration, version string, logger *log.Logger) *API {
-	return &API{manager: manager, powerWatch: powerWatch, warmHook: warmHook, defaultTTL: defaultTTL, version: version, logger: logger}
+func New(manager *awake.Manager, defaultTTL time.Duration, version string, logger *log.Logger) *API {
+	return &API{manager: manager, defaultTTL: defaultTTL, version: version, logger: logger}
 }
 
 type holderResponse struct {
@@ -45,28 +33,15 @@ type holderResponse struct {
 }
 
 type statusResponse struct {
-	ActiveHolders []holderResponse   `json:"activeHolders"`
-	IsInhibited   bool               `json:"isInhibited"`
-	PowerWatch    powerWatchResponse `json:"powerWatch"`
-	Version       string             `json:"version"`
-}
-
-type powerWatchResponse struct {
-	Active                 bool   `json:"active"`
-	StopBudgetSeconds      int64  `json:"stopBudgetSeconds"`
-	InhibitDelayMaxSeconds int64  `json:"inhibitDelayMaxSeconds,omitempty"`
-	InhibitDelayMaxError   string `json:"inhibitDelayMaxError,omitempty"`
-	Hint                   string `json:"hint,omitempty"`
-	WarmHookArmed          bool   `json:"warmHookArmed"`
-	WarmHookAlive          bool   `json:"warmHookAlive"`
+	ActiveHolders []holderResponse `json:"activeHolders"`
+	IsInhibited   bool             `json:"isInhibited"`
+	Version       string           `json:"version"`
 }
 
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == statusPath:
 		a.status(w, r)
-	case r.URL.Path == warmHookPath:
-		a.setWarmHook(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/busy/"):
 		a.busy(w, r, strings.TrimPrefix(r.URL.Path, "/v1/busy/"))
 	case strings.HasPrefix(r.URL.Path, "/v1/idle/"):
@@ -94,50 +69,11 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 			RemainingTTLSeconds: remainingSeconds,
 		})
 	}
-	powerStatus := a.powerWatch()
 	writeJSON(w, http.StatusOK, statusResponse{
 		ActiveHolders: holders,
 		IsInhibited:   status.Inhibited,
-		PowerWatch: powerWatchResponse{
-			Active:                 powerStatus.Active,
-			StopBudgetSeconds:      durationSeconds(powerStatus.StopBudget),
-			InhibitDelayMaxSeconds: durationSeconds(powerStatus.InhibitDelayMax),
-			InhibitDelayMaxError:   powerStatus.InhibitDelayMaxError,
-			Hint:                   powerStatus.Hint,
-			WarmHookArmed:          powerStatus.WarmHookArmed,
-			WarmHookAlive:          powerStatus.WarmHookAlive,
-		},
-		Version: a.version,
+		Version:       a.version,
 	})
-}
-
-func (a *API) setWarmHook(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w, http.MethodPost)
-		return
-	}
-	request := struct {
-		Armed *bool `json:"armed"`
-	}{}
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&request); err != nil || request.Armed == nil {
-		writeError(w, http.StatusBadRequest, "body must be JSON with a boolean armed field")
-		return
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		writeError(w, http.StatusBadRequest, "body must contain one JSON object")
-		return
-	}
-	if *request.Armed {
-		a.warmHook.Arm()
-	} else {
-		a.warmHook.DisarmAsync()
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-func durationSeconds(duration time.Duration) int64 {
-	return int64((duration + time.Second - 1) / time.Second)
 }
 
 func (a *API) busy(w http.ResponseWriter, r *http.Request, agent string) {

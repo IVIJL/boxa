@@ -57,8 +57,8 @@ Source of truth for status queries.
 **Closeout notification**:
 The desktop notification the host-side deliver script raises when an
 **Allow-for window** or an **Agent-browser session**/**network window**
-closes, or that reports the outcome of a **Pre-shutdown stop**. For a window or
-session closeout, it carries a click action that opens the run's log (the
+closes, or that reports the outcome of an unattended `boxa stop --all
+--reason` run. For a window or session closeout, it carries a click action that opens the run's log (the
 **Harvest log** or the agent-browser summary/proxy log). The notification is a
 convenience pointer; that log file is the canonical record and is always
 written even if no notification backend is available. The click action is
@@ -70,7 +70,7 @@ _Avoid_: toast (Windows-specific), popup, alert
 
 **Keep-awake daemon**:
 The host-side process that holds the operating system awake while coding
-agents work and owns **Awake leases** and **Power-watch**.
+agents work and owns **Awake leases**.
 _Avoid_: host daemon, awake daemon, sleep blocker
 
 **Awake lease**:
@@ -83,25 +83,6 @@ The Claude hook that translates agent activity into **Awake lease** signals.
 On Stop, its shell-aware behaviour keeps the lease busy while a background
 shell is still running and otherwise releases it.
 _Avoid_: agent-awake hook, keep-awake hook
-
-**Power-watch**:
-The **Keep-awake daemon** component that stops boxes before system shutdown or
-poweroff. On Windows it normally requests the stop through the **Warm hook**;
-it deliberately ignores sleep and resume.
-_Avoid_: power watcher, sleep watcher, shutdown watcher
-
-**Warm hook**:
-The Windows **Power-watch** mechanism that pre-spawns a WSL stop helper while
-boxes are running, then requests the **Pre-shutdown stop** over the helper's
-existing stdin pipe instead of starting it during shutdown.
-_Avoid_: WSL hook, pre-spawn hook, shutdown hook
-
-**Pre-shutdown stop**:
-The `boxa stop --all --reason presleep` run that **Power-watch** requests before
-shutdown or poweroff. On Windows the **Warm hook** normally executes it in its
-already-running WSL child. Its outcome reaches the user through a **Closeout
-notification**; the legacy `presleep` reason token remains part of the command.
-_Avoid_: presleep hook, sleep stop
 
 ### Agent-browser
 

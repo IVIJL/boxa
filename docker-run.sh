@@ -2656,37 +2656,32 @@ graceful_stop_container() {
     docker stop -t 15 "$name" > /dev/null 2>&1 || true
 }
 
-# Prepare Containers concurrently, then stop the outer layer in one Docker
-# call. Shutdown budgets apply to the whole fleet, so both all-Container entry
-# points must share this batched path rather than spending one timeout per box.
-# Failures propagate: `stop --all` runs unattended (pre-sleep Closeout), so a
-# Container that refused to stop must surface as a non-zero exit. Interactive
+# Prepare Containers concurrently, then stop them concurrently. The docker CLI
+# stops a multi-name `docker stop` one Container at a time, so one background
+# stop per Container is what keeps the whole fleet inside a single 15s budget.
+# Failures propagate: `stop --all` may run unattended (`--reason` Closeout), so
+# a Container that refused to stop must surface as a non-zero exit. Interactive
 # callers opt out with `|| true` — see the "* Stop all" branch.
 stop_containers_batched() {
-    local -a containers=("$@") prepare_pids=()
-    local name prepare_pid
+    local -a containers=("$@") prepare_pids=() stop_pids=()
+    local name pid failed=false
 
     [ "${#containers[@]}" -gt 0 ] || return 0
     for name in "${containers[@]}"; do
         prepare_container_for_stop "$name" &
         prepare_pids+=("$!")
     done
-    for prepare_pid in "${prepare_pids[@]}"; do
-        wait "$prepare_pid"
+    for pid in "${prepare_pids[@]}"; do
+        wait "$pid"
     done
-    docker stop -t 15 "${containers[@]}" > /dev/null
-}
-
-signal_warm_hook() {
-    local armed="$1" port="${BOXA_KEEP_AWAKE_PORT:-17777}" platform
-    platform="${BOXA_KEEP_AWAKE_PLATFORM:-$(host_platform::detect 2>/dev/null || true)}"
-    keep_awake_probe::select_target "$platform" "$port" || return 0
-    keep_awake_probe::warm_hook \
-        "$KEEP_AWAKE_PROBE_TARGET_ADDRESS" "$port" "$armed" >/dev/null 2>&1 || true
-}
-
-arm_warm_hook() {
-    signal_warm_hook true || true
+    for name in "${containers[@]}"; do
+        docker stop -t 15 "$name" > /dev/null &
+        stop_pids+=("$!")
+    done
+    for pid in "${stop_pids[@]}"; do
+        wait "$pid" || failed=true
+    done
+    [ "$failed" = false ]
 }
 
 stop_traefik_if_idle() {
@@ -2706,14 +2701,6 @@ stop_dns_if_idle() {
         docker stop boxa_dns > /dev/null
         docker rm boxa_dns > /dev/null
         echo "Stopped: boxa_dns (no remaining containers)"
-    fi
-}
-
-disarm_warm_hook_if_idle() {
-    local remaining
-    remaining=$(docker ps --filter "name=^boxa-" --format '{{.Names}}' | filter_user_containers)
-    if [ -z "$remaining" ]; then
-        signal_warm_hook false || true
     fi
 }
 
@@ -3016,7 +3003,6 @@ restart_exited_container() {
     if ! wait_for_boxa_ready "$name"; then
         exit 1
     fi
-    arm_warm_hook || true
     # Root-context setup (firewall, gitconfig, host-home symlink) is handled by
     # the entrypoint on every container start. Here we only run the user-mode
     # setup as node.
@@ -3755,7 +3741,6 @@ case "${1:-}" in
     update)    MODE="update";    shift ;;
     doctor)    MODE="doctor";    shift; DOCTOR_ARGS=("$@") ;;
     keep-awake) MODE="keep-awake"; shift; KEEP_AWAKE_ARGS=("$@") ;;
-    __keep-awake-stop-wait) MODE="keep-awake-stop-wait"; shift ;;
     dns-install)   MODE="dns-install";   shift ;;
     dns-status)    MODE="dns-status";    shift ;;
     dns-uninstall) MODE="dns-uninstall"; shift ;;
@@ -3766,10 +3751,6 @@ case "${1:-}" in
     sync-skills) MODE="sync-skills"; shift ;;
     *)         MODE="auto" ;;
 esac
-
-if [ "$MODE" = "keep-awake-stop-wait" ]; then
-    exec "$BOXA_DIR/scripts/keep-awake-stop-wait.sh" "$@"
-fi
 
 # --- boxa ls ---------------------------------------------------------------
 
@@ -5041,7 +5022,6 @@ if [ "$MODE" = "stop" ]; then
 
         stop_traefik_if_idle
         stop_dns_if_idle
-        disarm_warm_hook_if_idle || true
 
         if [ -n "$STOP_REASON" ] && [ "${#stopped_projects[@]}" -gt 0 ] \
             && [ -x "$BOXA_DIR/scripts/deliver-allow-for-notification.sh" ]; then
@@ -5073,7 +5053,6 @@ if [ "$MODE" = "stop" ]; then
             fi
             stop_traefik_if_idle
             stop_dns_if_idle
-            disarm_warm_hook_if_idle || true
             exit 0
         fi
         echo "Container $name is not running." >&2
@@ -5109,7 +5088,6 @@ if [ "$MODE" = "stop" ]; then
         done
         stop_traefik_if_idle
         stop_dns_if_idle
-        disarm_warm_hook_if_idle || true
     else
         proj="${selected#boxa-}"
         graceful_stop_container "$selected"
@@ -5124,7 +5102,6 @@ if [ "$MODE" = "stop" ]; then
         fi
         stop_traefik_if_idle
         stop_dns_if_idle
-        disarm_warm_hook_if_idle || true
     fi
     exit 0
 fi
@@ -5820,7 +5797,6 @@ if [ -d "${1:-.}" ]; then
         _boxa::converge_container_resources "$CONTAINER_NAME" "$PROJECT_PATH" \
             "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
         start_boxa_connections "$CONTAINER_NAME"
-        arm_warm_hook || true
         attach_to_container "$CONTAINER_NAME"
         # exec → script ends here
     fi
@@ -5846,7 +5822,6 @@ else
         _boxa::converge_container_resources "$CONTAINER_NAME" "" \
             "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
         start_boxa_connections "$CONTAINER_NAME"   # self-heal forwards (idempotent)
-        arm_warm_hook || true
         attach_to_container "$CONTAINER_NAME"
     elif docker ps -a --filter "name=^${CONTAINER_NAME}$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
         bootstrap_traefik
@@ -5869,7 +5844,6 @@ else
             _boxa::converge_container_resources "$selected" "" \
                 "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
             start_boxa_connections "$selected"   # self-heal forwards (idempotent)
-            arm_warm_hook || true
         fi
         attach_to_container "$selected"
     fi
@@ -6529,7 +6503,6 @@ docker run -d --name "$CONTAINER_NAME" --stop-timeout 45 "${DOCKER_ARGS[@]}" "$I
 if ! wait_for_boxa_ready "$CONTAINER_NAME"; then
     exit 1
 fi
-arm_warm_hook || true
 
 # Apply default port routes
 apply_port_routes "$CONTAINER_NAME"

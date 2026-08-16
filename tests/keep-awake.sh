@@ -246,12 +246,9 @@ case "$*" in
             *)                  [ "$KEEP_AWAKE_TEST_GATEWAY_HEALTHY" = true ] || exit 7 ;;
         esac
         ;;
-    *'/v1/warm-hook')
-        printf 'warm-hook %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
-        ;;
 esac
 [ "$KEEP_AWAKE_TEST_CURL_HEALTHY" = true ] || exit 7
-printf '{"activeHolders":[{"agent":"codex","session":"test","remainingTTLSeconds":899}],"isInhibited":true,"powerWatch":{"warmHookArmed":true,"warmHookAlive":true},"version":"test"}\n'
+printf '{"activeHolders":[{"agent":"codex","session":"test","remainingTTLSeconds":899}],"isInhibited":true,"version":"test"}\n'
 EOF
 
 cat > "$TMPROOT/bin/sleep" <<'EOF'
@@ -612,9 +609,6 @@ assert_contains "Docker build provides a writable Go build cache" \
     "--env GOCACHE=/tmp/gocache" "$docker_build_log"
 assert_eq "Docker-built artifact is owned by the invoking user" "$(id -u)" \
     "$(stat -c %u "$TMPROOT/install/keep-awake")"
-assert_contains "system enable with a running Container arms the warm hook" \
-    '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
-
 : > "$KEEP_AWAKE_TEST_LOG"
 export KEEP_AWAKE_TEST_RUNNING_BOX=true
 refresh_output="$("$KEEP_AWAKE" refresh)"
@@ -627,29 +621,9 @@ assert_contains "refresh restarts the existing Linux service" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_not_contains "refresh does not recreate the Host connection" \
     "boxa connect host" "$(cat "$KEEP_AWAKE_TEST_LOG")"
-assert_contains "refresh with a running Container re-arms the warm hook" \
-    '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
-
-: > "$KEEP_AWAKE_TEST_LOG"
-export KEEP_AWAKE_TEST_STATUS_FAILURES=30
-"$KEEP_AWAKE" refresh >/dev/null
-export KEEP_AWAKE_TEST_STATUS_FAILURES=0
-assert_eq "refresh retries warm-hook re-arm beyond the old five-second window" 31 \
-    "$(grep -c '^status ' "$KEEP_AWAKE_TEST_LOG")"
-assert_contains "refresh re-arms after late daemon readiness" \
-    '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
-
-: > "$KEEP_AWAKE_TEST_LOG"
-export KEEP_AWAKE_TEST_RUNNING_BOX=false
-"$KEEP_AWAKE" refresh >/dev/null
-assert_not_contains "refresh without a running Container does not arm the warm hook" \
-    "/v1/warm-hook" "$(cat "$KEEP_AWAKE_TEST_LOG")"
-
 status_output="$("$KEEP_AWAKE" status)"
 assert_contains "status reports reachable daemon" "Daemon reachable: yes" "$status_output"
 assert_contains "status reports active holders" '"agent":"codex"' "$status_output"
-assert_contains "status reports warm-hook state" \
-    "Warm hook: armed=true, alive=true" "$status_output"
 assert_contains "status reports autostart" "Autostart installed: yes" "$status_output"
 assert_contains "status reports system autostart mode" "autostart: system" "$status_output"
 assert_contains "status reports Host connection" "Host connection present: yes" "$status_output"
@@ -682,8 +656,6 @@ export KEEP_AWAKE_TEST_RUNNING_BOX=true
 refresh_disabled_output="$("$KEEP_AWAKE" refresh)"
 assert_eq "disabled refresh remains a no-op with a running Container" "" \
     "$refresh_disabled_output"
-assert_not_contains "disabled refresh does not arm the warm hook" "/v1/warm-hook" \
-    "$(cat "$KEEP_AWAKE_TEST_LOG")"
 export KEEP_AWAKE_TEST_CURL_HEALTHY=false
 disabled_status="$("$KEEP_AWAKE" status)"
 assert_contains "disabled status reports daemon down" "Daemon reachable: no" "$disabled_status"
@@ -715,8 +687,6 @@ assert_contains "Linux terminal snippet keeps resolved log path" \
 assert_contains "terminal mode starts daemon immediately" \
     "daemon -port 17777 -log-file $XDG_STATE_HOME/boxa/keep-awake/keep-awake.log" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
-assert_contains "terminal enable with a running Container arms the warm hook" \
-    '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "terminal mode is persisted" "autostart=terminal" \
     "$(cat "$XDG_CONFIG_HOME/boxa/keep-awake.conf")"
 terminal_status="$("$KEEP_AWAKE" status)"
@@ -740,8 +710,6 @@ assert_not_contains "none mode prints no WezTerm snippet" "gui-startup" "$none_o
 assert_contains "none mode starts daemon immediately" \
     "daemon -port 17777 -log-file $XDG_STATE_HOME/boxa/keep-awake/keep-awake.log" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
-assert_contains "none enable with a running Container arms the warm hook" \
-    '-d {"armed":true}' "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "none mode is persisted" "autostart=none" \
     "$(cat "$XDG_CONFIG_HOME/boxa/keep-awake.conf")"
 none_status="$("$KEEP_AWAKE" status)"
@@ -764,8 +732,6 @@ assert_not_contains "none refresh replaces the installed binary" \
     "stale-binary-marker" "$(cat "$TMPROOT/install/keep-awake")"
 assert_not_contains "none refresh starts no competing daemon" "daemon -port" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
-assert_not_contains "none refresh does not arm the user-managed daemon" \
-    "/v1/warm-hook" "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "none refresh asks the user to restart their own daemon" \
     "restart the user-managed daemon with your own mechanism" \
     "$none_refresh_output"
@@ -1235,8 +1201,6 @@ assert_contains "Windows none refresh reports the swap-forced stop" \
     "stopped for the Windows binary swap" "$windows_none_refresh_output"
 assert_not_contains "Windows none refresh reruns no boxa-owned autostart" \
     "schtasks /Run" "$(cat "$KEEP_AWAKE_TEST_LOG")"
-assert_not_contains "Windows none refresh has no restarted daemon to re-arm" \
-    "/v1/warm-hook" "$(cat "$KEEP_AWAKE_TEST_LOG")"
 : > "$KEEP_AWAKE_TEST_LOG"
 export KEEP_AWAKE_TEST_INSTALL_FAIL=true
 windows_none_refresh_rc=0

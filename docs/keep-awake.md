@@ -114,83 +114,12 @@ Resolution order for any client is: native Linux/macOS → `localhost`; WSL →
 probe `localhost`, then the Windows vEthernet/default-gateway IP; boxa Container
 → `localhost` on the Host connection's local port (17777 by default).
 `GET /v1/status` returns the active holders, remaining TTLs, inhibitor state,
-**Power-watch** state (including whether the Windows **Warm hook** is armed and
-its child is alive), and daemon version.
+and daemon version.
 
-## Pre-shutdown stop
+The daemon does not react to shutdown, poweroff, or sleep: those transitions
+leave boxes untouched, and after a resume they remain available. Stop boxes
+explicitly with `boxa stop --all` when needed.
 
-On native Linux, **Power-watch** starts with the **Keep-awake daemon** and
-holds a systemd-logind delay inhibitor for shutdown. When logind announces a
-shutdown or poweroff transition, Power-watch runs
-`boxa stop --all --reason presleep` regardless of any held Awake leases, then
-releases the delay inhibitor so the transition can continue. Its output is
-written to the daemon log. Power-watch does not subscribe to sleep events, so
-manual or idle sleep leaves boxes running and they remain available after
-resume.
-
-The Windows daemon owns a hidden top-level window and Win32 message pump on a
-dedicated OS thread. It cannot rely on starting `wsl.exe` after shutdown has
-begun: Windows is already ending the user session and may reject new processes
-with `0xC0000142` (`STATUS_DLL_INIT_FAILED`). Instead, the **Warm hook** starts
-`wsl.exe -d <distro> -- boxa __keep-awake-stop-wait` ahead of time. The WSL
-child reports `ready` and waits on stdin. During shutdown/restart the daemon
-publishes the shutdown block reason `Stopping boxa containers…`, writes
-`stop` to that existing child's stdin, and waits while the child runs
-`boxa stop --all --reason presleep` and reports `done`.
-
-The Warm hook is maintained only around running boxes. A successful `boxa up`
-that creates or restarts a Container arms it best effort; stop paths disarm it
-only after the last running `boxa-*` Container is gone. The child also checks
-once when it starts: if no boxes are running, it reports `no-boxes` and exits,
-which self-disarms a stale arm request instead of keeping the WSL VM alive.
-While armed, an unexpectedly exited child is respawned with exponential
-backoff from one second up to 30 seconds. Disarming closes stdin and reaps the
-child.
-
-If no live warm child is available when shutdown begins, Power-watch logs this
-and falls back to the old direct command path. The default fallback tries to
-start `wsl.exe -d <distro> -- boxa stop --all --reason presleep`; it is only a
-best-effort last resort because Windows may already refuse that new process.
-The fallback does not extend the shutdown window: the warm attempt and any
-fallback share the configured budget, capped at the unchanged hard 45-second
-maximum. Power-watch clears the shutdown block reason after completion or
-timeout. It does not listen for suspend/resume messages and performs no
-idle-sleep prediction, so sleep likewise leaves boxes untouched.
-
-macOS Power-watch is currently a no-op.
-
-The command and its one-minute stop budget can be overridden with the daemon
-flags `-power-watch-command` and `-power-watch-timeout`. On Windows the Warm
-hook always runs Boxa's standard Pre-shutdown stop; a custom command applies to
-the direct fallback when no warm child is alive. The effective Windows budget
-is capped at 45 seconds. A hanging command is terminated when that budget or
-logind's shorter effective delay expires.
-
-Warm-hook daemon changes need no separate deployment step. Because the code is
-under `keep-awake/`, `boxa update` detects it in the pulled commit range and
+Daemon changes need no separate deployment step. Because the code is under
+`keep-awake/`, `boxa update` detects it in the pulled commit range and
 automatically runs `boxa keep-awake refresh` for an enabled installation.
-
-logind commonly defaults `InhibitDelayMaxSec` to only a few seconds. If the
-configured stop budget is longer, raise `InhibitDelayMaxSec` in
-`/etc/systemd/logind.conf` and restart logind (normally by rebooting) so Boxa
-has enough time to stop every Container cleanly. `/v1/status` reports the
-effective delay, stop budget, Power-watch activity, and a hint when the delay
-is shorter than the budget.
-
-### Windows manual verification
-
-These checks require a real Windows host with Boxa installed through WSL:
-
-1. Start two boxes and verify `/v1/status` reports `warmHookArmed` and
-   `warmHookAlive`; stop one and confirm both remain true, then start it again.
-2. Choose Start → Shut down and confirm the `Stopping boxa containers…` reason
-   appears when stopping is slow; after the next boot, verify both boxes were
-   stopped.
-3. With no live warm child, exercise the fallback using a deliberately wedged
-   `-power-watch-command` and a short `-power-watch-timeout`; confirm the daemon
-   logs the fallback and Windows continues no later than that timeout.
-4. Start two named boxes, sleep from the lid or power menu, then resume and
-   confirm both boxes stayed running and no sleep-related Closeout notification
-   appeared.
-5. Stop and restart the daemon, inspect its log for window-class cleanup or
-   registration errors, then repeat the shutdown check.

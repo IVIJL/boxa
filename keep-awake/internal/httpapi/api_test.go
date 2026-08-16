@@ -11,7 +11,6 @@ import (
 
 	"github.com/IVIJL/boxa/keep-awake/internal/awake"
 	"github.com/IVIJL/boxa/keep-awake/internal/inhibit"
-	"github.com/IVIJL/boxa/keep-awake/internal/powerwatch"
 )
 
 type fakeClock struct {
@@ -36,100 +35,15 @@ type decodedStatus struct {
 		Session             string `json:"session"`
 		RemainingTTLSeconds int64  `json:"remainingTTLSeconds"`
 	} `json:"activeHolders"`
-	IsInhibited bool `json:"isInhibited"`
-	PowerWatch  struct {
-		Active                 bool   `json:"active"`
-		StopBudgetSeconds      int64  `json:"stopBudgetSeconds"`
-		InhibitDelayMaxSeconds int64  `json:"inhibitDelayMaxSeconds"`
-		Hint                   string `json:"hint"`
-		WarmHookArmed          bool   `json:"warmHookArmed"`
-		WarmHookAlive          bool   `json:"warmHookAlive"`
-	} `json:"powerWatch"`
-	Version string `json:"version"`
-}
-
-type fakeWarmHook struct {
-	mu          sync.Mutex
-	armCalls    int
-	disarmCalls int
-}
-
-func (f *fakeWarmHook) Arm() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.armCalls++
-}
-func (f *fakeWarmHook) DisarmAsync() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.disarmCalls++
-}
-func (f *fakeWarmHook) calls() (int, int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.armCalls, f.disarmCalls
-}
-
-type blockingWarmHook struct {
-	started chan struct{}
-	release chan struct{}
-}
-
-func (h *blockingWarmHook) Arm() {}
-func (h *blockingWarmHook) DisarmAsync() {
-	close(h.started)
-	go func() { <-h.release }()
-}
-
-type orderedWarmHook struct {
-	mu             sync.Mutex
-	armed          bool
-	disarmStarted  chan struct{}
-	disarmContinue chan struct{}
-	disarmDone     chan struct{}
-}
-
-func (h *orderedWarmHook) Arm() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.armed {
-		return
-	}
-	h.armed = true
-}
-
-func (h *orderedWarmHook) DisarmAsync() {
-	h.mu.Lock()
-	h.armed = false
-	h.mu.Unlock()
-	close(h.disarmStarted)
-	go func() {
-		<-h.disarmContinue
-		close(h.disarmDone)
-	}()
-}
-
-func (h *orderedWarmHook) isArmed() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.armed
+	IsInhibited bool   `json:"isInhibited"`
+	Version     string `json:"version"`
 }
 
 func newTestAPI() (*API, *fakeClock, *inhibit.Fake) {
 	clock := &fakeClock{now: time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)}
 	fake := &inhibit.Fake{}
 	manager := awake.NewManager(awake.NewRegistry(clock), fake)
-	powerStatus := func() powerwatch.Status {
-		return powerwatch.Status{
-			Active:          true,
-			StopBudget:      time.Minute,
-			InhibitDelayMax: 5 * time.Second,
-			Hint:            "raise InhibitDelayMaxSec in logind.conf",
-			WarmHookArmed:   true,
-			WarmHookAlive:   true,
-		}
-	}
-	return New(manager, powerStatus, &fakeWarmHook{}, 15*time.Minute, "test-version", nil), clock, fake
+	return New(manager, 15*time.Minute, "test-version", nil), clock, fake
 }
 
 func request(t *testing.T, handler http.Handler, method, target string) *httptest.ResponseRecorder {
@@ -162,11 +76,6 @@ func TestBusyStatusAndTTLExpiry(t *testing.T) {
 	if !status.IsInhibited || status.Version != "test-version" || len(status.ActiveHolders) != 1 {
 		t.Fatalf("unexpected busy status: %+v", status)
 	}
-	if !status.PowerWatch.Active || status.PowerWatch.StopBudgetSeconds != 60 ||
-		status.PowerWatch.InhibitDelayMaxSeconds != 5 || !status.PowerWatch.WarmHookArmed ||
-		!status.PowerWatch.WarmHookAlive || !strings.Contains(status.PowerWatch.Hint, "InhibitDelayMaxSec") {
-		t.Fatalf("unexpected power-watch status: %+v", status.PowerWatch)
-	}
 	holder := status.ActiveHolders[0]
 	if holder.Agent != "codex" || holder.Session != "box-a" || holder.RemainingTTLSeconds != 10 {
 		t.Fatalf("unexpected holder: %+v", holder)
@@ -176,99 +85,6 @@ func TestBusyStatusAndTTLExpiry(t *testing.T) {
 	status = getStatus(t, api)
 	if status.IsInhibited || len(status.ActiveHolders) != 0 || fake.ReleaseCalls() != 1 {
 		t.Fatalf("expired status: %+v, release calls=%d", status, fake.ReleaseCalls())
-	}
-}
-
-func TestWarmHookArmAndDisarm(t *testing.T) {
-	api, _, _ := newTestAPI()
-	warmHook := api.warmHook.(*fakeWarmHook)
-
-	for _, body := range []string{`{"armed":true}`, `{"armed":false}`} {
-		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodPost, warmHookPath, strings.NewReader(body))
-		api.ServeHTTP(recorder, request)
-		if recorder.Code != http.StatusOK {
-			t.Fatalf("body=%s code=%d response=%s", body, recorder.Code, recorder.Body.String())
-		}
-	}
-	deadline := time.Now().Add(time.Second)
-	for {
-		armCalls, disarmCalls := warmHook.calls()
-		if armCalls == 1 && disarmCalls == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("warm-hook calls: arm=%d disarm=%d", armCalls, disarmCalls)
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-func TestWarmHookDisarmRespondsWithoutWaiting(t *testing.T) {
-	api, _, _ := newTestAPI()
-	warmHook := &blockingWarmHook{started: make(chan struct{}), release: make(chan struct{})}
-	api.warmHook = warmHook
-	done := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodPost, warmHookPath, strings.NewReader(`{"armed":false}`))
-		api.ServeHTTP(recorder, request)
-		done <- recorder
-	}()
-
-	select {
-	case <-warmHook.started:
-	case <-time.After(time.Second):
-		t.Fatal("warm-hook disarm did not start")
-	}
-	select {
-	case recorder := <-done:
-		if recorder.Code != http.StatusOK {
-			t.Fatalf("code=%d response=%s", recorder.Code, recorder.Body.String())
-		}
-	case <-time.After(100 * time.Millisecond):
-		close(warmHook.release)
-		t.Fatal("warm-hook disarm blocked the HTTP response")
-	}
-	close(warmHook.release)
-}
-
-func TestWarmHookDisarmThenArmLeavesHookArmed(t *testing.T) {
-	api, _, _ := newTestAPI()
-	warmHook := &orderedWarmHook{
-		armed:          true,
-		disarmStarted:  make(chan struct{}),
-		disarmContinue: make(chan struct{}),
-		disarmDone:     make(chan struct{}),
-	}
-	api.warmHook = warmHook
-
-	recorder := httptest.NewRecorder()
-	disarmRequest := httptest.NewRequest(http.MethodPost, warmHookPath, strings.NewReader(`{"armed":false}`))
-	api.ServeHTTP(recorder, disarmRequest)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("disarm code=%d response=%s", recorder.Code, recorder.Body.String())
-	}
-	select {
-	case <-warmHook.disarmStarted:
-	case <-time.After(time.Second):
-		t.Fatal("warm-hook disarm did not start")
-	}
-
-	recorder = httptest.NewRecorder()
-	armRequest := httptest.NewRequest(http.MethodPost, warmHookPath, strings.NewReader(`{"armed":true}`))
-	api.ServeHTTP(recorder, armRequest)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("arm code=%d response=%s", recorder.Code, recorder.Body.String())
-	}
-	close(warmHook.disarmContinue)
-	select {
-	case <-warmHook.disarmDone:
-	case <-time.After(time.Second):
-		t.Fatal("warm-hook disarm cleanup did not finish")
-	}
-	if !warmHook.isArmed() {
-		t.Fatal("warm hook is disarmed after the last request armed it")
 	}
 }
 
@@ -324,7 +140,6 @@ func TestContractErrors(t *testing.T) {
 		{http.MethodGet, "/status", http.StatusNotFound, "/v1/status"},
 		{http.MethodGet, "/v2/status", http.StatusNotFound, "/v1/status"},
 		{http.MethodPost, "/v1/status", http.StatusMethodNotAllowed, "use GET"},
-		{http.MethodGet, warmHookPath, http.StatusMethodNotAllowed, "use POST"},
 		{http.MethodGet, "/v1/busy/codex?ttl=0", http.StatusBadRequest, "positive integer"},
 		{http.MethodGet, "/v1/busy/bad%2Fagent", http.StatusBadRequest, "agent"},
 		{http.MethodGet, "/v1/busy/codex?session=bad%00session", http.StatusBadRequest, "session"},
