@@ -474,6 +474,33 @@ source "$BOXA_DIR/lib/keep-awake-probe.sh"
 
 # --- Helper functions --------------------------------------------------------
 
+readonly BOXA_MKCERT_CA_MOUNT_PATH="/run/boxa/mkcert-rootCA.pem"
+readonly BOXA_MKCERT_CA_TRUST_PATH="/usr/local/share/ca-certificates/boxa-mkcert-rootCA.crt"
+
+# Print the host's public mkcert root CA path, or fail silently when HTTPS has
+# never been enabled. Discovery stays in lib/mkcert.sh so this lifecycle hook
+# follows the same binary/version/CAROOT rules as certificate provisioning.
+_boxa::mkcert_root_ca() {
+    local caroot root_ca
+    caroot="$(_mkcert::caroot)" || return 1
+    root_ca="$caroot/rootCA.pem"
+    [ -f "$root_ca" ] || return 1
+    printf '%s' "$root_ca"
+}
+
+# Add only the public root certificate to a new Container. The fixed file
+# mount deliberately excludes rootCA-key.pem and the rest of CAROOT.
+_boxa::append_mkcert_ca_args() {
+    local root_ca
+    root_ca="$(_boxa::mkcert_root_ca 2>/dev/null)" || return 0
+    DOCKER_ARGS+=(
+        -v "$root_ca:$BOXA_MKCERT_CA_MOUNT_PATH:ro"
+        -e "NODE_EXTRA_CA_CERTS=$BOXA_MKCERT_CA_TRUST_PATH"
+        -e "REQUESTS_CA_BUNDLE=$BOXA_MKCERT_CA_TRUST_PATH"
+        -e "SSL_CERT_FILE=$BOXA_MKCERT_CA_TRUST_PATH"
+    )
+}
+
 # Percent-encode a filesystem path for embedding in a URI path component.
 # RFC 3986 unreserved chars and `/` pass through; everything else is
 # %-encoded. Needed because host project paths can contain spaces or
@@ -3010,6 +3037,16 @@ restart_exited_container() {
     if ! docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$name" 2>/dev/null \
             | grep -qxF "$DNS_UPSTREAM_CONTAINER_FILE"; then
         echo "Recreating container to add the DNS upstream mount (ADR 0015)..."
+        _boxa::remove_container_after_oom_sweep "$name"
+        return 1
+    fi
+    # A Container created before HTTPS was enabled has no CA mount. Recreate
+    # it once the host has a public mkcert root so the entrypoint can install
+    # that CA and every inherited ecosystem trust variable is present.
+    if _boxa::mkcert_root_ca >/dev/null 2>&1 \
+            && ! docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$name" 2>/dev/null \
+                | grep -qxF "$BOXA_MKCERT_CA_MOUNT_PATH"; then
+        echo "Recreating container to add the mkcert root CA mount..."
         _boxa::remove_container_after_oom_sweep "$name"
         return 1
     fi
@@ -6081,6 +6118,8 @@ DOCKER_ARGS=(
     -e "BOXA_PROJECT_NAME=$BOXA_PROJECT_NAME"
     -e DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK=false
 )
+
+_boxa::append_mkcert_ca_args
 
 # Docker DNS upstream(s) for init-firewall.sh — bind-mounted read-only (not a
 # frozen -e env var) so `docker start` restarts re-read the current value.

@@ -18,6 +18,15 @@ if [ "$(id -u)" = "0" ]; then
     # rewrite them; copying to /etc/gitconfig sidesteps the bind mount.
     cp /home/node/.gitconfig-host /etc/gitconfig 2>/dev/null || true
 
+    # docker-run.sh mounts only mkcert's public root certificate. Install it
+    # into the system trust store on every start so CA rotation is picked up;
+    # HTTP-only hosts have no mount and take the silent no-op path.
+    if [ -f /run/boxa/mkcert-rootCA.pem ]; then
+        install -m 0644 /run/boxa/mkcert-rootCA.pem \
+            /usr/local/share/ca-certificates/boxa-mkcert-rootCA.crt
+        update-ca-certificates >/dev/null
+    fi
+
     # Volumes for IDE servers may be created as root on first mount.
     chown node:node /home/node/.cursor-server /home/node/.vscode-server 2>/dev/null || true
 
