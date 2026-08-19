@@ -177,7 +177,7 @@ fi
 _detect_host_network() {
     local host_ip primary_interface
 
-    read -r host_ip primary_interface < <(ip -4 route show default | awk '
+    IFS=' ' read -r host_ip primary_interface < <(ip -4 route show default | awk '
         NR == 1 {
             for (field = 1; field <= NF; field++) {
                 if ($field == "via") {

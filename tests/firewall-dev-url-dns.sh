@@ -95,11 +95,14 @@ chmod +x "$_TMPROOT/bin/ip"
 export TEST_ROUTE_MODE
 
 network_block="$_TMPROOT/init-firewall.network"
-awk '
-    /^_detect_host_network\(\) \{$/ { capture=1 }
-    capture { print }
-    capture && /^echo "Host network detected as:/ { exit }
-' "$init_script" > "$network_block"
+{
+    printf "IFS=\$'\\n\\t'\n"
+    awk '
+        /^_detect_host_network\(\) \{$/ { capture=1 }
+        capture { print }
+        capture && /^echo "Host network detected as:/ { exit }
+    ' "$init_script"
+} > "$network_block"
 
 TEST_ROUTE_MODE=
 network_output=$(bash "$network_block" 2>&1)
