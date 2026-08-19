@@ -20,7 +20,23 @@ source /usr/local/share/boxa/lib/allowlist.sh
 ACTION="${1:-}"
 DOMAINS="${2:-}"
 
-# 1. Regenerate runtime config from the bind-mounted allowlist file.
+_render_dev_url_dns() {
+    local config_file="$1" traefik_ip
+
+    traefik_ip=$(runuser -u dnsmasq -- \
+        dig +short +time=2 +tries=1 @127.0.0.11 boxa_traefik A 2>/dev/null \
+        | awk 'NR == 1 { print $1 }' || true)
+    sed -i -e '\|^address=/test/|d' \
+        -e '\|^address=/127\.0\.0\.1\.sslip\.io/|d' "$config_file"
+    if [[ "$traefik_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        printf 'address=/test/%s\naddress=/127.0.0.1.sslip.io/%s\n' \
+            "$traefik_ip" "$traefik_ip" >> "$config_file"
+    fi
+}
+
+# 1. Refresh dev URL DNS through the permanent dnsmasq-owner exception for
+# Docker embedded DNS, then regenerate runtime config from the allowlist file.
+_render_dev_url_dns /etc/dnsmasq.d/boxa-firewall.conf
 allowlist::render_dnsmasq "$ALLOWLIST_CONTAINER_FILE" "$DNSMASQ_RUNTIME_FILE"
 
 # 2. Restart dnsmasq. SIGTERM first; escalate to SIGKILL if it lingers.
