@@ -175,26 +175,39 @@ if [ "$ALLOWLIST_DOMAIN_COUNT" -eq 0 ]; then
 fi
 
 _detect_host_network() {
-    local primary_interface
+    local host_ip primary_interface
 
-    primary_interface=$(ip -4 route show default | awk '
+    read -r host_ip primary_interface < <(ip -4 route show default | awk '
         NR == 1 {
             for (field = 1; field <= NF; field++) {
+                if ($field == "via") {
+                    host_ip = $(field + 1)
+                }
                 if ($field == "dev") {
-                    print $(field + 1)
-                    exit
+                    primary_interface = $(field + 1)
                 }
             }
+            print host_ip, primary_interface
+            exit
         }
     ')
-    if [ -z "$primary_interface" ]; then
+    if [ -z "$host_ip" ] || [ -z "$primary_interface" ]; then
         return 1
     fi
 
-    ip -4 route show dev "$primary_interface" scope link | awk '
+    ip -4 route show dev "$primary_interface" scope link | awk -v host_ip="$host_ip" '
+        function ip_to_int(ip, octets) {
+            split(ip, octets, ".")
+            return (((octets[1] * 256 + octets[2]) * 256 + octets[3]) * 256 + octets[4])
+        }
+
         $1 ~ /^[0-9]+(\.[0-9]+){3}\/[0-9]+$/ {
-            print $1
-            exit
+            split($1, route, "/")
+            block_size = 2 ^ (32 - route[2])
+            if (int(ip_to_int(route[1]) / block_size) == int(ip_to_int(host_ip) / block_size)) {
+                print $1
+                exit
+            }
         }
     '
 }

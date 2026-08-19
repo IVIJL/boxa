@@ -82,6 +82,9 @@ if [ "$*" = "-4 route show default" ]; then
     fi
 elif [ "$*" = "-4 route show dev eth0 scope link" ]; then
     if [ "${TEST_ROUTE_MODE:-}" != "no-link" ]; then
+        if [ "${TEST_ROUTE_MODE:-}" = "foreign-onlink-first" ]; then
+            printf '169.254.169.254/32 proto kernel scope link src 172.18.1.9\n'
+        fi
         printf '172.18.0.0/16 proto kernel scope link src 172.18.1.9\n'
     fi
 else
@@ -103,6 +106,13 @@ network_output=$(bash "$network_block" 2>&1)
 network_status=$?
 assert_status "init accepts a scope-link subnet" 0 "$network_status"
 assert_eq "init uses the real scope-link prefix" \
+    'Host network detected as: 172.18.0.0/16' "$network_output"
+
+TEST_ROUTE_MODE=foreign-onlink-first
+network_output=$(bash "$network_block" 2>&1)
+network_status=$?
+assert_status "init skips an unrelated scope-link route" 0 "$network_status"
+assert_eq "init selects the scope-link prefix containing the gateway" \
     'Host network detected as: 172.18.0.0/16' "$network_output"
 
 TEST_ROUTE_MODE=no-default
