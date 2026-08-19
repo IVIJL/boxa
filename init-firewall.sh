@@ -174,14 +174,40 @@ if [ "$ALLOWLIST_DOMAIN_COUNT" -eq 0 ]; then
     echo "Firewall will block all outbound traffic except GitHub."
 fi
 
-# Get host IP from default route
-HOST_IP=$(ip route | grep default | cut -d" " -f3)
-if [ -z "$HOST_IP" ]; then
-    echo "ERROR: Failed to detect host IP"
+_detect_host_network() {
+    local primary_interface
+
+    primary_interface=$(ip -4 route show default | awk '
+        NR == 1 {
+            for (field = 1; field <= NF; field++) {
+                if ($field == "dev") {
+                    print $(field + 1)
+                    exit
+                }
+            }
+        }
+    ')
+    if [ -z "$primary_interface" ]; then
+        return 1
+    fi
+
+    ip -4 route show dev "$primary_interface" scope link | awk '
+        $1 ~ /^[0-9]+(\.[0-9]+){3}\/[0-9]+$/ {
+            print $1
+            exit
+        }
+    '
+}
+
+if ! HOST_NETWORK=$(_detect_host_network); then
+    echo "ERROR: Failed to detect host network"
+    exit 1
+fi
+if [ -z "$HOST_NETWORK" ]; then
+    echo "ERROR: Failed to detect host network"
     exit 1
 fi
 
-HOST_NETWORK=$(echo "$HOST_IP" | sed "s/\.[0-9]*$/.0\/24/")
 echo "Host network detected as: $HOST_NETWORK"
 
 # Set up remaining iptables rules
