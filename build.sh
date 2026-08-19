@@ -391,7 +391,10 @@ echo "=== Done ==="
 docker images "$IMAGE" --format "Image: {{.Repository}}:{{.Tag}}  Size: {{.Size}}  Created: {{.CreatedSince}}"
 echo ""
 echo "Build cache usage:"
-docker system df --format '{{.Type}}\t{{.Size}} total, {{.Reclaimable}} reclaimable' 2>/dev/null | grep -i "build" || true
+# `docker system df` sizes everything the daemon owns; on a large cache the
+# scan can block for a minute, so cap this purely informational line.
+timeout 5 docker system df --format '{{.Type}}\t{{.Size}} total, {{.Reclaimable}} reclaimable' 2>/dev/null | grep -i "build" \
+    || echo "  (skipped — docker system df did not answer in 5s)"
 
 # Heads-up about containers running the OLD image. Each one keeps its
 # pinned image ID until stopped & restarted, so the rebuild does not
