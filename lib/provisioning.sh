@@ -60,6 +60,7 @@ BOXA_PROVISIONING_STEPS=(
     "boxa-skill|scripts/ensure-boxa-skill.sh|A"
     "completions|scripts/ensure-completions.sh|A"
     "keep-awake|scripts/ensure-keep-awake.sh|B"
+    "ssh-gate|scripts/ensure-ssh-gate.sh|B"
     "mcp-onboarding|scripts/ensure-mcp-onboarding.sh|B"
     "claude-token|-|B"
     "https|-|B"
@@ -157,6 +158,14 @@ boxa::provisioning_probe() {
                 "$keep_awake_script" probe
             fi
             ;;
+        ssh-gate)
+            local ssh_gate_script="$BOXA_DIR/scripts/ensure-ssh-gate.sh"
+            if [ ! -x "$ssh_gate_script" ]; then
+                printf 'missing'
+            else
+                "$ssh_gate_script" probe
+            fi
+            ;;
         *)
             printf 'missing'; return 2 ;;
     esac
@@ -205,6 +214,9 @@ boxa::repair_elective() {
             ;;
         keep-awake)
             "$BOXA_DIR/scripts/ensure-keep-awake.sh" enable
+            ;;
+        ssh-gate)
+            "$BOXA_DIR/scripts/ensure-ssh-gate.sh" enable
             ;;
         claude-token)
             "$BOXA_DIR/docker-run.sh" claude-token
@@ -355,12 +367,10 @@ boxa::provisioning_has_step() {
 #                     every category-B step (no elective mutation). Backs `boxa
 #                     doctor`'s default behaviour with a single result reset, so
 #                     the A and B results coexist in one summary.
-#   fix [ids…]        Repair steps. With NO ids: repair all category-A steps
-#                     plus every category-B step whose probe is `missing` (a
-#                     declined elective is left alone — not silently
-#                     re-triggered). With ids: repair exactly those steps,
-#                     forcing category-B repair regardless of declined state
-#                     (the user named it explicitly). Unknown ids are rejected.
+#   fix [ids…]        Repair steps. With NO ids: repair all category-A and
+#                     category-B steps. With ids: repair exactly those steps.
+#                     `--fix` is the explicit consent that permits repairing a
+#                     previously declined elective. Unknown ids are rejected.
 #
 # Requires BOXA_DIR to point at the repo root (set by docker-run.sh).
 # Results are reported through the global arrays below, reset on each call:
@@ -455,14 +465,13 @@ boxa::run_provisioning() {
                 if [ "$category" = "A" ]; then
                     _boxa::run_step_a "$id" "$script"
                 elif [ "$category" = "B" ]; then
-                    # Bare `fix` only repairs electives that were never decided;
-                    # an explicit id forces the repair regardless of state.
-                    if ! $has_ids; then
-                        state="$(boxa::provisioning_probe "$id")"
-                        case "$state" in
-                            declined) BOXA_PROVISIONING_DECLINED+=("$id"); continue ;;
-                            ok)       BOXA_PROVISIONING_OK+=("$id"); continue ;;
-                        esac
+                    # Already-provisioned electives are no-ops. Missing and
+                    # declined states are both repaired: `doctor --fix` is the
+                    # explicit user choice ADR 0017 requires for mutation.
+                    state="$(boxa::provisioning_probe "$id")"
+                    if [ "$state" = ok ]; then
+                        BOXA_PROVISIONING_OK+=("$id")
+                        continue
                     fi
                     if boxa::repair_elective "$id"; then
                         # Verify the action actually resolved the elective before

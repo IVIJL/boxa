@@ -782,6 +782,35 @@ setup_mcp_onboarding() {
     fi
 }
 
+# --- SSH gate migration offer (ADR 0026) ------------------------------------
+
+setup_ssh_gate() {
+    info "Checking SSH agent forwarding choice..."
+
+    local hook="$BOXA_DIR/scripts/ensure-ssh-gate.sh"
+    if [ ! -x "$hook" ]; then
+        warn "scripts/ensure-ssh-gate.sh missing or non-executable; skipping."
+        SKIPPED+=("SSH gate offer (hook missing)")
+        return
+    fi
+
+    local hook_args=(offer)
+    if $AUTO_YES || [ ! -t 0 ] || [ ! -t 1 ]; then
+        hook_args+=(--non-interactive)
+    fi
+
+    if "$hook" "${hook_args[@]}"; then
+        case "$("$hook" probe)" in
+            ok)       CONFIGURED+=("SSH agent forwarding choice") ;;
+            declined) SKIPPED+=("SSH agent forwarding (declined)") ;;
+            *)        SKIPPED+=("SSH agent forwarding (not decided; run 'boxa ssh on --global' later)") ;;
+        esac
+    else
+        warn "SSH gate check failed — run 'boxa ssh on --global' manually later."
+        SKIPPED+=("SSH gate offer (check failed; see warnings above)")
+    fi
+}
+
 # Delegates to scripts/ensure-codex-delegate-seed.sh — the same hook the
 # `boxa update` self-heal chain calls. On a fresh interactive install it
 # offers to seed the default 'codex-delegate' catalog entry (trusted Codex
@@ -1659,6 +1688,9 @@ main() {
 
     echo ""
     setup_mcp_onboarding
+
+    echo ""
+    setup_ssh_gate
 
     echo ""
     setup_codex_delegate_seed

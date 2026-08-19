@@ -63,6 +63,22 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$tmp/scripts/ensure-keep-awake.sh"
+cat > "$tmp/scripts/ensure-ssh-gate.sh" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    probe)
+        if [ -f "$BOXA_DIR/_ssh_gate_state" ]; then
+            cat "$BOXA_DIR/_ssh_gate_state"
+        else
+            printf 'missing\n'
+        fi
+        ;;
+    enable)
+        printf 'ok\n' > "$BOXA_DIR/_ssh_gate_state"
+        ;;
+esac
+EOF
+chmod +x "$tmp/scripts/ensure-ssh-gate.sh"
 
 # shellcheck source=../lib/provisioning.sh disable=SC1091
 source "$REPO_DIR/lib/provisioning.sh"
@@ -73,8 +89,8 @@ check "field id"       "allow-for-host-state" "$(boxa::provisioning_field "$entr
 check "field script"   "scripts/ensure-allow-for-host-state.sh" "$(boxa::provisioning_field "$entry" script)"
 check "field category" "A" "$(boxa::provisioning_field "$entry" category)"
 
-# --- Registry: 9 category-A + 4 category-B + 5 category-C steps ---------------
-check "registry size" "18" "${#BOXA_PROVISIONING_STEPS[@]}"
+# --- Registry: 9 category-A + 5 category-B + 5 category-C steps ---------------
+check "registry size" "19" "${#BOXA_PROVISIONING_STEPS[@]}"
 
 # --- First run repairs the one stub that has work, rest already OK ------------
 boxa::run_provisioning repair-a >/dev/null
@@ -145,6 +161,15 @@ rm "$HOME/.config/boxa/claude-token"
 
 # Probe and repair: keep-awake uses the canonical ensure script for both paths.
 rm -f "$tmp/_keep_awake_state"
+
+# Probe and repair: SSH gate uses the canonical ensure script for both paths.
+rm -f "$tmp/_ssh_gate_state"
+check "probe ssh-gate missing" "missing" "$(boxa::provisioning_probe ssh-gate)"
+printf 'declined\n' > "$tmp/_ssh_gate_state"
+check "probe ssh-gate declined" "declined" "$(boxa::provisioning_probe ssh-gate)"
+boxa::run_provisioning fix ssh-gate >/dev/null
+check "fix ssh-gate reuses enable" "ssh-gate" "${BOXA_PROVISIONING_REPAIRED[*]}"
+check "fix ssh-gate reaches ok" "ok" "$(boxa::provisioning_probe ssh-gate)"
 check "probe keep-awake missing" "missing" "$(boxa::provisioning_probe keep-awake)"
 printf 'declined\n' > "$tmp/_keep_awake_state"
 check "probe keep-awake declined" "declined" "$(boxa::provisioning_probe keep-awake)"
@@ -173,12 +198,25 @@ if len(sys.argv) > 1 and sys.argv[1] == "onboarding-status":
         print('{ "shouldOffer": true, "profileExists": false, "seen": false }')
 PYEOF
 
-# report-electives: no mutation, classifies all four as missing in this fixture
+# Bare fix is explicit consent for declined electives too. Keep every other
+# elective already OK so this pass proves only ssh-gate is repaired.
+TEST_HTTPS_STATE=active
+printf 'x\n' > "$HOME/.config/boxa/claude-token"
+printf 'ok\n' > "$tmp/_keep_awake_state"
+printf 'declined\n' > "$tmp/_ssh_gate_state"
+touch "$tmp/_mcp_done"
+boxa::run_provisioning fix >/dev/null
+check "bare fix repairs declined ssh-gate" "ok" "$(boxa::provisioning_probe ssh-gate)"
+rm -f "$HOME/.config/boxa/claude-token" "$tmp/_keep_awake_state" \
+    "$tmp/_ssh_gate_state" "$tmp/_mcp_done"
+
+# report-electives: no mutation, classifies all five as missing in this fixture
 # (keep-awake unset; https unset; no token; MCP shouldOffer -> missing).
 # shellcheck disable=SC2034  # read by the sourced https.sh stub via subshell
 TEST_HTTPS_STATE=""
+rm -f "$tmp/_ssh_gate_state"
 boxa::run_provisioning report-electives >/dev/null
-check "report missing count" "4" "${#BOXA_PROVISIONING_MISSING[@]}"
+check "report missing count" "5" "${#BOXA_PROVISIONING_MISSING[@]}"
 
 # fix re-probes after the action (P2): an action that runs but does NOT resolve
 # the elective is reported as still-missing, never faked as repaired.

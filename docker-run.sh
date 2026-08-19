@@ -4157,6 +4157,12 @@ if [ "$MODE" = "update" ]; then
         "$BOXA_DIR/scripts/ensure-mcp-onboarding.sh" --quiet-if-noop || true
     fi
 
+    # SSH gate migration (ADR 0026) — one-time elective offer. A global gate
+    # choice or the separate dismissed marker suppresses later update prompts.
+    if [ -x "$BOXA_DIR/scripts/ensure-ssh-gate.sh" ]; then
+        "$BOXA_DIR/scripts/ensure-ssh-gate.sh" offer || true
+    fi
+
     # Codex-delegate seed (ADR 0021) — one-time offer to prepare the default
     # 'codex-delegate' catalog entry (the image already bakes the Codex CLI).
     # Same elective shape as MCP onboarding: its own applied/dismissed marker
