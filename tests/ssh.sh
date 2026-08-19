@@ -12,9 +12,12 @@ source "$BOXA_DIR/lib/resources.sh"
 source "$BOXA_DIR/lib/picker.sh"
 # shellcheck source-path=SCRIPTDIR source=../lib/ssh.sh disable=SC1091
 source "$BOXA_DIR/lib/ssh.sh"
+_BOXA_TEST_SSH_ENSURE_AGENT_DEF="$(declare -f _boxa::ssh_ensure_agent)"
 
 _TMPROOT="$(mktemp -d)"
 export BOXA_SSH_CONF="$_TMPROOT/ssh.conf"
+export BOXA_SSH_AGENT_ENV="$_TMPROOT/ssh-agent.env"
+export BOXA_KEYCHAIN_ENV="$_TMPROOT/missing-keychain-env"
 forwarding_block="$_TMPROOT/forwarding.sh"
 sed -n '/^# SSH agent forwarding:/,/^# Pass through API key/p' \
     "$BOXA_DIR/docker-run.sh" | sed '$d' > "$forwarding_block"
@@ -153,6 +156,10 @@ assert_eq "project on overrides global off" "on" "$(resolve_gate /work/app)"
 seed_conf "agent=on" "[relative/path]" "agent=off"
 assert_eq "invalid section is ignored" "on" "$(resolve_gate /work/app)"
 
+seed_conf "agent=off" "[/work/app" "agent=on" "[/work/app]" "agent=off"
+assert_eq "malformed section quarantines keys until a valid header" "off" \
+    "$(resolve_gate /work/other)"
+
 seed_conf "agent=on" "[/work/app]" "agent=maybe"
 assert_eq "invalid project value does not override global" "on" \
     "$(resolve_gate /work/app)"
@@ -267,6 +274,31 @@ assert_eq "missing agent keeps no-keys startup hint" \
 assert_contains "unavailable warning appears only with gate on" \
     "WARNING: SSH agent not available" "$SSH_WARNING"
 
+# --- Persisted agent fallback -----------------------------------------------
+
+printf '%s\n' \
+    "SSH_AUTH_SOCK=$agent_socket; export SSH_AUTH_SOCK;" \
+    "SSH_AGENT_PID=$agent_pid; export SSH_AGENT_PID;" > "$BOXA_SSH_AGENT_ENV"
+chmod 600 "$BOXA_SSH_AGENT_ENV"
+SSH_AUTH_SOCK="$_TMPROOT/missing.sock"
+export BOXA_TEST_SSH_ADD_RC=1
+_boxa::ssh_resolve_agent
+assert_eq "persisted live agent is restored after a dead environment socket" \
+    "$agent_socket" "$SSH_AUTH_SOCK"
+
+printf '%s\n' \
+    "SSH_AUTH_SOCK=$_TMPROOT/dead.sock; export SSH_AUTH_SOCK;" \
+    'SSH_AGENT_PID=999999; export SSH_AGENT_PID;' > "$BOXA_SSH_AGENT_ENV"
+SSH_AUTH_SOCK="$_TMPROOT/missing.sock"
+export BOXA_TEST_SSH_ADD_RC=2
+if _boxa::ssh_resolve_agent; then
+    printf 'FAIL  persisted dead agent socket is ignored\n'
+    fail_count=$((fail_count + 1))
+else
+    printf 'PASS  persisted dead agent socket is ignored\n'
+fi
+assert_eq "dead persisted socket is cleared" "" "${SSH_AUTH_SOCK:-}"
+
 # --- Scope guards -----------------------------------------------------------
 
 docker_text="$(cat "$BOXA_DIR/docker-run.sh")"
@@ -367,15 +399,86 @@ assert_eq "declined consent still offers a manual path" \
 
 ssh_picker_calls=0
 _boxa::ssh_add_keys() { ssh_picker_calls=$((ssh_picker_calls + 1)); }
+printf '%s\n' \
+    "SSH_AUTH_SOCK=$agent_socket; export SSH_AUTH_SOCK;" \
+    "SSH_AGENT_PID=$agent_pid; export SSH_AGENT_PID;" > "$BOXA_SSH_AGENT_ENV"
+chmod 600 "$BOXA_SSH_AGENT_ENV"
+SSH_AUTH_SOCK="$_TMPROOT/missing.sock"
 BOXA_TEST_SSH_ADD_RC=0
 _boxa::ssh_add_keys_if_agent_unready
-assert_eq "boxa ssh on skips picker for a keyed agent" "0" "$ssh_picker_calls"
+assert_eq "boxa ssh on restores persisted keyed agent and skips picker" \
+    "0" "$ssh_picker_calls"
 BOXA_TEST_SSH_ADD_RC=1
 _boxa::ssh_add_keys_if_agent_unready
 assert_eq "boxa ssh on opens picker for an empty agent" "1" "$ssh_picker_calls"
 BOXA_TEST_SSH_ADD_RC=2
 _boxa::ssh_add_keys_if_agent_unready
 assert_eq "boxa ssh on opens picker for a dead agent" "2" "$ssh_picker_calls"
+
+# A plain agent started by the picker must survive as discoverable state for a
+# later boxa process. These mocks keep the test deterministic and avoid a
+# second real agent process.
+eval "$_BOXA_TEST_SSH_ENSURE_AGENT_DEF"
+keychain() { return 1; }
+ssh-agent() {
+    printf '%s\n' \
+        "SSH_AUTH_SOCK=$agent_socket; export SSH_AUTH_SOCK;" \
+        "SSH_AGENT_PID=$agent_pid; export SSH_AGENT_PID;" \
+        "echo Agent pid $agent_pid;"
+}
+ssh-add() {
+    [ "${1:-}" = -l ] || return 0
+    [ "${SSH_AUTH_SOCK:-}" = "$agent_socket" ] && return 1
+    return 2
+}
+rm -f "$BOXA_SSH_AGENT_ENV"
+SSH_AUTH_SOCK="$_TMPROOT/missing.sock"
+_boxa::ssh_ensure_agent >/dev/null 2>&1
+assert_eq "picker persists newly started agent output" "present" \
+    "$([ -s "$BOXA_SSH_AGENT_ENV" ] && printf present || printf absent)"
+assert_eq "persisted agent env has mode 600" "600" \
+    "$(stat -c '%a' "$BOXA_SSH_AGENT_ENV" 2>/dev/null || printf missing)"
+SSH_AUTH_SOCK="$_TMPROOT/missing.sock"
+_boxa::ssh_resolve_agent
+assert_eq "later invocation restores picker-started agent" \
+    "$agent_socket" "$SSH_AUTH_SOCK"
+
+# --- Existing-container startup state --------------------------------------
+
+BOXA_TEST_CONTAINER_MOUNTED=1
+BOXA_TEST_CONTAINER_KEYS='256 SHA256:first work@example (ED25519)'
+docker() {
+    case "${1:-}:${2:-}" in
+        inspect:-f)
+            [ "$BOXA_TEST_CONTAINER_MOUNTED" = 1 ] \
+                && printf '%s\n' /tmp/ssh-agent.sock
+            ;;
+        exec:-u)
+            if [ -n "$BOXA_TEST_CONTAINER_KEYS" ]; then
+                printf '%s\n' "$BOXA_TEST_CONTAINER_KEYS"
+                return 0
+            fi
+            return 1
+            ;;
+        *) return 2 ;;
+    esac
+}
+assert_eq "existing mounted container reports forwarded keys" \
+    "SSH: forwarded (keys: work@example)" \
+    "$(_boxa::existing_container_ssh_status boxa-app)"
+BOXA_TEST_CONTAINER_KEYS=
+assert_eq "existing mounted container reports an empty agent" \
+    "SSH: forwarding on, but agent has no keys — run 'boxa ssh add'" \
+    "$(_boxa::existing_container_ssh_status boxa-app)"
+BOXA_TEST_CONTAINER_MOUNTED=0
+seed_conf 'agent=on'
+assert_eq "existing unmounted container reports reality despite current gate" \
+    "SSH: not forwarded (enable: boxa ssh on)" \
+    "$(_boxa::existing_container_ssh_status boxa-app)"
+
+assert_eq "every existing-container attach prints SSH state" "5" \
+    "$(sed -n '5925,6000p' "$BOXA_DIR/docker-run.sh" \
+        | grep -c '_boxa::print_existing_container_ssh_status')"
 
 # shellcheck disable=SC2016  # matching literal shell source
 assert_contains "CLI exposes standalone boxa ssh add" \

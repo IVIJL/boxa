@@ -27,9 +27,13 @@ _boxa::resolve_ssh_gate() {
         line="${line%"${line##*[![:space:]]}"}"
         [ -z "$line" ] && continue
 
-        if [[ "$line" == \[*\] ]]; then
-            value="${line:1:${#line}-2}"
-            if [[ "$value" == /* ]]; then
+        if [[ "$line" == \[* ]]; then
+            if [[ "$line" == \[*\] ]]; then
+                value="${line:1:${#line}-2}"
+            else
+                value=
+            fi
+            if [[ "$line" == \[*\] && "$value" == /* ]]; then
                 section="$value"
             else
                 section="INVALID"
@@ -121,8 +125,12 @@ _boxa::write_ssh_conf() {
         parsed="${parsed#"${parsed%%[![:space:]]*}"}"
         parsed="${parsed%"${parsed##*[![:space:]]}"}"
 
-        if [[ "$parsed" == \[*\] ]]; then
-            value="${parsed:1:${#parsed}-2}"
+        if [[ "$parsed" == \[* ]]; then
+            if [[ "$parsed" == \[*\] ]]; then
+                value="${parsed:1:${#parsed}-2}"
+            else
+                value=
+            fi
             if [ "$scope" = global ] && [ -z "$target_seen" ]; then
                 [ -z "$output_started" ] || printf '\n' >> "$temp"
                 printf 'agent = %s' "$agent_value" >> "$temp"
@@ -135,7 +143,7 @@ _boxa::write_ssh_conf() {
                 output_started=1
                 target_seen=1
             fi
-            if [[ "$value" == /* ]]; then
+            if [[ "$parsed" == \[*\] && "$value" == /* ]]; then
                 section="$value"
             else
                 section=INVALID
@@ -233,26 +241,125 @@ _boxa::ssh_agent_state() {
     esac
 }
 
+_boxa::ssh_agent_available() {
+    local status
+
+    [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ] || return 1
+    ssh-add -l >/dev/null 2>&1
+    status=$?
+    [ "$status" -le 1 ]
+}
+
+_boxa::ssh_source_agent_env() {
+    local env_file="$1"
+
+    [ -r "$env_file" ] || return 1
+    unset SSH_AUTH_SOCK SSH_AGENT_PID
+    # Both accepted files are generated shell assignments, never user config.
+    # shellcheck disable=SC1090
+    . "$env_file" >/dev/null 2>&1 || {
+        unset SSH_AUTH_SOCK SSH_AGENT_PID
+        return 1
+    }
+    export SSH_AUTH_SOCK SSH_AGENT_PID
+    if ! _boxa::ssh_agent_available; then
+        unset SSH_AUTH_SOCK SSH_AGENT_PID
+        return 1
+    fi
+}
+
+# Resolve an already-running agent without starting one: current environment,
+# keychain's saved state, then the plain agent last started by Boxa's picker.
+_boxa::ssh_resolve_agent() {
+    local keychain_env="${BOXA_KEYCHAIN_ENV:-$HOME/.keychain/$(hostname)-sh}"
+    local boxa_agent_env="${BOXA_SSH_AGENT_ENV:-$HOME/.config/boxa/ssh-agent.env}"
+
+    if _boxa::ssh_agent_available; then
+        return 0
+    fi
+    unset SSH_AUTH_SOCK SSH_AGENT_PID
+    _boxa::ssh_source_agent_env "$keychain_env" && return 0
+    _boxa::ssh_source_agent_env "$boxa_agent_env" && return 0
+    unset SSH_AUTH_SOCK SSH_AGENT_PID
+    return 1
+}
+
+_boxa::ssh_persist_agent_env() {
+    local agent_output="$1"
+    local env_file="${BOXA_SSH_AGENT_ENV:-$HOME/.config/boxa/ssh-agent.env}"
+    local env_dir temp
+
+    env_dir="${env_file%/*}"
+    [ "$env_dir" != "$env_file" ] || env_dir=.
+    mkdir -p "$env_dir" || return 1
+    temp="$(mktemp "${env_file}.tmp.XXXXXX")" || return 1
+    if ! printf '%s\n' "$agent_output" > "$temp" || ! chmod 600 "$temp" \
+            || ! mv "$temp" "$env_file"; then
+        rm -f "$temp"
+        return 1
+    fi
+}
+
 # Starting or reviving an agent is deliberately confined to the key picker.
 _boxa::ssh_ensure_agent() {
     local agent_output
 
-    [ "$(_boxa::ssh_agent_state)" != dead ] && return 0
+    _boxa::ssh_resolve_agent && return 0
 
     if command -v keychain >/dev/null 2>&1; then
         agent_output="$(keychain --eval --quiet --agents ssh)" || agent_output=
         [ -z "$agent_output" ] || eval "$agent_output"
     fi
-    if [ "$(_boxa::ssh_agent_state)" = dead ]; then
+    if ! _boxa::ssh_agent_available; then
         printf 'Starting SSH agent...\n' >&2
         agent_output="$(ssh-agent -s)" || return 1
         eval "$agent_output" >/dev/null
+        if ! _boxa::ssh_agent_available; then
+            printf 'Could not start an SSH agent.\n' >&2
+            return 1
+        fi
+        if ! _boxa::ssh_persist_agent_env "$agent_output"; then
+            printf 'Could not persist the SSH agent environment.\n' >&2
+            return 1
+        fi
     fi
 
-    if [ "$(_boxa::ssh_agent_state)" = dead ]; then
+    if ! _boxa::ssh_agent_available; then
         printf 'Could not start an SSH agent.\n' >&2
         return 1
     fi
+}
+
+# Report the frozen forwarding reality of an existing Container. The current
+# ssh.conf is intentionally irrelevant because mounts change only on recreate.
+_boxa::existing_container_ssh_status() {
+    local name="$1" key_list key_names
+
+    if ! docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' \
+            "$name" 2>/dev/null | grep -qxF /tmp/ssh-agent.sock; then
+        printf 'SSH: not forwarded (enable: boxa ssh on)\n'
+        return 0
+    fi
+
+    if key_list="$(docker exec -u node "$name" ssh-add -l 2>/dev/null)"; then
+        key_names="$(printf '%s\n' "$key_list" | awk '
+            {
+                $1 = ""
+                $2 = ""
+                sub(/^[[:space:]]+/, "")
+                sub(/[[:space:]]+\([^()]*\)$/, "")
+                names = names (names == "" ? "" : ", ") $0
+            }
+            END { print names }
+        ')"
+        printf 'SSH: forwarded (keys: %s)\n' "$key_names"
+    else
+        printf "SSH: forwarding on, but agent has no keys — run 'boxa ssh add'\n"
+    fi
+}
+
+_boxa::print_existing_container_ssh_status() {
+    _boxa::existing_container_ssh_status "$1"
 }
 
 _boxa::ssh_confirm_discovery() {
@@ -336,6 +443,7 @@ _boxa::ssh_add_keys() {
 }
 
 _boxa::ssh_add_keys_if_agent_unready() {
+    _boxa::ssh_resolve_agent || true
     [ "$(_boxa::ssh_agent_state)" = keys ] && return 0
     _boxa::ssh_add_keys
 }

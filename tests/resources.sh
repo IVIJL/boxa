@@ -220,6 +220,14 @@ seed_conf "memory=7g" "[relative/path]" "memory=9g"
 resolve_ok /work/project
 assert_eq "relative section is ignored, not global" "7516192768" "$_BOXA_MEMORY_BYTES"
 
+seed_conf "memory=7g" "[/work/project" "memory=9g" "[/work/project]" "memory=6g"
+resolve_ok /work/other
+assert_eq "malformed section quarantines keys from global scope" \
+    "7516192768" "$_BOXA_MEMORY_BYTES"
+resolve_ok /work/project
+assert_eq "valid section after malformed header resumes parsing" \
+    "6442450944" "$_BOXA_MEMORY_BYTES"
+
 # --- Structure-preserving config writer ------------------------------------
 
 expected_conf="$_TMPROOT/expected.conf"

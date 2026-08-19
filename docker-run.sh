@@ -5944,6 +5944,7 @@ if [ -d "${1:-.}" ]; then
         _boxa::converge_container_resources "$CONTAINER_NAME" "$PROJECT_PATH" \
             "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
         start_boxa_connections "$CONTAINER_NAME"
+        _boxa::print_existing_container_ssh_status "$CONTAINER_NAME"
         attach_to_container "$CONTAINER_NAME"
         # exec → script ends here
     fi
@@ -5954,6 +5955,7 @@ if [ -d "${1:-.}" ]; then
         bootstrap_dns
         if restart_exited_container "$CONTAINER_NAME" "$PROJECT_PATH" \
                 "$CLI_MEMORY" "$CLI_MEMORY_SWAP"; then
+            _boxa::print_existing_container_ssh_status "$CONTAINER_NAME"
             attach_to_container "$CONTAINER_NAME"
             # exec → script ends here
         fi
@@ -5969,12 +5971,14 @@ else
         _boxa::converge_container_resources "$CONTAINER_NAME" "" \
             "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
         start_boxa_connections "$CONTAINER_NAME"   # self-heal forwards (idempotent)
+        _boxa::print_existing_container_ssh_status "$CONTAINER_NAME"
         attach_to_container "$CONTAINER_NAME"
     elif docker ps -a --filter "name=^${CONTAINER_NAME}$" --filter "status=exited" --format '{{.ID}}' | grep -q .; then
         bootstrap_traefik
         bootstrap_dns
         if restart_exited_container "$CONTAINER_NAME" "" \
                 "$CLI_MEMORY" "$CLI_MEMORY_SWAP"; then
+            _boxa::print_existing_container_ssh_status "$CONTAINER_NAME"
             attach_to_container "$CONTAINER_NAME"
         else
             echo "Container $CONTAINER_NAME removed. Run again to create a new one." >&2
@@ -5992,6 +5996,7 @@ else
                 "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
             start_boxa_connections "$selected"   # self-heal forwards (idempotent)
         fi
+        _boxa::print_existing_container_ssh_status "$selected"
         attach_to_container "$selected"
     fi
 fi
@@ -6184,7 +6189,7 @@ _boxa::resolve_ssh_gate "$PROJECT_PATH"
 if [ "$_BOXA_SSH_GATE" = on ]; then
     ssh_agent_status=2
     ssh_key_list=""
-    if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+    if _boxa::ssh_resolve_agent; then
         if ssh_key_list="$(ssh-add -l 2>/dev/null)"; then
             ssh_agent_status=0
         else

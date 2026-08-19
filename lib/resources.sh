@@ -76,9 +76,13 @@ _boxa::load_resources_conf() {
         line="${line%"${line##*[![:space:]]}"}"
         [ -z "$line" ] && continue
 
-        if [[ "$line" == \[*\] ]]; then
-            value="${line:1:${#line}-2}"
-            if [[ "$value" == /* ]]; then
+        if [[ "$line" == \[* ]]; then
+            if [[ "$line" == \[*\] ]]; then
+                value="${line:1:${#line}-2}"
+            else
+                value=
+            fi
+            if [[ "$line" == \[*\] && "$value" == /* ]]; then
                 section="$value"
             else
                 section="INVALID"
@@ -154,10 +158,14 @@ _boxa::remove_conf_keys() {
         parsed="${parsed#"${parsed%%[![:space:]]*}"}"
         parsed="${parsed%"${parsed##*[![:space:]]}"}"
 
-        if [[ "$parsed" == \[*\] ]]; then
+        if [[ "$parsed" == \[* ]]; then
             [ -z "$in_target" ] || _boxa::flush_conf_target
-            value="${parsed:1:${#parsed}-2}"
-            if [[ "$value" == /* ]]; then
+            if [[ "$parsed" == \[*\] ]]; then
+                value="${parsed:1:${#parsed}-2}"
+            else
+                value=
+            fi
+            if [[ "$parsed" == \[*\] && "$value" == /* ]]; then
                 section="$value"
             else
                 section="INVALID"
@@ -415,7 +423,7 @@ _boxa::write_resources_conf() {
             parsed="${parsed#"${parsed%%[![:space:]]*}"}"
             parsed="${parsed%"${parsed##*[![:space:]]}"}"
 
-            if [[ "$parsed" == \[*\] ]]; then
+            if [[ "$parsed" == \[* ]]; then
                 if [ "$scope" = global ]; then
                     if [ -z "$memory_seen" ]; then
                         [ -n "$output_started" ] && printf '\n' >> "$temp"
@@ -443,8 +451,12 @@ _boxa::write_resources_conf() {
                     [ -z "$memory_swap_value" ] || swap_seen=1
                 fi
 
-                value="${parsed:1:${#parsed}-2}"
-                if [[ "$value" == /* ]]; then
+                if [[ "$parsed" == \[*\] ]]; then
+                    value="${parsed:1:${#parsed}-2}"
+                else
+                    value=
+                fi
+                if [[ "$parsed" == \[*\] && "$value" == /* ]]; then
                     section="$value"
                 else
                     section="INVALID"
