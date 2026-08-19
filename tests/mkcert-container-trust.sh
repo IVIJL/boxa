@@ -87,10 +87,10 @@ assert_contains "public root CA is mounted read-only" \
 assert_not_contains "private CA key is never mounted" "rootCA-key.pem" "$args_text"
 assert_contains "Node inherits the installed CA path" \
     "NODE_EXTRA_CA_CERTS=$BOXA_MKCERT_CA_TRUST_PATH" "$args_text"
-assert_contains "Python requests inherits the installed CA path" \
-    "REQUESTS_CA_BUNDLE=$BOXA_MKCERT_CA_TRUST_PATH" "$args_text"
-assert_contains "Python SSL inherits the installed CA path" \
-    "SSL_CERT_FILE=$BOXA_MKCERT_CA_TRUST_PATH" "$args_text"
+assert_contains "Python requests inherits the combined CA bundle" \
+    "REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt" "$args_text"
+assert_contains "Python SSL inherits the combined CA bundle" \
+    "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" "$args_text"
 
 entrypoint_text="$(cat "$BOXA_DIR/scripts/boxa-entrypoint.sh")"
 assert_contains "entrypoint copies the mounted public CA" \

@@ -496,8 +496,8 @@ _boxa::append_mkcert_ca_args() {
     DOCKER_ARGS+=(
         -v "$root_ca:$BOXA_MKCERT_CA_MOUNT_PATH:ro"
         -e "NODE_EXTRA_CA_CERTS=$BOXA_MKCERT_CA_TRUST_PATH"
-        -e "REQUESTS_CA_BUNDLE=$BOXA_MKCERT_CA_TRUST_PATH"
-        -e "SSL_CERT_FILE=$BOXA_MKCERT_CA_TRUST_PATH"
+        -e "REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
+        -e "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
     )
 }
 
