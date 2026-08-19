@@ -274,6 +274,24 @@ assert_eq "missing agent keeps no-keys startup hint" \
 assert_contains "unavailable warning appears only with gate on" \
     "WARNING: SSH agent not available" "$SSH_WARNING"
 
+keychain_read_marker="$_TMPROOT/keychain-read"
+export BOXA_KEYCHAIN_ENV="$_TMPROOT/keychain-env"
+printf '%s\n' \
+    "touch $keychain_read_marker" \
+    "SSH_AUTH_SOCK=$agent_socket; export SSH_AUTH_SOCK;" \
+    "SSH_AGENT_PID=$agent_pid; export SSH_AGENT_PID;" > "$BOXA_KEYCHAIN_ENV"
+rm -f "$BOXA_SSH_AGENT_ENV"
+run_forwarding /work/app ""
+assert_eq "container creation does not read keychain state" "absent" \
+    "$([ -e "$keychain_read_marker" ] && printf present || printf absent)"
+assert_not_contains "keychain-only agent is not mounted at container creation" \
+    "/tmp/ssh-agent.sock" "$DOCKER_ARGS_TEXT"
+assert_eq "keychain-only startup state reports no agent" \
+    "SSH: forwarding on, but agent has no keys — run 'boxa ssh add'" \
+    "$SSH_STATUS"
+rm -f "$BOXA_KEYCHAIN_ENV"
+export BOXA_KEYCHAIN_ENV="$_TMPROOT/missing-keychain-env"
+
 # --- Persisted agent fallback -----------------------------------------------
 
 printf '%s\n' \

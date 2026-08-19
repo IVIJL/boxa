@@ -268,17 +268,15 @@ _boxa::ssh_source_agent_env() {
     fi
 }
 
-# Resolve an already-running agent without starting one: current environment,
-# keychain's saved state, then the plain agent last started by Boxa's picker.
+# Passively resolve an already-running agent: current environment, then the
+# plain agent last started by Boxa's picker.
 _boxa::ssh_resolve_agent() {
-    local keychain_env="${BOXA_KEYCHAIN_ENV:-$HOME/.keychain/$(hostname)-sh}"
     local boxa_agent_env="${BOXA_SSH_AGENT_ENV:-$HOME/.config/boxa/ssh-agent.env}"
 
     if _boxa::ssh_agent_available; then
         return 0
     fi
     unset SSH_AUTH_SOCK SSH_AGENT_PID
-    _boxa::ssh_source_agent_env "$keychain_env" && return 0
     _boxa::ssh_source_agent_env "$boxa_agent_env" && return 0
     unset SSH_AUTH_SOCK SSH_AGENT_PID
     return 1
@@ -303,8 +301,10 @@ _boxa::ssh_persist_agent_env() {
 # Starting or reviving an agent is deliberately confined to the key picker.
 _boxa::ssh_ensure_agent() {
     local agent_output
+    local keychain_env="${BOXA_KEYCHAIN_ENV:-$HOME/.keychain/$(hostname)-sh}"
 
     _boxa::ssh_resolve_agent && return 0
+    _boxa::ssh_source_agent_env "$keychain_env" && return 0
 
     if command -v keychain >/dev/null 2>&1; then
         agent_output="$(keychain --eval --quiet --agents ssh)" || agent_output=
