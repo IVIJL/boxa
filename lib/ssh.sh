@@ -364,7 +364,7 @@ _boxa::print_existing_container_ssh_status() {
 
 _boxa::ssh_confirm_discovery() {
     local answer
-    printf 'Podívat se do ~/.ssh a nabídnout klíče k přidání? [y/N] ' >&2
+    printf 'Look into ~/.ssh and offer keys to add? [y/N] ' >&2
     IFS= read -r answer </dev/tty || answer=
     case "$answer" in
         [Yy]*) return 0 ;;
@@ -374,7 +374,7 @@ _boxa::ssh_confirm_discovery() {
 
 _boxa::ssh_read_manual_path() {
     local path
-    printf 'Cesta k privátnímu klíči: ' >&2
+    printf 'Path to private key: ' >&2
     IFS= read -r path </dev/tty || return 1
     [ -n "$path" ] || return 1
     case "$path" in
@@ -401,7 +401,7 @@ _boxa::ssh_add_key() {
 }
 
 _boxa::ssh_add_keys() {
-    local manual_option='Zadat cestu ke klíči ručně'
+    local manual_option='Enter a key path manually'
     local path comment label selected manual_path
     local i found
     local -a key_paths=() key_labels=()
@@ -418,7 +418,7 @@ _boxa::ssh_add_keys() {
     fi
 
     selected="$(printf '%s\n' ${key_labels[@]+"${key_labels[@]}"} \
-        | picker::many --prompt 'Vyberte klíče:' \
+        | picker::many --prompt 'Select keys:' \
             --first-option "$manual_option")" || return 1
     _boxa::ssh_ensure_agent || return 1
 

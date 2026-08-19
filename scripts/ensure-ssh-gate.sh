@@ -70,9 +70,9 @@ ssh_gate::offer() {
         return 0
     fi
 
-    printf '\nBoxa nově neforwarduje SSH agenta do kontejnerů automaticky.\n'
-    printf 'Forwardovaný socket dává kontejneru podpisovou pravomoc nad všemi klíči v agentu.\n'
-    printf 'Zapnout forwarding? [y/N] '
+    printf '\nBoxa no longer forwards your SSH agent into containers automatically.\n'
+    printf 'A forwarded socket grants a container signing authority over every key in the agent.\n'
+    printf 'Enable forwarding? [y/N] '
     read -r answer || answer=""
     case "$answer" in
         y|Y|yes|YES) ssh_gate::enable ;;

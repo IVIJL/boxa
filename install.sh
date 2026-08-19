@@ -1109,7 +1109,7 @@ hs.hotkey.bind({ "ctrl", "shift" }, "s", function()
   if out ~= "" then
     hs.eventtap.keyStrokes(out)
   else
-    hs.alert.show("boxa clip: žádný obrázek v clipboardu")
+    hs.alert.show("boxa clip: no image in clipboard")
   end
 end)
 $mark_end

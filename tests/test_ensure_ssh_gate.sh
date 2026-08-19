@@ -80,7 +80,7 @@ mkdir -p "${BOXA_SSH_CONF%/*}"
 printf '[/work/app]\nagent = on\n' > "$BOXA_SSH_CONF"
 project_output="$(printf 'n\n' | "$HOOK" offer --interactive)"
 check "project-only choice does not suppress prompt" "yes" \
-    "$([[ "$project_output" == *'Zapnout forwarding? [y/N]'* ]] && printf yes || printf no)"
+    "$([[ "$project_output" == *'Enable forwarding? [y/N]'* ]] && printf yes || printf no)"
 check "project-only decline writes marker" "present" \
     "$([ -f "$BOXA_SSH_GATE_MARKER" ] && printf present || printf absent)"
 

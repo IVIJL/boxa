@@ -3,10 +3,10 @@ local opt = vim.opt
 local exe = vim.fn.executable
 local uv = vim.uv or vim.loop
 
--- detekce prostředí
+-- environment detection
 local has_wayland = env.WAYLAND_DISPLAY and exe("wl-copy") == 1 and exe("wl-paste") == 1
 
--- X11: pokud DISPLAY je ve tvaru ":0" (unix socket), vyžaduj existenci X0 socketu
+-- X11: when DISPLAY looks like ":0" (unix socket), require the X0 socket to exist
 local function x11_socket_ok()
   local display = env.DISPLAY or ""
   if display:match("^:") then
@@ -19,7 +19,7 @@ local has_x11 = env.DISPLAY
   and (exe("xclip") == 1 or exe("xsel") == 1)
   and x11_socket_ok()
 
--- helper: paste s odstraněním CR
+-- helper: paste with CR stripped
 local function paste_clean(cmd)
   return function()
     local handle = io.popen(cmd)
