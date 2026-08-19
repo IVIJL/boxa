@@ -367,10 +367,10 @@ boxa::provisioning_has_step() {
 #                     every category-B step (no elective mutation). Backs `boxa
 #                     doctor`'s default behaviour with a single result reset, so
 #                     the A and B results coexist in one summary.
-#   fix [ids…]        Repair steps. With NO ids: repair all category-A and
-#                     category-B steps. With ids: repair exactly those steps.
-#                     `--fix` is the explicit consent that permits repairing a
-#                     previously declined elective. Unknown ids are rejected.
+#   fix [ids…]        Repair steps. With NO ids: repair all category-A steps and
+#                     missing category-B steps; declined electives require
+#                     naming the step explicitly. With ids: repair exactly
+#                     those steps. Unknown ids are rejected.
 #
 # Requires BOXA_DIR to point at the repo root (set by docker-run.sh).
 # Results are reported through the global arrays below, reset on each call:
@@ -465,12 +465,16 @@ boxa::run_provisioning() {
                 if [ "$category" = "A" ]; then
                     _boxa::run_step_a "$id" "$script"
                 elif [ "$category" = "B" ]; then
-                    # Already-provisioned electives are no-ops. Missing and
-                    # declined states are both repaired: `doctor --fix` is the
-                    # explicit user choice ADR 0017 requires for mutation.
+                    # Bare fix repairs missing electives, but preserves an
+                    # earlier decline. Naming the step explicitly is consent
+                    # to repair either state.
                     state="$(boxa::provisioning_probe "$id")"
                     if [ "$state" = ok ]; then
                         BOXA_PROVISIONING_OK+=("$id")
+                        continue
+                    fi
+                    if ! $has_ids && [ "$state" = declined ]; then
+                        BOXA_PROVISIONING_DECLINED+=("$id")
                         continue
                     fi
                     if boxa::repair_elective "$id"; then

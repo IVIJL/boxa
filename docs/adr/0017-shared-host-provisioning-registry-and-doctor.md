@@ -94,10 +94,13 @@ this is the repeatable repair path the system lacked.
   prerequisite** (with the exact command to fix each). It asks for **sudo only
   at the moment a step needs it**; run non-interactively without sudo, a
   sudo-requiring step degrades to a reported prerequisite rather than failing.
-- **`boxa doctor --fix`** — additionally repairs **Elective steps**.
+- **`boxa doctor --fix`** — additionally repairs **Elective steps** that were
+  never decided (missing). A previously declined elective is left untouched
+  because the decline records a user choice.
 - **`boxa doctor --fix <step> […]`** — repairs only the named step(s); the
-  step ids come from the registry, which is also what `doctor`'s report prints
-  back as ready-to-run commands.
+  explicit name permits repairing a previously declined elective. Step ids
+  come from the registry, which is also what `doctor`'s report prints back as
+  ready-to-run commands.
 
 There is deliberately **no read-only/`--check` mode**: anything Unconditional is
 immutable-and-mandatory, so the default already just fixes it. Reporting an

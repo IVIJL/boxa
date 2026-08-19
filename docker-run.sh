@@ -240,8 +240,8 @@ Usage: boxa doctor [--fix [step…]]
 
 Check host provisioning regardless of repository state. The default run
 silently repairs unconditional steps and reports skipped or declined elective
-steps. --fix repairs every elective step, or only the named step ids. Run plain
-boxa doctor to list the available ids. See ADR 0017.
+steps. Bare --fix repairs missing elective steps; declined electives must be
+named explicitly. Run plain boxa doctor to list the available ids. See ADR 0017.
 
 Examples:
   boxa doctor
@@ -4232,10 +4232,10 @@ if [ "$MODE" = "doctor" ]; then
     # Repeatable host-provisioning repair, independent of any repo change
     # (ADR 0017 § 3). Default: silently repair every unconditional (category-A)
     # step and REPORT every elective (category-B) step that is missing or was
-    # declined — never mutating an elective. `--fix` repairs electives too: all
-    # of them, or only the named step ids. Steps request sudo only at the moment
-    # they need it (the ensure-*.sh scripts use `sudo -n` internally), so there
-    # is no upfront prompt.
+    # declined — never mutating an elective. Bare `--fix` repairs missing
+    # electives; declined electives require naming the step explicitly. Steps
+    # request sudo only at the moment they need it (the ensure-*.sh scripts use
+    # `sudo -n` internally), so there is no upfront prompt.
     # shellcheck source=lib/provisioning.sh
     source "$BOXA_DIR/lib/provisioning.sh"
 
@@ -4314,7 +4314,13 @@ if [ "$MODE" = "doctor" ]; then
         fi
         if [ "${#BOXA_PROVISIONING_OK[@]}" -gt 0 ]; then
             echo "Already OK:"
-            for _step in "${BOXA_PROVISIONING_OK[@]}"; do echo "  - $_step"; done
+            for _step in "${BOXA_PROVISIONING_OK[@]}"; do
+                case "$_step" in
+                    ssh-gate)   echo "  - ssh-gate    (disable: boxa ssh off --global)" ;;
+                    keep-awake) echo "  - keep-awake    (disable: boxa keep-awake disable)" ;;
+                    *)          echo "  - $_step" ;;
+                esac
+            done
         fi
         if [ "${#BOXA_PROVISIONING_SKIPPED[@]}" -gt 0 ]; then
             echo "Skipped (no runnable script):"
@@ -4383,7 +4389,7 @@ if [ "$MODE" = "doctor" ]; then
             for _step in "${BOXA_PROVISIONING_MISSING[@]}"; do echo "  - $_step"; done
         fi
         if [ "${#BOXA_PROVISIONING_DECLINED[@]}" -gt 0 ]; then
-            echo "Left as declined (run 'boxa doctor --fix <step>' to re-offer):"
+            echo "Declined earlier — left untouched (enable explicitly with 'boxa doctor --fix <step>'):"
             for _step in "${BOXA_PROVISIONING_DECLINED[@]}"; do echo "  - $_step"; done
         fi
     else

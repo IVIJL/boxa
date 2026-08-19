@@ -198,15 +198,22 @@ if len(sys.argv) > 1 and sys.argv[1] == "onboarding-status":
         print('{ "shouldOffer": true, "profileExists": false, "seen": false }')
 PYEOF
 
-# Bare fix is explicit consent for declined electives too. Keep every other
-# elective already OK so this pass proves only ssh-gate is repaired.
+# Bare fix preserves a declined elective. Keep every other elective already OK
+# so this pass proves ssh-gate is classified as declined and left untouched.
 TEST_HTTPS_STATE=active
 printf 'x\n' > "$HOME/.config/boxa/claude-token"
 printf 'ok\n' > "$tmp/_keep_awake_state"
 printf 'declined\n' > "$tmp/_ssh_gate_state"
 touch "$tmp/_mcp_done"
 boxa::run_provisioning fix >/dev/null
-check "bare fix repairs declined ssh-gate" "ok" "$(boxa::provisioning_probe ssh-gate)"
+check "bare fix preserves declined ssh-gate" "declined" "$(boxa::provisioning_probe ssh-gate)"
+check "bare fix classifies declined ssh-gate" "ssh-gate" "${BOXA_PROVISIONING_DECLINED[*]}"
+
+# A never-decided elective is still repaired by bare fix.
+rm "$tmp/_ssh_gate_state"
+boxa::run_provisioning fix >/dev/null
+check "bare fix repairs missing ssh-gate" "ssh-gate" "${BOXA_PROVISIONING_REPAIRED[*]}"
+check "bare fix missing ssh-gate reaches ok" "ok" "$(boxa::provisioning_probe ssh-gate)"
 rm -f "$HOME/.config/boxa/claude-token" "$tmp/_keep_awake_state" \
     "$tmp/_ssh_gate_state" "$tmp/_mcp_done"
 
