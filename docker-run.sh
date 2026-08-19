@@ -377,6 +377,7 @@ EOF
 }
 
 SSH_WARNING=""
+SSH_STATUS=""
 BOXA_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 # Brand module — single source of truth for CLI_NAME and the values derived
@@ -419,6 +420,10 @@ source "$BOXA_DIR/lib/naming.sh"
 # Per-project Memory and Memory+swap limit resolution (ADR 0020).
 # shellcheck source=lib/resources.sh
 source "$BOXA_DIR/lib/resources.sh"
+
+# Per-project opt-in SSH agent forwarding gate (ADR 0026).
+# shellcheck source=lib/ssh.sh
+source "$BOXA_DIR/lib/ssh.sh"
 
 # Per-project Memory autopsy: cgroup live data, inspect post-mortem state,
 # project-aggregate RSS, OOM archives, and concrete recovery commands.
@@ -5849,43 +5854,6 @@ else
     fi
 fi
 
-# --- SSH agent setup (only when creating a new container) --------------------
-
-# SSH agent recovery - try to restore agent before giving up
-if [ -z "${SSH_AUTH_SOCK:-}" ]; then
-    # Try keychain's saved agent info
-    keychain_sh="$HOME/.keychain/$(hostname)-sh"
-    if [ -f "$keychain_sh" ]; then
-        # shellcheck disable=SC1090
-        . "$keychain_sh"
-    fi
-fi
-
-# Verify agent is alive (socket path set but socket is dead)
-if [ -n "${SSH_AUTH_SOCK:-}" ] && [ ! -S "$SSH_AUTH_SOCK" ]; then
-    unset SSH_AUTH_SOCK
-fi
-
-# If still no agent, try to start one via keychain
-if [ -z "${SSH_AUTH_SOCK:-}" ] && command -v keychain &>/dev/null; then
-    eval "$(keychain --eval --quiet --agents ssh)"
-fi
-
-# Final fallback: start plain ssh-agent
-if [ -z "${SSH_AUTH_SOCK:-}" ]; then
-    echo "Starting SSH agent..."
-    eval "$(ssh-agent -s)" > /dev/null
-    echo "  Add your keys with: ssh-add"
-fi
-
-# Try to load default keys (non-fatal — boxa works without SSH keys)
-if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
-    if ! ssh-add -l &>/dev/null; then
-        echo "SSH agent has no keys, trying to add default keys..."
-        ssh-add 2>/dev/null || echo "  No SSH keys found — SSH forwarding will have no keys. Add keys with: ssh-add"
-    fi
-fi
-
 # --- Bootstrap Traefik, DNS resolver & devproxy network ---------------------
 
 bootstrap_traefik
@@ -6068,15 +6036,47 @@ elif [ -f "$BOXA_SSH_CONFIG" ]; then
     DOCKER_ARGS+=(-v "$BOXA_SSH_CONFIG:/home/node/.ssh/config:ro")
 fi
 
-# SSH agent forwarding (private keys never enter the container)
-if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
-    DOCKER_ARGS+=(
-        -v "$SSH_AUTH_SOCK:/tmp/ssh-agent.sock"
-        -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock
-    )
+# SSH agent forwarding: the gate controls only the signing socket. The Boxa
+# SSH config mount above remains independent.
+_boxa::resolve_ssh_gate "$PROJECT_PATH"
+if [ "$_BOXA_SSH_GATE" = on ]; then
+    ssh_agent_status=2
+    ssh_key_list=""
+    if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+        if ssh_key_list="$(ssh-add -l 2>/dev/null)"; then
+            ssh_agent_status=0
+        else
+            ssh_agent_status=$?
+        fi
+    fi
+
+    if [ "$ssh_agent_status" -le 1 ]; then
+        DOCKER_ARGS+=(
+            -v "$SSH_AUTH_SOCK:/tmp/ssh-agent.sock"
+            -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock
+        )
+    else
+        SSH_WARNING="WARNING: SSH agent not available - SSH forwarding won't work inside boxa
+  Ensure an SSH agent is running, then restart boxa"
+    fi
+
+    if [ "$ssh_agent_status" -eq 0 ]; then
+        ssh_key_names="$(printf '%s\n' "$ssh_key_list" | awk '
+            {
+                $1 = ""
+                $2 = ""
+                sub(/^[[:space:]]+/, "")
+                sub(/[[:space:]]+\([^()]*\)$/, "")
+                names = names (names == "" ? "" : ", ") $0
+            }
+            END { print names }
+        ')"
+        SSH_STATUS="SSH: forwarded (keys: $ssh_key_names)"
+    else
+        SSH_STATUS="SSH: forwarding on, but agent has no keys — run 'boxa ssh add'"
+    fi
 else
-    SSH_WARNING="WARNING: SSH agent not available - SSH forwarding won't work inside boxa
-  Ensure keychain or ssh-agent is running, then restart boxa"
+    SSH_STATUS="SSH: not forwarded (enable: boxa ssh on)"
 fi
 
 # Pass through API key
@@ -6466,6 +6466,7 @@ fi
 if [ -n "$SSH_WARNING" ]; then
     echo "$SSH_WARNING"
 fi
+echo "$SSH_STATUS"
 
 # Auto-cleanup obsolete boxa-claude-bin volume (claude binaries now bind-mounted
 # from host ~/.local/share/claude). Safe: docker refuses removal if any container
