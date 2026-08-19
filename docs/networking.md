@@ -42,6 +42,8 @@ that lives in project `api`.
 
 Boxa containers already share the `devproxy` network, so a process running
 *directly* in box `web` can reach box `api` as `boxa-api:<port>` with no setup.
+This default box-to-box visibility and its trust boundary are recorded in
+[ADR 0027](adr/0027-box-to-box-visibility-and-in-container-dev-urls.md).
 The catch is **Docker-in-Docker**: the inner compose containers you actually run
 (see [Docker-in-Docker](docker-in-docker.md)) sit on their own nested network and
 are *not* on `devproxy`, so they cannot resolve `boxa-api`. `boxa connect`

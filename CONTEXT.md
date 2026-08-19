@@ -157,6 +157,14 @@ _Avoid_: chrome log, browser audit
 
 ### Connections
 
+**Box-to-box visibility**:
+The default direct reachability between outer **Containers** on the shared
+`devproxy` network. There is no firewall isolation between boxes and no
+**Connection** is needed: use `boxa-<name>:<port>` directly, or a dev URL via
+Traefik. Inner DinD containers are not on `devproxy`; they use a
+**Cross-boxa connection** instead. See ADR 0027.
+_Avoid_: implicit connection, box trust grant, isolated box network
+
 **Cross-boxa connection**:
 A managed TCP forward owned by a source **Container**, giving its
 processes and inner DinD containers a stable local address
@@ -443,6 +451,9 @@ serves dev URLs on the external domain instead, keeping the local
 preference sticky. Entered and healed solely by probing the actual
 resolution path, loudly announced on every Container start while
 active. `.test` keeps resolving inside **Containers** throughout.
+The in-box dnsmasq answers both dev URL suffixes with Traefik's IP, obtained
+through Docker embedded DNS at `127.0.0.11`; it does not query `boxa_dns`.
+See ADR 0024 and ADR 0027.
 _Avoid_: external-only mode, sslip mode, broken DNS, unsupported mode
 
 ### Memory

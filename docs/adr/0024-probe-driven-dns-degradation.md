@@ -48,8 +48,10 @@ the real resolution path told the truth.
    contradicts the "systemically impossible, use the external domain"
    message, adds a second publish port and drop-in dialect to
    self-heal, and rescues only a minority surface. `.test` inside
-   Containers is unaffected anyway (in-box dnsmasq reaches `boxa_dns`
-   over the devproxy network, no loopback involved).
+   Containers is unaffected anyway: in-box dnsmasq answers `.test` and
+   `.127.0.0.1.sslip.io` with Traefik's IP, resolved through Docker embedded
+   DNS at `127.0.0.11`; other queries fall through that resolver to the host's
+   upstream DNS. Neither path uses host loopback or `boxa_dns`.
 4. **Leave installed artifacts in place.** When an existing install
    degrades, NRPT and the resolved drop-in stay — dead but harmless,
    and removal/reinstall would cost a UAC round-trip in each

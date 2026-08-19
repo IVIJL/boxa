@@ -76,10 +76,10 @@ Boundaries:
     boxa mcp activate <entry> --project <path> --for claude
   (use '--for codex' for a Codex session; the codex-delegate entry is
   Claude-only. A new activation appears only in a NEW agent session.)
-- Dev URLs bypass the container and Agent-browser network gates via
-  built-in routes. Both forms resolve locally:
-  http(s)://<port>.${project}.test and
-  http(s)://<port>.${project}.127.0.0.1.sslip.io
+- Dev URLs (*.test and *.127.0.0.1.sslip.io) reach this and other live
+  boxes through Traefik, bypassing the container and Agent-browser gates.
+  Explicit :<port> forms do not work inside containers; use
+  localhost:<port> for this box or boxa-<name>:<port> for another box.
 
 For full guidance (SSH, agent-browser, ports, host/container bridging),
 invoke the 'boxa' skill.
