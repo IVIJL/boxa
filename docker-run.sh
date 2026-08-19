@@ -2661,7 +2661,7 @@ prepare_container_for_stop() {
         if [ -S "$XDG_RUNTIME_DIR/docker.sock" ] && docker info >/dev/null 2>&1; then
             inner=$(docker ps --format "{{.ID}} {{.Names}}" 2>/dev/null)
             if [ -n "$inner" ]; then
-                echo "Stopping inner containers..."
+                echo "Stopping inner Docker containers (up to 30s)..."
                 ids=()
                 while read -r cid cname; do
                     echo "  Stopping: $cname ($cid)"
@@ -2678,6 +2678,7 @@ prepare_container_for_stop() {
 graceful_stop_container() {
     local name="$1"
     prepare_container_for_stop "$name"
+    echo "Stopping container $name..."
     docker stop -t 15 "$name" > /dev/null 2>&1 || true
 }
 
@@ -2699,6 +2700,7 @@ stop_containers_batched() {
     for pid in "${prepare_pids[@]}"; do
         wait "$pid"
     done
+    echo "Stopping containers (up to 15s)..."
     for name in "${containers[@]}"; do
         docker stop -t 15 "$name" > /dev/null &
         stop_pids+=("$!")
@@ -2875,7 +2877,7 @@ warn_if_dns_broken() {
 # not tmpfs, so it persists). Returns 0 when ready, 1 (after printing the log)
 # when the container died during init.
 wait_for_boxa_ready() {
-    local name="$1" owner waited=0
+    local name="$1" owner waited=0 waiting_message_shown=false
     while [ "$waited" -lt 120 ]; do
         if [ "$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)" != "running" ]; then
             echo "" >&2
@@ -2889,6 +2891,10 @@ wait_for_boxa_ready() {
         fi
         owner=$(docker exec "$name" stat -c '%U' /proc/1 2>/dev/null || true)
         [ "$owner" = "node" ] && return 0
+        if [ "$waiting_message_shown" = false ]; then
+            echo "Waiting for container init (firewall, DNS setup)..."
+            waiting_message_shown=true
+        fi
         sleep 0.5
         waited=$((waited + 1))
     done
