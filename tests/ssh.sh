@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOXA_DIR="$SCRIPT_DIR/.."
 # shellcheck source-path=SCRIPTDIR source=../lib/resources.sh disable=SC1091
 source "$BOXA_DIR/lib/resources.sh"
+# shellcheck source-path=SCRIPTDIR source=../lib/picker.sh disable=SC1091
+source "$BOXA_DIR/lib/picker.sh"
 # shellcheck source-path=SCRIPTDIR source=../lib/ssh.sh disable=SC1091
 source "$BOXA_DIR/lib/ssh.sh"
 
@@ -92,8 +94,25 @@ resolve_gate() {
 }
 
 ssh-add() {
-    printf '%s\n' "${BOXA_TEST_SSH_ADD_OUTPUT:-}"
-    return "${BOXA_TEST_SSH_ADD_RC:-1}"
+    local input_state=unused mode=interactive
+    if [ "${1:-}" = -l ]; then
+        printf '%s\n' "${BOXA_TEST_SSH_ADD_OUTPUT:-}"
+        return "${BOXA_TEST_SSH_ADD_RC:-1}"
+    fi
+    if [ "${SSH_ASKPASS_REQUIRE:-}" = force ]; then
+        mode=noninteractive
+        if IFS= read -r _ssh_add_input; then
+            input_state=open
+        else
+            input_state=closed
+        fi
+        printf '%s:%s:%s\n' "$mode" "$input_state" "${2:-}" \
+            >> "${BOXA_TEST_SSH_ADD_LOG:?}"
+        return "${BOXA_TEST_SSH_ADD_NONINTERACTIVE_RC:-1}"
+    fi
+    printf '%s:%s:%s\n' "$mode" "$input_state" "${2:-}" \
+        >> "${BOXA_TEST_SSH_ADD_LOG:?}"
+    return "${BOXA_TEST_SSH_ADD_INTERACTIVE_RC:-0}"
 }
 
 run_forwarding() {
@@ -267,6 +286,104 @@ assert_contains "full host SSH config flag mount remains" \
     '$HOME/.ssh/config:/home/node/.ssh/config:ro' "$docker_text"
 assert_contains "CLI warns running Projects about required restart" \
     "takes effect after boxa stop && boxa" "$docker_text"
+
+# --- Key discovery ----------------------------------------------------------
+
+key_dir="$_TMPROOT/keys"
+mkdir -p "$key_dir/subdir"
+printf 'private bytes must remain unread by Boxa\n' > "$key_dir/id_work"
+chmod 000 "$key_dir/id_work"
+printf '%s\n' 'ssh-ed25519 AAAATEST work@example' > "$key_dir/id_work.pub"
+printf 'another private key\n' > "$key_dir/custom.pem"
+printf 'hidden private key\n' > "$key_dir/.hidden_key"
+printf 'host config\n' > "$key_dir/config"
+printf 'hosts\n' > "$key_dir/known_hosts.old"
+printf 'authorized\n' > "$key_dir/authorized_keys2"
+printf 'environment\n' > "$key_dir/environment"
+printf 'rc\n' > "$key_dir/rc"
+printf 'moduli\n' > "$key_dir/moduli"
+mkfifo "$key_dir/control.fifo"
+ln -s "$agent_socket" "$key_dir/agent.sock"
+
+discovered="$(_boxa::ssh_discover_keys "$key_dir")"
+assert_contains "discovery includes regular candidate" "$key_dir/id_work" "$discovered"
+assert_contains "discovery includes extension-agnostic candidate" \
+    "$key_dir/custom.pem" "$discovered"
+assert_contains "discovery includes hidden candidate" "$key_dir/.hidden_key" "$discovered"
+assert_not_contains "discovery excludes public companions" ".pub" "$discovered"
+assert_not_contains "discovery excludes config" "$key_dir/config" "$discovered"
+assert_not_contains "discovery excludes known_hosts variants" \
+    "$key_dir/known_hosts.old" "$discovered"
+assert_not_contains "discovery excludes authorized_keys variants" \
+    "$key_dir/authorized_keys2" "$discovered"
+assert_not_contains "discovery excludes directories" "$key_dir/subdir" "$discovered"
+assert_not_contains "discovery excludes non-regular socket entries" \
+    "$key_dir/agent.sock" "$discovered"
+assert_not_contains "discovery excludes non-regular fifos" \
+    "$key_dir/control.fifo" "$discovered"
+assert_eq "public companion comment is available for picker label" \
+    "work@example" "$(_boxa::ssh_public_comment "$key_dir/id_work")"
+
+# --- ssh-add behavioral passphrase detection -------------------------------
+
+export BOXA_TEST_SSH_ADD_LOG="$_TMPROOT/ssh-add.log"
+: > "$BOXA_TEST_SSH_ADD_LOG"
+export BOXA_TEST_SSH_ADD_NONINTERACTIVE_RC=0
+warning="$(_boxa::ssh_add_key "$key_dir/id_work" 2>&1 <<< 'must-not-be-read')"
+assert_eq "passphrase-less key gets only the non-interactive attempt" \
+    "noninteractive:closed:$key_dir/id_work" \
+    "$(cat "$BOXA_TEST_SSH_ADD_LOG")"
+assert_contains "passphrase-less warning explains forwarded agent power" \
+    "Any agent in any forwarded box can use it anywhere" "$warning"
+assert_contains "passphrase-less warning recommends ssh-keygen -p" \
+    "ssh-keygen -p" "$warning"
+
+: > "$BOXA_TEST_SSH_ADD_LOG"
+export BOXA_TEST_SSH_ADD_NONINTERACTIVE_RC=1
+export BOXA_TEST_SSH_ADD_INTERACTIVE_RC=0
+_boxa::ssh_add_key "$key_dir/id_work" <<< 'one-passphrase' >/dev/null
+assert_eq "protected key gets one closed attempt and one interactive attempt" \
+    $'noninteractive:closed:'"$key_dir/id_work"$'\ninteractive:unused:'"$key_dir/id_work" \
+    "$(cat "$BOXA_TEST_SSH_ADD_LOG")"
+
+# --- Consent/manual fallback and boxa ssh on handoff -----------------------
+
+discovery_marker="$_TMPROOT/discovery-called"
+_boxa::ssh_ensure_agent() { return 0; }
+_boxa::ssh_confirm_discovery() { return 1; }
+_boxa::ssh_discover_keys() { touch "$discovery_marker"; }
+_boxa::ssh_read_manual_path() { printf '%s\n' "$key_dir/id_work"; }
+export BOXA_PICKER_FZF=0
+export BOXA_PICKER_TEST_CHOICE=a
+export BOXA_TEST_SSH_ADD_NONINTERACTIVE_RC=0
+: > "$BOXA_TEST_SSH_ADD_LOG"
+# shellcheck disable=SC2218  # implementation is sourced above; a test stub follows
+_boxa::ssh_add_keys >/dev/null 2>&1
+assert_eq "declined consent never lists the SSH directory" "absent" \
+    "$([ -e "$discovery_marker" ] && printf present || printf absent)"
+assert_eq "declined consent still offers a manual path" \
+    "noninteractive:closed:$key_dir/id_work" \
+    "$(cat "$BOXA_TEST_SSH_ADD_LOG")"
+
+ssh_picker_calls=0
+_boxa::ssh_add_keys() { ssh_picker_calls=$((ssh_picker_calls + 1)); }
+BOXA_TEST_SSH_ADD_RC=0
+_boxa::ssh_add_keys_if_agent_unready
+assert_eq "boxa ssh on skips picker for a keyed agent" "0" "$ssh_picker_calls"
+BOXA_TEST_SSH_ADD_RC=1
+_boxa::ssh_add_keys_if_agent_unready
+assert_eq "boxa ssh on opens picker for an empty agent" "1" "$ssh_picker_calls"
+BOXA_TEST_SSH_ADD_RC=2
+_boxa::ssh_add_keys_if_agent_unready
+assert_eq "boxa ssh on opens picker for a dead agent" "2" "$ssh_picker_calls"
+
+# shellcheck disable=SC2016  # matching literal shell source
+assert_contains "CLI exposes standalone boxa ssh add" \
+    'if [ "$SSH_ACTION" = add ]' "$docker_text"
+assert_contains "bash completion exposes ssh add" \
+    'compgen -W "add on off"' "$(cat "$BOXA_DIR/completions/boxa.bash")"
+assert_contains "zsh completion exposes ssh add" \
+    "'add:Add keys to the host SSH agent'" "$(cat "$BOXA_DIR/completions/_boxa")"
 
 if [ "$fail_count" -gt 0 ]; then
     printf '\n%d test(s) failed.\n' "$fail_count"

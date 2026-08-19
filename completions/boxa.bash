@@ -72,7 +72,7 @@ _boxa() {
         ssh)
             if [ "$cword" -eq 2 ]; then
                 # shellcheck disable=SC2207
-                COMPREPLY=( $(compgen -W "on off" -- "$cur") )
+                COMPREPLY=( $(compgen -W "add on off" -- "$cur") )
             elif [ "${words[2]:-}" = on ] || [ "${words[2]:-}" = off ]; then
                 # shellcheck disable=SC2207
                 COMPREPLY=( $(compgen -W "--global $(_boxa_containers_bash)" -- "$cur") )

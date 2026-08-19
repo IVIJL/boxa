@@ -95,6 +95,7 @@ _boxa() {
                     if (( CURRENT == 3 )); then
                         local -a ssh_actions
                         ssh_actions=(
+                            'add:Add keys to the host SSH agent'
                             'on:Enable SSH agent forwarding'
                             'off:Disable SSH agent forwarding'
                         )

@@ -191,3 +191,151 @@ _boxa::ssh_status() {
     esac
     printf 'Config: %s\n' "$conf"
 }
+
+# Print private-key candidates without opening them. Shell pathname expansion
+# performs the directory read; the basename and file type are the only inputs
+# to discovery. Public-key companions are handled separately for labels.
+_boxa::ssh_discover_keys() {
+    local ssh_dir="${1:-$HOME/.ssh}"
+    local path name
+    local -a entries=("$ssh_dir"/* "$ssh_dir"/.[!.]* "$ssh_dir"/..?*)
+
+    [ -d "$ssh_dir" ] || return 0
+    for path in ${entries[@]+"${entries[@]}"}; do
+        [ -f "$path" ] || continue
+        name="${path##*/}"
+        case "$name" in
+            *.pub|config|known_hosts*|authorized_keys*|environment|rc|moduli)
+                continue
+                ;;
+        esac
+        printf '%s\n' "$path"
+    done
+}
+
+# The optional public-key comment is the only key-file content Boxa reads.
+_boxa::ssh_public_comment() {
+    local public_key="$1.pub"
+    local key_type key_data comment
+
+    [ -f "$public_key" ] || return 0
+    IFS=' ' read -r key_type key_data comment < "$public_key" || true
+    [ -n "${key_type:-}" ] && [ -n "${key_data:-}" ] || return 0
+    printf '%s\n' "${comment:-}"
+}
+
+_boxa::ssh_agent_state() {
+    ssh-add -l >/dev/null 2>&1
+    case $? in
+        0) printf 'keys\n' ;;
+        1) printf 'empty\n' ;;
+        *) printf 'dead\n' ;;
+    esac
+}
+
+# Starting or reviving an agent is deliberately confined to the key picker.
+_boxa::ssh_ensure_agent() {
+    local agent_output
+
+    [ "$(_boxa::ssh_agent_state)" != dead ] && return 0
+
+    if command -v keychain >/dev/null 2>&1; then
+        agent_output="$(keychain --eval --quiet --agents ssh)" || agent_output=
+        [ -z "$agent_output" ] || eval "$agent_output"
+    fi
+    if [ "$(_boxa::ssh_agent_state)" = dead ]; then
+        printf 'Starting SSH agent...\n' >&2
+        agent_output="$(ssh-agent -s)" || return 1
+        eval "$agent_output" >/dev/null
+    fi
+
+    if [ "$(_boxa::ssh_agent_state)" = dead ]; then
+        printf 'Could not start an SSH agent.\n' >&2
+        return 1
+    fi
+}
+
+_boxa::ssh_confirm_discovery() {
+    local answer
+    printf 'Podívat se do ~/.ssh a nabídnout klíče k přidání? [y/N] ' >&2
+    IFS= read -r answer </dev/tty || answer=
+    case "$answer" in
+        [Yy]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_boxa::ssh_read_manual_path() {
+    local path
+    printf 'Cesta k privátnímu klíči: ' >&2
+    IFS= read -r path </dev/tty || return 1
+    [ -n "$path" ] || return 1
+    case "$path" in
+        \~) path="$HOME" ;;
+        \~/*) path="$HOME/${path#\~/}" ;;
+    esac
+    printf '%s\n' "$path"
+}
+
+# Let ssh-add itself determine whether the key needs a passphrase. Boxa never
+# opens the private key: a forced failing askpass makes the first attempt
+# non-interactive, and only a failed attempt gets one interactive invocation.
+_boxa::ssh_add_key() {
+    local key_path="$1"
+
+    if SSH_ASKPASS=/bin/false SSH_ASKPASS_REQUIRE=force \
+            ssh-add -- "$key_path" </dev/null >/dev/null 2>&1; then
+        printf 'WARNING: %s has no passphrase. Any agent in any forwarded box can use it anywhere.\n' \
+            "$key_path" >&2
+        printf 'Protect it with: ssh-keygen -p -f %q\n' "$key_path" >&2
+        return 0
+    fi
+    ssh-add -- "$key_path"
+}
+
+_boxa::ssh_add_keys() {
+    local manual_option='Zadat cestu ke klíči ručně'
+    local path comment label selected manual_path
+    local i found
+    local -a key_paths=() key_labels=()
+
+    if _boxa::ssh_confirm_discovery; then
+        while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            comment="$(_boxa::ssh_public_comment "$path")"
+            label="$path"
+            [ -z "$comment" ] || label="$label — $comment"
+            key_paths+=("$path")
+            key_labels+=("$label")
+        done < <(_boxa::ssh_discover_keys "$HOME/.ssh")
+    fi
+
+    selected="$(printf '%s\n' ${key_labels[@]+"${key_labels[@]}"} \
+        | picker::many --prompt 'Vyberte klíče:' \
+            --first-option "$manual_option")" || return 1
+    _boxa::ssh_ensure_agent || return 1
+
+    while IFS= read -r label; do
+        [ -n "$label" ] || continue
+        if [ "$label" = "$manual_option" ]; then
+            manual_path="$(_boxa::ssh_read_manual_path)" || return 1
+            _boxa::ssh_add_key "$manual_path" || return 1
+            continue
+        fi
+
+        found=
+        for ((i = 0; i < ${#key_labels[@]}; i++)); do
+            if [ "$label" = "${key_labels[$i]}" ]; then
+                _boxa::ssh_add_key "${key_paths[$i]}" || return 1
+                found=1
+                break
+            fi
+        done
+        [ -n "$found" ] || return 1
+    done <<< "$selected"
+}
+
+_boxa::ssh_add_keys_if_agent_unready() {
+    [ "$(_boxa::ssh_agent_state)" = keys ] && return 0
+    _boxa::ssh_add_keys
+}

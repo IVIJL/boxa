@@ -41,6 +41,7 @@ Containers:
   boxa mem unset [project|path]  Remove durable per-project Memory limits
   boxa mem unset --global       Remove the durable global Memory limits
   boxa ssh                       Show SSH gate state for the current Project
+  boxa ssh add                   Interactively add keys to the host SSH agent
   boxa ssh on|off [project|path]
                                    Set the durable per-project SSH gate
   boxa ssh on|off --global       Set the durable global SSH gate
@@ -222,13 +223,15 @@ EOF
             cat <<'EOF'
 Usage:
   boxa ssh
+  boxa ssh add
   boxa ssh on|off [project|path]
   boxa ssh on|off --global
 
 Show the effective SSH agent forwarding gate for the current Project, its
-source, and the path to ~/.config/boxa/ssh.conf. `on` and `off` durably write
-the selected project or global scope. Project changes default to the current
-directory and take effect when the Container is next created.
+source, and the path to ~/.config/boxa/ssh.conf. `add` interactively adds keys
+to the host agent. `on` and `off` durably write the selected project or global
+scope. Project changes default to the current directory and take effect when
+the Container is next created.
 EOF
             ;;
         doctor)
@@ -3515,36 +3518,47 @@ case "${1:-}" in
              if [ -n "$SSH_ACTION" ]; then
                  case "$SSH_ACTION" in
                      on|off) shift ;;
+                     add)
+                         shift
+                         [ "$#" -eq 0 ] || {
+                             echo "Usage: boxa ssh add" >&2
+                             exit 1
+                         }
+                         ;;
                      *)
-                         echo "Usage: boxa ssh [on|off [project|path] [--global]]" >&2
+                         echo "Usage: boxa ssh [add|on|off [project|path] [--global]]" >&2
                          exit 1
                          ;;
                  esac
-                 while [ "$#" -gt 0 ]; do
-                     case "$1" in
-                         --global)
-                             SSH_GLOBAL=true
-                             ;;
-                         -* )
-                             echo "Unknown flag for ssh $SSH_ACTION: $1" >&2
-                             exit 1
-                             ;;
-                         *)
-                             if [ -n "$SSH_TARGET" ]; then
-                                 echo "Unexpected positional for ssh $SSH_ACTION: $1" >&2
+                 if [ "$SSH_ACTION" = add ]; then
+                     :
+                 else
+                     while [ "$#" -gt 0 ]; do
+                         case "$1" in
+                             --global)
+                                 SSH_GLOBAL=true
+                                 ;;
+                             -* )
+                                 echo "Unknown flag for ssh $SSH_ACTION: $1" >&2
                                  exit 1
-                             fi
-                             SSH_TARGET="$1"
-                             ;;
-                     esac
-                     shift
-                 done
-                 if [ "$SSH_GLOBAL" = true ] && [ -n "$SSH_TARGET" ]; then
-                     echo "boxa ssh $SSH_ACTION --global does not accept a project or path." >&2
-                     exit 1
+                                 ;;
+                             *)
+                                 if [ -n "$SSH_TARGET" ]; then
+                                     echo "Unexpected positional for ssh $SSH_ACTION: $1" >&2
+                                     exit 1
+                                 fi
+                                 SSH_TARGET="$1"
+                                 ;;
+                         esac
+                         shift
+                     done
+                     if [ "$SSH_GLOBAL" = true ] && [ -n "$SSH_TARGET" ]; then
+                         echo "boxa ssh $SSH_ACTION --global does not accept a project or path." >&2
+                         exit 1
+                     fi
                  fi
              elif [ "$#" -gt 0 ]; then
-                 echo "Usage: boxa ssh [on|off [project|path] [--global]]" >&2
+                 echo "Usage: boxa ssh [add|on|off [project|path] [--global]]" >&2
                  exit 1
              fi
              ;;
@@ -3926,13 +3940,18 @@ if [ "$MODE" = "mem-unset" ]; then
     exit 0
 fi
 
-# --- boxa ssh [on|off [project|path] [--global]] ---------------------------
+# --- boxa ssh [add|on|off [project|path] [--global]] -----------------------
 
 if [ "$MODE" = "ssh" ]; then
     if [ -z "$SSH_ACTION" ]; then
         _boxa::mem_resolve_target "" "$PWD" || exit 1
         _boxa::ssh_status "$_BOXA_MEM_PROJECT_PATH"
         exit 0
+    fi
+
+    if [ "$SSH_ACTION" = add ]; then
+        _boxa::ssh_add_keys
+        exit $?
     fi
 
     ssh_scope=project
@@ -3979,6 +3998,9 @@ if [ "$MODE" = "ssh" ]; then
     fi
     if [ -n "${ssh_restart_needed:-}" ]; then
         echo "WARNING: SSH forwarding change takes effect after boxa stop && boxa."
+    fi
+    if [ "$SSH_ACTION" = on ]; then
+        _boxa::ssh_add_keys_if_agent_unready || exit 1
     fi
     exit 0
 fi
