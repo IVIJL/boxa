@@ -43,7 +43,7 @@ _boxa() {
     # `prev` reserved for future use; reference it once to satisfy shellcheck.
     : "${prev:-}"
 
-    local top_commands="help ls mem stop remove port ports connect connections build update uninstall prune claude-token allow deny blocked allow-for agent-browser cursor code clip ssh-config sync-skills dns-install dns-status dns-uninstall"
+    local top_commands="help ls mem ssh stop remove port ports connect connections build update uninstall prune claude-token allow deny blocked allow-for agent-browser cursor code clip ssh-config sync-skills dns-install dns-status dns-uninstall"
 
     # Top-level subcommand
     if [ "$cword" -eq 1 ]; then
@@ -65,6 +65,15 @@ _boxa() {
                 # shellcheck disable=SC2207
                 COMPREPLY=( $(compgen -W "--global --swap $(_boxa_containers_bash)" -- "$cur") )
             elif [ "${words[2]:-}" = unset ]; then
+                # shellcheck disable=SC2207
+                COMPREPLY=( $(compgen -W "--global $(_boxa_containers_bash)" -- "$cur") )
+            fi
+            ;;
+        ssh)
+            if [ "$cword" -eq 2 ]; then
+                # shellcheck disable=SC2207
+                COMPREPLY=( $(compgen -W "on off" -- "$cur") )
+            elif [ "${words[2]:-}" = on ] || [ "${words[2]:-}" = off ]; then
                 # shellcheck disable=SC2207
                 COMPREPLY=( $(compgen -W "--global $(_boxa_containers_bash)" -- "$cur") )
             fi

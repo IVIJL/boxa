@@ -118,25 +118,30 @@ _boxa::load_resources_conf() {
     done < "$conf"
 }
 
-# Remove both Memory keys from one scope. A project section containing no
-# other content is removed with the keys; unrelated bytes pass through.
-_boxa::remove_resources_conf_keys() {
+# Remove selected keys from one scope. A project section containing no other
+# content is removed with the keys; unrelated bytes pass through.
+# Usage: _boxa::remove_conf_keys <global|project> <section> <conf> <temp> <key...>
+_boxa::remove_conf_keys() {
     local scope="$1" target_section="$2" conf="$3" temp="$4"
     local line parsed key value section="" output_started='' in_target=''
-    local target_has_content=''
+    local target_has_content='' remove_line='' remove_key
     local -a target_lines=()
+    shift 4
+    local -a keys=("$@")
 
-    _boxa::emit_resources_line() {
+    _BOXA_CONF_KEYS_REMOVED=
+
+    _boxa::emit_conf_line() {
         [ -z "$output_started" ] || printf '\n' >> "$temp"
         printf '%s' "$1" >> "$temp"
         output_started=1
     }
 
-    _boxa::flush_resources_target() {
+    _boxa::flush_conf_target() {
         local buffered
         if [ -n "$target_has_content" ]; then
             for buffered in "${target_lines[@]}"; do
-                _boxa::emit_resources_line "$buffered"
+                _boxa::emit_conf_line "$buffered"
             done
         fi
         target_lines=()
@@ -150,7 +155,7 @@ _boxa::remove_resources_conf_keys() {
         parsed="${parsed%"${parsed##*[![:space:]]}"}"
 
         if [[ "$parsed" == \[*\] ]]; then
-            [ -z "$in_target" ] || _boxa::flush_resources_target
+            [ -z "$in_target" ] || _boxa::flush_conf_target
             value="${parsed:1:${#parsed}-2}"
             if [[ "$value" == /* ]]; then
                 section="$value"
@@ -172,24 +177,29 @@ _boxa::remove_resources_conf_keys() {
         fi
         if { [ "$scope" = global ] && [ -z "$section" ]; } \
             || [ -n "$in_target" ]; then
-            case "$key" in
-                memory|memory_swap)
-                    _BOXA_RESOURCES_CONF_CHANGED=1
-                    continue
-                    ;;
-            esac
+            remove_line=
+            for remove_key in "${keys[@]}"; do
+                if [ "$key" = "$remove_key" ]; then
+                    remove_line=1
+                    break
+                fi
+            done
+            if [ -n "$remove_line" ]; then
+                _BOXA_CONF_KEYS_REMOVED=1
+                continue
+            fi
         fi
 
         if [ -n "$in_target" ]; then
             target_lines+=("$line")
             [ -z "${line//[[:space:]]/}" ] || target_has_content=1
         else
-            _boxa::emit_resources_line "$line"
+            _boxa::emit_conf_line "$line"
         fi
     done < "$conf"
-    [ -z "$in_target" ] || _boxa::flush_resources_target
+    [ -z "$in_target" ] || _boxa::flush_conf_target
 
-    unset -f _boxa::emit_resources_line _boxa::flush_resources_target
+    unset -f _boxa::emit_conf_line _boxa::flush_conf_target
 }
 
 # Reject a global change if any project that inherits a changed key would
@@ -347,7 +357,9 @@ _boxa::write_resources_conf() {
             && [ "$(tail -c 1 "$conf" | wc -l | tr -d ' ')" -gt 0 ]; then
             file_had_newline=1
         fi
-        _boxa::remove_resources_conf_keys "$scope" "$target_section" "$conf" "$temp"
+        _boxa::remove_conf_keys "$scope" "$target_section" "$conf" "$temp" \
+            memory memory_swap
+        _BOXA_RESOURCES_CONF_CHANGED="$_BOXA_CONF_KEYS_REMOVED"
         if [ -n "$file_had_newline" ] && [ -s "$temp" ]; then
             printf '\n' >> "$temp"
         fi

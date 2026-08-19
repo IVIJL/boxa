@@ -181,6 +181,32 @@ Container may signal. The exception is host-managed end to end: nothing
 inside the Container can create, widen, or remove it.
 _Avoid_: host-service, host relay, host hole, host forward
 
+### SSH
+
+**SSH gate**:
+The opt-in gate controlling whether the host's SSH agent socket is
+forwarded into a **Container**. Off by default; enabled globally or per
+**Project** (`boxa ssh on`, durable in `~/.config/boxa/ssh.conf`).
+Governs only the agent socket — the signing capability — not the
+**Boxa SSH config** mount. Takes effect at Container creation.
+_Avoid_: ssh forwarding flag, agent mount, ssh sharing
+
+**Boxa SSH config**:
+The user-curated host aliases file `~/.config/boxa/ssh_config`
+(`boxa ssh-config`), mounted read-only into every Container regardless
+of the **SSH gate**. Carries addresses and usernames only — never key
+material or signing capability.
+_Avoid_: ssh config mount, host ssh config (that is the `--ssh-config` flag)
+
+**Key picker**:
+The consent-first interactive flow in `boxa ssh on` / `boxa ssh add`
+that offers host keys for `ssh-add`: asks before listing `~/.ssh`,
+discovers candidates by filename only (never reading private key
+material), lets the user multi-select or type a path, and warns when a
+selected key turns out to be passphrase-less. The only way boxa ever
+causes a key to enter the agent.
+_Avoid_: key scanner, key importer, auto-add
+
 ### MCP
 
 **MCP server**:
@@ -548,6 +574,15 @@ _Avoid_: boxa check, boxa repair, boxa heal
   **Allowlist** admits domains via DNS resolution into the
   **Allowed-domains ipset**; a **Host connection** admits exactly one
   IP:port pair. Neither implies the other.
+- The **SSH gate** stands in the same row as the **Allowlist**, a **Host
+  connection**, and the **Agent-browser allowlist**: default-deny, host-owned,
+  never grantable from inside the **Container**. It admits a signing
+  capability, not traffic — reaching an SSH host still requires the
+  **Allowlist** (or a **Host connection**).
+- The **SSH gate** resolves per **Project**: a project section in
+  `ssh.conf` overrides the global choice; absent both, the gate is off.
+  Boxa never loads keys into the agent on its own — only the **Key
+  picker** (user-confirmed `ssh-add`) does.
 - A **Project** has one effective **MCP profile** at a time, formed only from
   its explicit **MCP activations**. The user-wide **MCP catalog** contributes
   available definitions, never implicit selections.

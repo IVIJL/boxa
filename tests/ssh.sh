@@ -6,6 +6,8 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOXA_DIR="$SCRIPT_DIR/.."
+# shellcheck source-path=SCRIPTDIR source=../lib/resources.sh disable=SC1091
+source "$BOXA_DIR/lib/resources.sh"
 # shellcheck source-path=SCRIPTDIR source=../lib/ssh.sh disable=SC1091
 source "$BOXA_DIR/lib/ssh.sh"
 
@@ -66,6 +68,16 @@ assert_not_contains() {
     fi
 }
 
+assert_file_eq() {
+    local label="$1" expected="$2" actual="$3"
+    if cmp -s "$expected" "$actual"; then
+        printf 'PASS  %s\n' "$label"
+    else
+        printf 'FAIL  %s\n' "$label"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
 seed_conf() {
     : > "$BOXA_SSH_CONF"
     local line
@@ -103,12 +115,17 @@ run_forwarding() {
 
 rm -f "$BOXA_SSH_CONF"
 assert_eq "missing config defaults off" "off" "$(resolve_gate /work/app)"
+assert_eq "missing config source is default" "default" "$_BOXA_SSH_SOURCE"
 
 seed_conf "agent = on"
 assert_eq "global on" "on" "$(resolve_gate /work/app)"
+_boxa::resolve_ssh_gate /work/app
+assert_eq "global source is reported" "global" "$_BOXA_SSH_SOURCE"
 
 seed_conf "agent=on" "[/work/app]" "agent = off"
 assert_eq "project off overrides global on" "off" "$(resolve_gate /work/app)"
+_boxa::resolve_ssh_gate /work/app
+assert_eq "project source is reported" "project" "$_BOXA_SSH_SOURCE"
 assert_eq "other project keeps global on" "on" "$(resolve_gate /work/other)"
 
 seed_conf "agent=off" "[/work/app]" "agent=on"
@@ -126,6 +143,59 @@ seed_conf "agent=\$(touch $marker)"
 resolve_gate /work/app >/dev/null
 assert_eq "config is never sourced" "absent" \
     "$([ -e "$marker" ] && printf present || printf absent)"
+
+status_output="$(_boxa::ssh_status /work/app)"
+assert_contains "status includes effective state" "SSH agent forwarding: off" \
+    "$status_output"
+assert_contains "status includes source" "Source: default (off)" "$status_output"
+assert_contains "status includes config path" "Config: $BOXA_SSH_CONF" "$status_output"
+
+# --- Structure-preserving config writer -----------------------------------
+
+expected_conf="$_TMPROOT/expected.conf"
+printf '%s' $'# global\nagent = off # replace\nunknown = untouched\n[/work/app]\nagent=off\nkeep = bytes' \
+    > "$BOXA_SSH_CONF"
+printf '%s' $'# global\nunknown = untouched\nagent = on\n[/work/app]\nagent=off\nkeep = bytes' \
+    > "$expected_conf"
+_boxa::write_ssh_conf global '' on
+assert_file_eq "global writer preserves foreign bytes and final-newline state" \
+    "$expected_conf" "$BOXA_SSH_CONF"
+_boxa::write_ssh_conf global '' on
+assert_file_eq "repeated global write is idempotent" "$expected_conf" "$BOXA_SSH_CONF"
+
+printf '%s\n' '# keep global' 'agent = on' '[/work/app]' 'agent = off' \
+    'foreign = preserve' '[/work/other]' 'agent = off' > "$BOXA_SSH_CONF"
+printf '%s\n' '# keep global' 'agent = on' '[/work/app]' \
+    'foreign = preserve' 'agent = on' '[/work/other]' 'agent = off' > "$expected_conf"
+_boxa::write_ssh_conf project /work/app on
+assert_file_eq "project writer replaces only target key and preserves foreign bytes" \
+    "$expected_conf" "$BOXA_SSH_CONF"
+_boxa::write_ssh_conf project /work/app on
+assert_file_eq "repeated project write does not duplicate section or key" \
+    "$expected_conf" "$BOXA_SSH_CONF"
+
+printf '%s\n' '# keep' '[/work/other]' 'agent = on' > "$BOXA_SSH_CONF"
+printf '%s\n' '# keep' '[/work/other]' 'agent = on' '[/work/new]' 'agent = off' \
+    > "$expected_conf"
+_boxa::write_ssh_conf project /work/new off
+assert_file_eq "project writer appends one missing section" \
+    "$expected_conf" "$BOXA_SSH_CONF"
+
+printf '%s\n' '[/work/app]' 'agent = on' 'agent = off' 'keep = yes' \
+    > "$BOXA_SSH_CONF"
+printf '%s\n' '[/work/app]' 'keep = yes' 'agent = on' > "$expected_conf"
+_boxa::write_ssh_conf project /work/app on
+assert_file_eq "writer collapses duplicate target keys" "$expected_conf" "$BOXA_SSH_CONF"
+
+cp "$BOXA_SSH_CONF" "$expected_conf"
+if _boxa::write_ssh_conf project '/work/C#' on 2>/dev/null; then
+    printf 'FAIL  writer rejects an unrepresentable project path\n'
+    fail_count=$((fail_count + 1))
+else
+    printf 'PASS  writer rejects an unrepresentable project path\n'
+fi
+assert_file_eq "rejected writer leaves config byte-identical" \
+    "$expected_conf" "$BOXA_SSH_CONF"
 
 # --- Conditional Docker arguments and startup state ------------------------
 
@@ -195,6 +265,8 @@ assert_contains "Boxa SSH config mount remains" \
 # shellcheck disable=SC2016
 assert_contains "full host SSH config flag mount remains" \
     '$HOME/.ssh/config:/home/node/.ssh/config:ro' "$docker_text"
+assert_contains "CLI warns running Projects about required restart" \
+    "takes effect after boxa stop && boxa" "$docker_text"
 
 if [ "$fail_count" -gt 0 ]; then
     printf '\n%d test(s) failed.\n' "$fail_count"

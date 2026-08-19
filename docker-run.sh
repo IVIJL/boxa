@@ -40,6 +40,10 @@ Containers:
   boxa mem set --global <size>   Set the durable global Memory limit
   boxa mem unset [project|path]  Remove durable per-project Memory limits
   boxa mem unset --global       Remove the durable global Memory limits
+  boxa ssh                       Show SSH gate state for the current Project
+  boxa ssh on|off [project|path]
+                                   Set the durable per-project SSH gate
+  boxa ssh on|off --global       Set the durable global SSH gate
   boxa stop [name] [--clean]     Stop one container (--clean removes volumes)
   boxa stop --all [--reason TOKEN]
                                    Stop every boxa Container without cleanup
@@ -214,6 +218,19 @@ Examples:
   boxa mem ~/projects/app
 EOF
             ;;
+        ssh)
+            cat <<'EOF'
+Usage:
+  boxa ssh
+  boxa ssh on|off [project|path]
+  boxa ssh on|off --global
+
+Show the effective SSH agent forwarding gate for the current Project, its
+source, and the path to ~/.config/boxa/ssh.conf. `on` and `off` durably write
+the selected project or global scope. Project changes default to the current
+directory and take effect when the Container is next created.
+EOF
+            ;;
         doctor)
             cat <<'EOF'
 Usage: boxa doctor [--fix [step…]]
@@ -370,7 +387,7 @@ EOF
     esac
 
     case "$command" in
-        agent-browser|mcp|allow-for|allow|mem|doctor|keep-awake|build|uninstall|ports|connect|dns-install|dns-status|dns-uninstall) ;;
+        agent-browser|mcp|allow-for|allow|mem|ssh|doctor|keep-awake|build|uninstall|ports|connect|dns-install|dns-status|dns-uninstall) ;;
         *) printf "\nRun 'boxa <command> --help' for details.\n" ;;
     esac
     exit 0
@@ -3491,6 +3508,46 @@ case "${1:-}" in
                  MEM_TARGET="${1:-}"
              fi
              ;;
+    ssh)     MODE="ssh";     shift
+             SSH_ACTION="${1:-}"
+             SSH_GLOBAL=false
+             SSH_TARGET=
+             if [ -n "$SSH_ACTION" ]; then
+                 case "$SSH_ACTION" in
+                     on|off) shift ;;
+                     *)
+                         echo "Usage: boxa ssh [on|off [project|path] [--global]]" >&2
+                         exit 1
+                         ;;
+                 esac
+                 while [ "$#" -gt 0 ]; do
+                     case "$1" in
+                         --global)
+                             SSH_GLOBAL=true
+                             ;;
+                         -* )
+                             echo "Unknown flag for ssh $SSH_ACTION: $1" >&2
+                             exit 1
+                             ;;
+                         *)
+                             if [ -n "$SSH_TARGET" ]; then
+                                 echo "Unexpected positional for ssh $SSH_ACTION: $1" >&2
+                                 exit 1
+                             fi
+                             SSH_TARGET="$1"
+                             ;;
+                     esac
+                     shift
+                 done
+                 if [ "$SSH_GLOBAL" = true ] && [ -n "$SSH_TARGET" ]; then
+                     echo "boxa ssh $SSH_ACTION --global does not accept a project or path." >&2
+                     exit 1
+                 fi
+             elif [ "$#" -gt 0 ]; then
+                 echo "Usage: boxa ssh [on|off [project|path] [--global]]" >&2
+                 exit 1
+             fi
+             ;;
     stop)    MODE="stop";    shift; PROJECT_FILTER=""
              # Parse flags and optional project name (any order).
              while [ "$#" -gt 0 ]; do
@@ -3865,6 +3922,63 @@ if [ "$MODE" = "mem-unset" ]; then
         echo "Global Memory limits removed."
     else
         echo "Memory limits removed for $mem_unset_path."
+    fi
+    exit 0
+fi
+
+# --- boxa ssh [on|off [project|path] [--global]] ---------------------------
+
+if [ "$MODE" = "ssh" ]; then
+    if [ -z "$SSH_ACTION" ]; then
+        _boxa::mem_resolve_target "" "$PWD" || exit 1
+        _boxa::ssh_status "$_BOXA_MEM_PROJECT_PATH"
+        exit 0
+    fi
+
+    ssh_scope=project
+    ssh_path=
+    ssh_container=
+    if [ "$SSH_GLOBAL" = true ]; then
+        ssh_scope=global
+    else
+        _boxa::mem_resolve_target "$SSH_TARGET" "$PWD" || exit 1
+        ssh_path="$_BOXA_MEM_PROJECT_PATH"
+        ssh_container="$_BOXA_MEM_CONTAINER"
+        if [ -z "$ssh_path" ]; then
+            ssh_path="$(_boxa::container_project_path "$ssh_container" 2>/dev/null || true)"
+        fi
+        if [[ "$ssh_path" != /* ]]; then
+            echo "Cannot determine the absolute host path for Project $_BOXA_MEM_PROJECT." >&2
+            echo "Pass an existing project path or start the Project once before changing its SSH gate by name." >&2
+            exit 1
+        fi
+    fi
+
+    _boxa::write_ssh_conf "$ssh_scope" "$ssh_path" "$SSH_ACTION" || exit 1
+    if [ "$ssh_scope" = global ]; then
+        echo "SSH agent forwarding set to $SSH_ACTION in the global ssh.conf scope."
+        ssh_running_containers="$(docker ps --filter 'name=^boxa-' \
+            --format '{{.Names}}' 2>/dev/null | filter_user_containers || true)"
+        while IFS= read -r ssh_running_container; do
+            [ -n "$ssh_running_container" ] || continue
+            ssh_running_path="$(_boxa::container_project_path \
+                "$ssh_running_container" 2>/dev/null || true)"
+            [ -n "$ssh_running_path" ] || continue
+            _boxa::resolve_ssh_gate "$ssh_running_path"
+            if [ "$_BOXA_SSH_SOURCE" = global ]; then
+                ssh_restart_needed=1
+                break
+            fi
+        done <<< "$ssh_running_containers"
+    else
+        echo "SSH agent forwarding set to $SSH_ACTION for $ssh_path."
+        if docker ps --filter "name=^${ssh_container}$" --format '{{.ID}}' \
+            2>/dev/null | grep -q .; then
+            ssh_restart_needed=1
+        fi
+    fi
+    if [ -n "${ssh_restart_needed:-}" ]; then
+        echo "WARNING: SSH forwarding change takes effect after boxa stop && boxa."
     fi
     exit 0
 fi

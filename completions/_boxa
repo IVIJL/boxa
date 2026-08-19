@@ -28,6 +28,7 @@ _boxa() {
                 'help:Show help message'
                 'ls:List running containers'
                 'mem:Show per-project memory diagnostics'
+                'ssh:Manage the SSH agent forwarding gate'
                 'stop:Stop container (--clean removes volumes)'
                 'remove:Remove project data (volumes)'
                 'port:Expose port via Traefik'
@@ -87,6 +88,21 @@ _boxa() {
                         local -a flags
                         flags=('--global:Remove limits from the global resources.conf scope')
                         _describe 'mem unset flags' flags
+                        _boxa_containers
+                    fi
+                    ;;
+                ssh)
+                    if (( CURRENT == 3 )); then
+                        local -a ssh_actions
+                        ssh_actions=(
+                            'on:Enable SSH agent forwarding'
+                            'off:Disable SSH agent forwarding'
+                        )
+                        _describe 'ssh actions' ssh_actions
+                    elif [[ $words[3] == on || $words[3] == off ]]; then
+                        local -a flags
+                        flags=('--global:Set the global ssh.conf scope')
+                        _describe 'ssh flags' flags
                         _boxa_containers
                     fi
                     ;;
