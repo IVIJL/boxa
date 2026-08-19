@@ -293,3 +293,5 @@ ask again until you explicitly run `boxa dns-install --enable-https`.
 - [Firewall](firewall.md) — outbound egress control; remember to `boxa allow`
   any external host your app needs to reach.
 - [Agent-browser](agent-browser.md) — dev URLs bypass the browser proxy.
+- [SSH](ssh.md) — reaching an SSH server needs network access and, separately,
+  an enabled SSH gate for host-agent signing.

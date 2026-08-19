@@ -11,8 +11,9 @@ editor that speaks `devcontainer.json` can attach to a running box.
 
 ## VS Code / Cursor
 
-Both attach the same way and forward your SSH agent automatically via the Dev
-Containers extension.
+Both attach through Dev Containers. For a Container created by Boxa, attaching
+does not add SSH access: the host agent socket is present only when the
+[SSH gate](ssh.md) was enabled at Container creation.
 
 ### This repository (boxa itself)
 
@@ -63,12 +64,11 @@ firewall, rootless Docker, and chezmoi.
 
 [Zed](https://zed.dev/) remote support is on the [roadmap](../ROADMAP.md): Zed
 would connect into a running container over SSH (Zed's remote-development mode),
-the same way Cursor / VS Code attach today via Dev Containers. The
-agent-forwarding and [SSH config](ssh.md) plumbing boxa already exposes is the
-foundation for it.
+the same way Cursor / VS Code attach today via Dev Containers. The opt-in
+[SSH gate and Boxa SSH config](ssh.md) plumbing are the foundation for it.
 
 ## See also
 
-- [SSH](ssh.md) — agent forwarding and host config, used by both attach flows.
+- [SSH](ssh.md) — SSH gate, Key picker, and Boxa SSH config.
 - [Docker-in-Docker](docker-in-docker.md) — why boxa builds locally rather than
   pulling a prebuilt image.

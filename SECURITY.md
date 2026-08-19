@@ -24,6 +24,7 @@ include, but are not limited to:
 - the HTTPS / mkcert trust-store handling;
 - the MCP credential isolation and broker;
 - the agent-browser proxy and its host-grant lifecycle;
+- the SSH gate and the signing authority exposed by a forwarded agent socket;
 - `install.sh` / `build.sh` and anything they execute with elevated privileges
   on the host.
 

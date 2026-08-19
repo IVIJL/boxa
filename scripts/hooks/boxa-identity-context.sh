@@ -34,8 +34,9 @@ You are inside a boxa container for project "$project".
 Boundaries:
 - The 'boxa' CLI lives on the host, not in this container. To start
   or stop containers, open allow-for windows, manage the allowlist,
-  create or remove Host connections, or drive the host Agent-browser
-  Chrome, ask the user to run the corresponding 'boxa …' command on host.
+  create or remove Host connections, change the SSH gate, or drive the
+  host Agent-browser Chrome, ask the user to run the corresponding
+  'boxa …' command on host.
 - Container network is default-deny. Only ~15 allowlisted domains
   resolve; everything else is REJECTed at the firewall. If
   curl/npm/pip/fetch (container-side traffic) fails with a connection
@@ -56,6 +57,15 @@ Boundaries:
   container firewall; 'boxa allow' / 'boxa allow-for' will NOT fix
   them. Ask the user to run on host instead:
     boxa agent-browser allow-for <minutes> ${project}
+- SSH agent forwarding is a SEPARATE, opt-in SSH gate. It is off by
+  default and can be changed only on the host. A forwarded socket grants
+  signing authority over every key in the host agent. If SSH signing is
+  unavailable, ask the user to run on host:
+    boxa ssh
+  Then follow its state: 'boxa ssh on' enables the current Project and
+  'boxa ssh add' opens the consent-first Key picker. Gate changes take
+  effect only when the Container is created; network access to the SSH
+  host remains a separate Allowlist or Host connection decision.
 - MCP servers are host-gated per Project. If an expected MCP tool
   (e.g. mcp__boxa-codex-delegate for Codex delegation) is missing from
   this session, the server is not exposed here. Ask the user to run on
@@ -66,11 +76,12 @@ Boundaries:
     boxa mcp activate <entry> --project <path> --for claude
   (use '--for codex' for a Codex session; the codex-delegate entry is
   Claude-only. A new activation appears only in a NEW agent session.)
-- Dev URLs bypass both gates via built-in routes. Both forms resolve
-  locally: http(s)://<port>.${project}.test and
+- Dev URLs bypass the container and Agent-browser network gates via
+  built-in routes. Both forms resolve locally:
+  http(s)://<port>.${project}.test and
   http(s)://<port>.${project}.127.0.0.1.sslip.io
 
-For full guidance (agent-browser, ports, host/container bridging),
+For full guidance (SSH, agent-browser, ports, host/container bridging),
 invoke the 'boxa' skill.
 EOF
 )

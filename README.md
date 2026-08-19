@@ -88,8 +88,9 @@ Each project gets its own container (`boxa-<project>`), Docker volume, and shell
 history, wired to a shared Traefik proxy and a local DNS resolver. On start the
 container brings up the default-deny firewall, the rootless Docker daemon, and
 your dotfiles — all from a privileged entrypoint, with no in-container `sudo`.
-Your project files are bind-mounted; your SSH **agent** is forwarded (never the
-keys). The full per-feature reference lives in [docs/](docs/).
+Your project files are bind-mounted; the opt-in **SSH gate** controls whether
+the host agent socket is forwarded. The full per-feature reference lives in
+[docs/](docs/).
 
 ## Editor support
 
@@ -110,7 +111,7 @@ Per-feature guides:
 - [Agent-browser](docs/agent-browser.md) — sessions, network windows, allowlist, artefacts, per-OS prerequisites.
 - [MCP servers](docs/mcp.md) — catalog, readiness, Project activation, execution identity, and diagnostics.
 - [Networking & port routing](docs/networking.md) — local `.test` DNS, sslip.io fallback, HTTPS via mkcert, cross-boxa `connect`.
-- [SSH](docs/ssh.md) — agent forwarding, boxa SSH config, WSL2 keychain.
+- [SSH](docs/ssh.md) — opt-in SSH gate, Key picker, Boxa SSH config, WSL2 keychain.
 - [Docker-in-Docker](docs/docker-in-docker.md) — rootless DinD, persistence, graceful shutdown.
 - [Memory limits](docs/memory.md) — per-project Memory limit and swap semantics, `resources.conf`, OOM archive, `boxa mem`, troubleshooting.
 - [Keep-awake](docs/keep-awake.md) — elective host daemon, autostart, lease API, and agent-hook example.
