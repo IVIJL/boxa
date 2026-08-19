@@ -26,13 +26,13 @@ EOF
 }
 
 ssh_gate::probe() {
-    # An explicit global on OR off is already a decision. An empty project
-    # path cannot match a valid section, so the shared parser reports only the
-    # global value here without duplicating ssh.conf parsing.
+    # Only explicit global on is active; global off records a decline decision.
+    # An empty project path cannot match a valid section, so the shared parser
+    # reports only the global value here without duplicating ssh.conf parsing.
     _boxa::resolve_ssh_gate ""
-    if [ "$_BOXA_SSH_SOURCE" = global ]; then
+    if [ "$_BOXA_SSH_SOURCE" = global ] && [ "$_BOXA_SSH_GATE" = on ]; then
         printf 'ok\n'
-    elif [ -f "$SSH_GATE_MARKER" ]; then
+    elif [ "$_BOXA_SSH_SOURCE" = global ] || [ -f "$SSH_GATE_MARKER" ]; then
         printf 'declined\n'
     else
         printf 'missing\n'

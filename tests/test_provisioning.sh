@@ -178,6 +178,32 @@ check "fix keep-awake reuses enable" "keep-awake" "${BOXA_PROVISIONING_REPAIRED[
 check "fix keep-awake reaches ok" "ok" "$(boxa::provisioning_probe keep-awake)"
 rm -f "$tmp/_keep_awake_state"
 
+# Doctor summary keeps elective disable guidance after repairing the step.
+doctor_cli_dir="$tmp/doctor-cli"
+mkdir -p "$doctor_cli_dir"
+cp "$REPO_DIR/docker-run.sh" "$doctor_cli_dir/docker-run.sh"
+cp -R "$REPO_DIR/lib" "$doctor_cli_dir/lib"
+cat > "$doctor_cli_dir/lib/provisioning.sh" <<'EOF'
+#!/usr/bin/env bash
+BOXA_PROVISIONING_STEPS=("ssh-gate|scripts/ensure-ssh-gate.sh|B")
+boxa::run_provisioning() {
+    BOXA_PROVISIONING_REPAIRED=("ssh-gate")
+    BOXA_PROVISIONING_OK=()
+    BOXA_PROVISIONING_SKIPPED=()
+    BOXA_PROVISIONING_PREREQ_MISSING=()
+    BOXA_PROVISIONING_MISSING=()
+    BOXA_PROVISIONING_DECLINED=()
+    BOXA_PROVISIONING_FAILED=()
+}
+boxa::prereq_remedy() { :; }
+EOF
+doctor_output="$(HOME="$tmp/doctor-home" \
+    bash "$doctor_cli_dir/docker-run.sh" doctor --fix ssh-gate 2>&1)"
+check "doctor repaired ssh-gate includes disable hint" \
+    "yes" \
+    "$([[ "$doctor_output" == *'  - ssh-gate    (disable: boxa ssh off --global)'* ]] \
+        && printf yes || printf no)"
+
 # Stub the MCP Python core so the mcp-onboarding probe is DETERMINISTIC,
 # independent of any ambient `mcp` package in site-packages: shouldOffer=true
 # (missing) until a marker file appears, then profileExists=true (ok). The

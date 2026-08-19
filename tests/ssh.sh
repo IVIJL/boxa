@@ -96,6 +96,7 @@ resolve_gate() {
     printf '%s\n' "$_BOXA_SSH_GATE"
 }
 
+# shellcheck disable=SC2317  # mock is called indirectly by sourced SSH helpers
 ssh-add() {
     local input_state=unused mode=interactive
     if [ "${1:-}" = -l ]; then
@@ -495,7 +496,7 @@ assert_eq "existing unmounted container reports reality despite current gate" \
     "$(_boxa::existing_container_ssh_status boxa-app)"
 
 assert_eq "every existing-container attach prints SSH state" "5" \
-    "$(sed -n '5925,6000p' "$BOXA_DIR/docker-run.sh" \
+    "$(sed -n '5925,6020p' "$BOXA_DIR/docker-run.sh" \
         | grep -c '_boxa::print_existing_container_ssh_status')"
 
 # shellcheck disable=SC2016  # matching literal shell source

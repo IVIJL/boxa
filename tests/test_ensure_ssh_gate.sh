@@ -66,13 +66,14 @@ off_before="$(cksum "$BOXA_SSH_CONF")"
 off_output="$(printf 'y\n' | "$HOOK" offer --interactive)"
 check "global off suppresses prompt" "" "$off_output"
 check "global off remains unchanged" "$off_before" "$(cksum "$BOXA_SSH_CONF")"
-check "global off probes ok" "ok" "$("$HOOK" probe)"
+check "global off probes declined" "declined" "$("$HOOK" probe)"
 
 printf 'agent = on\n' > "$BOXA_SSH_CONF"
 on_output="$(printf 'n\n' | "$HOOK" offer --interactive)"
 check "global on suppresses prompt" "" "$on_output"
 check "global on does not create marker" "absent" \
     "$([ -e "$BOXA_SSH_GATE_MARKER" ] && printf present || printf absent)"
+check "global on probes ok" "ok" "$("$HOOK" probe)"
 
 reset_state
 mkdir -p "${BOXA_SSH_CONF%/*}"

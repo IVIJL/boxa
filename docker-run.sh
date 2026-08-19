@@ -4305,21 +4305,27 @@ if [ "$MODE" = "doctor" ]; then
     # path heals and never removes or re-prompts for them while it is broken.
     _boxa::self_heal_resolver_drop_in
 
+    _doctor_print_step() {
+        case "$1" in
+            ssh-gate)   echo "  - ssh-gate    (disable: boxa ssh off --global)" ;;
+            keep-awake) echo "  - keep-awake    (disable: boxa keep-awake disable)" ;;
+            *)          echo "  - $1" ;;
+        esac
+    }
+
     _doctor_print_summary() {
         echo ""
         echo "=== boxa doctor summary ==="
         if [ "${#BOXA_PROVISIONING_REPAIRED[@]}" -gt 0 ]; then
             echo "Repaired:"
-            for _step in "${BOXA_PROVISIONING_REPAIRED[@]}"; do echo "  - $_step"; done
+            for _step in "${BOXA_PROVISIONING_REPAIRED[@]}"; do
+                _doctor_print_step "$_step"
+            done
         fi
         if [ "${#BOXA_PROVISIONING_OK[@]}" -gt 0 ]; then
             echo "Already OK:"
             for _step in "${BOXA_PROVISIONING_OK[@]}"; do
-                case "$_step" in
-                    ssh-gate)   echo "  - ssh-gate    (disable: boxa ssh off --global)" ;;
-                    keep-awake) echo "  - keep-awake    (disable: boxa keep-awake disable)" ;;
-                    *)          echo "  - $_step" ;;
-                esac
+                _doctor_print_step "$_step"
             done
         fi
         if [ "${#BOXA_PROVISIONING_SKIPPED[@]}" -gt 0 ]; then
