@@ -7,9 +7,9 @@ Run with:
 
 Two units under test:
 
-  * ``mcp.projects`` — the enumerator that intersects the boxa Project registry
-    with Claude project records by exact host path, carries the absolute host
-    path, and surfaces same-display-name ambiguity without dropping targets.
+  * ``mcp.projects`` — the enumerator that combines the boxa Project registry
+    with host-valid legacy volume targets, carries the absolute host path, and
+    surfaces same-display-name ambiguity without dropping targets.
   * ``mcp.apply`` scope override — applying a candidate to an explicit scope that
     overrides its inherited one, with scoped secrets following the chosen scope,
     plus the post-override slot-conflict guard. HOME / XDG_CONFIG_HOME point at a
@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
@@ -113,31 +114,44 @@ class EnumerateProjectTargetsTest(unittest.TestCase):
         os.makedirs(path)
         return path
 
-    def test_live_host_shape_offers_only_exact_registered_host_path(self):
-        host_project = self._project("home/vlcak/Projekty/easyjukebox_api")
-        claude = _StubClaude([
-            host_project,
-            "/workspace/easyjukebox-api",
-            os.path.join(self._tmp.name, "home", "vlcak"),
-        ])
+    def test_live_host_shape_unions_fresh_registry_and_legacy_projects(self):
+        fresh = [self._project(f"fresh/project-{index}") for index in range(2)]
+        legacy = [self._project(f"legacy/project-{index}") for index in range(8)]
+        twins = [f"/workspace/project-{index}" for index in range(4)]
+        home = os.path.expanduser("~")
+        claude = _StubClaude([*legacy, *twins, home])
         registry = {
-            host_project: {"name": "easyjukebox-api"},
+            path: {"name": f"fresh-{index}"}
+            for index, path in enumerate(fresh)
+        }
+        volumes = {
+            project_volume_name(sanitize_basename(os.path.basename(path)))
+            for path in [*legacy, home]
         }
 
-        result = enumerate_project_targets(claude, registry)
+        result = enumerate_project_targets(claude, registry, _StubProbe(volumes))
 
+        self.assertEqual(len(result.targets), 10)
         self.assertEqual(
-            [(target.name, target.project_key) for target in result.targets],
-            [("easyjukebox-api", host_project)],
+            {target.project_key for target in result.targets}, set(fresh + legacy)
+        )
+        self.assertNotIn(home, {target.project_key for target in result.targets})
+        self.assertTrue(
+            set(twins).isdisjoint(
+                target.project_key for target in result.targets
+            )
         )
         self.assertEqual(result.collisions, [])
         self.assertEqual(result.missing_claude_records, [])
+        self.assertEqual(result.excluded_home, [home])
 
     def test_same_display_name_keeps_both_paths_and_reports_ambiguity(self):
         paths = [self._project("work/a/api"), self._project("work/b/api")]
         registry = {path: {"name": "api"} for path in paths}
 
-        result = enumerate_project_targets(_StubClaude(paths), registry)
+        result = enumerate_project_targets(
+            _StubClaude(paths), registry, _StubProbe([])
+        )
 
         self.assertEqual(
             [target.project_key for target in result.targets], paths
@@ -146,19 +160,129 @@ class EnumerateProjectTargetsTest(unittest.TestCase):
         self.assertEqual(result.collisions[0].name, "api")
         self.assertEqual(result.collisions[0].project_keys, paths)
 
-    def test_registered_path_without_exact_claude_record_is_diagnostic(self):
-        project = self._project("work/app")
-        registry = {project: {"name": "app"}}
-        result = enumerate_project_targets(_StubClaude([project + "/"]), registry)
+    def test_legacy_same_name_paths_are_kept_and_reported_as_a_collision(self):
+        paths = [self._project("legacy/a/api"), self._project("legacy/b/api")]
+
+        result = enumerate_project_targets(
+            _StubClaude(paths), {}, _StubProbe(["boxa-api-history"])
+        )
+
+        self.assertEqual(
+            [target.project_key for target in result.targets], paths
+        )
+        self.assertEqual(result.collisions[0].project_keys, paths)
+
+    def test_registry_display_name_wins_for_a_shared_path(self):
+        project = self._project("legacy/raw_name")
+
+        result = enumerate_project_targets(
+            _StubClaude([project]),
+            {project: {"name": "Registry Name"}},
+            _StubProbe(["boxa-raw-name-history"]),
+        )
+
+        self.assertEqual(result.targets[0].name, "Registry Name")
+
+    def test_trailing_slash_home_alias_is_excluded(self):
+        home = self._project("home")
+        alias = home + "/"
+
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            result = enumerate_project_targets(
+                _StubClaude([alias]), {}, _StubProbe([])
+            )
 
         self.assertEqual(result.targets, [])
-        self.assertEqual(result.missing_claude_records, [project])
+        self.assertEqual(result.excluded_home, [alias])
+
+    def test_symlink_home_alias_is_excluded(self):
+        home = self._project("home")
+        alias = os.path.join(self._tmp.name, "home-alias")
+        os.symlink(home, alias, target_is_directory=True)
+
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            result = enumerate_project_targets(
+                _StubClaude([alias]), {}, _StubProbe([])
+            )
+
+        self.assertEqual(result.targets, [])
+        self.assertEqual(result.excluded_home, [alias])
+
+    def test_nonexistent_home_prefixed_path_is_stale_not_excluded_home(self):
+        home = self._project("home")
+        key = os.path.join(home, "missing", "..")
+
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            result = enumerate_project_targets(
+                _StubClaude([key]), {}, _StubProbe([])
+            )
+
+        self.assertEqual(result.targets, [])
+        self.assertEqual(result.stale_projects, [key])
+        self.assertEqual(result.excluded_home, [])
+
+    def test_registry_key_wins_when_claude_key_is_a_symlink_alias(self):
+        registry_key = self._project("work/app")
+        claude_key = os.path.join(self._tmp.name, "alias", "app")
+        os.makedirs(os.path.dirname(claude_key))
+        os.symlink(registry_key, claude_key, target_is_directory=True)
+        probe = _StubProbe(["boxa-app-history"])
+
+        result = enumerate_project_targets(
+            _StubClaude([claude_key]),
+            {registry_key: {"name": "Registry Name"}},
+            probe,
+        )
+
+        self.assertEqual(
+            [(target.name, target.project_key) for target in result.targets],
+            [("Registry Name", registry_key)],
+        )
+        self.assertEqual(probe.queried, [])
+
+    def test_literal_environment_variable_path_segment_is_not_expanded(self):
+        literal_key = self._project("home/$USER/proj")
+        expanded_key = self._project("home/actualuser/proj")
+
+        with mock.patch.dict(os.environ, {"USER": "actualuser"}):
+            for registry_key, claude_key in (
+                (literal_key, expanded_key),
+                (expanded_key, literal_key),
+            ):
+                with self.subTest(
+                    registry_key=registry_key, claude_key=claude_key
+                ):
+                    result = enumerate_project_targets(
+                        _StubClaude([claude_key]),
+                        {registry_key: {"name": "Registry Project"}},
+                        _StubProbe(["boxa-proj-history"]),
+                    )
+
+                    self.assertEqual(
+                        {target.project_key for target in result.targets},
+                        {literal_key, expanded_key},
+                    )
+
+    def test_registered_path_without_claude_record_is_offered(self):
+        project = self._project("work/app")
+        registry = {project: {"name": "app"}}
+        result = enumerate_project_targets(
+            _StubClaude([]), registry, _StubProbe([])
+        )
+
+        self.assertEqual(
+            [(target.name, target.project_key) for target in result.targets],
+            [("app", project)],
+        )
+        self.assertEqual(result.missing_claude_records, [])
 
     def test_stale_registered_path_is_diagnostic(self):
         project = os.path.join(self._tmp.name, "deleted")
         registry = {project: {"name": "deleted"}}
 
-        result = enumerate_project_targets(_StubClaude([project]), registry)
+        result = enumerate_project_targets(
+            _StubClaude([project]), registry, _StubProbe([])
+        )
 
         self.assertEqual(result.targets, [])
         self.assertEqual(result.stale_projects, [project])
@@ -167,7 +291,9 @@ class EnumerateProjectTargetsTest(unittest.TestCase):
         project = self._project("unsafe\tproject")
         registry = {project: {"name": "unsafe"}}
 
-        result = enumerate_project_targets(_StubClaude([project]), registry)
+        result = enumerate_project_targets(
+            _StubClaude([project]), registry, _StubProbe([])
+        )
 
         self.assertEqual(result.targets, [])
         self.assertEqual(result.unsafe_project_keys, [project])
@@ -179,7 +305,7 @@ class EnumerateProjectTargetsTest(unittest.TestCase):
             "/work/no-name": {},
         }
         result = enumerate_project_targets(
-            _StubClaude(list(registry)), registry
+            _StubClaude(list(registry)), registry, _StubProbe([])
         )
         self.assertEqual(result.targets, [])
         self.assertEqual(result.missing_claude_records, [])
@@ -193,7 +319,9 @@ class EnumerateProjectTargetsTest(unittest.TestCase):
         registry = {
             path: {"name": path.rsplit("/", 1)[-1]} for path in paths
         }
-        result = enumerate_project_targets(_StubClaude(paths), registry)
+        result = enumerate_project_targets(
+            _StubClaude(paths), registry, _StubProbe([])
+        )
         self.assertEqual(
             [t.name for t in result.targets], ["Alpha", "Mid", "Zeta"]
         )
@@ -215,12 +343,16 @@ class EnumerateProjectTargetsTest(unittest.TestCase):
             stale = os.path.join(tmp, "work", "deleted")
             unsafe = os.path.join(tmp, "work", "unsafe\tproject")
             os.makedirs(unsafe)
+            home = os.path.expanduser("~")
             with open(
                 os.path.join(claude_dir, ".claude.json"),
                 "w",
                 encoding="utf-8",
             ) as fh:
-                json.dump({"projects": {path: {} for path in paths}}, fh)
+                json.dump(
+                    {"projects": {**{path: {} for path in paths}, home: {}}},
+                    fh,
+                )
             with open(
                 os.path.join(registry_dir, "projects.json"),
                 "w",
@@ -268,19 +400,23 @@ class EnumerateProjectTargetsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
         self.assertEqual(
-            [target["projectKey"] for target in payload["targets"]], paths
+            [target["projectKey"] for target in payload["targets"]],
+            [*paths, missing],
         )
         self.assertEqual(payload["collisions"][0]["projectKeys"], paths)
-        self.assertEqual(payload["missingClaudeRecords"], [missing])
+        self.assertEqual(payload["missingClaudeRecords"], [])
         self.assertEqual(payload["staleProjects"], [stale])
         self.assertEqual(payload["unsafeProjectKeys"], [unsafe])
+        self.assertEqual(payload["excludedHome"], [home])
         self.assertEqual(text_proc.returncode, 0, text_proc.stderr)
         diagnostic_lines = [
             line for line in text_proc.stdout.splitlines() if "\t" not in line
         ]
         self.assertTrue(any("not an existing directory" in line for line in diagnostic_lines))
         self.assertTrue(any("ASCII protocol delimiter" in line for line in diagnostic_lines))
+        self.assertTrue(any("home directory" in line for line in diagnostic_lines))
         self.assertIn(repr(unsafe), text_proc.stdout)
+        self.assertIn(repr(home), text_proc.stdout)
 
 
 class EnumerateVolumeProjectTargetsTest(unittest.TestCase):

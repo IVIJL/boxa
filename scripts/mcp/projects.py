@@ -12,10 +12,11 @@ host path via Claude's project records"):
     because rendering writes into Claude Code's ``~/.claude.json`` ``projects``
     map, which is keyed by absolute path. A bare sanitized Project NAME is
     insufficient — two host paths can sanitize to the same name (ADR 0005).
-  * The boxa Project registry maps exact host paths to their display names.
-    Import targets are the path-based intersection of that registry with
-    Claude's ``projects`` map. Container-side ``/workspace`` records and other
-    Claude records outside the registry are therefore irrelevant.
+  * The boxa Project registry maps exact host paths to their display names, but
+    it is populated lazily when a Project starts. Import targets therefore
+    combine existing registry paths with legacy Claude project records whose
+    host directories and canonical history volumes still exist. Container-side
+    ``/workspace`` records are excluded because they are not host directories.
   * Two registry paths may share a display name. Both remain valid targets and
     their paths disambiguate them in the picker; the ambiguity is also surfaced
     as a diagnostic instead of silently dropping either Project.
@@ -145,12 +146,12 @@ class VolumeProbe:
 class ProjectTarget:
     """One importable boxa Project target (ADR 0013 amendment).
 
-    Carries both the registry display name and the absolute host path
+    Carries both the display name and the absolute host path
     (``project_key``) that keys the Claude ``projects`` map and the rendered
     Project-scoped profile.
     """
 
-    name: str  # boxa registry display name
+    name: str  # registry display name, or sanitized basename for legacy paths
     project_key: str  # absolute host path (the render key)
 
     def to_dict(self) -> dict[str, str]:
@@ -159,7 +160,7 @@ class ProjectTarget:
 
 @dataclass(frozen=True)
 class ProjectCollision:
-    """Two or more target paths share one registry display name.
+    """Two or more target paths share one display name.
 
     Both paths remain targets because the picker displays their exact host
     paths. The caller also reports the ambiguity in the picker header.
@@ -177,9 +178,10 @@ class ProjectTargets:
     """Result of enumerating importable boxa Project targets.
 
     ``targets`` are the offered Projects (sorted by name); ``collisions`` are
-    name clashes surfaced for disambiguation. Missing Claude records, stale
-    paths, and protocol-unsafe keys are retained as diagnostics. All fields are
-    secret-free directory metadata.
+    name clashes surfaced for disambiguation. The backwards-compatible missing
+    Claude-record field, stale paths, protocol-unsafe keys, and excluded home
+    directory records are retained as diagnostics. All fields are secret-free
+    directory metadata.
     """
 
     targets: list[ProjectTarget] = field(default_factory=list)
@@ -187,6 +189,7 @@ class ProjectTargets:
     missing_claude_records: list[str] = field(default_factory=list)
     stale_projects: list[str] = field(default_factory=list)
     unsafe_project_keys: list[str] = field(default_factory=list)
+    excluded_home: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -195,20 +198,24 @@ class ProjectTargets:
             "missingClaudeRecords": list(self.missing_claude_records),
             "staleProjects": list(self.stale_projects),
             "unsafeProjectKeys": list(self.unsafe_project_keys),
+            "excludedHome": list(self.excluded_home),
         }
 
 
 def enumerate_project_targets(
     claude_provider,
     registry_projects: Mapping[str, object],
+    probe: Optional[VolumeProbe] = None,
 ) -> ProjectTargets:
-    """Enumerate import targets by exact registry/Claude path intersection."""
-    claude_keys = {str(key) for key in claude_provider.project_keys()}
-    by_name: dict[str, list[str]] = {}
-    targets: list[ProjectTarget] = []
-    missing: list[str] = []
-    stale: list[str] = []
-    unsafe: list[str] = []
+    """Enumerate registry targets plus host-valid legacy volume targets."""
+    probe = probe or VolumeProbe()
+
+    def canonical_path(path: str) -> str:
+        return os.path.realpath(path)
+
+    registry_targets: dict[str, ProjectTarget] = {}
+    stale: set[str] = set()
+    unsafe: set[str] = set()
     for project_key, raw_metadata in registry_projects.items():
         if not isinstance(project_key, str) or not project_key.startswith("/"):
             continue
@@ -218,15 +225,55 @@ def enumerate_project_targets(
         if not isinstance(raw_name, str) or not raw_name:
             continue
         if any(ord(char) < 32 or ord(char) == 127 for char in project_key):
-            unsafe.append(project_key)
+            unsafe.add(project_key)
             continue
         if not os.path.isdir(project_key):
-            stale.append(project_key)
+            stale.add(project_key)
             continue
-        if project_key not in claude_keys:
-            missing.append(project_key)
+        canonical_key = canonical_path(project_key)
+        registry_targets.setdefault(
+            canonical_key,
+            ProjectTarget(name=raw_name, project_key=project_key),
+        )
+
+    volume_targets: dict[str, ProjectTarget] = {}
+    excluded_home: set[str] = set()
+    home = canonical_path(os.path.expanduser("~"))
+    seen_keys: set[str] = set()
+    for raw_key in claude_provider.project_keys():
+        key = str(raw_key)
+        if key in seen_keys:
             continue
-        targets.append(ProjectTarget(name=raw_name, project_key=project_key))
+        seen_keys.add(key)
+        if not key.startswith("/"):
+            continue
+        if any(ord(char) < 32 or ord(char) == 127 for char in key):
+            unsafe.add(key)
+            continue
+        if not os.path.isdir(key):
+            stale.add(key)
+            continue
+        canonical_key = canonical_path(key)
+        if canonical_key == home:
+            excluded_home.add(key)
+            continue
+        if canonical_key in registry_targets or canonical_key in volume_targets:
+            continue
+        name = sanitize_basename(basename_of(key))
+        if not name or not probe.exists(project_volume_name(name)):
+            continue
+        volume_targets[canonical_key] = ProjectTarget(name=name, project_key=key)
+
+    # Canonical paths are identity keys only. Emitted project keys remain the
+    # original source strings; on overlap, the registry's original key and
+    # authoritative display name replace the Claude record's values.
+    targets_by_key = volume_targets
+    targets_by_key.update(registry_targets)
+
+    by_name: dict[str, list[str]] = {}
+    for target in targets_by_key.values():
+        raw_name = target.name
+        project_key = target.project_key
         by_name.setdefault(raw_name, []).append(project_key)
 
     collisions = [
@@ -235,14 +282,16 @@ def enumerate_project_targets(
         if len(keys) > 1
     ]
 
-    targets.sort(key=lambda t: (t.name, t.project_key))
+    targets = sorted(
+        targets_by_key.values(), key=lambda target: (target.name, target.project_key)
+    )
     collisions.sort(key=lambda c: c.name)
     return ProjectTargets(
         targets=targets,
         collisions=collisions,
-        missing_claude_records=sorted(missing),
         stale_projects=sorted(stale),
         unsafe_project_keys=sorted(unsafe),
+        excluded_home=sorted(excluded_home),
     )
 
 

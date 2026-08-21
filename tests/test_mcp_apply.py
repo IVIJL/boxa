@@ -937,16 +937,16 @@ class CliWizardWiringTest(ApplyEnv):
         tty = mock.mock_open(read_data="y\n")
         with mock.patch.object(
             mcp_cli, "_controlling_terminal_usable", return_value=True
-        ), mock.patch("builtins.open", tty):
+        ), mock.patch.object(mcp_cli, "_open_controlling_terminal", tty):
             accepted = mcp_cli._wizard_degradation_consent("degraded")
 
         self.assertTrue(accepted)
-        tty.assert_called_once_with("/dev/tty", "r+", encoding="utf-8")
+        tty.assert_called_once_with()
 
     def test_wizard_degradation_consent_requires_usable_tty(self) -> None:
         with mock.patch.object(
             mcp_cli, "_controlling_terminal_usable", return_value=False
-        ), mock.patch("builtins.open") as tty:
+        ), mock.patch.object(mcp_cli, "_open_controlling_terminal") as tty:
             accepted = mcp_cli._wizard_degradation_consent("degraded")
 
         self.assertIsNone(accepted)

@@ -24,6 +24,7 @@ output can be emitted directly without a redaction pass.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shlex
@@ -848,10 +849,19 @@ def _apply_wizard_activations(
     return outcomes, failed
 
 
+def _open_controlling_terminal() -> io.TextIOWrapper:
+    """Open the controlling terminal for line-oriented reads and writes."""
+    return io.TextIOWrapper(
+        io.FileIO(os.open("/dev/tty", os.O_RDWR), mode="r+", closefd=True),
+        encoding="utf-8",
+        write_through=True,
+    )
+
+
 def _controlling_terminal_usable() -> bool:
     """Return whether the process can open its controlling terminal."""
     try:
-        with open("/dev/tty", "r+", encoding="utf-8"):
+        with _open_controlling_terminal():
             pass
     except OSError:
         return False
@@ -863,7 +873,7 @@ def _wizard_degradation_consent(entry_name: str) -> Optional[bool]:
     if not _controlling_terminal_usable():
         return None
     try:
-        with open("/dev/tty", "r+", encoding="utf-8") as tty:
+        with _open_controlling_terminal() as tty:
             tty.write(
                 "WARNING: degraded-secret-isolation: node owns the Docker "
                 "daemon and can inspect this server's container environment.\n"
@@ -949,7 +959,7 @@ def _secret_consent(
             "the host-only secret store? [y/N] "
         )
     try:
-        with open("/dev/tty", "r+", encoding="utf-8") as tty:
+        with _open_controlling_terminal() as tty:
             tty.write(prompt)
             tty.flush()
             reply = tty.readline().strip()
@@ -3319,8 +3329,8 @@ def _cmd_project_targets(argv: list[str], as_json: bool) -> int:
     """`project-targets-{json,text}`: enumerate importable boxa Project targets.
 
     The machine-readable enumerator the import wizard / `mcp add` pickers drive:
-    the exact-path intersection of Claude's project records with the boxa
-    Project registry. Output is secret-free directory metadata.
+    the union of existing boxa registry paths and host-valid legacy Project
+    paths from Claude's records. Output is secret-free directory metadata.
     """
     diagnostics = False
     volume_based = False
@@ -3347,7 +3357,9 @@ def _cmd_project_targets(argv: list[str], as_json: bool) -> int:
             registry = {}
         projects = registry.get("projects") if isinstance(registry, dict) else None
         registry_projects = projects if isinstance(projects, dict) else {}
-        result = enumerate_project_targets(ClaudeProvider(), registry_projects)
+        result = enumerate_project_targets(
+            ClaudeProvider(), registry_projects, VolumeProbe()
+        )
     if as_json:
         return _emit(result.to_dict())
 
@@ -3359,8 +3371,9 @@ def _cmd_project_targets(argv: list[str], as_json: bool) -> int:
             )
         else:
             sys.stdout.write(
-                "No importable boxa Projects found. A Project must be in the boxa "
-                "Project registry AND have an exact-path Claude project record.\n"
+                "No importable boxa Projects found. A Project must have an "
+                "existing registered path, or an existing host path with an "
+                "initialized boxa-<name>-history volume.\n"
             )
     for t in result.targets:
         # Tab-separated so the shell picker can split name from absolute path.
@@ -3382,20 +3395,20 @@ def _cmd_project_targets(argv: list[str], as_json: bool) -> int:
                 f"Ambiguous Project name {collision.name!r}; paths shown for "
                 f"disambiguation: {', '.join(collision.project_keys)}\n"
             )
-        for project_key in result.missing_claude_records:
-            sys.stdout.write(
-                f"Skipped registered Project without an exact-path Claude "
-                f"record: {project_key!r}\n"
-            )
         for project_key in result.stale_projects:
             sys.stdout.write(
-                "Skipped stale registered Project because its path is not an "
+                "Skipped stale Project because its path is not an "
                 f"existing directory: {project_key!r}\n"
             )
         for project_key in result.unsafe_project_keys:
             sys.stdout.write(
-                "Skipped registered Project because its path contains an ASCII "
+                "Skipped Project because its path contains an ASCII "
                 f"protocol delimiter: {project_key!r}\n"
+            )
+        for project_key in result.excluded_home:
+            sys.stdout.write(
+                "Skipped Claude project record because the home directory is "
+                f"never an import destination: {project_key!r}\n"
             )
     return 0
 
