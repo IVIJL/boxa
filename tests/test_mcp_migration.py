@@ -3,19 +3,32 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-from mcp import activation, migration  # noqa: E402
+from mcp import activation, cli, migration  # noqa: E402
 from mcp.catalog import load_catalog  # noqa: E402
-from mcp.profile import project_profile_path, save_profile  # noqa: E402
+from mcp.profile import (  # noqa: E402
+    global_profile_path,
+    load_profile,
+    project_profile_path,
+    save_profile,
+)
+from mcp.secrets import (  # noqa: E402
+    global_secrets_path,
+    load_secrets,
+    project_secrets_path,
+    save_secrets,
+)
 
 
 def _server(argv):
@@ -325,6 +338,271 @@ class MigrationCleanupTest(unittest.TestCase):
         self.assertEqual(len(load_catalog()["entries"]), 1)
         self.assertEqual(set(os.listdir(self.project)), before)
         self.assertEqual(activation.load_activations()["projects"], {})
+
+    def test_complete_migration_purges_profile_and_is_idempotent(self):
+        path = global_profile_path()
+        save_profile(path, {
+            "version": 1,
+            "servers": {"legacy": _server(["/bin/cat"])},
+        })
+
+        first = migration.migrate_legacy()
+
+        self.assertFalse(first["legacyRetained"])
+        self.assertTrue(first["legacyPurged"])
+        self.assertFalse(os.path.exists(path))
+        manifest_before = self._bytes(migration.migration_path())
+
+        second = migration.migrate_legacy()
+
+        self.assertFalse(second["changed"])
+        self.assertEqual(self._bytes(migration.migration_path()), manifest_before)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli.main(["migrate-text"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Migrated legacy entries were purged", stdout.getvalue())
+        self.assertIn("Next: boxa mcp status", stdout.getvalue())
+
+    def test_modified_migrated_entry_survives_purge(self):
+        path = global_profile_path()
+        save_profile(path, {
+            "version": 1,
+            "servers": {"legacy": _server(["/bin/cat"])},
+        })
+        with mock.patch.object(
+            migration,
+            "_purge_migrated_legacy",
+            side_effect=lambda manifest, catalog: (manifest, False),
+        ):
+            migration.migrate_legacy()
+        save_profile(path, {
+            "version": 1,
+            "servers": {"legacy": _server(["/bin/echo"])},
+        })
+
+        result = migration.migrate_legacy()
+
+        self.assertTrue(result["legacyRetained"])
+        self.assertEqual(
+            load_profile(path)["servers"]["legacy"]["command"]["argv"],
+            ["/bin/echo"],
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_catalog_effective_list(
+                ["--project", self.project], as_json=False
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn("superseded by the catalog", stdout.getvalue())
+        self.assertIn("legacy", stdout.getvalue())
+
+    def test_old_manifest_without_fingerprint_keeps_legacy_entry(self):
+        path = global_profile_path()
+        save_profile(path, {
+            "version": 1,
+            "servers": {"legacy": _server(["/bin/cat"])},
+        })
+        with mock.patch.object(
+            migration,
+            "_purge_migrated_legacy",
+            side_effect=lambda manifest, catalog: (manifest, False),
+        ):
+            migration.migrate_legacy()
+        manifest_path = migration.migration_path()
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        for row in manifest["definitions"]:
+            row.pop("legacyFingerprint", None)
+        activation._atomic_json(manifest_path, manifest, 0o600)
+
+        first = migration.migrate_legacy()
+        manifest_after = self._bytes(manifest_path)
+        second = migration.migrate_legacy()
+
+        self.assertTrue(first["legacyRetained"])
+        self.assertTrue(os.path.exists(path))
+        self.assertFalse(second["changed"])
+        self.assertEqual(self._bytes(manifest_path), manifest_after)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli.main(["migrate-text"])
+        self.assertEqual(rc, 0)
+        self.assertIn("without matching migration proof were retained", stdout.getvalue())
+
+    def test_complete_manifest_purges_only_recorded_profile_entries(self):
+        path = global_profile_path()
+        save_profile(path, {
+            "version": 1,
+            "servers": {"migrated": _server(["/bin/cat"])},
+        })
+        first = migration.migrate_legacy()
+        self.assertFalse(os.path.exists(path))
+
+        save_profile(path, {
+            "version": 1,
+            "servers": {"later-added": _server(["/bin/echo"])},
+        })
+        manifest_path = migration.migration_path()
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        manifest["legacyRetained"] = True
+        manifest.pop("legacyPurged", None)
+        activation._atomic_json(manifest_path, manifest, 0o600)
+
+        rerun = migration.migrate_legacy()
+
+        self.assertTrue(rerun["changed"])
+        self.assertEqual(
+            set(load_profile(path)["servers"]),
+            {"later-added"},
+        )
+        self.assertEqual(first["definitions"], rerun["definitions"])
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_catalog_effective_list(
+                ["--project", self.project], as_json=False
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn("superseded by the catalog", stdout.getvalue())
+        self.assertIn("later-added", stdout.getvalue())
+        self.assertNotIn("issue 08", stdout.getvalue())
+
+    def test_purge_moves_migrated_secrets_and_preserves_later_blocks(self):
+        cases = (
+            (
+                "global",
+                "",
+                global_profile_path(),
+                global_secrets_path(),
+            ),
+            (
+                "project",
+                self.project,
+                project_profile_path(self.project),
+                project_secrets_path(self.project),
+            ),
+        )
+        for scope, project, profile_path, secret_path in cases:
+            with self.subTest(scope=scope):
+                server = _server(["/bin/cat"])
+                server["secretEnvKeys"] = ["TOKEN"]
+                profile = {"version": 1, "servers": {"legacy": server}}
+                if project:
+                    profile["projectKey"] = project
+                save_profile(profile_path, profile)
+                save_secrets(secret_path, {
+                    "version": 1,
+                    "servers": {
+                        "legacy": {"TOKEN": "secret"},
+                        "later-added": {"TOKEN": "keep"},
+                    },
+                })
+
+                result = migration.migrate_legacy()
+                entry_id = result["definitions"][0]["catalogId"]
+                store = load_secrets(secret_path)
+
+                self.assertNotIn("legacy", store["servers"])
+                self.assertEqual(store["servers"][entry_id], {"TOKEN": "secret"})
+                self.assertEqual(
+                    store["servers"]["later-added"], {"TOKEN": "keep"}
+                )
+
+                # Reset isolated state before the second subtest.
+                for path in (
+                    migration.migration_path(),
+                    migration.cleanup_marker_path(),
+                    migration.render_state_path(),
+                    migration.legacy_render_state_path(),
+                ):
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(path)
+                mcp_root = os.path.dirname(migration.migration_path())
+                for name in ("catalog.json", "activations.json"):
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(os.path.join(mcp_root, name))
+
+    def test_purge_deletes_empty_project_secret_file(self):
+        profile_path = project_profile_path(self.project)
+        secret_path = project_secrets_path(self.project)
+        server = _server(["/bin/cat"])
+        save_profile(profile_path, {
+            "version": 1,
+            "projectKey": self.project,
+            "servers": {"legacy": server},
+        })
+        save_secrets(secret_path, {
+            "version": 1,
+            "servers": {"legacy": {}},
+        })
+
+        migration.migrate_legacy()
+
+        self.assertFalse(os.path.exists(profile_path))
+        self.assertFalse(os.path.exists(secret_path))
+
+    def test_missing_profile_still_purges_matching_secret_block(self):
+        profile_path = global_profile_path()
+        secret_path = global_secrets_path()
+        server = _server(["/bin/cat"])
+        server["secretEnvKeys"] = ["TOKEN"]
+        save_profile(profile_path, {
+            "version": 1,
+            "servers": {"legacy": server},
+        })
+        save_secrets(secret_path, {
+            "version": 1,
+            "servers": {"legacy": {"TOKEN": "secret"}},
+        })
+        with mock.patch.object(
+            migration,
+            "_purge_migrated_legacy",
+            side_effect=lambda manifest, catalog: (manifest, False),
+        ):
+            migration.migrate_legacy()
+        os.remove(profile_path)
+
+        result = migration.migrate_legacy()
+        entry_id = result["definitions"][0]["catalogId"]
+
+        self.assertFalse(result["legacyRetained"])
+        self.assertNotIn("legacy", load_secrets(secret_path)["servers"])
+        self.assertEqual(
+            load_secrets(secret_path)["servers"][entry_id], {"TOKEN": "secret"}
+        )
+
+    def test_missing_profile_member_still_purges_matching_secret_block(self):
+        profile_path = global_profile_path()
+        secret_path = global_secrets_path()
+        server = _server(["/bin/cat"])
+        server["secretEnvKeys"] = ["TOKEN"]
+        save_profile(profile_path, {
+            "version": 1,
+            "servers": {"legacy": server},
+        })
+        save_secrets(secret_path, {
+            "version": 1,
+            "servers": {"legacy": {"TOKEN": "secret"}},
+        })
+        with mock.patch.object(
+            migration,
+            "_purge_migrated_legacy",
+            side_effect=lambda manifest, catalog: (manifest, False),
+        ):
+            migration.migrate_legacy()
+        save_profile(profile_path, {"version": 1, "servers": {}})
+
+        result = migration.migrate_legacy()
+        entry_id = result["definitions"][0]["catalogId"]
+
+        self.assertFalse(result["legacyRetained"])
+        self.assertNotIn("legacy", load_secrets(secret_path)["servers"])
+        self.assertEqual(
+            load_secrets(secret_path)["servers"][entry_id], {"TOKEN": "secret"}
+        )
 
 
 if __name__ == "__main__":

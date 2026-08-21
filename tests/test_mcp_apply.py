@@ -604,6 +604,21 @@ class CliSelectionTest(ApplyEnv):
         self.assertEqual(len(payload["imported"]), 1)
         self.assertTrue(payload["definitionOnly"])
 
+    def test_apply_text_prints_install_and_activation_next_steps(self) -> None:
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        proc = self._run_cli(
+            ["apply-text", "--project", _PROJECT_KEY,
+             "--server", "global-helper"],
+            path,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Next: boxa mcp install global-helper", proc.stdout)
+        self.assertIn(
+            "Then: boxa mcp activate global-helper --project <path> "
+            "--for claude|codex",
+            proc.stdout,
+        )
+
 
 class CliWizardWiringTest(ApplyEnv):
     """The wizard's CLI contract: applicable-wizard list + --override apply.
@@ -784,6 +799,10 @@ class DryRunDefaultTest(ApplyEnv):
             capture_output=True, text=True, env=env, cwd=_REPO_ROOT,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Next: boxa mcp import --apply", proc.stdout)
+        self.assertIn(
+            "boxa mcp import --apply --server global-helper", proc.stdout
+        )
         # No profile or secret store created by a dry-run discovery.
         self.assertFalse(os.path.isfile(global_profile_path()))
         self.assertFalse(os.path.isfile(profile_path("project", _PROJECT_KEY)))

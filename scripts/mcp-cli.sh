@@ -429,8 +429,11 @@ cmd_import() {
                 return 2
                 ;;
             *)
-                echo "Unexpected argument for 'mcp import': $1" >&2
-                return 2
+                if [ "${#servers[@]}" -gt 0 ]; then
+                    echo "'mcp import' takes at most one positional server name; use repeatable --server for more." >&2
+                    return 2
+                fi
+                servers+=("$1")
                 ;;
         esac
         shift
@@ -449,18 +452,27 @@ cmd_import() {
     # Selection flags are only meaningful for an apply. Reject them on a plain
     # dry-run rather than silently ignoring the user's choice.
     if [ "$apply" != true ]; then
-        if [ "${#servers[@]}" -gt 0 ] || [ "${#import_ids[@]}" -gt 0 ] \
-            || [ "$all_applicable" = true ] || [ "$yes" = true ] \
+        if [ "${#import_ids[@]}" -gt 0 ] || [ "$all_applicable" = true ] || [ "$yes" = true ] \
             || [ "$force" = true ] || [ -n "$consumer" ] || [ -n "$conflict" ]; then
             echo "Selection, acceptance, force, and activation flags require --apply or --activate." >&2
             return 2
         fi
         if [ "$json" = true ]; then
-            _run_py import-json "${scope_args[@]}"
+            local -a view_args=("${scope_args[@]}")
+            local selected_server
+            for selected_server in "${servers[@]+"${servers[@]}"}"; do
+                view_args+=(--server "$selected_server")
+            done
+            _run_py import-json "${view_args[@]}"
             return $?
         fi
         # Dry-run by default (ADR 0013 / local-plan-mcp.md decision 10). No writes.
-        _run_py import-text "${scope_args[@]}"
+        local -a view_args=("${scope_args[@]}")
+        local selected_server
+        for selected_server in "${servers[@]+"${servers[@]}"}"; do
+            view_args+=(--server "$selected_server")
+        done
+        _run_py import-text "${view_args[@]}"
         return $?
     fi
 
@@ -795,7 +807,7 @@ _wizard_select() {
     local picked
     picked="$(printf '%s\n' "${menu[@]}" | picker::many \
         --prompt "Select MCP servers to import" \
-        --header "Container-safe candidates (multi-select; q to cancel)")" \
+        --header "Container-safe candidates; choose one or more (q to cancel)")" \
         || { echo "Selection cancelled; nothing applied." >&2; return 2; }
 
     local -a chosen_ids=()
@@ -927,6 +939,49 @@ _wizard_project_picker() {
         return 2
     fi
     printf '%s\n' "$key"
+}
+
+# Pick one or more initialized Projects for an interactive catalog activation.
+# The current Project is listed as the first/default option when available.
+_activation_project_picker() {
+    local default_key targets
+    default_key="$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")"
+    targets="$(_run_py activation-project-targets-text --current "$default_key")"
+
+    local -a menu=()
+    local default_row="" name key row
+    while IFS=$'\t' read -r name key; do
+        [ -n "$key" ] || continue
+        row="$(printf '%-20s' "$name")"$'\t'"$key"
+        if [ "$key" = "$default_key" ]; then
+            default_row="$row"
+        else
+            menu+=("$row")
+        fi
+    done <<< "$targets"
+    if [ -z "$default_row" ] && [ "${#menu[@]}" -eq 0 ]; then
+        echo "No initialized boxa Projects are available for activation." >&2
+        return 2
+    fi
+
+    local picked
+    if [ -n "$default_row" ]; then
+        picked="$(printf '%s\n' "${menu[@]+"${menu[@]}"}" | picker::many \
+            --prompt "Activate in Projects" \
+            --header "Choose one or more Projects; current Project is the default (a)" \
+            --first-option "$default_row")" \
+            || { echo "No Project chosen; nothing activated." >&2; return 2; }
+    else
+        picked="$(printf '%s\n' "${menu[@]}" | picker::many \
+            --prompt "Activate in Projects" \
+            --header "Choose one or more Projects")" \
+            || { echo "No Project chosen; nothing activated." >&2; return 2; }
+    fi
+
+    while IFS= read -r row; do
+        key="$(_row_key "$row")"
+        [ -n "$key" ] && printf '%s\n' "$key"
+    done <<< "$picked"
 }
 
 # Full apply wizard. Prints the resolved Python apply args (one per line:
@@ -1977,19 +2032,28 @@ cmd_add() {
 }
 
 cmd_catalog() {
-    local json=false
+    local json=false verbose=false
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -h|--help) _usage; return 0 ;;
             --json) json=true ;;
+            --verbose) verbose=true ;;
             *) echo "Unknown argument for 'mcp catalog': $1" >&2; return 2 ;;
         esac
         shift
     done
     if [ "$json" = true ]; then
-        _run_py catalog-json
+        if [ "$verbose" = true ]; then
+            _run_py catalog-json --verbose
+        else
+            _run_py catalog-json
+        fi
     else
-        _run_py catalog-text
+        if [ "$verbose" = true ]; then
+            _run_py catalog-text --verbose
+        else
+            _run_py catalog-text
+        fi
     fi
 }
 
@@ -2107,11 +2171,16 @@ cmd_readiness() {
     fi
 }
 
+_mcp_interactive() {
+    [ "${BOXA_MCP_TEST_INTERACTIVE:-}" = "1" ] || { [ -t 0 ] && [ -t 1 ]; }
+}
+
 cmd_activation() {
     local action="$1"
     shift
     local json=false project="" consumer="" token="" accept_degraded=false
     local everywhere=false no_everywhere=false yes=false
+    local project_explicit=false
     local import_offer_id=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -2120,8 +2189,9 @@ cmd_activation() {
                 shift
                 [ "$#" -gt 0 ] || { echo "'mcp $action --project' requires a path." >&2; return 2; }
                 project="$1"
+                project_explicit=true
                 ;;
-            --project=*) project="${1#--project=}" ;;
+            --project=*) project="${1#--project=}"; project_explicit=true ;;
             --for)
                 shift
                 [ "$#" -gt 0 ] || { echo "'mcp $action --for' requires a consumer." >&2; return 2; }
@@ -2144,18 +2214,18 @@ cmd_activation() {
     if [ -z "$token" ]; then
         if [ "$action" = "activate" ] && [ "$everywhere" != true ] \
             && [ "$no_everywhere" != true ]; then
-            [ -n "$project" ] || project="$PWD"
-            project="$(_resolve_project_key "$project")" || return 2
-            if [ "$yes" = true ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
-                local -a import_args=(--activate --yes --project "$project")
+            local offer_project="${project:-$PWD}"
+            offer_project="$(_resolve_project_key "$offer_project")" || return 2
+            if [ "$yes" = true ] && ! _mcp_interactive; then
+                local -a import_args=(--activate --yes --project "$offer_project")
                 [ "$json" = true ] && import_args+=(--json)
                 [ -n "$consumer" ] && import_args+=(--for "$consumer")
                 cmd_import "${import_args[@]}"
                 return $?
             fi
-            if [ -t 0 ] && [ -t 1 ]; then
+            if _mcp_interactive; then
                 local offers offer_count offer_reply
-                offers="$(_run_py list-applicable --project "$project")"
+                offers="$(_run_py list-applicable --project "$offer_project")"
                 offer_count="$(printf '%s\n' "$offers" | awk 'NF { count++ } END { print count + 0 }')"
                 if [ "$offer_count" -gt 0 ]; then
                     printf 'Found %s MCP server(s) in your agent config — add one? [y/N] ' \
@@ -2167,6 +2237,8 @@ cmd_activation() {
                             picked_offer="$(printf '%s\n' "$offers" | picker::one \
                                 --prompt "Select inherited MCP server: ")" || return 1
                             import_offer_id="${picked_offer%%$'\t'*}"
+                            project="$offer_project"
+                            project_explicit=true
                             ;;
                     esac
                 fi
@@ -2174,7 +2246,7 @@ cmd_activation() {
         fi
         if [ -n "$import_offer_id" ]; then
             token="$import_offer_id"
-        elif [ -t 0 ] && [ -t 1 ]; then
+        elif _mcp_interactive; then
             local picked
             picked="$(_run_py catalog-picker | picker::one --prompt "Select MCP catalog entry: ")" || return 1
             token="${picked%%$'\t'*}"
@@ -2196,17 +2268,30 @@ cmd_activation() {
         echo "'mcp deactivate' does not accept everywhere flags or --yes." >&2
         return 2
     fi
-    local -a args=("$token")
+    local -a args=("$token") projects=()
     if [ "$everywhere" = true ]; then
         args+=(--everywhere)
     elif [ "$no_everywhere" = true ]; then
         args+=(--no-everywhere)
     else
-        if [ -z "$project" ]; then
-            project="$PWD"
+        if [ "$action" = "activate" ] && [ "$project_explicit" != true ] \
+            && _mcp_interactive; then
+            local picked_project
+            while IFS= read -r picked_project; do
+                [ -n "$picked_project" ] && projects+=("$picked_project")
+            done < <(_activation_project_picker "$PWD")
+            [ "${#projects[@]}" -gt 0 ] \
+                || { echo "No Project chosen; nothing activated." >&2; return 2; }
+        else
+            [ -n "$project" ] || project="$PWD"
+            project="$(_resolve_project_key "$project")" || return 2
+            projects+=("$project")
         fi
-        project="$(_resolve_project_key "$project")" || return 2
-        args+=(--project "$project")
+        local selected_project
+        for selected_project in "${projects[@]}"; do
+            args+=(--project "$selected_project")
+        done
+        project="${projects[0]}"
     fi
     if [ "$action" = "activate" ]; then
         if [ "$no_everywhere" = true ]; then
@@ -2216,7 +2301,7 @@ cmd_activation() {
             fi
         else
             if [ -z "$consumer" ]; then
-                if [ -t 0 ] && [ -t 1 ]; then
+                if _mcp_interactive; then
                     consumer="$(printf '%s\n' claude codex claude,codex | picker::one --prompt "Activate for consumer: ")" || return 1
                 else
                     echo "Non-interactive 'mcp activate' requires --for claude, codex, or both." >&2
@@ -2237,7 +2322,7 @@ cmd_activation() {
             fi
             if [ "$accept_degraded" = true ]; then
                 args+=(--accept-degraded-secret-isolation)
-            elif [ -t 0 ] && [ -t 1 ] \
+            elif _mcp_interactive \
                 && [ "$(_run_py activation-degradation-text "$token" --project "${project:-$PWD}")" = "degraded-secret-isolation" ]; then
                 printf '%s\n' "WARNING: degraded-secret-isolation: node owns the Docker daemon and can inspect this server's container environment." >&2
                 printf 'Accept this temporary secret-isolation limitation? [y/N] ' >&2
@@ -2255,7 +2340,7 @@ cmd_activation() {
                 && [ "$(_run_py activation-agent-trusted-text "$token")" = "true" ]; then
                 printf '%s\n' "WARNING: agent-identity trust will extend to every present and future Project." >&2
                 if [ "$yes" != true ]; then
-                    if [ ! -t 0 ] || [ ! -t 1 ]; then
+                    if ! _mcp_interactive; then
                         echo "Non-interactive agent-trusted everywhere activation requires explicit --yes." >&2
                         return 2
                     fi
@@ -2275,9 +2360,12 @@ cmd_activation() {
             # install and activation operations. Cancellation returns before any
             # activation/config mutation. Non-interactive callers get the normal
             # readiness refusal and must run install themselves.
-            if [ "$everywhere" != true ] && [ -t 0 ] && [ -t 1 ]; then
+            if [ "$everywhere" != true ] && _mcp_interactive; then
                 local readiness_error=""
-                if ! readiness_error="$(_run_py readiness-json "$token" --project "$project" 2>&1 >/dev/null)"; then
+                for selected_project in "${projects[@]}"; do
+                    if readiness_error="$(_run_py readiness-json "$token" --project "$selected_project" 2>&1 >/dev/null)"; then
+                        continue
+                    fi
                     case "$readiness_error" in
                         *"is not running; readiness never starts it implicitly"*)
                             # The Python activation core records this exact state as
@@ -2289,8 +2377,8 @@ cmd_activation() {
                             IFS= read -r reply || reply=""
                             case "$reply" in
                                 y|Y|yes|YES)
-                                    cmd_install "$token" --project "$project" || return $?
-                                    _run_py readiness-json "$token" --project "$project" >/dev/null || return $?
+                                    cmd_install "$token" --project "$selected_project" || return $?
+                                    _run_py readiness-json "$token" --project "$selected_project" >/dev/null || return $?
                                     ;;
                                 *)
                                     echo "Cancelled; no MCP activation or agent config changed." >&2
@@ -2299,7 +2387,7 @@ cmd_activation() {
                             esac
                             ;;
                     esac
-                fi
+                done
             fi
         fi
     elif [ -n "$consumer" ] || [ "$accept_degraded" = true ]; then

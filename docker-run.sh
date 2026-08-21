@@ -3023,6 +3023,70 @@ refresh_mac_claude_bin_volume() {
         && printf '%s\n' "$image_id" > "$marker"; } 2>/dev/null || true
 }
 
+# Remember every successfully created or started Project independently of its
+# disposable Container. MCP activation uses this registry to offer stopped
+# Projects whose persistent volumes remain after `boxa stop` removes Docker's
+# only copy of BOXA_PROJECT_HOST_PATH.
+_boxa::record_project() {
+    local project_path="$1" project_name="$2"
+    local config_dir registry lockfile
+    [ -n "$project_path" ] && [ -n "$project_name" ] || return 0
+    project_path="$(realpath "$project_path")" || return 0
+    config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/boxa"
+    registry="$config_dir/projects.json"
+    lockfile="$registry.lock"
+    if ! mkdir -p "$config_dir"; then
+        echo "boxa: WARNING: could not update Project registry at $registry" >&2
+        return 0
+    fi
+
+    (
+        local tmp now
+        if command -v flock >/dev/null 2>&1; then
+            if ! { exec 9>"$lockfile"; } 2>/dev/null; then
+                echo "boxa: WARNING: could not open Project registry lock at $lockfile; continuing without locking" >&2
+            elif ! flock -x -w 10 9; then
+                echo "boxa: WARNING: could not lock Project registry at $lockfile within 10 seconds; registry was not updated" >&2
+                return 0
+            fi
+        else
+            echo "boxa: WARNING: flock is unavailable; Project registry update is not protected from concurrent starts" >&2
+        fi
+
+        tmp="$(mktemp "$config_dir/.projects.json.XXXXXX")" || {
+            echo "boxa: WARNING: could not update Project registry at $registry" >&2
+            return 0
+        }
+        now="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        if [ -f "$registry" ] \
+                && jq -e '.version == 1 and (.projects | type == "object")' \
+                    "$registry" >/dev/null 2>&1; then
+            if ! jq --arg path "$project_path" --arg name "$project_name" \
+                    --arg last_seen "$now" \
+                    '.projects[$path] = {name: $name, lastSeen: $last_seen}' \
+                    "$registry" > "$tmp"; then
+                rm -f "$tmp"
+                echo "boxa: WARNING: could not update Project registry at $registry" >&2
+                return 0
+            fi
+        elif ! jq -n --arg path "$project_path" --arg name "$project_name" \
+                --arg last_seen "$now" \
+                '{version: 1, projects: {($path): {name: $name, lastSeen: $last_seen}}}' \
+                > "$tmp"; then
+            rm -f "$tmp"
+            echo "boxa: WARNING: could not update Project registry at $registry" >&2
+            return 0
+        fi
+        chmod 0600 "$tmp"
+        if cmp -s "$tmp" "$registry" 2>/dev/null; then
+            rm -f "$tmp"
+        elif ! mv -f "$tmp" "$registry"; then
+            rm -f "$tmp"
+            echo "boxa: WARNING: could not update Project registry at $registry" >&2
+        fi
+    )
+}
+
 # Restart an exited boxa container and re-run init scripts
 # Returns 1 if restart fails (stale mounts after reboot) — caller should recreate
 reevaluate_pending_mcp() {
@@ -3084,6 +3148,7 @@ restart_exited_container() {
     if ! wait_for_boxa_ready "$name"; then
         exit 1
     fi
+    _boxa::record_project "$mcp_project_path" "${name#boxa-}"
     # Root-context setup (firewall, gitconfig, host-home symlink) is handled by
     # the entrypoint on every container start. Here we only run the user-mode
     # setup as node.
@@ -6722,6 +6787,8 @@ docker run -d --name "$CONTAINER_NAME" --stop-timeout 45 "${DOCKER_ARGS[@]}" "$I
 if ! wait_for_boxa_ready "$CONTAINER_NAME"; then
     exit 1
 fi
+
+_boxa::record_project "$PROJECT_PATH" "$PROJECT_NAME"
 
 # Apply default port routes
 apply_port_routes "$CONTAINER_NAME"

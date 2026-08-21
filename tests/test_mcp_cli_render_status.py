@@ -15,14 +15,16 @@ def _run(call: str) -> subprocess.CompletedProcess:
     script = f'''
         set -uo pipefail
         source "{CLI}"
-        _run_py_secret_write() {{ printf '%s\n' "$1" >> "$CALLS"; _LAST_SECRET_SCOPES_FILE=""; return 0; }}
+        _run_py_secret_write() {{ printf '%s\n' "$1" >> "$CALLS"; printf '%s\n' "$*" >> "$ARG_CALLS"; _LAST_SECRET_SCOPES_FILE=""; return 0; }}
         _finish_secret_write() {{ return 0; }}
-        _run_py() {{ printf '%s\n' "$1" >> "$CALLS"; return 0; }}
+        _run_py() {{ printf '%s\n' "$1" >> "$CALLS"; printf '%s\n' "$*" >> "$ARG_CALLS"; return 0; }}
         {call}
     '''
     descriptor, calls = tempfile.mkstemp()
     os.close(descriptor)
-    env = dict(os.environ, CALLS=calls)
+    args_descriptor, arg_calls = tempfile.mkstemp()
+    os.close(args_descriptor)
+    env = dict(os.environ, CALLS=calls, ARG_CALLS=arg_calls)
     proc = subprocess.run(
         ["bash", "-c", script, os.path.join(ROOT, "scripts", "_harness.sh")],
         cwd=ROOT,
@@ -33,8 +35,11 @@ def _run(call: str) -> subprocess.CompletedProcess:
     try:
         with open(calls, encoding="utf-8") as fh:
             proc.calls = fh.read().splitlines()
+        with open(arg_calls, encoding="utf-8") as fh:
+            proc.arg_calls = fh.read().splitlines()
     finally:
         os.unlink(calls)
+        os.unlink(arg_calls)
     return proc
 
 
@@ -75,6 +80,87 @@ class NoRenderDispatchTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 2)
         self.assertIn("cannot be combined", proc.stderr)
+
+    def test_positional_import_filters_dry_run_and_apply(self):
+        proc = _run("cmd_import dozzle")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(any(
+            call.startswith("import-text ") and "--server dozzle" in call
+            for call in proc.arg_calls
+        ))
+
+        proc = _run("cmd_import dozzle --apply")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(any(
+            call.startswith("apply-text ") and "--server dozzle" in call
+            for call in proc.arg_calls
+        ))
+
+    def test_interactive_activate_passes_every_selected_project(self):
+        script = f'''
+            set -uo pipefail
+            source "{CLI}"
+            export BOXA_MCP_TEST_INTERACTIVE=1
+            export BOXA_PICKER_FZF=0
+            export BOXA_PICKER_TEST_CHOICE=1,2
+            _resolve_project_key() {{ printf '%s\n' "$1"; }}
+            _run_py() {{
+                case "$1" in
+                    activation-project-targets-text)
+                        printf 'current\t%s\none\t/work/one\ntwo\t/work/two\n' "$PWD"
+                        ;;
+                    activation-degradation-text) printf '%s\n' isolated ;;
+                    readiness-json) return 0 ;;
+                    activate-text) printf '%s\n' "$*" >"$CALLS" ;;
+                    *) return 0 ;;
+                esac
+            }}
+            cmd_activation activate context7 --for claude
+        '''
+        descriptor, calls = tempfile.mkstemp()
+        os.close(descriptor)
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", script, os.path.join(ROOT, "scripts", "_harness.sh")],
+                cwd=ROOT,
+                env=dict(os.environ, CALLS=calls),
+                capture_output=True,
+                text=True,
+            )
+            with open(calls, encoding="utf-8") as fh:
+                invoked = fh.read()
+        finally:
+            os.unlink(calls)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--project /work/one", invoked)
+        self.assertIn("--project /work/two", invoked)
+        self.assertIn("--for claude", invoked)
+
+    def test_codex_only_current_project_appears_in_activation_picker_rows(self):
+        script = f'''
+            set -uo pipefail
+            source "{CLI}"
+            export BOXA_PICKER_FZF=0
+            export BOXA_PICKER_TEST_CHOICE=a
+            _run_py() {{
+                case "$1" in
+                    activation-project-targets-text)
+                        printf 'codex-only\t%s\n' "$PWD"
+                        ;;
+                    *) return 0 ;;
+                esac
+            }}
+            _activation_project_picker "$PWD"
+        '''
+        proc = subprocess.run(
+            ["bash", "-c", script, os.path.join(ROOT, "scripts", "_harness.sh")],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), ROOT)
+        self.assertIn("codex-only", proc.stderr)
 
 
 if __name__ == "__main__":

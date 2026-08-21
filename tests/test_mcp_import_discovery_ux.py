@@ -130,6 +130,22 @@ class ImportDiscoveryUxTest(unittest.TestCase):
         entry_id = payload["flow"][0]["catalogId"]
         self.assertIn(entry_id, load_activations()["projects"][self.project])
 
+    def test_remote_import_apply_skips_install_hint(self):
+        discovered = catalog_verdicts(merge_candidates([
+            _remote("remote", "https://mcp.example.test/api")
+        ]))
+        stdout = io.StringIO()
+        with mock.patch.object(cli, "_discover", return_value=discovered), \
+                contextlib.redirect_stdout(stdout):
+            rc = cli.main(["apply-text", "--server", "remote"])
+
+        self.assertEqual(rc, 0)
+        self.assertNotIn("mcp install remote", stdout.getvalue())
+        self.assertIn(
+            "Next: boxa mcp activate remote --project <path> --for claude|codex",
+            stdout.getvalue(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

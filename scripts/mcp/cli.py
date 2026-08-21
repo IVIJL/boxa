@@ -26,14 +26,18 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess  # noqa: S404 - the Boxa Project registry is Docker-backed
 import sys
 from typing import Optional
 
 from . import import_result, inherited_list_result, onboarding, seed, trusted
 from .activation import (
     ActivationError,
+    _entry_activations,
     activate_everywhere,
     clear_everywhere,
+    load_activations,
+    preflight_activate as preflight_catalog,
     reevaluate_pending,
     remove_catalog_entry,
     update_catalog_entry,
@@ -114,7 +118,12 @@ from .lifecycle import (
 )
 from .merge import MergedCandidate, merge_candidates
 from .migration import MigrationError, migrate_legacy
-from .projects import VolumeProbe, enumerate_project_targets
+from .projects import (
+    VolumeProbe,
+    basename_of,
+    enumerate_project_targets,
+    sanitize_basename,
+)
 from .providers import ClaudeProvider, CodexProvider
 from .readiness import (
     ReadinessError,
@@ -177,6 +186,7 @@ class _Scope:
         self.project_keys: list[str] = []
         self.all_projects: bool = False
         self.include_global: bool = True
+        self.server_names: list[str] = []
 
 
 def _parse_scope(argv: list[str]) -> Optional[_Scope]:
@@ -195,6 +205,12 @@ def _parse_scope(argv: list[str]) -> Optional[_Scope]:
                 sys.stderr.write("mcp.cli: --project requires a value\n")
                 return None
             scope.project_keys.append(argv[i])
+        elif arg == "--server":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("mcp.cli: --server requires a value\n")
+                return None
+            scope.server_names.append(argv[i])
         else:
             sys.stderr.write(f"mcp.cli: unknown argument {arg!r}\n")
             return None
@@ -233,7 +249,11 @@ def _discover(scope: _Scope) -> list[MergedCandidate]:
     # both output paths (text + JSON) all see the classified result.
     for cand in raw:
         classify_candidate(cand)
-    return catalog_verdicts(merge_candidates(raw))
+    merged = catalog_verdicts(merge_candidates(raw))
+    if scope.server_names:
+        wanted = set(scope.server_names)
+        merged = [item for item in merged if item.candidate.name in wanted]
+    return merged
 
 
 def _render_text(merged: list[MergedCandidate]) -> int:
@@ -246,6 +266,10 @@ def _render_text(merged: list[MergedCandidate]) -> int:
     """
     if not merged:
         sys.stdout.write("No Inherited MCP servers detected in the selected scope.\n")
+        sys.stdout.write(
+            "\nDry-run only: no MCP profile or agent config was modified.\n"
+        )
+        sys.stdout.write("Next: boxa mcp import --apply            (interactive)\n")
         return 0
 
     # v1 supports Container MCP servers only (ADR 0013). After classification,
@@ -331,9 +355,12 @@ def _render_text(merged: list[MergedCandidate]) -> int:
         sys.stdout.write(f"    placement: {cls.placement}{confidence}\n")
         for reason in cls.reasons:
             sys.stdout.write(f"    reason   : {reason}\n")
-    sys.stdout.write(
-        "\nDry-run only: no MCP profile or agent config was modified.\n"
-    )
+    sys.stdout.write("\nDry-run only: no MCP profile or agent config was modified.\n")
+    sys.stdout.write("Next: boxa mcp import --apply            (interactive)\n")
+    if merged:
+        sys.stdout.write(
+            f"      boxa mcp import --apply --server {merged[0].candidate.name}\n"
+        )
     return 0
 
 
@@ -683,6 +710,24 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
         )
 
     sys.stdout.write("\nCatalog definitions updated only. Nothing was installed, activated, or rendered.\n")
+    imported = {item.import_id: item for item in result.imported}
+    selected_by_id = {item.import_id: item for item in selected}
+    if len(imported) == 1:
+        imported_item = next(iter(imported.values()))
+        candidate = selected_by_id[imported_item.import_id].candidate
+        if candidate.type != "http":
+            sys.stdout.write(f"Next: boxa mcp install {imported_item.catalog_name}\n")
+            sys.stdout.write(
+                f"Then: boxa mcp activate {imported_item.catalog_name} "
+                "--project <path> --for claude|codex\n"
+            )
+        else:
+            sys.stdout.write(
+                f"Next: boxa mcp activate {imported_item.catalog_name} "
+                "--project <path> --for claude|codex\n"
+            )
+    elif imported:
+        sys.stdout.write("Next: boxa mcp catalog\n")
     return 0
 
 
@@ -1226,6 +1271,7 @@ def _render_install_text(result: InstallResult) -> int:
     if result.installed_command:
         sys.stdout.write(f"  launch command: {result.installed_command}\n")
     sys.stdout.write("\nProfile updated.\n")
+    sys.stdout.write("Next: boxa mcp migrate\n")
     return 0
 
 
@@ -1587,31 +1633,48 @@ def _cmd_add(argv: list[str], as_json: bool) -> int:
     else:
         sys.stdout.write("  secrets  : none stored\n")
     sys.stdout.write("\nProfile updated.\n")
+    sys.stdout.write("Next: boxa mcp migrate\n")
     return 0
 
 
 def _catalog_payload() -> dict[str, object]:
     entries = catalog_entries_sorted()
+    activations = load_activations()
     for entry in entries:
         entry["isolationStatus"] = (
             "not-applicable"
             if entry["type"] == "http"
             else degradation_status(entry) or "isolated"
         )
+        projects = _entry_activations(activations, str(entry["id"]))
+        entry["activationEverywhere"] = str(entry["id"]) in activations["everywhere"]
+        entry["activationProjects"] = [row["projectKey"] for row in projects]
+        entry["activationProjectCount"] = len(projects)
     return {"version": CATALOG_VERSION, "entries": entries}
 
 
-def _render_catalog_text(entries: list[dict[str, object]]) -> int:
+def _render_catalog_text(
+    entries: list[dict[str, object]], *, verbose: bool = False
+) -> int:
     if not entries:
         sys.stdout.write("MCP catalog is empty. Catalog membership does not activate tools.\n")
         return 0
-    headers = ("NAME", "ID", "MODE", "RUNTIME", "ISOLATION", "READINESS")
+    headers = (
+        "NAME", "ID", "MODE", "RUNTIME", "ACTIVATIONS", "ISOLATION", "READINESS"
+    )
     rows = [
         (
             str(entry["name"]),
             str(entry["id"]),
             str(entry.get("executionMode", "none")),
             str(entry.get("runtimeKind", "remote-http")),
+            (
+                "everywhere"
+                if entry["activationEverywhere"]
+                else f"{entry['activationProjectCount']} projects"
+                if entry["activationProjectCount"]
+                else "-"
+            ),
             "not-applicable" if entry["type"] == "http" else degradation_status(entry) or "isolated",
             str(entry["readiness"]["summary"]),  # type: ignore[index]
         )
@@ -1630,13 +1693,21 @@ def _render_catalog_text(entries: list[dict[str, object]]) -> int:
             "  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip()
             + "\n"
         )
+    if verbose:
+        for entry in entries:
+            projects = entry["activationProjects"]
+            scope = "everywhere" if entry["activationEverywhere"] else "project-scoped"
+            project_text = ", ".join(str(value) for value in projects) if projects else "-"
+            sys.stdout.write(
+                f"Activations for {entry['name']} ({scope}): {project_text}\n"
+            )
     sys.stdout.write("Catalog membership does not activate or start an MCP server.\n")
     return 0
 
 
 def _cmd_catalog(argv: list[str], as_json: bool) -> int:
-    if argv:
-        sys.stderr.write("mcp.cli: catalog takes no arguments\n")
+    if any(arg != "--verbose" for arg in argv) or argv.count("--verbose") > 1:
+        sys.stderr.write("mcp.cli: catalog takes only --verbose\n")
         return 2
     try:
         payload = _catalog_payload()
@@ -1645,7 +1716,9 @@ def _cmd_catalog(argv: list[str], as_json: bool) -> int:
         return 1
     if as_json:
         return _emit(payload)
-    return _render_catalog_text(payload["entries"])  # type: ignore[arg-type]
+    return _render_catalog_text(  # type: ignore[arg-type]
+        payload["entries"], verbose="--verbose" in argv
+    )
 
 
 def _cmd_catalog_picker(argv: list[str]) -> int:
@@ -1774,9 +1847,14 @@ def _cmd_catalog_add(argv: list[str], as_json: bool) -> int:
     if entry["type"] == "http":
         sys.stdout.write(f"  url      : {entry['url']}\n")
         sys.stdout.write("  readiness: no runtime readiness\n")
+        sys.stdout.write(
+            f"Next: boxa mcp activate {entry['name']} --project <path> "
+            "--for claude|codex\n"
+        )
     else:
         sys.stdout.write(f"  mode     : {entry['executionMode']}\n")
         sys.stdout.write(f"  runtime  : {entry['runtimeKind']}\n")
+        sys.stdout.write(f"Next: boxa mcp install {entry['name']} --project <path>\n")
     sys.stdout.write("Catalog membership does not activate or start the server.\n")
     return 0
 
@@ -1925,7 +2003,7 @@ def _parse_activation(
 
 def _cmd_activate(argv: list[str], as_json: bool) -> int:
     token: Optional[str] = None
-    project: Optional[str] = None
+    projects: list[str] = []
     consumers: list[str] = []
     accept_degraded = False
     everywhere = False
@@ -1939,7 +2017,7 @@ def _cmd_activate(argv: list[str], as_json: bool) -> int:
             if i >= len(argv):
                 sys.stderr.write("mcp.cli: activate --project requires a value\n")
                 return 2
-            project = argv[i]
+            projects.append(argv[i])
         elif arg == "--for":
             i += 1
             if i >= len(argv):
@@ -1969,10 +2047,10 @@ def _cmd_activate(argv: list[str], as_json: bool) -> int:
     if everywhere and no_everywhere:
         sys.stderr.write("mcp.cli: activate accepts only one of --everywhere and --no-everywhere\n")
         return 2
-    if (everywhere or no_everywhere) and project:
+    if (everywhere or no_everywhere) and projects:
         sys.stderr.write("mcp.cli: --everywhere/--no-everywhere cannot be combined with --project\n")
         return 2
-    if not everywhere and not no_everywhere and not project:
+    if not everywhere and not no_everywhere and not projects:
         sys.stderr.write("mcp.cli: activate requires --project <absolute-path> or --everywhere\n")
         return 2
     if no_everywhere and (consumers or accept_degraded or yes):
@@ -1997,15 +2075,76 @@ def _cmd_activate(argv: list[str], as_json: bool) -> int:
             if yes:
                 sys.stderr.write("mcp.cli: per-Project activation does not accept --yes\n")
                 return 2
-            result = activate_catalog(
-                token,
-                str(project),
-                consumers,
-                accept_degraded_secret_isolation=accept_degraded,
-            )
+            for project in projects:
+                try:
+                    preflight_catalog(
+                        token,
+                        project,
+                        consumers,
+                        accept_degraded_secret_isolation=accept_degraded,
+                    )
+                except (ActivationError, CatalogError) as exc:
+                    sys.stderr.write(
+                        f"mcp.cli: activation preflight failed for Project "
+                        f"{project}: {exc}\n"
+                    )
+                    return 1
+            results = []
+            for project in projects:
+                try:
+                    result = activate_catalog(
+                        token,
+                        project,
+                        consumers,
+                        accept_degraded_secret_isolation=accept_degraded,
+                    )
+                except Exception as exc:
+                    if as_json:
+                        _emit({
+                            "results": [item.to_dict() for item in results],
+                            "failed": {"projectKey": project, "error": str(exc)},
+                        })
+                        return 1
+                    for completed in results:
+                        outcome = "pending" if completed.pending else "activated"
+                        sys.stdout.write(
+                            f"{outcome:<10} {completed.project_key}\n"
+                        )
+                    sys.stderr.write(f"failed     {project}: {exc}\n")
+                    return 1
+                results.append(result)
     except (ActivationError, CatalogError) as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return 1
+    if not no_everywhere and not everywhere:
+        if as_json:
+            if len(results) == 1:
+                return _emit(results[0].to_dict())
+            return _emit({"results": [item.to_dict() for item in results]})
+        for result in results:
+            if result.pending:
+                sys.stdout.write(
+                    f"Pending MCP catalog activation {result.entry['name']!r} for "
+                    f"{', '.join(result.consumers)} in Project {result.project_key}.\n"
+                )
+                sys.stdout.write(
+                    "Readiness will be re-evaluated at the next Container start: "
+                    f"{result.pending_reason}.\n"
+                )
+                sys.stdout.write(
+                    f"Next: boxa mcp readiness {result.entry['name']} "
+                    f"--project {result.project_key}\n"
+                )
+            else:
+                sys.stdout.write(
+                    f"Activated MCP catalog entry {result.entry['name']!r} for "
+                    f"{', '.join(result.consumers)} in Project {result.project_key}.\n"
+                )
+                sys.stdout.write(
+                    "The launch-time MCP profile is ready; start a new agent "
+                    "session to connect.\n"
+                )
+        return 0
     if as_json:
         return _emit(result.to_dict())
     if no_everywhere:
@@ -2034,21 +2173,6 @@ def _cmd_activate(argv: list[str], as_json: bool) -> int:
                 f"  {outcome.outcome:10} {outcome.project_key}{detail}\n"
             )
         return 0
-    if result.pending:
-        sys.stdout.write(
-            f"Pending MCP catalog activation {result.entry['name']!r} for "
-            f"{', '.join(result.consumers)} in Project {result.project_key}.\n"
-        )
-        sys.stdout.write(
-            f"Readiness will be re-evaluated at the next Container start: "
-            f"{result.pending_reason}.\n"
-        )
-        return 0
-    sys.stdout.write(
-        f"Activated MCP catalog entry {result.entry['name']!r} for "
-        f"{', '.join(result.consumers)} in Project {result.project_key}.\n"
-    )
-    sys.stdout.write("The launch-time MCP profile is ready; start a new agent session to connect.\n")
     return 0
 
 
@@ -2172,6 +2296,16 @@ def _cmd_catalog_install(argv: list[str], as_json: bool) -> int:
     sys.stdout.write(f"Readiness after install: {state}. No activation or agent config changed.\n")
     for check in report.readiness.missing:
         sys.stdout.write(f"  missing {check.kind}: {check.label}\n")
+    if report.readiness.ready:
+        sys.stdout.write(
+            f"Next: boxa mcp activate {report.entry['name']} "
+            f"--project {report.project_key} --for claude|codex\n"
+        )
+    else:
+        sys.stdout.write(
+            f"Next: boxa mcp readiness {report.entry['name']} "
+            f"--project {report.project_key}\n"
+        )
     return 0 if report.readiness.ready else 1
 
 
@@ -2238,6 +2372,7 @@ def _cmd_catalog_effective_list(argv: list[str], as_json: bool) -> int:
             "READINESS",
             "ACTIVATION",
             "EVERYWHERE",
+            "PROJECTS",
             "CONSUMERS",
             "MODE / USER",
             "TRUST SCOPE",
@@ -2250,6 +2385,7 @@ def _cmd_catalog_effective_list(argv: list[str], as_json: bool) -> int:
                 e["readiness"]["state"],
                 e["activation"],
                 "yes" if e["everywhere"] else "no",
+                "everywhere" if e["everywhere"] else str(e["activationProjectCount"]),
                 ",".join(e["consumers"] or e["everywhereConsumers"]) or "-",
                 f"{e['executionMode']} / {e['executionUser']}",
                 e["agentIdentityTrustScope"],
@@ -2278,7 +2414,10 @@ def _cmd_catalog_effective_list(argv: list[str], as_json: bool) -> int:
                     "every present and future Project.\n"
                 )
     if legacy.entries:
-        sys.stdout.write("\nLegacy MCP profile entries (kept until migration issue 08):\n")
+        sys.stdout.write(
+            "\nLegacy MCP profile entries (superseded by the catalog; "
+            "run 'boxa mcp migrate'):\n"
+        )
         _render_effective_table(legacy)
     if status["importNudge"]:
         sys.stdout.write(f"\n{status['importNudge']}\n")
@@ -2454,6 +2593,103 @@ def _cmd_project_targets(argv: list[str], as_json: bool) -> int:
             f"mcp.cli: project name {c.name!r} is ambiguous "
             f"({len(c.project_keys)} host paths sanitize to it): "
             f"{', '.join(c.project_keys)}\n"
+        )
+    return 0
+
+
+def _cmd_activation_project_targets(argv: list[str], as_json: bool) -> int:
+    current = ""
+    i = 0
+    while i < len(argv):
+        if argv[i] != "--current" or i + 1 >= len(argv):
+            sys.stderr.write(
+                "mcp.cli: activation Project targets require --current <path>\n"
+            )
+            return 2
+        current = argv[i + 1]
+        i += 2
+
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    registry_path = os.path.join(config_home, "boxa", "projects.json")
+    known: list[str] = []
+    try:
+        with open(registry_path, encoding="utf-8") as fh:
+            registry = json.load(fh)
+    except (OSError, ValueError):
+        registry = {}
+    projects = registry.get("projects") if isinstance(registry, dict) else None
+    if isinstance(projects, dict):
+        known.extend(
+            os.path.realpath(path)
+            for path, metadata in projects.items()
+            if isinstance(path, str)
+            and os.path.isabs(path)
+            and isinstance(metadata, dict)
+        )
+    try:
+        containers = subprocess.run(  # noqa: S603 - fixed Docker argv
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "name=^boxa-",
+                "--format",
+                "{{.Names}}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        containers = None
+    for container in (containers.stdout or "").splitlines() if containers else []:
+        inspected = subprocess.run(  # noqa: S603 - Docker-provided container name
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{range .Config.Env}}{{println .}}{{end}}",
+                container,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        if inspected.returncode != 0:
+            continue
+        prefix = "BOXA_PROJECT_HOST_PATH="
+        for line in (inspected.stdout or "").splitlines():
+            if line.startswith(prefix) and line != prefix:
+                known.append(os.path.realpath(line[len(prefix):]))
+                break
+    if current:
+        current = os.path.realpath(current)
+        current_name = sanitize_basename(basename_of(current))
+        known = [
+            path for path in known
+            if sanitize_basename(basename_of(path)) != current_name
+        ]
+        known.append(current)
+
+    class _KnownProjects:
+        def project_keys(self) -> list[str]:
+            return known
+
+    result = enumerate_project_targets(_KnownProjects(), VolumeProbe())
+    if as_json:
+        return _emit(result.to_dict())
+    for target in result.targets:
+        sys.stdout.write(f"{target.name}\t{target.project_key}\n")
+    for collision in result.collisions:
+        sys.stderr.write(
+            f"mcp.cli: project name {collision.name!r} is ambiguous "
+            f"({len(collision.project_keys)} Project paths): "
+            f"{', '.join(collision.project_keys)}\n"
         )
     return 0
 
@@ -2659,6 +2895,10 @@ def main(argv: list[str]) -> int:
         return _cmd_project_targets(rest, as_json=True)
     if command == "project-targets-text":
         return _cmd_project_targets(rest, as_json=False)
+    if command == "activation-project-targets-json":
+        return _cmd_activation_project_targets(rest, as_json=True)
+    if command == "activation-project-targets-text":
+        return _cmd_activation_project_targets(rest, as_json=False)
     if command in ("migrate-json", "migrate-text"):
         allow_tracked_mcp_json = False
         allow_tracked_codex_config = False
@@ -2686,10 +2926,18 @@ def main(argv: list[str]) -> int:
             return _emit(result)
         count = len(result.get("definitions", []))
         state = "completed" if result.get("changed") else "already complete"
+        detail = (
+            "No legacy entries required migration or purging."
+            if result.get("status") == "not-needed"
+            else "Legacy entries without matching migration proof were retained."
+            if result.get("legacyRetained")
+            else "Migrated legacy entries were purged from the legacy profile store."
+        )
         sys.stdout.write(
             f"Legacy MCP migration {state}: {count} definition(s); "
-            "global activations: 0. Legacy source retained.\n"
+            f"global activations: 0. {detail}\n"
         )
+        sys.stdout.write("Next: boxa mcp status\n")
         return 0
     if command == "onboarding-status":
         # One-time MCP onboarding eligibility (issue 10). The install/update

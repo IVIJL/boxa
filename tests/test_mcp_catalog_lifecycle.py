@@ -106,6 +106,30 @@ class CatalogLifecycleIsolationTest(unittest.TestCase):
         self.assertNotIn("renders", row)
         self.assertNotIn("trackedCodexConfig", row)
         self.assertNotIn("trackedMcpJson", row)
+        self.assertEqual(row["activationProjectCount"], 2)
+        self.assertEqual(row["activationProjects"], self.projects)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_catalog_effective_list(
+                ["--project", self.projects[0]], as_json=True
+            )
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        json_row = next(
+            item for item in payload["catalogEntries"]
+            if item["id"] == self.entry["id"]
+        )
+        self.assertEqual(json_row["activationProjects"], self.projects)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_catalog_effective_list(
+                ["--project", self.projects[0]], as_json=False
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn("PROJECTS", stdout.getvalue())
+        self.assertIn("2", stdout.getvalue())
 
     def test_remote_status_names_no_runtime_readiness_and_allowlist_hint(self):
         remote = add_remote_entry(

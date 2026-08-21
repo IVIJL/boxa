@@ -101,6 +101,19 @@ assert_eq "many+first: pick reals" \
 beta" "$(_picker::select many 1 "1,2" "* All" alpha beta gamma)"
 assert_eq "many+first: 'a' returns sentinel" \
     "* All" "$(_picker::select many 1 "a" "* All" alpha beta)"
+assert_eq "many+first: mixed letter and number preserves order" \
+    "* All
+beta" "$(_picker::select many 1 "a,2" "* All" alpha beta gamma)"
+
+duplicate_error="$(_picker::select many 1 "a,a" "* All" alpha beta 2>&1 >/dev/null)"
+duplicate_rc=$?
+if [ "$duplicate_rc" -ne 0 ] && [ "$duplicate_error" = "Duplicate choice: a" ]; then
+    printf 'PASS  many+first: duplicate rejected clearly\n'
+else
+    printf 'FAIL  many+first: duplicate rejected clearly\n      rc: %s\n      stderr: %q\n' \
+        "$duplicate_rc" "$duplicate_error"
+    fail_count=$((fail_count + 1))
+fi
 
 # --- whitespace trim ---------------------------------------------------------
 
@@ -130,6 +143,8 @@ assert_eq "e2e one+first: 'a'"     "* All" \
     "$(run_e2e a picker::one --prompt "P:" --first-option "* All")"
 assert_eq "e2e many: comma 1,3"    "alpha
 gamma" "$(run_e2e 1,3 picker::many --prompt "P:")"
+assert_eq "e2e many+first: mixed a,2" "* All
+beta" "$(run_e2e a,2 picker::many --prompt "P:" --first-option "* All")"
 
 assert_fail "e2e one: empty cancels" \
     bash -c 'export BOXA_PICKER_FZF=0 BOXA_PICKER_TEST_CHOICE=""; \
@@ -157,6 +172,46 @@ case "$header_stderr" in
     *"no session for X"*) printf 'PASS  e2e one+header: header on stderr\n' ;;
     *) printf 'FAIL  e2e one+header: header on stderr\n      stderr: %q\n' "$header_stderr"
        fail_count=$((fail_count + 1)) ;;
+esac
+
+many_fallback_stderr="$(BOXA_PICKER_FZF=0 BOXA_PICKER_TEST_CHOICE=a,2 \
+    bash -c 'source "'"$SCRIPT_DIR"'/../lib/picker.sh"; \
+             printf "%s\n" alpha beta \
+                 | picker::many --prompt "P:" --header "Choose items" \
+                     --first-option "* All" 2>&1 1>/dev/null')"
+case "$many_fallback_stderr" in
+    *Tab*)
+        printf 'FAIL  e2e many fallback: hint omits Tab\n      stderr: %q\n' \
+            "$many_fallback_stderr"
+        fail_count=$((fail_count + 1))
+        ;;
+    *"(comma-separated: numbers and a/q)"*)
+        printf 'PASS  e2e many fallback: hint omits Tab and explains selection\n'
+        ;;
+    *)
+        printf 'FAIL  e2e many fallback: hint explains selection\n      stderr: %q\n' \
+            "$many_fallback_stderr"
+        fail_count=$((fail_count + 1))
+        ;;
+esac
+
+fzf() {
+    printf '%s\n' "$*" >&2
+    local selected
+    IFS= read -r selected
+    printf '%s\n' "$selected"
+}
+fzf_stderr="$(_picker::fzf many "P:" "Choose items" alpha beta 2>&1 1>/dev/null)"
+unset -f fzf
+case "$fzf_stderr" in
+    *"Choose items"*"Tab selects multiple"*)
+        printf 'PASS  fzf many: header explains Tab selection\n'
+        ;;
+    *)
+        printf 'FAIL  fzf many: header explains Tab selection\n      stderr: %q\n' \
+            "$fzf_stderr"
+        fail_count=$((fail_count + 1))
+        ;;
 esac
 
 unset BOXA_PICKER_FZF

@@ -83,6 +83,10 @@ _picker::fzf_available() {
 _picker::fzf() {
     local mode="$1" prompt="$2" header="$3"; shift 3
     local args=(--prompt="$prompt")
+    if [ "$mode" = many ]; then
+        [ -n "$header" ] && header+=$'\n'
+        header+="Tab selects multiple"
+    fi
     [ -n "$header" ] && args+=(--header="$header")
     [ "$mode" = many ] && args+=(--multi)
     printf '%s\n' "$@" | fzf "${args[@]}" || return 1
@@ -118,7 +122,7 @@ _picker::fallback() {
         done
     fi
     if [ "$mode" = many ]; then
-        hint="(comma-separated numbers$([ -n "$letter_part" ] && echo ", $letter_part")/q)"
+        hint="(comma-separated: numbers$([ -n "$letter_part" ] && echo " and $letter_part")/q)"
     else
         hint="(number$([ -n "$letter_part" ] && echo "/$letter_part")/q)"
     fi
@@ -168,8 +172,9 @@ _picker::select() {
     local letters="abcdefghijklmnopqrstuvwxyz"
     local max=$((${#items[@]} - first_count))
 
-    # Letter shortcuts map to sentinels in declaration order.
-    if [[ "$choice" =~ ^[a-z]$ ]]; then
+    # Letter shortcuts map to sentinels in declaration order. Many-mode parses
+    # letters together with numbered choices below so inputs such as a,2 work.
+    if [ "$mode" != many ] && [[ "$choice" =~ ^[a-z]$ ]]; then
         local prefix="${letters%%"$choice"*}"
         local idx=${#prefix}
         if [ "$idx" -lt "$first_count" ]; then
@@ -183,15 +188,32 @@ _picker::select() {
     if [ "$mode" = many ]; then
         local -a raw=()
         IFS=',' read -ra raw <<< "$choice"
-        local idx
-        local -a picked=()
+        local idx resolved prefix seen_index
+        local -a picked=() selected_indices=()
         for idx in ${raw[@]+"${raw[@]}"}; do
             idx="${idx// /}"
-            if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "$max" ]; then
+            if [[ "$idx" =~ ^[a-z]$ ]]; then
+                prefix="${letters%%"$idx"*}"
+                resolved=${#prefix}
+                if [ "$resolved" -ge "$first_count" ]; then
+                    echo "Invalid choice: $idx" >&2
+                    return 1
+                fi
+            elif [[ "$idx" =~ ^[0-9]+$ ]] \
+                && [ "$idx" -ge 1 ] && [ "$idx" -le "$max" ]; then
+                resolved=$((first_count + idx - 1))
+            else
                 echo "Invalid choice: $idx" >&2
                 return 1
             fi
-            picked+=("${items[$((first_count + idx - 1))]}")
+            for seen_index in ${selected_indices[@]+"${selected_indices[@]}"}; do
+                if [ "$seen_index" -eq "$resolved" ]; then
+                    echo "Duplicate choice: $idx" >&2
+                    return 1
+                fi
+            done
+            selected_indices+=("$resolved")
+            picked+=("${items[$resolved]}")
         done
         printf '%s\n' "${picked[@]}"
     else

@@ -6,6 +6,8 @@ import contextlib
 import io
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -131,6 +133,161 @@ class ActivationIsolationTest(unittest.TestCase):
                     state[os.path.relpath(path, self.project)] = fh.read()
         return state
 
+    def test_activation_picker_includes_codex_only_registered_project(self):
+        codex_only = os.path.join(self.tmp.name, "codex-only")
+
+        def docker_run(argv, **_kwargs):
+            if argv[:3] == ["docker", "ps", "-a"]:
+                return subprocess.CompletedProcess(argv, 0, "boxa-codex-only\n", "")
+            if argv[:3] == ["docker", "inspect", "-f"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, f"BOXA_PROJECT_HOST_PATH={codex_only}\n", ""
+                )
+            if argv[:3] == ["docker", "volume", "inspect"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            self.fail(f"unexpected Docker call: {argv}")
+
+        stdout = io.StringIO()
+        with mock.patch("mcp.cli.subprocess.run", side_effect=docker_run), \
+                contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_activation_project_targets([], as_json=False)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout.getvalue(), f"codex-only\t{codex_only}\n")
+
+    def test_activation_picker_current_wins_basename_collision(self):
+        current = os.path.join(self.tmp.name, "new", "app")
+        old = os.path.join(self.tmp.name, "old", "app")
+
+        def docker_run(argv, **_kwargs):
+            if argv[:3] == ["docker", "ps", "-a"]:
+                return subprocess.CompletedProcess(argv, 0, "boxa-app\n", "")
+            if argv[:3] == ["docker", "inspect", "-f"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, f"BOXA_PROJECT_HOST_PATH={old}\n", ""
+                )
+            if argv[:3] == ["docker", "volume", "inspect"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            self.fail(f"unexpected Docker call: {argv}")
+
+        stdout = io.StringIO()
+        with mock.patch("mcp.cli.subprocess.run", side_effect=docker_run), \
+                contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_activation_project_targets(
+                ["--current", current], as_json=False
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout.getvalue(), f"app\t{os.path.realpath(current)}\n")
+
+    def test_activation_picker_includes_removed_container_from_registry(self):
+        stopped = os.path.realpath(os.path.join(self.tmp.name, "stopped"))
+        registry_path = os.path.join(
+            os.environ["XDG_CONFIG_HOME"], "boxa", "projects.json"
+        )
+        os.makedirs(os.path.dirname(registry_path), exist_ok=True)
+        with open(registry_path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "version": 1,
+                "projects": {
+                    stopped: {"name": "stopped", "lastSeen": "2026-08-21T00:00:00Z"}
+                },
+            }, fh)
+
+        def docker_run(argv, **_kwargs):
+            if argv[:3] == ["docker", "ps", "-a"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[:3] == ["docker", "volume", "inspect"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            self.fail(f"unexpected Docker call: {argv}")
+
+        stdout = io.StringIO()
+        with mock.patch("mcp.cli.subprocess.run", side_effect=docker_run), \
+                contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_activation_project_targets([], as_json=False)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout.getvalue(), f"stopped\t{stopped}\n")
+
+    def test_docker_run_project_registry_write_is_idempotent(self):
+        docker_run_path = os.path.join(ROOT, "docker-run.sh")
+        with open(docker_run_path, encoding="utf-8") as fh:
+            docker_run = fh.read()
+        match = re.search(
+            r"(?ms)^_boxa::record_project\(\) \{\n.*?^\}\n", docker_run
+        )
+        self.assertIsNotNone(match)
+        project = os.path.join(self.tmp.name, "registered")
+        os.makedirs(project)
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"{match.group(0)}\n"
+                '_boxa::record_project "$1" registered\n'
+                '_boxa::record_project "$1" registered\n',
+                "bash",
+                project,
+            ],
+            check=True,
+            env=os.environ.copy(),
+        )
+        registry_path = os.path.join(
+            os.environ["XDG_CONFIG_HOME"], "boxa", "projects.json"
+        )
+        with open(registry_path, encoding="utf-8") as fh:
+            registry = json.load(fh)
+
+        self.assertEqual(registry["version"], 1)
+        self.assertEqual(
+            registry["projects"],
+            {
+                os.path.realpath(project): {
+                    "name": "registered",
+                    "lastSeen": mock.ANY,
+                }
+            },
+        )
+
+    def test_docker_run_project_registry_parallel_writes_preserve_all_projects(self):
+        docker_run_path = os.path.join(ROOT, "docker-run.sh")
+        with open(docker_run_path, encoding="utf-8") as fh:
+            docker_run = fh.read()
+        match = re.search(
+            r"(?ms)^_boxa::record_project\(\) \{\n.*?^\}\n", docker_run
+        )
+        self.assertIsNotNone(match)
+        projects = [
+            os.path.join(self.tmp.name, f"parallel-{index}")
+            for index in range(24)
+        ]
+        for project in projects:
+            os.makedirs(project)
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"{match.group(0)}\n"
+                'for project in "$1"/parallel-*; do\n'
+                '    _boxa::record_project "$project" "${project##*/}" &\n'
+                "done\n"
+                "wait\n",
+                "bash",
+                self.tmp.name,
+            ],
+            check=True,
+            env=os.environ.copy(),
+        )
+        registry_path = os.path.join(
+            os.environ["XDG_CONFIG_HOME"], "boxa", "projects.json"
+        )
+        with open(registry_path, encoding="utf-8") as fh:
+            registry = json.load(fh)
+
+        self.assertEqual(
+            set(registry["projects"]), set(map(os.path.realpath, projects))
+        )
+
     def test_activate_and_deactivate_touch_no_project_file(self):
         before = self._project_state()
         activated = activation.activate(
@@ -196,12 +353,93 @@ class ActivationIsolationTest(unittest.TestCase):
             )
         self.assertEqual(rc, 0)
         self.assertIn("Pending MCP catalog activation", stdout.getvalue())
+        self.assertIn(
+            f"Next: boxa mcp readiness {self.entry['name']} "
+            f"--project {self.project}",
+            stdout.getvalue(),
+        )
         record = activation.load_activations()["projects"][self.project][self.entry["id"]]
         self.assertFalse(record["enabled"])
         self.assertIn("not running", record["pendingReason"])
         with open(activation.runtime_path(), encoding="utf-8") as fh:
             runtime_record = json.load(fh)["projects"][self.project][self.entry["id"]]
         self.assertEqual(runtime_record, record)
+
+    def test_cli_activation_accepts_repeated_projects_and_reports_each(self):
+        other = os.path.join(self.tmp.name, "other-project")
+        os.makedirs(other)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_activate(
+                [
+                    self.entry["id"],
+                    "--project", self.project,
+                    "--project", other,
+                    "--for", "claude",
+                ],
+                as_json=False,
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn(self.project, stdout.getvalue())
+        self.assertIn(other, stdout.getvalue())
+        records = activation.load_activations()["projects"]
+        self.assertIn(self.entry["id"], records[self.project])
+        self.assertIn(self.entry["id"], records[other])
+
+    def test_cli_multi_project_preflight_failure_writes_nothing(self):
+        other = os.path.join(self.tmp.name, "other-project")
+        calls = []
+
+        def preflight(token, project, consumers, **kwargs):
+            calls.append(project)
+            if project == other:
+                raise activation.ActivationError("not ready")
+
+        stderr = io.StringIO()
+        with mock.patch.object(cli, "preflight_catalog", side_effect=preflight), \
+                mock.patch.object(cli, "activate_catalog") as activate_mock, \
+                contextlib.redirect_stderr(stderr):
+            rc = cli._cmd_activate([
+                self.entry["id"],
+                "--project", self.project,
+                "--project", other,
+                "--for", "claude",
+            ], as_json=False)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [self.project, other])
+        activate_mock.assert_not_called()
+        self.assertIn(other, stderr.getvalue())
+        self.assertEqual(activation.load_activations()["projects"], {})
+
+    def test_cli_mid_write_failure_reports_visible_outcomes(self):
+        other = os.path.join(self.tmp.name, "other-project")
+        first = activation.ActivationResult(
+            self.entry, self.project, ["claude"], True
+        )
+
+        def activate_side_effect(token, project, consumers, **kwargs):
+            if project == other:
+                raise OSError("write failed")
+            return first
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(cli, "preflight_catalog"), \
+                mock.patch.object(
+                    cli, "activate_catalog", side_effect=activate_side_effect
+                ), contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            rc = cli._cmd_activate([
+                self.entry["id"],
+                "--project", self.project,
+                "--project", other,
+                "--for", "claude",
+            ], as_json=False)
+
+        self.assertEqual(rc, 1)
+        self.assertIn(f"activated  {self.project}", stdout.getvalue())
+        self.assertIn(f"failed     {other}: write failed", stderr.getvalue())
 
     def test_pending_reevaluation_passes_and_enables_new_sessions(self):
         result = activation.activate(

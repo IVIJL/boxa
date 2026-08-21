@@ -867,7 +867,7 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
 
 def catalog_project_status(project: str, probe: Optional[object] = None) -> dict[str, Any]:
     """Unified catalog, readiness, activation, mode, and isolation snapshot."""
-    from .activation import canonical_project, load_activations
+    from .activation import _entry_activations, canonical_project, load_activations
     from .catalog import degradation_status, load_catalog
     from .catalog_import import catalog_verdicts
     from .classify import classify_candidate
@@ -910,6 +910,10 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
             and record.get("enabled", True) is False
         )
         everywhere = activations.get("everywhere", {}).get(entry_id)
+        activation_projects = [
+            item["projectKey"]
+            for item in _entry_activations(activations, entry_id)
+        ]
         rows.append({
             "id": entry_id,
             "name": entry["name"],
@@ -937,6 +941,8 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
                 if isinstance(everywhere, dict)
                 else []
             ),
+            "activationProjects": activation_projects,
+            "activationProjectCount": len(activation_projects),
             "optedOut": opted_out,
             "executionMode": entry.get("executionMode", "none"),
             "executionUser": (

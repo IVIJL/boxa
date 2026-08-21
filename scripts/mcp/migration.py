@@ -23,7 +23,7 @@ from .launch_profile import claude_server_definition, rendered_name
 from .profile import PROFILE_VERSION, config_root, global_profile_path, load_profile
 from .providers.claude import render_target_path
 from .providers.codex import default_config_path as codex_global_config_path
-from .secrets import load_secrets, project_secrets_path, save_secrets
+from .secrets import global_secrets_path, load_secrets, project_secrets_path, save_secrets
 
 
 MIGRATION_VERSION = 1
@@ -98,6 +98,10 @@ def _canonical(value: Any) -> str:
 def _definition_key(name: str, entry: dict[str, Any]) -> str:
     definition = {key: value for key, value in entry.items() if key != "id"}
     return hashlib.sha256(_canonical([name, definition]).encode()).hexdigest()
+
+
+def _legacy_fingerprint(entry: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical(entry).encode()).hexdigest()
 
 
 def _catalog_entry(name: str, legacy: dict[str, Any]) -> dict[str, Any]:
@@ -778,6 +782,142 @@ def _compensate(txn: casfile.Transaction, label: str, exc: BaseException) -> Non
     raise MigrationError(f"{label} failed: {exc}") from exc
 
 
+def _purge_migrated_legacy(
+    manifest: dict[str, Any], catalog: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    """Remove only manifest-recorded legacy definitions and secret blocks."""
+    if manifest.get("legacyRetained") is False:
+        return dict(manifest), False
+
+    definitions = [
+        row
+        for row in manifest.get("definitions", [])
+        if isinstance(row, dict)
+    ]
+    profile_rows: dict[str, list[dict[str, Any]]] = {}
+    secret_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in definitions:
+        source = row.get("source")
+        name = row.get("legacyName")
+        if not isinstance(source, str) or not isinstance(name, str):
+            raise MigrationError("malformed migration audit definition")
+        profile_rows.setdefault(source, []).append(row)
+        scope = row.get("scope")
+        if scope == "global":
+            secret_path = global_secrets_path()
+        elif scope == "project" and isinstance(row.get("project"), str):
+            secret_path = project_secrets_path(str(row["project"]))
+        else:
+            raise MigrationError("malformed migration audit definition scope")
+        secret_rows.setdefault(secret_path, []).append(row)
+
+    profile_updates: dict[str, tuple[bytes, Optional[dict[str, Any]]]] = {}
+    purge_rows: set[int] = set()
+    legacy_retained = False
+    for path, rows in profile_rows.items():
+        original = casfile.read_bytes(path)
+        if original is None:
+            purge_rows.update(id(row) for row in rows)
+            continue
+        profile = _load_legacy_profile(path)
+        servers = profile["servers"]
+        changed = False
+        for row in rows:
+            name = str(row["legacyName"])
+            current = servers.get(name)
+            if current is None:
+                purge_rows.add(id(row))
+                continue
+            fingerprint = row.get("legacyFingerprint")
+            if not isinstance(fingerprint, str) or not isinstance(current, dict):
+                legacy_retained = True
+                continue
+            try:
+                current_entry = _catalog_entry(name, current)
+            except MigrationError:
+                legacy_retained = True
+                continue
+            if _legacy_fingerprint(current_entry) != fingerprint:
+                legacy_retained = True
+                continue
+            del servers[name]
+            purge_rows.add(id(row))
+            changed = True
+        if servers:
+            legacy_retained = True
+        if changed:
+            profile_updates[path] = (original, profile if servers else None)
+
+    secret_updates: dict[str, tuple[bytes, Optional[dict[str, Any]]]] = {}
+    for path, rows in secret_rows.items():
+        original = casfile.read_bytes(path)
+        if original is None:
+            continue
+        try:
+            store = load_secrets(path)
+        except (OSError, ValueError) as exc:
+            raise MigrationError(
+                f"cannot read legacy MCP secret store {path}: {exc}"
+            ) from exc
+        servers = store["servers"]
+        changed = False
+        for row in rows:
+            if id(row) not in purge_rows:
+                continue
+            name = str(row["legacyName"])
+            source_block = servers.get(name)
+            if source_block is None:
+                continue
+            if not source_block:
+                del servers[name]
+                changed = True
+                continue
+            entry_id = str(row.get("catalogId") or "")
+            entry = catalog.get("entries", {}).get(entry_id)
+            if not isinstance(entry, dict):
+                raise MigrationError(
+                    f"migration audit references missing catalog entry {entry_id!r}"
+                )
+            target_key = str(entry.get("secretStoreKey") or entry_id)
+            target_block = servers.get(target_key)
+            if target_block is not None and target_block != source_block:
+                raise MigrationError(
+                    f"cannot safely purge legacy credentials for {name!r}: "
+                    f"stable identity {entry_id!r} has different credentials in {path}"
+                )
+            servers[target_key] = dict(source_block)
+            if target_key != name:
+                del servers[name]
+            changed = True
+        if changed:
+            secret_updates[path] = (original, store if servers else None)
+
+    updated = dict(manifest)
+    updated["legacyRetained"] = legacy_retained
+    updated["legacyPurged"] = True
+    manifest_changed = updated != manifest
+    changed = bool(profile_updates or secret_updates or manifest_changed)
+    if not changed:
+        return updated, False
+    with casfile.transaction() as txn:
+        try:
+            for path, (original, profile) in profile_updates.items():
+                if profile is None:
+                    casfile.remove(path, original)
+                else:
+                    casfile.swap_json(path, original, profile, 0o644)
+            for path, (original, store) in secret_updates.items():
+                if store is None:
+                    casfile.remove(path, original)
+                else:
+                    casfile.swap_json(path, original, store, 0o600)
+            if manifest_changed:
+                activation._atomic_json(migration_path(), updated, 0o600)
+        except Exception as exc:
+            _compensate(txn, "legacy MCP profile purge", exc)
+    return updated, True
+
+
 def migrate_legacy(
     *,
     allow_tracked_mcp_json: bool = False,
@@ -795,8 +935,11 @@ def migrate_legacy(
                 allow_tracked_mcp_json=allow_tracked_mcp_json,
                 allow_tracked_codex_config=allow_tracked_codex_config,
             )
-            result = dict(prior_manifest)
-            result["changed"] = cleanup_changed
+            purged_manifest, purge_changed = _purge_migrated_legacy(
+                prior_manifest, catalog
+            )
+            result = dict(purged_manifest)
+            result["changed"] = cleanup_changed or purge_changed
             return result
 
         legacy = _inventory()
@@ -882,6 +1025,7 @@ def migrate_legacy(
                 "consumers": list(item.consumers),
                 "nameConflict": conflict,
                 "source": item.source_path,
+                "legacyFingerprint": _legacy_fingerprint(item.entry),
             })
 
         manifest = {
@@ -904,12 +1048,13 @@ def migrate_legacy(
                 activation._atomic_json(migration_path(), manifest, 0o600)
             except Exception as exc:
                 _compensate(txn, "migration", exc)
-        _cleanup_shared_renders(
+        _cleanup_changed = _cleanup_shared_renders(
             activations,
             manifest,
             allow_tracked_mcp_json=allow_tracked_mcp_json,
             allow_tracked_codex_config=allow_tracked_codex_config,
         )
-        result = dict(manifest)
+        purged_manifest, _purge_changed = _purge_migrated_legacy(manifest, catalog)
+        result = dict(purged_manifest)
         result["changed"] = True
         return result

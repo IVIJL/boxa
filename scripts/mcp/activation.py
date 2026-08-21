@@ -555,10 +555,63 @@ def activate(
         )
 
 
+def preflight_activate(
+    token: str, project: str, consumers: list[str], probe: Optional[object] = None,
+    *, accept_degraded_secret_isolation: bool = False,
+) -> None:
+    """Validate one activation without mutating the activation store."""
+    with mutation_lock():
+        _activation_preflight(
+            token,
+            project,
+            consumers,
+            probe,
+            accept_degraded_secret_isolation=accept_degraded_secret_isolation,
+        )
+
+
 def _activate_locked(
     token: str, project: str, consumers: list[str], probe: Optional[object] = None,
     *, accept_degraded_secret_isolation: bool = False,
 ) -> ActivationResult:
+    entry_id, entry, key, pending_reason = _activation_preflight(
+        token,
+        project,
+        consumers,
+        probe,
+        accept_degraded_secret_isolation=accept_degraded_secret_isolation,
+    )
+    data = load_activations()
+    degraded = degradation_status(entry)
+    accepted = data.get("acknowledgements", {}).get(key, {}).get(entry_id) is True
+    if degraded and not accepted:
+        data.setdefault("acknowledgements", {}).setdefault(key, {})[entry_id] = True
+    records = data["projects"].setdefault(key, {})
+    record = {
+        "catalogId": entry_id,
+        "consumers": sorted(set(consumers)),
+        "enabled": not bool(pending_reason),
+    }
+    if pending_reason:
+        record["pendingReason"] = pending_reason
+    previous = records.get(entry_id)
+    changed = previous != record
+    records[entry_id] = record
+    _commit_activation_state(data)
+    return ActivationResult(
+        dict(entry),
+        key,
+        record["consumers"],
+        changed,
+        pending=bool(pending_reason),
+        pending_reason=pending_reason,
+    )
+
+
+def _activation_preflight(
+    token: str, project: str, consumers: list[str], probe: Optional[object] = None,
+    *, accept_degraded_secret_isolation: bool = False,
+) -> tuple[str, dict[str, Any], str, str]:
     key = canonical_project(project)
     try:
         catalog = load_catalog()
@@ -616,28 +669,7 @@ def _activate_locked(
             "this server's container environment; acknowledge interactively or use "
             "--accept-degraded-secret-isolation for non-interactive activation"
         )
-    if degraded and not accepted:
-        data.setdefault("acknowledgements", {}).setdefault(key, {})[entry_id] = True
-    records = data["projects"].setdefault(key, {})
-    record = {
-        "catalogId": entry_id,
-        "consumers": sorted(set(consumers)),
-        "enabled": not bool(pending_reason),
-    }
-    if pending_reason:
-        record["pendingReason"] = pending_reason
-    previous = records.get(entry_id)
-    changed = previous != record
-    records[entry_id] = record
-    _commit_activation_state(data)
-    return ActivationResult(
-        dict(entry),
-        key,
-        record["consumers"],
-        changed,
-        pending=bool(pending_reason),
-        pending_reason=pending_reason,
-    )
+    return entry_id, entry, key, pending_reason
 
 
 def activate_everywhere(

@@ -15,7 +15,7 @@ from contextlib import redirect_stderr, redirect_stdout
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "scripts"))
 
-from mcp import cli  # noqa: E402
+from mcp import activation, cli  # noqa: E402
 from mcp.catalog import (  # noqa: E402
     CATALOG_VERSION,
     CatalogError,
@@ -191,7 +191,57 @@ class CatalogTest(unittest.TestCase):
         listed = json.loads(stdout.getvalue())["entries"]
         expected = dict(added)
         expected["isolationStatus"] = "isolated"
+        expected["activationEverywhere"] = False
+        expected["activationProjects"] = []
+        expected["activationProjectCount"] = 0
         self.assertEqual(listed, [expected])
+
+    def test_catalog_json_and_text_show_activation_scope(self) -> None:
+        project_one = os.path.join(self.tmp.name, "one")
+        project_two = os.path.join(self.tmp.name, "two")
+        scoped = add_entry("scoped", ["npx", "scoped"])
+        global_entry = add_entry("global-entry", ["npx", "global"])
+        inactive = add_entry("inactive", ["npx", "inactive"])
+        data = activation.empty_activations()
+        for project in (project_one, project_two):
+            data["projects"][project] = {
+                scoped["id"]: {
+                    "catalogId": scoped["id"],
+                    "consumers": ["claude"],
+                    "enabled": True,
+                }
+            }
+        data["everywhere"][global_entry["id"]] = {
+            "catalogId": global_entry["id"],
+            "consumers": ["codex"],
+        }
+        activation.save_activation_store(data)
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            rc = cli.main(["catalog-json"])
+        self.assertEqual(rc, 0)
+        entries = {
+            entry["name"]: entry
+            for entry in json.loads(stdout.getvalue())["entries"]
+        }
+        self.assertEqual(
+            entries["scoped"]["activationProjects"],
+            [project_one, project_two],
+        )
+        self.assertEqual(entries["scoped"]["activationProjectCount"], 2)
+        self.assertTrue(entries["global-entry"]["activationEverywhere"])
+        self.assertEqual(entries["inactive"]["activationProjects"], [])
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            rc = cli.main(["catalog-text", "--verbose"])
+        text = stdout.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("ACTIVATIONS", text)
+        self.assertIn("2 projects", text)
+        self.assertIn("everywhere", text)
+        self.assertIn(project_one, text)
 
     def test_cli_add_and_update_remote_url(self) -> None:
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -220,6 +270,29 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(
             json.loads(stdout.getvalue())["entry"]["url"],
             "https://two.example/mcp",
+        )
+
+    def test_catalog_add_text_prints_concrete_next_step(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            rc = cli.main(["catalog-add-text", "context7", "--", "npx", "ctx"])
+        self.assertEqual(rc, 0)
+        self.assertIn(
+            "Next: boxa mcp install context7 --project <path>",
+            stdout.getvalue(),
+        )
+
+    def test_remote_catalog_add_text_skips_install_step(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            rc = cli.main([
+                "catalog-add-text", "remote", "--url", "https://example.test/mcp"
+            ])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("mcp install", stdout.getvalue())
+        self.assertIn(
+            "Next: boxa mcp activate remote --project <path> --for claude|codex",
+            stdout.getvalue(),
         )
 
 

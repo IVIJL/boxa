@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shlex
@@ -9,11 +11,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-from mcp import activation, readiness  # noqa: E402
+from mcp import activation, cli, readiness  # noqa: E402
 from mcp.catalog import add_entry, add_remote_entry, load_catalog, update_entry  # noqa: E402
 
 
@@ -173,6 +176,43 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(activation.load_activations()["projects"], {})
         # A new probe simulates ordinary Container recreation over shared npm state.
         self.assertTrue(readiness.readiness(entry["id"], self.project, Probe(self.project, self.state)).ready)
+
+    def test_catalog_install_ready_prints_activation_next_step(self) -> None:
+        entry = self.direct_entry("direct")
+        report = readiness.install(
+            entry["id"], self.project, Probe(self.project, self.state)
+        )
+        stdout = io.StringIO()
+        with mock.patch.object(cli, "install_catalog_entry", return_value=report), \
+                contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_catalog_install(
+                [entry["id"], "--project", self.project], as_json=False
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn(
+            f"Next: boxa mcp activate direct --project {self.project} "
+            "--for claude|codex",
+            stdout.getvalue(),
+        )
+
+    def test_catalog_install_not_ready_points_to_readiness(self) -> None:
+        entry = add_entry("secure", ["npx", "secure-mcp"])
+        update_entry(entry["id"], secretEnvKeys=["TOKEN"])
+        report = readiness.install(
+            entry["id"], self.project, Probe(self.project, self.state)
+        )
+        stdout = io.StringIO()
+        with mock.patch.object(cli, "install_catalog_entry", return_value=report), \
+                contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_catalog_install(
+                [entry["id"], "--project", self.project], as_json=False
+            )
+        self.assertEqual(rc, 1)
+        self.assertIn("missing credential: TOKEN", stdout.getvalue())
+        self.assertIn(
+            f"Next: boxa mcp readiness secure --project {self.project}",
+            stdout.getvalue(),
+        )
 
     def test_docker_install_is_project_local_and_survives_restart(self) -> None:
         entry = add_entry("github", ["docker", "run", "--rm", "ghcr.io/acme/mcp:1"])
