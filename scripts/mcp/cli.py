@@ -549,6 +549,10 @@ class _Selection:
         # import id, set only by the interactive apply wizard. Empty otherwise,
         # so the non-interactive path preserves inherited scope byte-for-byte.
         self.overrides: dict[str, ScopeOverride] = {}
+        # Interactive import-wizard follow-up activations. Each tuple is
+        # (consumer set, absolute Project key); non-interactive callers never
+        # emit this private plumbing flag.
+        self.wizard_activations: dict[str, list[tuple[str, str]]] = {}
 
 
 def _parse_selection(argv: list[str]) -> Optional[_Selection]:
@@ -643,6 +647,29 @@ def _parse_selection(argv: list[str]) -> Optional[_Selection]:
                 sys.stderr.write(f"mcp.cli: invalid --override: {exc}\n")
                 return None
             i += consumed
+        elif arg == "--wizard-activation":
+            if i + 3 >= len(argv):
+                sys.stderr.write(
+                    "mcp.cli: --wizard-activation requires "
+                    "<import-id> <consumer> <project-key>\n"
+                )
+                return None
+            iid, consumer, project_key = argv[i + 1:i + 4]
+            if consumer not in {"claude", "codex", "claude,codex"}:
+                sys.stderr.write(
+                    "mcp.cli: --wizard-activation consumer must be "
+                    "claude, codex, or claude,codex\n"
+                )
+                return None
+            if not os.path.isabs(project_key):
+                sys.stderr.write(
+                    "mcp.cli: --wizard-activation requires an absolute "
+                    "project key\n"
+                )
+                return None
+            self_activations = sel.wizard_activations.setdefault(iid, [])
+            self_activations.append((consumer, os.path.realpath(project_key)))
+            i += 3
         else:
             sys.stderr.write(f"mcp.cli: unknown argument {arg!r}\n")
             return None
@@ -725,8 +752,174 @@ def _resolve_selection(
         )
         return None
 
+    unknown_activations = set(sel.wizard_activations) - set(chosen)
+    if unknown_activations:
+        unknown = sorted(unknown_activations)[0]
+        sys.stderr.write(
+            f"mcp.cli: wizard activation references unselected import id {unknown!r}\n"
+        )
+        return None
+
     # Preserve discovery order for a stable, repeatable summary.
     return [m for m in merged if m.import_id in chosen]
+
+
+def _apply_wizard_activations(
+    result, sel: _Selection
+) -> tuple[list[dict[str, object]], bool]:
+    """Activate imported wizard selections and preserve every Project outcome."""
+    imported = {item.import_id: item for item in result.imported}
+    outcomes: list[dict[str, object]] = []
+    failed = False
+    for import_id, requests in sel.wizard_activations.items():
+        item = imported.get(import_id)
+        if item is None:
+            continue
+        try:
+            _entry_id, entry = catalog_resolve(catalog_load(), item.catalog_id)
+        except (CatalogError, OSError, ValueError) as exc:
+            failed = True
+            for consumer, project in requests:
+                outcomes.append({
+                    "outcome": "failed",
+                    "projectKey": project,
+                    "entry": {
+                        "id": item.catalog_id,
+                        "name": getattr(item, "catalog_name", item.catalog_id),
+                    },
+                    "consumers": consumer.split(","),
+                    "error": str(exc),
+                })
+            continue
+
+        accept_degraded = False
+        if isolation_status(entry) == "degraded-secret-isolation":
+            consent = _wizard_degradation_consent(str(entry["name"]))
+            if consent is not True:
+                reason = (
+                    "degraded-secret-isolation confirmation was declined"
+                    if consent is False
+                    else "degraded-secret-isolation requires interactive confirmation"
+                )
+                for consumer, project in requests:
+                    outcomes.append({
+                        "outcome": "skipped",
+                        "projectKey": project,
+                        "reason": reason,
+                        "next": (
+                            "boxa mcp activate "
+                            f"{shlex.quote(str(entry['name']))} --project "
+                            f"{shlex.quote(project)} --for {consumer} "
+                            "--accept-degraded-secret-isolation"
+                        ),
+                    })
+                continue
+            accept_degraded = True
+
+        for consumer, project in requests:
+            consumers = consumer.split(",")
+            try:
+                preflight_catalog(
+                    item.catalog_id,
+                    project,
+                    consumers,
+                    accept_degraded_secret_isolation=accept_degraded,
+                )
+                activation = activate_catalog(
+                    item.catalog_id,
+                    project,
+                    consumers,
+                    accept_degraded_secret_isolation=accept_degraded,
+                )
+            except Exception as exc:
+                failed = True
+                outcomes.append({
+                    "outcome": "failed",
+                    "projectKey": project,
+                    "entry": dict(entry),
+                    "consumers": consumers,
+                    "error": str(exc),
+                })
+                continue
+            payload = activation.to_dict()
+            payload["outcome"] = "pending" if activation.pending else "activated"
+            outcomes.append(payload)
+    return outcomes, failed
+
+
+def _wizard_degradation_consent(entry_name: str) -> Optional[bool]:
+    """Prompt once for a wizard entry; None means no interactive terminal."""
+    if not sys.stdin.isatty():
+        return None
+    try:
+        with open("/dev/tty", "r+", encoding="utf-8") as tty:
+            tty.write(
+                "WARNING: degraded-secret-isolation: node owns the Docker "
+                "daemon and can inspect this server's container environment.\n"
+            )
+            tty.write(
+                f"Accept this temporary secret-isolation limitation for "
+                f"{entry_name!r}? [y/N] "
+            )
+            tty.flush()
+            reply = tty.readline().strip()
+    except OSError:
+        return None
+    return reply.lower() in {"y", "yes"}
+
+
+def _render_wizard_activation_outcomes(
+    activations: list[dict[str, object]],
+) -> None:
+    """Render every completed, skipped, and failed wizard activation."""
+    for activation in activations:
+        outcome = activation.get("outcome")
+        project_key = str(activation["projectKey"])
+        if outcome == "failed":
+            entry = activation["entry"]
+            assert isinstance(entry, dict)
+            consumers = activation["consumers"]
+            assert isinstance(consumers, list)
+            sys.stderr.write(
+                f"Failed MCP activation {entry['name']!r} for "
+                f"{', '.join(consumers)} in Project {project_key}: "
+                f"{activation['error']}.\n"
+            )
+            continue
+        if outcome == "skipped":
+            sys.stdout.write(
+                f"Skipped MCP activation for Project {project_key}: "
+                f"{activation['reason']}.\n"
+            )
+            sys.stdout.write(f"Next: {activation['next']}\n")
+            continue
+        entry = activation["entry"]
+        assert isinstance(entry, dict)
+        consumers = activation["consumers"]
+        assert isinstance(consumers, list)
+        if activation.get("pending"):
+            sys.stdout.write(
+                f"Pending MCP catalog activation {entry['name']!r} for "
+                f"{', '.join(consumers)} in Project {project_key}.\n"
+            )
+            sys.stdout.write(
+                "Readiness will be re-evaluated at the next Container "
+                f"start: {activation['pendingReason']}.\n"
+            )
+            sys.stdout.write(
+                "Next: boxa mcp readiness "
+                f"{shlex.quote(str(entry['name']))} --project "
+                f"{shlex.quote(project_key)}\n"
+            )
+        else:
+            sys.stdout.write(
+                f"Activated MCP catalog entry {entry['name']!r} for "
+                f"{', '.join(consumers)} in Project {project_key}.\n"
+            )
+            sys.stdout.write(
+                "The launch-time MCP profile is ready; start a new agent "
+                "session to connect.\n"
+            )
 
 
 def _secret_consent(
@@ -782,7 +975,13 @@ def _apply_payload(merged: list[MergedCandidate], sel: _Selection) -> dict:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return {"error": "conflict"}
     _emit_secret_scopes(result.secret_scopes)
-    return result.to_dict()
+    payload = result.to_dict()
+    if sel.wizard_activations:
+        activations, activation_failed = _apply_wizard_activations(result, sel)
+        payload["activations"] = activations
+        if activation_failed:
+            payload["activationFailed"] = True
+    return payload
 
 
 def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
@@ -822,6 +1021,7 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
         return 2
 
     _emit_secret_scopes(result.secret_scopes)
+    activations, activation_failed = _apply_wizard_activations(result, sel)
     if not result.imported and not result.skipped:
         sys.stdout.write("No definitions imported.\n")
         return 0
@@ -850,14 +1050,21 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
             "Consider removing their plaintext copies from the host config.\n"
         )
 
-    sys.stdout.write("\nCatalog definitions updated only. Nothing was installed, activated, or rendered.\n")
+    if activations:
+        sys.stdout.write("\n")
+        _render_wizard_activation_outcomes(activations)
+    else:
+        sys.stdout.write(
+            "\nCatalog definitions updated only. Nothing was installed, "
+            "activated, or rendered.\n"
+        )
     imported = {item.import_id: item for item in result.imported}
     selected_by_id = {item.import_id: item for item in selected}
     skipped_secret_keys = {
         str(item["name"]): set(item["keys"])
         for item in result.skipped_secrets
     }
-    if len(imported) == 1:
+    if len(imported) == 1 and not activations:
         imported_item = next(iter(imported.values()))
         candidate = selected_by_id[imported_item.import_id].candidate
         if candidate.type != "http":
@@ -889,9 +1096,9 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
                 f"{shlex.quote(imported_item.catalog_name)} "
                 "--project <path> --for claude|codex\n"
             )
-    elif imported:
+    elif imported and not activations:
         sys.stdout.write("Next: boxa mcp catalog\n")
-    return 0
+    return 1 if activation_failed else 0
 
 
 def _cmd_import_activate(argv: list[str], as_json: bool) -> int:
@@ -1040,9 +1247,9 @@ def _render_applicable_wizard(merged: list[MergedCandidate]) -> int:
     when its (inherited or overridden) scope is project. SECRET-FREE — identity
     and directory metadata only.
 
-    Format (tab-separated, one applicable candidate per line)::
+    Format (unit-separator-delimited, one applicable candidate per line)::
 
-        <import_id>\\t<name>\\t<source_scope>\\t<source_project_key>
+        <import_id>\\x1f<name>\\x1f<source_scope>\\x1f<source_project_key>
 
     ``source_scope`` is the bare scope (``global`` / ``project``) WITHOUT the
     project suffix (the key follows in its own column). ``source_project_key`` is
@@ -1052,14 +1259,34 @@ def _render_applicable_wizard(merged: list[MergedCandidate]) -> int:
     require an explicit force confirmation. Unknown/excluded candidates stay
     report-only.
     """
+    separator = "\x1f"
+
+    def display_field(value: object) -> str:
+        return "".join(
+            " " if ord(char) < 32 or ord(char) == 127 else char
+            for char in str(value)
+        )
+
     for m in merged:
         placement = m.candidate.classification.placement
         if placement not in {"container", "host-only"} or m.catalog_status == "already-cataloged":
             continue
+        project_key = m.candidate.source_project or ""
+        if any(ord(char) < 32 or ord(char) == 127 for char in project_key):
+            sys.stderr.write(
+                "Skipping MCP import candidate "
+                f"{display_field(m.candidate.name)!r}: source Project key "
+                "contains an ASCII protocol delimiter.\n"
+            )
+            continue
         if m.catalog_status == "proposal" and placement == "container":
             sys.stdout.write(
-                f"{m.import_id}\t{m.candidate.name}\t"
-                f"{m.candidate.source_scope}\t{m.candidate.source_project or ''}\n"
+                separator.join((
+                    m.import_id,
+                    display_field(m.candidate.name),
+                    m.candidate.source_scope,
+                    project_key,
+                )) + "\n"
             )
             continue
         reason = "; ".join(m.candidate.classification.reasons)
@@ -1068,9 +1295,15 @@ def _render_applicable_wizard(merged: list[MergedCandidate]) -> int:
                 m.catalog_diff, sort_keys=True, separators=(",", ":")
             )
         sys.stdout.write(
-            f"{m.import_id}\t{m.candidate.name}\t"
-            f"{m.candidate.source_scope}\t{m.candidate.source_project or ''}\t"
-            f"{m.catalog_status}\t{placement}\t{reason}\n"
+            separator.join((
+                m.import_id,
+                display_field(m.candidate.name),
+                m.candidate.source_scope,
+                project_key,
+                m.catalog_status,
+                placement,
+                display_field(reason),
+            )) + "\n"
         )
     return 0
 
@@ -3281,7 +3514,8 @@ def main(argv: list[str]) -> int:
         payload = _apply_payload(merged, sel)
         if payload.get("error") in ("selection", "conflict"):
             return 2
-        return _emit(payload)
+        _emit(payload)
+        return 1 if payload.get("activationFailed") else 0
     if command == "apply-text":
         sel = _parse_selection(rest)
         if sel is None:
@@ -3457,17 +3691,30 @@ def main(argv: list[str]) -> int:
         if command == "migrate-json":
             return _emit(result)
         count = len(result.get("definitions", []))
+        global_count = sum(
+            1
+            for row in result.get("definitions", [])
+            if isinstance(row, dict) and row.get("scope") == "global"
+        )
         state = "completed" if result.get("changed") else "already complete"
+        retained = result.get("retainedLegacyEntries", [])
+        retained_detail = "; ".join(
+            f"{row['name']} ({row['reason']})"
+            for row in retained
+            if isinstance(row, dict)
+            and isinstance(row.get("name"), str)
+            and isinstance(row.get("reason"), str)
+        )
         detail = (
             "No legacy entries required migration or purging."
             if result.get("status") == "not-needed"
-            else "Legacy entries without matching migration proof were retained."
+            else f"Retained legacy entries: {retained_detail}."
             if result.get("legacyRetained")
             else "Migrated legacy entries were purged from the legacy profile store."
         )
         sys.stdout.write(
             f"Legacy MCP migration {state}: {count} definition(s); "
-            f"global activations: 0. {detail}\n"
+            f"global activations: {global_count}. {detail}\n"
         )
         sys.stdout.write("Next: boxa mcp status\n")
         return 0

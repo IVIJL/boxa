@@ -792,11 +792,15 @@ def _purge_migrated_legacy(
     if manifest.get("legacyRetained") is False:
         return dict(manifest), False
 
-    definitions = [
-        row
-        for row in manifest.get("definitions", [])
-        if isinstance(row, dict)
-    ]
+    manifest_definitions = manifest.get("definitions", [])
+    if isinstance(manifest_definitions, list):
+        copied_definitions = [
+            dict(row) if isinstance(row, dict) else row
+            for row in manifest_definitions
+        ]
+    else:
+        copied_definitions = []
+    definitions = [row for row in copied_definitions if isinstance(row, dict)]
     profile_rows: dict[str, list[dict[str, Any]]] = {}
     secret_rows: dict[str, list[dict[str, Any]]] = {}
     for row in definitions:
@@ -816,6 +820,8 @@ def _purge_migrated_legacy(
 
     profile_updates: dict[str, tuple[bytes, Optional[dict[str, Any]]]] = {}
     purge_rows: set[int] = set()
+    retained_entries: list[dict[str, str]] = []
+    retained_keys: set[tuple[str, str]] = set()
     legacy_retained = False
     for path, rows in profile_rows.items():
         original = casfile.read_bytes(path)
@@ -832,15 +838,64 @@ def _purge_migrated_legacy(
                 purge_rows.add(id(row))
                 continue
             fingerprint = row.get("legacyFingerprint")
-            if not isinstance(fingerprint, str) or not isinstance(current, dict):
+            if not isinstance(current, dict):
+                retained_entries.append({
+                    "name": name,
+                    "reason": (
+                        "the current definition is malformed; repair or remove "
+                        "this legacy entry, then re-run boxa mcp migrate"
+                    ),
+                })
+                retained_keys.add((path, name))
                 legacy_retained = True
                 continue
             try:
                 current_entry = _catalog_entry(name, current)
             except MigrationError:
+                retained_entries.append({
+                    "name": name,
+                    "reason": (
+                        "the current definition is malformed; repair or remove "
+                        "this legacy entry, then re-run boxa mcp migrate"
+                    ),
+                })
+                retained_keys.add((path, name))
                 legacy_retained = True
                 continue
+            if not isinstance(fingerprint, str):
+                entry_id = str(row.get("catalogId") or "")
+                recorded = catalog.get("entries", {}).get(entry_id)
+                try:
+                    migrated_entry = (
+                        _catalog_entry(name, recorded)
+                        if isinstance(recorded, dict)
+                        else None
+                    )
+                except MigrationError:
+                    migrated_entry = None
+                if current_entry != migrated_entry:
+                    retained_entries.append({
+                        "name": name,
+                        "reason": (
+                            "the current definition does not match the catalog "
+                            "definition recorded by migration; restore or remove "
+                            "this legacy entry, then re-run boxa mcp migrate"
+                        ),
+                    })
+                    retained_keys.add((path, name))
+                    legacy_retained = True
+                    continue
+                fingerprint = _legacy_fingerprint(current_entry)
+                row["legacyFingerprint"] = fingerprint
             if _legacy_fingerprint(current_entry) != fingerprint:
+                retained_entries.append({
+                    "name": name,
+                    "reason": (
+                        "the definition changed since migration; restore or remove "
+                        "this legacy entry, then re-run boxa mcp migrate"
+                    ),
+                })
+                retained_keys.add((path, name))
                 legacy_retained = True
                 continue
             del servers[name]
@@ -848,6 +903,19 @@ def _purge_migrated_legacy(
             changed = True
         if servers:
             legacy_retained = True
+            for name in servers:
+                key = (path, str(name))
+                if key in retained_keys:
+                    continue
+                retained_entries.append({
+                    "name": str(name),
+                    "reason": (
+                        "it was not recorded by this migration; remove this "
+                        "legacy entry after adding it to the catalog if needed, "
+                        "then re-run boxa mcp migrate"
+                    ),
+                })
+                retained_keys.add(key)
         if changed:
             profile_updates[path] = (original, profile if servers else None)
 
@@ -895,10 +963,13 @@ def _purge_migrated_legacy(
         if changed:
             secret_updates[path] = (original, store if servers else None)
 
-    updated = dict(manifest)
-    updated["legacyRetained"] = legacy_retained
-    updated["legacyPurged"] = True
-    manifest_changed = updated != manifest
+    persisted = dict(manifest)
+    persisted["definitions"] = copied_definitions
+    persisted["legacyRetained"] = legacy_retained
+    persisted["legacyPurged"] = True
+    manifest_changed = persisted != manifest
+    updated = dict(persisted)
+    updated["retainedLegacyEntries"] = retained_entries
     changed = bool(profile_updates or secret_updates or manifest_changed)
     if not changed:
         return updated, False
@@ -915,7 +986,7 @@ def _purge_migrated_legacy(
                 else:
                     casfile.swap_json(path, original, store, 0o600)
             if manifest_changed:
-                activation._atomic_json(migration_path(), updated, 0o600)
+                activation._atomic_json(migration_path(), persisted, 0o600)
         except Exception as exc:
             _compensate(txn, "legacy MCP profile purge", exc)
     return updated, True

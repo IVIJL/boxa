@@ -413,11 +413,14 @@ class MigrationCleanupTest(unittest.TestCase):
         self.assertIn("superseded by the catalog", stdout.getvalue())
         self.assertIn("legacy", stdout.getvalue())
 
-    def test_old_manifest_without_fingerprint_keeps_legacy_entry(self):
+    def test_old_manifest_without_fingerprints_backfills_and_purges(self):
         path = global_profile_path()
         save_profile(path, {
             "version": 1,
-            "servers": {"legacy": _server(["/bin/cat"])},
+            "servers": {
+                "context7": _server(["npx", "-y", "@upstash/context7-mcp"]),
+                "taskmaster-ai": _server(["npx", "-y", "task-master-ai"]),
+            },
         })
         with mock.patch.object(
             migration,
@@ -432,19 +435,73 @@ class MigrationCleanupTest(unittest.TestCase):
             row.pop("legacyFingerprint", None)
         activation._atomic_json(manifest_path, manifest, 0o600)
 
+        result = migration.migrate_legacy()
+
+        self.assertFalse(result["legacyRetained"])
+        self.assertFalse(os.path.exists(path))
+        with open(manifest_path, encoding="utf-8") as fh:
+            persisted = json.load(fh)
+        self.assertTrue(all(
+            isinstance(row.get("legacyFingerprint"), str)
+            for row in persisted["definitions"]
+        ))
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli.main(["migrate-text"])
+        self.assertEqual(rc, 0)
+        self.assertIn("global activations: 2", stdout.getvalue())
+
+    def test_old_manifest_retains_and_names_only_edited_entry(self):
+        path = global_profile_path()
+        save_profile(path, {
+            "version": 1,
+            "servers": {
+                "context7": _server(["npx", "-y", "@upstash/context7-mcp"]),
+                "taskmaster-ai": _server(["npx", "-y", "task-master-ai"]),
+            },
+        })
+        with mock.patch.object(
+            migration,
+            "_purge_migrated_legacy",
+            side_effect=lambda manifest, catalog: (manifest, False),
+        ):
+            migration.migrate_legacy()
+        manifest_path = migration.migration_path()
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        for row in manifest["definitions"]:
+            row.pop("legacyFingerprint", None)
+        activation._atomic_json(manifest_path, manifest, 0o600)
+        save_profile(path, {
+            "version": 1,
+            "servers": {
+                "context7": _server(["npx", "-y", "@upstash/context7-mcp"]),
+                "taskmaster-ai": _server(["npx", "task-master-ai", "--edited"]),
+            },
+        })
+
         first = migration.migrate_legacy()
         manifest_after = self._bytes(manifest_path)
         second = migration.migrate_legacy()
 
         self.assertTrue(first["legacyRetained"])
-        self.assertTrue(os.path.exists(path))
+        self.assertEqual(set(load_profile(path)["servers"]), {"taskmaster-ai"})
         self.assertFalse(second["changed"])
         self.assertEqual(self._bytes(manifest_path), manifest_after)
+        with open(manifest_path, encoding="utf-8") as fh:
+            persisted = json.load(fh)
+        rows = {row["legacyName"]: row for row in persisted["definitions"]}
+        self.assertIsInstance(rows["context7"].get("legacyFingerprint"), str)
+        self.assertNotIn("legacyFingerprint", rows["taskmaster-ai"])
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             rc = cli.main(["migrate-text"])
         self.assertEqual(rc, 0)
-        self.assertIn("without matching migration proof were retained", stdout.getvalue())
+        self.assertIn("taskmaster-ai", stdout.getvalue())
+        self.assertNotIn("context7", stdout.getvalue())
+        self.assertIn("does not match", stdout.getvalue())
+        self.assertIn("re-run boxa mcp migrate", stdout.getvalue())
 
     def test_complete_manifest_purges_only_recorded_profile_entries(self):
         path = global_profile_path()

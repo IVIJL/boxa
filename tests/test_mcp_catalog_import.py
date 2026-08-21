@@ -144,6 +144,83 @@ class CatalogImportTest(unittest.TestCase):
         self.assertNotIn("command", entry)
         self.assertNotIn("executionMode", entry)
 
+    def test_empty_container_fields_do_not_report_catalog_changes(self):
+        cases = (
+            (
+                _remote_candidate("headers", "https://example.test/mcp"),
+                "headers", None,
+            ),
+            (
+                _remote_candidate(
+                    "secret-headers", "https://other.example.test/mcp"
+                ),
+                "secretHeaderKeys", None,
+            ),
+            (_candidate("env", ["npx", "tool"]), "env", {}),
+        )
+        for candidate, field, stored_value in cases:
+            with self.subTest(field=field):
+                imported = import_definitions(merge_candidates([candidate]))
+                entry_id = imported.imported[0].catalog_id
+                catalog = load_catalog()
+                if stored_value is None:
+                    catalog["entries"][entry_id].pop(field, None)
+                else:
+                    catalog["entries"][entry_id][field] = stored_value
+                save_catalog(catalog)
+                before = load_catalog()
+
+                verdict = catalog_verdicts(merge_candidates([candidate]))[0]
+
+                self.assertEqual(verdict.catalog_status, "in-sync")
+                self.assertEqual(verdict.catalog_diff, [])
+                result = import_definitions([verdict])
+                self.assertFalse(result.imported[0].changed)
+                self.assertEqual(load_catalog(), before)
+
+    def test_missing_headers_with_secret_change_reports_only_secret_values(self):
+        secret_one = "Bearer initial-value"
+        secret_two = "Bearer changed-value"
+        path = self._write_source("remote", {
+            "type": "http",
+            "url": "https://example.test/mcp",
+            "headers": {"Authorization": secret_one},
+        })
+        candidate = _remote_candidate(
+            "remote", "https://example.test/mcp",
+            secret_header_keys=["Authorization"],
+        )
+        candidate.provider = "claude-code"
+        candidate.source_path = path
+        imported = import_definitions(
+            merge_candidates([candidate]), secret_consent=lambda *_args: True
+        )
+        entry_id = imported.imported[0].catalog_id
+        catalog = load_catalog()
+        catalog["entries"][entry_id].pop("headers")
+        save_catalog(catalog)
+        self._write_source("remote", {
+            "type": "http",
+            "url": "https://example.test/mcp",
+            "headers": {"Authorization": secret_two},
+        })
+
+        verdict = catalog_verdicts(merge_candidates([candidate]))[0]
+
+        self.assertEqual(verdict.catalog_status, "changed")
+        self.assertEqual(
+            verdict.catalog_diff,
+            [{
+                "field": "secretValues",
+                "catalog": "stored values",
+                "candidate": "host values differ",
+                "keys": ["Authorization"],
+            }],
+        )
+        serialized = json.dumps(verdict.to_dict())
+        self.assertNotIn(secret_one, serialized)
+        self.assertNotIn(secret_two, serialized)
+
     def test_same_scope_name_conflict_is_refused_before_write(self):
         selected = merge_candidates([
             _candidate("dup", ["npx", "one"]),

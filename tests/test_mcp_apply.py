@@ -24,17 +24,22 @@ Covers the issue-05 acceptance criteria:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 
-from mcp import secrets as secrets_mod  # noqa: E402
+from mcp import cli as mcp_cli, secrets as secrets_mod  # noqa: E402
+from mcp.activation import ActivationResult, load_activations  # noqa: E402
 from mcp.apply import (  # noqa: E402
     ApplyConflictError,
     apply_selection,
@@ -652,10 +657,71 @@ class CliWizardWiringTest(ApplyEnv):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         for line in proc.stdout.splitlines():
-            cols = line.split("\t")
+            cols = line.split("\x1f")
             if len(cols) == 4 and cols[1] == name:
                 return cols[0], cols[2], cols[3]  # id, scope, project_key
         self.fail(f"no applicable candidate named {name!r} in:\n{proc.stdout}")
+
+    def _run_apply_wizard(self, replies: str) -> subprocess.CompletedProcess:
+        env = dict(
+            os.environ,
+            CLI_PATH=os.path.join(_REPO_ROOT, "scripts", "mcp-cli.sh"),
+            HARNESS_PATH=os.path.join(_REPO_ROOT, "scripts", "_harness.sh"),
+        )
+        command = (
+            "bash -c 'source \"$CLI_PATH\"; "
+            "export BOXA_PICKER_FZF=0 BOXA_PICKER_TEST_CHOICE=1; "
+            "cmd_import --apply' \"$HARNESS_PATH\""
+        )
+        return subprocess.run(
+            ["script", "-qefc", command, "/dev/null"],
+            input=replies,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=_REPO_ROOT,
+        )
+
+    def _catalog_global_helper(self, claude_path: str) -> None:
+        proc = self._run_cli(
+            ["apply-json", "--server", "global-helper"],
+            claude_path,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_global_changed_candidate_runs_through_apply_wizard(self) -> None:
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        self._catalog_global_helper(path)
+        with open(path, encoding="utf-8") as fh:
+            fixture = json.load(fh)
+        fixture["mcpServers"]["global-helper"]["args"].append("--changed")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(fixture, fh)
+
+        proc = self._run_apply_wizard("y\n\n")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        transcript = proc.stdout + proc.stderr
+        self.assertIn("New: 0; Changed (reimport): 1", transcript)
+        self.assertIn("Reimport with host values?", transcript)
+        self.assertIn("Imported definition global-helper", transcript)
+
+    def test_global_in_sync_candidate_is_counted_and_not_offered(self) -> None:
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        with open(path, encoding="utf-8") as fh:
+            fixture = json.load(fh)
+        del fixture["mcpServers"]["global-helper"]["env"]["GLOBAL_HELPER_TOKEN"]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(fixture, fh)
+        self._catalog_global_helper(path)
+
+        proc = self._run_apply_wizard("")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        transcript = proc.stdout + proc.stderr
+        self.assertIn("New: 0; Changed (reimport): 0", transcript)
+        self.assertIn("1 entries in sync with host configs", transcript)
+        self.assertNotIn("New                 global-helper", transcript)
 
     def test_applicable_wizard_lists_source_project_key(self) -> None:
         path = self._claude_fixture(env_value=_SECRET_VALUE)
@@ -713,6 +779,273 @@ class CliWizardWiringTest(ApplyEnv):
         self.assertEqual(len(payload["imported"]), 1)
         self.assertTrue(payload["definitionOnly"])
         self.assertFalse(os.path.isfile(profile_path("project", _PROJECT_KEY)))
+
+    def test_wizard_multi_project_activation_uses_first_as_destination(self) -> None:
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        other_project = "/home/tester/Projekty/OtherApp"
+        iid, _scope, _pkey = self._import_id_for(
+            path, "global-helper", ["--project", _PROJECT_KEY]
+        )
+        proc = self._run_cli(
+            [
+                "apply-json", "--project", _PROJECT_KEY,
+                "--import-id", iid,
+                "--override", iid, "project", _PROJECT_KEY,
+                "--wizard-activation", iid, "claude,codex", _PROJECT_KEY,
+                "--wizard-activation", iid, "claude,codex", other_project,
+            ],
+            path,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(len(payload["imported"]), 1)
+        self.assertEqual(
+            [item["projectKey"] for item in payload["activations"]],
+            [_PROJECT_KEY, other_project],
+        )
+        entry_id = payload["imported"][0]["catalogId"]
+        records = load_activations()["projects"]
+        self.assertEqual(
+            records[_PROJECT_KEY][entry_id]["consumers"], ["claude", "codex"]
+        )
+        self.assertEqual(
+            records[other_project][entry_id]["consumers"], ["claude", "codex"]
+        )
+
+    def test_wizard_single_project_without_activation_preserves_old_state(self) -> None:
+        path = self._claude_fixture(env_value=_SECRET_VALUE)
+        iid, _scope, _pkey = self._import_id_for(
+            path, "global-helper", ["--project", _PROJECT_KEY]
+        )
+        proc = self._run_cli(
+            [
+                "apply-json", "--project", _PROJECT_KEY,
+                "--import-id", iid,
+                "--override", iid, "project", _PROJECT_KEY,
+            ],
+            path,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertNotIn("activations", payload)
+        self.assertEqual(load_activations()["projects"], {})
+
+    def test_wizard_degraded_activation_acknowledges_once_for_all_projects(self) -> None:
+        iid = "imp-degraded"
+        catalog_id = "entry-degraded"
+        projects = [_PROJECT_KEY, "/home/tester/Projekty/OtherApp"]
+        imported = SimpleNamespace(import_id=iid, catalog_id=catalog_id)
+        result = SimpleNamespace(imported=[imported])
+        sel = mcp_cli._Selection()
+        sel.wizard_activations[iid] = [
+            ("claude", project) for project in projects
+        ]
+        entry = {"id": catalog_id, "name": "degraded"}
+        activated = [
+            ActivationResult(entry, project, ["claude"], True)
+            for project in projects
+        ]
+
+        with mock.patch.object(
+            mcp_cli, "catalog_resolve", return_value=(catalog_id, entry)
+        ), mock.patch.object(
+            mcp_cli, "isolation_status", return_value="degraded-secret-isolation"
+        ), mock.patch.object(
+            mcp_cli, "_wizard_degradation_consent", return_value=True
+        ) as consent, mock.patch.object(
+            mcp_cli, "preflight_catalog"
+        ) as preflight, mock.patch.object(
+            mcp_cli, "activate_catalog", side_effect=activated
+        ) as activate:
+            outcomes, failed = mcp_cli._apply_wizard_activations(result, sel)
+
+        self.assertFalse(failed)
+        consent.assert_called_once_with("degraded")
+        self.assertEqual([item["projectKey"] for item in outcomes], projects)
+        for call in preflight.call_args_list + activate.call_args_list:
+            self.assertTrue(call.kwargs["accept_degraded_secret_isolation"])
+
+    def test_wizard_non_tty_degraded_activation_skips_with_next_hint(self) -> None:
+        iid = "imp-degraded"
+        catalog_id = "entry-degraded"
+        imported = SimpleNamespace(import_id=iid, catalog_id=catalog_id)
+        result = SimpleNamespace(imported=[imported])
+        sel = mcp_cli._Selection()
+        sel.wizard_activations[iid] = [("claude", _PROJECT_KEY)]
+        entry = {"id": catalog_id, "name": "degraded"}
+
+        with mock.patch.object(
+            mcp_cli, "catalog_resolve", return_value=(catalog_id, entry)
+        ), mock.patch.object(
+            mcp_cli, "isolation_status", return_value="degraded-secret-isolation"
+        ), mock.patch.object(
+            mcp_cli, "_wizard_degradation_consent", return_value=None
+        ), mock.patch.object(mcp_cli, "preflight_catalog") as preflight, \
+                mock.patch.object(mcp_cli, "activate_catalog") as activate:
+            outcomes, failed = mcp_cli._apply_wizard_activations(result, sel)
+
+        self.assertFalse(failed)
+        self.assertEqual(outcomes[0]["outcome"], "skipped")
+        self.assertIn("--accept-degraded-secret-isolation", outcomes[0]["next"])
+        preflight.assert_not_called()
+        activate.assert_not_called()
+
+    def test_wizard_partial_activation_reports_success_and_failure(self) -> None:
+        iid = "imp-partial"
+        catalog_id = "entry-partial"
+        other_project = "/home/tester/Projekty/OtherApp"
+        imported = SimpleNamespace(import_id=iid, catalog_id=catalog_id)
+        result = SimpleNamespace(imported=[imported])
+        sel = mcp_cli._Selection()
+        sel.wizard_activations[iid] = [
+            ("claude", _PROJECT_KEY), ("claude", other_project)
+        ]
+        entry = {"id": catalog_id, "name": "partial"}
+        first = ActivationResult(entry, _PROJECT_KEY, ["claude"], True)
+
+        with mock.patch.object(
+            mcp_cli, "catalog_resolve", return_value=(catalog_id, entry)
+        ), mock.patch.object(
+            mcp_cli, "isolation_status", return_value="isolated"
+        ), mock.patch.object(mcp_cli, "preflight_catalog"), mock.patch.object(
+            mcp_cli, "activate_catalog", side_effect=[first, OSError("write failed")]
+        ):
+            outcomes, failed = mcp_cli._apply_wizard_activations(result, sel)
+
+        self.assertTrue(failed)
+        self.assertEqual(outcomes[0]["outcome"], "activated")
+        self.assertEqual(outcomes[1]["outcome"], "failed")
+        self.assertEqual(outcomes[1]["projectKey"], other_project)
+        self.assertEqual(outcomes[1]["entry"]["name"], "partial")
+        self.assertEqual(outcomes[1]["consumers"], ["claude"])
+        self.assertEqual(outcomes[1]["error"], "write failed")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            mcp_cli._render_wizard_activation_outcomes(outcomes)
+        self.assertIn(_PROJECT_KEY, stdout.getvalue())
+        self.assertIn(
+            f"Failed MCP activation 'partial' for claude in Project "
+            f"{other_project}",
+            stderr.getvalue(),
+        )
+        self.assertIn("write failed", stderr.getvalue())
+
+    def test_wizard_degradation_consent_reads_one_tty_reply(self) -> None:
+        stdin = mock.Mock()
+        stdin.isatty.return_value = True
+        tty = mock.mock_open(read_data="y\n")
+        with mock.patch.object(mcp_cli.sys, "stdin", stdin), mock.patch(
+            "builtins.open", tty
+        ):
+            accepted = mcp_cli._wizard_degradation_consent("degraded")
+
+        self.assertTrue(accepted)
+        tty.assert_called_once_with("/dev/tty", "r+", encoding="utf-8")
+
+    def test_json_apply_wizard_never_offers_activation(self) -> None:
+        env = dict(
+            os.environ,
+            CLI_PATH=os.path.join(_REPO_ROOT, "scripts", "mcp-cli.sh"),
+            HARNESS_PATH=os.path.join(_REPO_ROOT, "scripts", "_harness.sh"),
+        )
+        command = r'''bash -c '
+            source "$CLI_PATH"
+            _wizard_select() {
+                eval "$1=(imp-one)"
+                eval "$2=(server)"
+                eval "$3=(project)"
+                eval "$4=(/source)"
+                eval "$5=(proposal)"
+                eval "$6=(container)"
+                eval "$7=(\"\")"
+            }
+            _wizard_scope_toggle() { printf "%s\n" project; }
+            _run_py() {
+                if [ "$1" = project-targets-text ]; then
+                    printf "%s\n" $'"'"'Source\t/source'"'"' \
+                        $'"'"'Other\t/other'"'"'
+                fi
+            }
+            picker::one() {
+                printf "PICKER_ONE\n" >/dev/tty
+                local first=""
+                while [ "$#" -gt 0 ]; do
+                    if [ "$1" = --first-option ]; then
+                        first="$2"
+                        shift 2
+                    else
+                        shift
+                    fi
+                done
+                [ -n "$first" ] && printf "%s\n" "$first"
+            }
+            picker::many() {
+                printf "PICKER_MANY\n" >/dev/tty
+                picker::one "$@"
+                IFS= read -r row && printf "%s\n" "$row"
+            }
+            _run_py_secret_write() { printf "PYARG:%s\n" "$@"; }
+            _finish_secret_write() { :; }
+            cmd_import --apply --json
+        ' "$HARNESS_PATH"'''
+        proc = subprocess.run(
+            ["script", "-qefc", command, "/dev/null"],
+            input="n\n",
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=_REPO_ROOT,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        transcript = proc.stdout + proc.stderr
+        self.assertIn("PICKER_ONE", transcript)
+        self.assertNotIn("PICKER_MANY", transcript)
+        self.assertNotIn("Activate 'server'", transcript)
+        self.assertNotIn("--wizard-activation", transcript)
+        self.assertIn("--import-id", transcript)
+
+    def test_applicable_wizard_preserves_safe_key_and_drops_unsafe_key(self) -> None:
+        safe = _container_cand(
+            "bad\x1fname\nline",
+            scope="project",
+            project="/project key",
+        )
+        unsafe_framing = _container_cand(
+            "unsafe-framing",
+            scope="project",
+            project="/project\x1fkey\npart",
+        )
+        unsafe_tab = _container_cand(
+            "unsafe-tab",
+            scope="project",
+            project="/project\tkey",
+        )
+        merged = merge_candidates([safe, unsafe_framing, unsafe_tab])
+        for item in merged:
+            item.catalog_status = "proposal"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = mcp_cli._render_applicable_wizard(merged)
+
+        self.assertEqual(rc, 0)
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        fields = lines[0].split("\x1f")
+        self.assertEqual(len(fields), 4)
+        self.assertEqual(fields[1], "bad name line")
+        self.assertEqual(fields[3], "/project key")
+        self.assertIn(
+            "Skipping MCP import candidate 'unsafe-framing'", stderr.getvalue()
+        )
+        self.assertIn(
+            "Skipping MCP import candidate 'unsafe-tab'", stderr.getvalue()
+        )
+        self.assertIn("source Project key contains", stderr.getvalue())
 
     def test_override_rejects_relative_project_key(self) -> None:
         # The wizard must only ever pass a resolved ABSOLUTE host path; a bare

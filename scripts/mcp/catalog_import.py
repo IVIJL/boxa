@@ -166,6 +166,21 @@ def _definition(entry: dict[str, Any]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+_CONTAINER_ENTRY_FIELDS = {
+    "headers", "secretHeaderKeys", "readiness", "command", "envKeys",
+    "secretEnvKeys", "env",
+}
+
+
+def _canonical_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Normalize empty container fields emitted by the import mapping."""
+    return {
+        key: value
+        for key, value in entry.items()
+        if key not in _CONTAINER_ENTRY_FIELDS or value not in (None, {}, [])
+    }
+
+
 def _dedup_key(entry: dict[str, Any]) -> tuple[str, object]:
     """Catalog identity for discovery dedup: command/args or remote URL."""
     if entry.get("type") == "http":
@@ -184,6 +199,8 @@ def _dedup_key(entry: dict[str, Any]) -> tuple[str, object]:
 
 def _safe_diff(current: dict[str, Any], proposed: dict[str, Any]) -> list[dict[str, Any]]:
     """Return a secret-free definition diff for an inherited name collision."""
+    current = _canonical_entry(current)
+    proposed = _canonical_entry(proposed)
     fields = (
         "type", "url", "headers", "secretHeaderKeys", "command", "envKeys",
         "secretEnvKeys", "runtimeKind", "env",
@@ -293,14 +310,15 @@ def catalog_verdicts(
         if matched is not None:
             entry_id, entry = matched
             updated = _matched_update(data, merged, entry_id)
-            comparable = dict(updated)
+            current = _canonical_entry(entry)
+            comparable = _canonical_entry(updated)
             if "importIdentity" not in entry:
                 comparable.pop("importIdentity", None)
             secret_changes = _secret_changes(
                 merged, entry, (scope_overrides or {}).get(merged.import_id)
             )
             merged.catalog_status = (
-                "in-sync" if comparable == entry and not secret_changes else "changed"
+                "in-sync" if comparable == current and not secret_changes else "changed"
             )
             merged.catalog_id = entry_id
             merged.catalog_name = entry["name"]

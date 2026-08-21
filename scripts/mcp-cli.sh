@@ -53,9 +53,9 @@ MCP_PY_DIR="$BOXA_DIR/scripts"
 
 # Shared interactive picker (ADR 0006): fzf when present, a numbered fallback
 # (comma multi-select, `q` cancel, /dev/tty reads) otherwise. The import wizard
-# (issue 12) drives picker::many for the multi-select and picker::one for the
-# project picker, so fzf-vs-fallback and the cancel UX stay consistent with the
-# rest of boxa and are exercised by tests/picker.sh.
+# drives picker::many for both server and Project selection, so fzf-vs-fallback
+# and the cancel UX stay consistent with the rest of boxa and are exercised by
+# tests/picker.sh.
 # shellcheck source-path=SCRIPTDIR source=../lib/picker.sh disable=SC1091
 . "$BOXA_DIR/lib/picker.sh"
 
@@ -598,7 +598,7 @@ cmd_import_apply() {
             # $? to 0 inside the then-branch, masking a wizard failure. The
             # wizard prints the resolved --import-id / --override args (one per
             # line) on stdout; all interaction goes to /dev/tty.
-            wizard_args="$(_apply_wizard "${_scope_args[@]}")"
+            wizard_args="$(_apply_wizard "$json" "${_scope_args[@]}")"
             wizard_rc=$?
             if [ "$wizard_rc" -ne 0 ]; then
                 return "$wizard_rc"
@@ -849,7 +849,7 @@ _wizard_select() {
     local -a menu_new=() menu_changed=() menu=()
     local in_sync_count=0
     local id name scope pkey catalog_status placement reason
-    while IFS=$'\t' read -r id name scope pkey catalog_status placement reason; do
+    while IFS=$'\x1f' read -r id name scope pkey catalog_status placement reason; do
         [ -n "$id" ] || continue
         if [ "$catalog_status" = "in-sync" ]; then
             in_sync_count=$((in_sync_count + 1))
@@ -951,12 +951,18 @@ _wizard_scope_toggle() {
 # issue 11's targets; the source project (when present) is offered as the FIRST
 # option so the user can pick it with one keystroke (pre-highlight in the no-fzf
 # fallback; fzf has no default-row API, so the source is simply listed first).
-# Prints the chosen absolute project key on stdout. Returns non-zero on cancel /
-# no targets.
+# Prints the chosen absolute project keys on stdout, one per line and in picker
+# order. Returns non-zero on cancel / no targets.
 #   $1  the server name (for the prompt)
 #   $2  the default (source) project key, or "" for no default
+#   $3  one|many (default: many)
 _wizard_project_picker() {
-    local name="$1" default_key="$2"
+    local name="$1" default_key="$2" mode="${3:-many}"
+    local picker_command="picker::$mode"
+    case "$mode" in
+        one|many) ;;
+        *) echo "Invalid Project picker mode: $mode" >&2; return 2 ;;
+    esac
     local targets
     # Let stderr through: project-targets-text reports basename collisions
     # there (two host paths sanitizing to one name, omitted from stdout for
@@ -997,27 +1003,43 @@ _wizard_project_picker() {
         menu+=("$row")
     done
 
-    local picked
+    local picked prompt header
+    if [ "$mode" = one ]; then
+        prompt="Pick the boxa Project for '$name'"
+        header="Choose a target Project (q to cancel)"
+    else
+        prompt="Pick boxa Projects for '$name'"
+        header="Choose one or more target Projects (q to cancel)"
+    fi
     if [ -n "$default_row" ]; then
-        picked="$(printf '%s\n' "${menu[@]+"${menu[@]}"}" | picker::one \
-            --prompt "Pick the boxa Project for '$name'" \
-            --header "Source project is the default (a)" \
+        if [ "$mode" = one ]; then
+            header="Source project is the default (a)"
+        else
+            header="Choose one or more Projects; source project is the default (a)"
+        fi
+        picked="$(printf '%s\n' "${menu[@]+"${menu[@]}"}" | "$picker_command" \
+            --prompt "$prompt" \
+            --header "$header" \
             --first-option "$default_row")" \
             || { echo "No Project chosen for '$name'." >&2; return 2; }
     else
-        picked="$(printf '%s\n' "${menu[@]}" | picker::one \
-            --prompt "Pick the boxa Project for '$name'" \
-            --header "Choose a target Project (q to cancel)")" \
+        picked="$(printf '%s\n' "${menu[@]}" | "$picker_command" \
+            --prompt "$prompt" \
+            --header "$header")" \
             || { echo "No Project chosen for '$name'." >&2; return 2; }
     fi
 
-    local key
-    key="$(_row_key "$picked")"
-    if [ -z "$key" ]; then
+    local key found=false
+    while IFS= read -r row; do
+        key="$(_row_key "$row")"
+        [ -n "$key" ] || continue
+        printf '%s\n' "$key"
+        found=true
+    done <<< "$picked"
+    if [ "$found" != true ]; then
         echo "No Project chosen for '$name'." >&2
         return 2
     fi
-    printf '%s\n' "$key"
 }
 
 # Pick one or more initialized Projects for an interactive catalog activation.
@@ -1065,8 +1087,11 @@ _activation_project_picker() {
 
 # Full apply wizard. Prints the resolved Python apply args (one per line:
 # --import-id <id> ... and --override <id> <scope> [<key>] ...) on stdout. All
-# interaction is on /dev/tty. Returns non-zero on a hard error or a cancel.
+# interaction is on /dev/tty. $1 is the JSON-mode boolean; remaining arguments
+# are the discovery scope. Returns non-zero on a hard error or a cancel.
 _apply_wizard() {
+    local json="$1"
+    shift
     local -a sel_ids=() sel_names=() sel_scopes=() sel_pkeys=()
     local -a sel_catalog_statuses=() sel_placements=() sel_reasons=()
     local rc
@@ -1134,15 +1159,42 @@ _apply_wizard() {
 
         # Resulting scope is project -> always run the project picker. The
         # source project (when the server came from a project) is the default.
-        if ! chosen_key="$(_wizard_project_picker "$name" "$pkey")"; then
+        local chosen_projects project_picker_mode=many
+        [ "$json" = true ] && project_picker_mode=one
+        if ! chosen_projects="$(_wizard_project_picker \
+            "$name" "$pkey" "$project_picker_mode")"; then
             return 2
         fi
+        local -a project_keys=()
+        while IFS= read -r chosen_key; do
+            [ -n "$chosen_key" ] && project_keys+=("$chosen_key")
+        done <<< "$chosen_projects"
+        [ "${#project_keys[@]}" -gt 0 ] || return 2
+        chosen_key="${project_keys[0]}"
         # Emit a project override whenever the scope changed (global->project)
         # OR the chosen project key differs from the inherited source key. When
         # the user keeps the inherited project unchanged, no override is needed.
         if [ "$inherited" != "project" ] || [ "$chosen_key" != "$pkey" ]; then
             out_args+=("--override" "$id" "project" "$chosen_key")
         fi
+
+        [ "$json" = true ] && continue
+
+        printf "Activate '%s' in the selected Project(s)? [y/N] " "$name" >/dev/tty
+        local activate_reply consumer=""
+        _tty_read activate_reply ''
+        case "$activate_reply" in
+            y|Y|yes|YES)
+                consumer="$(printf '%s\n' claude codex claude,codex \
+                    | picker::one --prompt "Activate for consumer: ")" || return 2
+                local activation_project
+                for activation_project in "${project_keys[@]}"; do
+                    out_args+=(
+                        "--wizard-activation" "$id" "$consumer" "$activation_project"
+                    )
+                done
+                ;;
+        esac
     done
 
     printf '%s\n' "${out_args[@]}"

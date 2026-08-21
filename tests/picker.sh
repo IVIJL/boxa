@@ -146,6 +146,31 @@ gamma" "$(run_e2e 1,3 picker::many --prompt "P:")"
 assert_eq "e2e many+first: mixed a,2" "* All
 beta" "$(run_e2e a,2 picker::many --prompt "P:" --first-option "* All")"
 
+wizard_projects_out="$(
+    BOXA_PICKER_FZF=0 BOXA_PICKER_TEST_CHOICE=a,1 \
+        bash -c '
+            source "$1"
+            _run_py() {
+                printf "%s\n" $'"'"'Source Project\t/source'"'"' \
+                    $'"'"'Other Project\t/other'"'"'
+            }
+            _wizard_project_picker server /source
+        ' "$SCRIPT_DIR/../scripts/_harness.sh" \
+            "$SCRIPT_DIR/../scripts/mcp-cli.sh" 2>/dev/null
+)"
+assert_eq "import Project picker: fallback selects destination + activation Project" \
+    $'/source\n/other' "$wizard_projects_out"
+
+# shellcheck disable=SC2016 # $1 is intentionally expanded by the child shell.
+assert_fail "import Project picker: q cancels" \
+    env BOXA_PICKER_FZF=0 BOXA_PICKER_TEST_CHOICE=q \
+        bash -c '
+            source "$1"
+            _run_py() { printf "%s\n" $'"'"'Source Project\t/source'"'"'; }
+            _wizard_project_picker server /source
+        ' "$SCRIPT_DIR/../scripts/_harness.sh" \
+            "$SCRIPT_DIR/../scripts/mcp-cli.sh"
+
 sectioned_out="$(
     printf '%s\n' \
         $'New                 alpha\timp-new' \
@@ -239,16 +264,14 @@ fzf() {
 }
 fzf_stderr="$(_picker::fzf many "P:" "Choose items" alpha beta 2>&1 1>/dev/null)"
 unset -f fzf
-case "$fzf_stderr" in
-    *"Choose items"*"Tab selects multiple"*)
-        printf 'PASS  fzf many: header explains Tab selection\n'
-        ;;
-    *)
-        printf 'FAIL  fzf many: header explains Tab selection\n      stderr: %q\n' \
-            "$fzf_stderr"
-        fail_count=$((fail_count + 1))
-        ;;
-esac
+if [[ "$fzf_stderr" = *"--multi"* \
+    && "$fzf_stderr" = *"Choose items"*"Tab selects multiple"* ]]; then
+    printf 'PASS  fzf many: enables multi-select and explains Tab selection\n'
+else
+    printf 'FAIL  fzf many: enables multi-select and explains Tab selection\n      stderr: %q\n' \
+        "$fzf_stderr"
+    fail_count=$((fail_count + 1))
+fi
 
 unset BOXA_PICKER_FZF
 
