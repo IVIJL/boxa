@@ -78,6 +78,7 @@ boundary is policy scoping, not process isolation.
   them (proxied) instead of `not-applicable`.
 - Import discovery may detect headers on inherited servers but imports
   names only and prompts for values — never silently copying a token out
-  of `~/.claude.json`.
+  of `~/.claude.json`. (Refined by ADR 0031: the prompt may offer to
+  move the value into the secret store, per-value and consent-first.)
 - A stopped broker means a proxied entry is unavailable; direct-URL
   entries are unaffected.

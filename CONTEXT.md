@@ -320,10 +320,17 @@ _Avoid_: shim, PATH alias, agent alias
 An **MCP server** discovered from an existing agent configuration that was
 not created by boxa. Container sessions never see it; the only path into the
 **Container** is proposal into the **MCP catalog** and explicit activation.
-Discovery classifies it heuristically and never by executing it, and a
-candidate identical to an existing catalog entry is reported as already
-cataloged instead of proposed again.
+Discovery classifies it heuristically and never by executing it. A candidate
+matching an already-cataloged entry is offered for **Reimport** when its host
+definition differs from the entry, and reported as in sync otherwise.
 _Avoid_: existing MCP server, user MCP server
+
+**Reimport**:
+Taking host-side changes of an already-cataloged **Inherited MCP server**
+back into its **MCP catalog** entry. The host definition wins for the fields
+it carries; boxa-only state (name, activations, trust, mode) is untouched,
+and credential values move only with per-value consent (ADR 0031).
+_Avoid_: resync, re-sync, re-import command
 
 **Boxa MCP server**:
 An **MCP server** represented by an **MCP catalog entry**.
