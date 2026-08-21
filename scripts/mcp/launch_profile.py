@@ -11,10 +11,12 @@ import json
 import os
 import re
 import stat
+import sys
 import tomllib
 from typing import Any, Optional
 
 from . import identity, trusted
+from .http_proxy import HttpProxyError, proxy_url
 
 
 BOXA_PREFIX = "boxa-"
@@ -25,6 +27,13 @@ def rendered_name(server_name: str) -> str:
     return f"{BOXA_PREFIX}{server_name}"
 
 
+def _proxy_url(entry_id: str, consumer: str) -> str:
+    try:
+        return proxy_url(entry_id, consumer)
+    except HttpProxyError as exc:
+        raise LaunchProfileError(str(exc)) from exc
+
+
 def claude_server_definition(
     entry_id: str,
     project: str,
@@ -32,7 +41,12 @@ def claude_server_definition(
 ) -> dict[str, Any]:
     """Build one secret-free Claude launch-time MCP server definition."""
     if entry["type"] == "http":
-        return {"type": "http", "url": entry["url"]}
+        if entry.get("secretHeaderKeys"):
+            return {"type": "http", "url": _proxy_url(entry_id, "claude")}
+        definition = {"type": "http", "url": entry["url"]}
+        if entry.get("headers"):
+            definition["headers"] = dict(entry["headers"])
+        return definition
     return {
         "type": "stdio",
         "command": WRAPPER_COMMAND,
@@ -94,20 +108,38 @@ def claude_launch_profile(
     project, entries = active_project_entries(
         "claude", runtime=runtime, project=project
     )
-    return {
-        "mcpServers": {
-            rendered_name(entry["name"]): claude_server_definition(
-                entry_id, project, entry
-            )
-            for entry_id, entry in entries
-        }
-    }
+    servers: dict[str, dict[str, Any]] = {}
+    for entry_id, entry in entries:
+        try:
+            definition = claude_server_definition(entry_id, project, entry)
+        except LaunchProfileError as exc:
+            if not entry.get("secretHeaderKeys"):
+                raise
+            _warn_skipped_proxy(entry, exc)
+            continue
+        servers[rendered_name(entry["name"])] = definition
+    return {"mcpServers": servers}
+
+
+def _warn_skipped_proxy(entry: dict[str, Any], exc: LaunchProfileError) -> None:
+    sys.stderr.write(
+        "boxa: warning: skipping proxied MCP entry "
+        f"{entry.get('name', '<unknown>')!r}: {exc}\n"
+    )
 
 
 def _codex_key(name: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_-]+", name):
         return f"mcp_servers.{name}"
     return f"mcp_servers.{json.dumps(name)}"
+
+
+def _toml_inline_string_map(values: dict[str, str]) -> str:
+    """Render a Codex ``-c`` value as a TOML inline string table."""
+    return "{ " + ", ".join(
+        f"{json.dumps(str(key))} = {json.dumps(str(value))}"
+        for key, value in values.items()
+    ) + " }"
 
 
 def _shared_codex_server_names(path: str) -> set[str]:
@@ -149,26 +181,39 @@ def codex_launch_profile(
     project, entries = active_project_entries(
         "codex", runtime=runtime, project=project
     )
-    activated_names = {rendered_name(entry["name"]) for _, entry in entries}
     config_path = (
         config_path
         if config_path is not None
         else os.path.expanduser("~/.codex/config.toml")
     )
-    overrides = [
-        f"{_codex_key(name)}.enabled=false"
-        for name in sorted(_shared_codex_server_names(config_path) - activated_names)
-    ]
+    rendered_overrides: list[str] = []
+    activated_names: set[str] = set()
     for entry_id, entry in entries:
-        key = _codex_key(rendered_name(entry["name"]))
+        name = rendered_name(entry["name"])
+        key = _codex_key(name)
         if entry["type"] == "http":
-            overrides.extend(
-                [
-                    f"{key}.enabled=true",
-                    f"{key}.url={json.dumps(entry['url'])}",
-                ]
-            )
+            try:
+                url = (
+                    _proxy_url(entry_id, "codex")
+                    if entry.get("secretHeaderKeys")
+                    else entry["url"]
+                )
+            except LaunchProfileError as exc:
+                if not entry.get("secretHeaderKeys"):
+                    raise
+                _warn_skipped_proxy(entry, exc)
+                continue
+            activated_names.add(name)
+            rendered_overrides.extend([
+                f"{key}.enabled=true",
+                f"{key}.url={json.dumps(url)}",
+            ])
+            if entry.get("headers") and not entry.get("secretHeaderKeys"):
+                rendered_overrides.append(
+                    f"{key}.http_headers={_toml_inline_string_map(entry['headers'])}"
+                )
             continue
+        activated_names.add(name)
         args = [
             "--catalog-id",
             entry_id,
@@ -178,11 +223,15 @@ def codex_launch_profile(
             project,
             entry["name"],
         ]
-        overrides.extend(
+        rendered_overrides.extend(
             [
                 f"{key}.enabled=true",
                 f"{key}.command={json.dumps(WRAPPER_COMMAND)}",
                 f"{key}.args={json.dumps(args, separators=(',', ':'))}",
             ]
         )
-    return overrides
+    overrides = [
+        f"{_codex_key(name)}.enabled=false"
+        for name in sorted(_shared_codex_server_names(config_path) - activated_names)
+    ]
+    return overrides + rendered_overrides

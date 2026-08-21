@@ -164,6 +164,7 @@ class LaunchProfileTest(unittest.TestCase):
 
     def test_http_entries_use_native_claude_and_codex_transports(self):
         entry_id, entry = self._entry("dozzle", entry_type="http")
+        entry["headers"] = {"X-Region": "eu"}
         runtime = {
             "entries": {entry_id: entry},
             "projects": {
@@ -176,7 +177,11 @@ class LaunchProfileTest(unittest.TestCase):
             launch_profile.claude_launch_profile(
                 runtime=runtime, project=self.project
             )["mcpServers"]["boxa-dozzle"],
-            {"type": "http", "url": entry["url"]},
+            {
+                "type": "http",
+                "url": entry["url"],
+                "headers": {"X-Region": "eu"},
+            },
         )
         self.assertEqual(
             launch_profile.codex_launch_profile(
@@ -187,8 +192,102 @@ class LaunchProfileTest(unittest.TestCase):
             [
                 "mcp_servers.boxa-dozzle.enabled=true",
                 f'mcp_servers.boxa-dozzle.url={json.dumps(entry["url"])}',
+                'mcp_servers.boxa-dozzle.http_headers={ "X-Region" = "eu" }',
             ],
         )
+
+    def test_secret_header_http_entries_use_header_free_loopback_profiles(self):
+        entry_id, entry = self._entry("secure", entry_type="http")
+        entry["headers"] = {"X-Region": "eu"}
+        entry["secretHeaderKeys"] = ["Authorization"]
+        runtime = {
+            "entries": {entry_id: entry},
+            "projects": {
+                self.project: {
+                    entry_id: self._record(entry_id, ["claude", "codex"])
+                }
+            },
+        }
+        port_path = os.path.join(self.tmp.name, "http-proxy.port")
+        with open(port_path, "w", encoding="utf-8") as fh:
+            fh.write("43123\n")
+        with mock.patch.dict(
+            os.environ, {"BOXA_MCP_HTTP_PROXY_PORT_FILE": port_path}
+        ), mock.patch(
+            "mcp.http_proxy.request_route_token",
+            side_effect=lambda _entry_id, consumer: {
+                "claude": "A" * 43,
+                "codex": "B" * 43,
+            }[consumer],
+        ):
+            claude = launch_profile.claude_launch_profile(
+                runtime=runtime, project=self.project
+            )["mcpServers"]["boxa-secure"]
+            codex = launch_profile.codex_launch_profile(
+                runtime=runtime,
+                project=self.project,
+                config_path=os.path.join(self.tmp.name, "missing.toml"),
+            )
+        expected_claude_url = f"http://127.0.0.1:43123/mcp/{'A' * 43}/{entry_id}"
+        expected_codex_url = f"http://127.0.0.1:43123/mcp/{'B' * 43}/{entry_id}"
+
+        self.assertEqual(claude, {"type": "http", "url": expected_claude_url})
+        self.assertEqual(
+            codex,
+            [
+                "mcp_servers.boxa-secure.enabled=true",
+                f"mcp_servers.boxa-secure.url={json.dumps(expected_codex_url)}",
+            ],
+        )
+        rendered = json.dumps({"claude": claude, "codex": codex})
+        self.assertNotIn("Authorization", rendered)
+        self.assertNotIn("X-Region", rendered)
+
+    def test_unavailable_proxy_skips_only_affected_entries_with_warning(self):
+        secure_id, secure = self._entry("secure", entry_type="http")
+        secure["secretHeaderKeys"] = ["Authorization"]
+        direct_id, direct = self._entry("direct", entry_type="http")
+        stdio_id, stdio = self._entry("stdio")
+        runtime = {
+            "entries": {
+                secure_id: secure,
+                direct_id: direct,
+                stdio_id: stdio,
+            },
+            "projects": {
+                self.project: {
+                    secure_id: self._record(secure_id, ["claude", "codex"]),
+                    direct_id: self._record(direct_id, ["claude", "codex"]),
+                    stdio_id: self._record(stdio_id, ["claude", "codex"]),
+                }
+            },
+        }
+        missing_port = os.path.join(self.tmp.name, "missing-http-proxy.port")
+        stderr = io.StringIO()
+        with mock.patch.dict(
+            os.environ, {"BOXA_MCP_HTTP_PROXY_PORT_FILE": missing_port}
+        ), contextlib.redirect_stderr(stderr):
+            claude = launch_profile.claude_launch_profile(
+                runtime=runtime, project=self.project
+            )
+            codex = launch_profile.codex_launch_profile(
+                runtime=runtime,
+                project=self.project,
+                config_path=os.path.join(self.tmp.name, "missing.toml"),
+            )
+
+        self.assertNotIn("boxa-secure", claude["mcpServers"])
+        self.assertEqual(
+            claude["mcpServers"]["boxa-direct"],
+            {"type": "http", "url": direct["url"]},
+        )
+        self.assertIn("boxa-stdio", claude["mcpServers"])
+        rendered_codex = "\n".join(codex)
+        self.assertNotIn("boxa-secure", rendered_codex)
+        self.assertIn("boxa-direct", rendered_codex)
+        self.assertIn("boxa-stdio", rendered_codex)
+        self.assertEqual(stderr.getvalue().count("skipping proxied MCP entry"), 2)
+        self.assertIn("secure", stderr.getvalue())
 
     def test_claude_profile_matches_existing_server_definition(self):
         entry_id, entry = self._entry("echo")

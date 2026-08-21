@@ -22,6 +22,7 @@ import json
 import os
 import socket
 import stat
+import struct
 import sys
 import tempfile
 import threading
@@ -35,6 +36,7 @@ if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
 from mcp import broker  # noqa: E402
+from mcp import http_proxy  # noqa: E402
 from mcp import protocol  # noqa: E402
 from mcp.broker import BrokerError  # noqa: E402
 
@@ -717,6 +719,35 @@ class BrokerSpawnBuildTests(_EnvIsolation, unittest.TestCase):
         self.assertIn("invalid OS-bound command or environment", error or "")
         self.assertNotIn(secret, error or "")
 
+    def test_route_issuance_refuses_non_agent_socket_peer(self):
+        entry_id = "12345678-1234-4123-8123-123456789abc"
+        issuer = mock.Mock(return_value="A" * 43)
+        client, server = socket.socketpair()
+        with mock.patch.object(broker, "_route_peer_is_agent", return_value=False):
+            thread = threading.Thread(
+                target=broker._handle, args=(server, issuer)
+            )
+            thread.start()
+            client.sendall(http_proxy.encode_route_request(entry_id, "codex"))
+            ok, error = protocol.decode_reply(protocol.read_line(client.recv))
+            thread.join(timeout=5)
+        client.close()
+
+        self.assertFalse(ok)
+        self.assertIn("agent process", error or "")
+        issuer.assert_not_called()
+
+    def test_route_peer_identity_is_derived_from_kernel_credentials(self):
+        conn = mock.Mock()
+        conn.getsockopt.return_value = struct.pack("3i", 4321, 1000, 1000)
+        agent = mock.Mock(pw_uid=1000)
+        with mock.patch.object(broker.pwd, "getpwnam", return_value=agent):
+            self.assertTrue(broker._route_peer_is_agent(conn))
+
+        conn.getsockopt.return_value = struct.pack("3i", 4321, 995, 995)
+        with mock.patch.object(broker.pwd, "getpwnam", return_value=agent):
+            self.assertFalse(broker._route_peer_is_agent(conn))
+
     def test_resolve_spawn_cwd_accepts_usable_dir(self):
         self.assertEqual(
             broker._resolve_spawn_cwd(self._tmp.name), self._tmp.name
@@ -758,6 +789,9 @@ class BrokerSocketRoundTripTests(_EnvIsolation, unittest.TestCase):
         self._set_env(
             XDG_CONFIG_HOME=self._tmp.name,
             BOXA_MCP_BROKER_SOCKET=self.sock_path,
+            BOXA_MCP_HTTP_PROXY_PORT_FILE=os.path.join(
+                self._tmp.name, "http-proxy.port"
+            ),
         )
 
     def _start_broker(self):
@@ -800,6 +834,16 @@ class BrokerSocketRoundTripTests(_EnvIsolation, unittest.TestCase):
         mode = os.stat(self.sock_path).st_mode & 0o777
         # 0660: owner+group rw, no world access.
         self.assertEqual(mode, 0o660, oct(mode))
+
+    def test_http_proxy_ephemeral_port_is_published_and_listening(self):
+        self._start_broker()
+        port_path = os.environ["BOXA_MCP_HTTP_PROXY_PORT_FILE"]
+        with open(port_path, encoding="ascii") as fh:
+            port = int(fh.read().strip())
+
+        self.assertNotEqual(port, 8765)
+        client = socket.create_connection(("127.0.0.1", port), timeout=2)
+        client.close()
 
     def test_accept_and_proxy_echo(self):
         self._start_broker()
@@ -979,6 +1023,9 @@ class RelayExitStatusOverBrokerTests(_EnvIsolation, unittest.TestCase):
             XDG_CONFIG_HOME=self._tmp.name,
             BOXA_MCP_BROKER_SOCKET=self.sock_path,
             BOXA_MCP_IDENTITY_PATH=ident,
+            BOXA_MCP_HTTP_PROXY_PORT_FILE=os.path.join(
+                self._tmp.name, "http-proxy.port"
+            ),
         )
 
     def _start_broker(self):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import stat
 import sys
 import tempfile
@@ -130,13 +131,148 @@ class CatalogTest(unittest.TestCase):
     def test_http_entry_requires_url_and_forbids_local_runtime_fields(self) -> None:
         entry = add_remote_entry("dozzle", "https://dozzle.example.test/mcp")
         self.assertEqual(
-            set(entry), {"id", "name", "type", "url", "readiness"}
+            set(entry), {
+                "id", "name", "type", "url", "headers",
+                "secretHeaderKeys", "readiness",
+            }
         )
         self.assertEqual(entry["readiness"]["summary"], "no-runtime-readiness")
         with self.assertRaisesRegex(CatalogError, "valid HTTP"):
             add_remote_entry("bad", "ftp://example.test/mcp")
         with self.assertRaisesRegex(CatalogError, "command argv"):
             update_entry(entry["id"], argv=["echo"])
+
+    def test_remote_headers_round_trip_without_secret_values(self) -> None:
+        entry = add_remote_entry(
+            "dozzle",
+            "https://dozzle.example.test/mcp",
+            headers={"X-Tenant": "engineering"},
+            secret_header_keys=["Authorization"],
+        )
+        self.assertEqual(entry["headers"], {"X-Tenant": "engineering"})
+        self.assertEqual(entry["secretHeaderKeys"], ["Authorization"])
+        updated = update_entry(
+            entry["id"],
+            headers={"X-Tenant": "platform"},
+            secretHeaderKeys=["X-Api-Key"],
+        )
+        self.assertEqual(updated["headers"], {"X-Tenant": "platform"})
+        self.assertEqual(updated["secretHeaderKeys"], ["X-Api-Key"])
+        with open(catalog_path(), encoding="utf-8") as fh:
+            raw = fh.read()
+        self.assertNotIn("secret-value", raw)
+        self.assertNotIn("Bearer ", raw)
+
+    def test_remote_header_validation_keeps_catalog_secret_free(self) -> None:
+        with self.assertRaisesRegex(CatalogError, "stores secret header values"):
+            add_remote_entry(
+                "overlap",
+                "https://example.test/mcp",
+                headers={"authorization": "public"},
+                secret_header_keys=["Authorization"],
+            )
+        for headers in (
+            {"Authorization": "public"},
+            {"X-Trace": "Bearer abcdefghijklmnop"},
+        ):
+            with self.subTest(headers=headers), self.assertRaisesRegex(
+                CatalogError, "looks like a secret"
+            ):
+                add_remote_entry(
+                    "secret-looking", "https://example.test/mcp", headers=headers
+                )
+        stdio = add_entry("stdio", ["npx", "stdio"])
+        with self.assertRaisesRegex(CatalogError, "do not accept headers"):
+            update_entry(stdio["id"], headers={"X-Tenant": "engineering"})
+
+    def test_remote_header_names_must_be_unique_case_insensitively(self) -> None:
+        for name, headers, secret_header_keys in (
+            ("duplicate-public", {"X-Trace": "one", "x-trace": "two"}, []),
+            ("duplicate-secret", {}, ["X-Api-Key", "x-api-key"]),
+        ):
+            with self.subTest(
+                headers=headers, secret_header_keys=secret_header_keys
+            ), self.assertRaisesRegex(CatalogError, "duplicate header name"):
+                add_remote_entry(
+                    name,
+                    "https://example.test/mcp",
+                    headers=headers,
+                    secret_header_keys=secret_header_keys,
+                )
+
+    def test_secret_headers_require_https(self) -> None:
+        with self.assertRaisesRegex(CatalogError, "secret headers require HTTPS"):
+            add_remote_entry(
+                "insecure",
+                "http://example.test/mcp",
+                secret_header_keys=["Authorization"],
+            )
+
+    def test_cli_add_and_update_remote_headers(self) -> None:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli.main([
+                "catalog-add-json", "remote", "--url", "https://example.test/mcp",
+                "--header", "X-Tenant=engineering",
+                "--secret-header-key", "Authorization",
+            ])
+        self.assertEqual(rc, 0, stderr.getvalue())
+        added = json.loads(stdout.getvalue())["entry"]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli.main([
+                "catalog-update-json", added["id"],
+                "--header", "X-Tenant=platform",
+                "--secret-header-key", "X-Api-Key",
+            ])
+        self.assertEqual(rc, 0, stderr.getvalue())
+        updated = json.loads(stdout.getvalue())["entry"]
+        self.assertEqual(updated["headers"], {"X-Tenant": "platform"})
+        self.assertEqual(updated["secretHeaderKeys"], ["X-Api-Key"])
+
+    def test_catalog_update_text_prints_secret_header_next_steps(self) -> None:
+        entry = add_remote_entry(
+            "remote", "https://example.test/mcp"
+        )
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli.main([
+                "catalog-update-text", entry["id"],
+                "--secret-header-key", "Authorization",
+            ])
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertIn(
+            "Next: boxa mcp secret set remote Authorization",
+            stdout.getvalue(),
+        )
+        self.assertIn("Then: boxa mcp reload", stdout.getvalue())
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            rc = cli.main([
+                "catalog-update-text", entry["id"],
+                "--secret-header-key", "Authorization",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("boxa mcp secret set", stdout.getvalue())
+
+    def test_catalog_update_text_shell_quotes_next_step_arguments(self) -> None:
+        name = "remote connector; echo unsafe"
+        entry = add_remote_entry(name, "https://example.test/mcp")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli.main([
+                "catalog-update-text", entry["id"],
+                "--secret-header-key", "X-Api-Key",
+            ])
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertIn(
+            "Next: "
+            + shlex.join([
+                "boxa", "mcp", "secret", "set", name, "X-Api-Key"
+            ]),
+            stdout.getvalue(),
+        )
 
     def test_http_entry_rejects_credential_like_query_and_fragment_keys(self) -> None:
         urls = (

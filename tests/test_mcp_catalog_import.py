@@ -37,7 +37,7 @@ def _candidate(name, argv, *, scope="global", project=None):
     )
 
 
-def _remote_candidate(name, url):
+def _remote_candidate(name, url, *, headers=None, secret_header_keys=None):
     return Candidate(
         provider="fixture",
         source_path="/does/not/exist",
@@ -45,6 +45,8 @@ def _remote_candidate(name, url):
         name=name,
         type="http",
         url=url,
+        headers=dict(headers or {}),
+        secret_header_keys=list(secret_header_keys or []),
         classification=Classification(placement="container", confidence="high"),
     )
 
@@ -81,6 +83,21 @@ class CatalogImportTest(unittest.TestCase):
             self.assertFalse(os.path.exists(path))
         with open(claude, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh), manual)
+
+    def test_remote_import_round_trips_header_declarations(self):
+        candidate = _remote_candidate(
+            "remote",
+            "https://example.test/mcp",
+            headers={"X-Tenant": "engineering"},
+            secret_header_keys=["Authorization"],
+        )
+        import_definitions(merge_candidates([candidate]))
+        entry = next(iter(load_catalog()["entries"].values()))
+        self.assertEqual(entry["headers"], {"X-Tenant": "engineering"})
+        self.assertEqual(entry["secretHeaderKeys"], ["Authorization"])
+        with open(os.path.join(os.environ["XDG_CONFIG_HOME"], "boxa", "mcp", "catalog.json"), encoding="utf-8") as fh:
+            raw = fh.read()
+        self.assertNotIn("Bearer ", raw)
 
     def test_repeat_is_idempotent_and_deduplicates_across_source_scope(self):
         candidates = merge_candidates([

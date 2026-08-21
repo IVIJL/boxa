@@ -900,9 +900,11 @@ _RUNTIME_FIELDS = {
     "command",
     "env",
     "envKeys",
+    "headers",
     "prerequisites",
     "runtimeKind",
     "secretEnvKeys",
+    "secretHeaderKeys",
     "type",
     "url",
 }
@@ -944,7 +946,7 @@ def _catalog_secret_updates(
     *,
     replacement_name: Optional[str],
 ) -> dict[str, dict[str, Any]]:
-    """Move name-keyed credentials on rename or purge this identity on remove."""
+    """Move name-keyed env credentials or purge this catalog identity."""
     updates: dict[str, dict[str, Any]] = {}
     for path in _catalog_secret_paths():
         try:
@@ -952,6 +954,7 @@ def _catalog_secret_updates(
         except (OSError, ValueError) as exc:
             raise ActivationError(f"cannot update MCP secret store {path}: {exc}") from exc
         servers = store["servers"]
+        headers = store.get("headers", {})
         changed = False
         if replacement_name is None:
             for key in (current_name, entry_id):
@@ -966,6 +969,10 @@ def _catalog_secret_updates(
                 )
             servers[replacement_name] = servers.pop(current_name)
             changed = True
+        if replacement_name is None and isinstance(headers, dict):
+            if entry_id in headers:
+                del headers[entry_id]
+                changed = True
         if changed:
             updates[path] = store
     return updates

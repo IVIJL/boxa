@@ -553,7 +553,7 @@ fi
 
 if mcp_config="$(
     PYTHONPATH="$MCP_PY_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m mcp.cli claude-launch-profile 2>/dev/null
+        python3 -m mcp.cli claude-launch-profile
 )" && [ -n "$mcp_config" ]; then
     :
 else
@@ -598,7 +598,7 @@ fi
 codex_args=()
 if mcp_overrides="$(
     PYTHONPATH="$MCP_PY_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 -m mcp.cli codex-launch-profile 2>/dev/null
+        python3 -m mcp.cli codex-launch-profile
 )"; then
     while IFS= read -r override; do
         [ -z "$override" ] || codex_args+=("-c" "$override")

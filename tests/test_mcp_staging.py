@@ -30,10 +30,16 @@ from mcp.staging import (  # noqa: E402
 )
 
 
-def _write_store(path: str, server: str, values: dict) -> None:
+def _write_store(
+    path: str, server: str, values: dict, *, headers: dict | None = None
+) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"version": 1, "servers": {server: values}}, fh)
+        json.dump({
+            "version": 1,
+            "servers": {server: values},
+            "headers": headers or {},
+        }, fh)
 
 
 class StagedBasenameTests(unittest.TestCase):
@@ -167,6 +173,28 @@ class StageScopeTests(unittest.TestCase):
             os.stat(os.path.join(self.dest, "secrets.json")).st_mode
         )
         self.assertEqual(mode, 0o400)
+
+    def test_header_secret_restage_uses_same_agent_unreadable_file(self):
+        entry_id = "11111111-1111-1111-1111-111111111111"
+        _write_store(
+            self._global(),
+            "srv",
+            {},
+            headers={entry_id: {"Authorization": "old"}},
+        )
+        stage_secrets(self.source, self.dest, project_key=None)
+        _write_store(
+            self._global(),
+            "srv",
+            {},
+            headers={entry_id: {"Authorization": "new"}},
+        )
+        stage_secrets(self.source, self.dest, project_key=None)
+        staged_path = os.path.join(self.dest, "secrets.json")
+        with open(staged_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["headers"][entry_id], {"Authorization": "new"})
+        self.assertEqual(stat.S_IMODE(os.stat(staged_path).st_mode), 0o400)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -22,7 +23,13 @@ from mcp.catalog_import import catalog_verdicts, import_definitions  # noqa: E40
 from mcp.merge import merge_candidates  # noqa: E402
 
 
-def _remote(name: str, url: str) -> Candidate:
+def _remote(
+    name: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    secret_header_keys: list[str] | None = None,
+) -> Candidate:
     return Candidate(
         provider="fixture",
         source_path="/fixture/config.json",
@@ -30,6 +37,8 @@ def _remote(name: str, url: str) -> Candidate:
         name=name,
         type="http",
         url=url,
+        headers=dict(headers or {}),
+        secret_header_keys=list(secret_header_keys or []),
         classification=Classification(
             placement="container", confidence="high", reasons=["fixture"]
         ),
@@ -132,7 +141,11 @@ class ImportDiscoveryUxTest(unittest.TestCase):
 
     def test_remote_import_apply_skips_install_hint(self):
         discovered = catalog_verdicts(merge_candidates([
-            _remote("remote", "https://mcp.example.test/api")
+            _remote(
+                "remote",
+                "https://mcp.example.test/api",
+                secret_header_keys=["Authorization"],
+            )
         ]))
         stdout = io.StringIO()
         with mock.patch.object(cli, "_discover", return_value=discovered), \
@@ -142,9 +155,63 @@ class ImportDiscoveryUxTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn("mcp install remote", stdout.getvalue())
         self.assertIn(
-            "Next: boxa mcp activate remote --project <path> --for claude|codex",
+            "Next: boxa mcp secret set remote Authorization",
             stdout.getvalue(),
         )
+        self.assertIn(
+            "Then: boxa mcp activate remote --project <path> --for claude|codex",
+            stdout.getvalue(),
+        )
+
+    def test_remote_import_secret_hint_shell_quotes_arguments(self):
+        name = "remote connector; echo unsafe"
+        header = "X-Api-Key"
+        discovered = catalog_verdicts(merge_candidates([
+            _remote(
+                name,
+                "https://mcp.example.test/api",
+                secret_header_keys=[header],
+            )
+        ]))
+        stdout = io.StringIO()
+        with mock.patch.object(cli, "_discover", return_value=discovered), \
+                contextlib.redirect_stdout(stdout):
+            rc = cli.main(["apply-text", "--server", name])
+
+        self.assertEqual(rc, 0)
+        self.assertIn(
+            "Next: " + shlex.join(["boxa", "mcp", "secret", "set", name, header]),
+            stdout.getvalue(),
+        )
+        self.assertIn(
+            "Then: boxa mcp activate " + shlex.quote(name)
+            + " --project <path> --for claude|codex",
+            stdout.getvalue(),
+        )
+
+    def test_dry_run_lists_header_names_without_secret_values(self):
+        secret_value = "Bearer header-value-must-not-appear"
+        self._write_claude({
+            "remote": {
+                "type": "http",
+                "url": "https://mcp.example.test/api",
+                "headers": {
+                    "Authorization": secret_value,
+                    "X-Tenant": "engineering",
+                },
+            }
+        })
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli.main(["import-text"])
+
+        self.assertEqual(rc, 0)
+        output = stdout.getvalue()
+        self.assertIn("headers  : X-Tenant", output)
+        self.assertIn(
+            "secret headers: Authorization (values not shown)", output
+        )
+        self.assertNotIn(secret_value, output)
 
 
 if __name__ == "__main__":

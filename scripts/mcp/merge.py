@@ -90,6 +90,8 @@ def _identity_tuple(cand: Candidate) -> tuple:
         _normalized_type(cand),
         tuple(cand.command.argv),
         tuple(sorted(cand.command.env_keys)),
+        tuple(sorted(cand.headers.items())),
+        tuple(sorted(cand.secret_header_keys, key=str.casefold)),
     )
     return identity + ((cand.url or ""),) if cand.url else identity
 
@@ -122,6 +124,8 @@ def compute_import_id(cand: Candidate) -> str:
     ]
     flat.extend(cand.command.argv)
     flat.append("\x1e".join(sorted(cand.command.env_keys)))
+    flat.extend(f"{name}={value}" for name, value in sorted(cand.headers.items()))
+    flat.append("\x1e".join(sorted(cand.secret_header_keys, key=str.casefold)))
     if cand.url:
         flat.append(cand.url)
     blob = "\x1f".join(flat).encode("utf-8")

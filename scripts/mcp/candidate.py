@@ -136,6 +136,8 @@ class Candidate:
     source_project: Optional[str] = None
     type: Optional[str] = None
     url: Optional[str] = None
+    headers: dict[str, str] = field(default_factory=dict)
+    secret_header_keys: list[str] = field(default_factory=list)
     command: Command = field(default_factory=Command)
     classification: Classification = field(default_factory=Classification)
 
@@ -152,6 +154,10 @@ class Candidate:
         }
         if self.url is not None:
             result["url"] = self.url
+        if self.headers:
+            result["headers"] = dict(self.headers)
+        if self.secret_header_keys:
+            result["secretHeaderKeys"] = list(self.secret_header_keys)
         return result
 
 

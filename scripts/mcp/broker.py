@@ -44,14 +44,24 @@ from __future__ import annotations
 
 import argparse
 import os
+import pwd
 import selectors
 import signal
 import socket
+import struct
 import sys
 import threading
 from typing import Optional
 
 from .identity import inside_container, project_key, project_name
+from .http_proxy import (
+    HttpProxyError,
+    create_server as create_http_proxy_server,
+    decode_route_request,
+    encode_route_reply,
+    publish_proxy_port,
+    remove_proxy_port,
+)
 from .docker_adapter import DockerAdapterError, build_plan as build_docker_plan
 from .profile import global_profile_path, load_profile, project_profile_path
 from .protocol import (
@@ -119,6 +129,24 @@ _PROXY_CHUNK = 64 * 1024
 # long stretches between MCP messages.
 _HANDSHAKE_TIMEOUT_SECONDS = 10.0
 _RAW_DOCKER_ENV = {"DOCKER_HOST", "DOCKER_CONTEXT", "XDG_RUNTIME_DIR"}
+
+
+def _route_peer_is_agent(conn: socket.socket) -> bool:
+    """Whether a route request came from the Container's agent account.
+
+    The bridge socket is also reachable by ``boxa-mcp`` so the broker can own
+    it. Refuse route capabilities to broker-spawned service processes while
+    retaining the intended ``node`` launch-profile caller. This deliberately
+    does not claim to distinguish agent programs sharing the node UID.
+    """
+    try:
+        size = struct.calcsize("3i")
+        credentials = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, size)
+        _pid, peer_uid, _gid = struct.unpack("3i", credentials)
+        agent_uid = pwd.getpwnam("node").pw_uid
+    except (AttributeError, KeyError, OSError, struct.error):
+        return False
+    return peer_uid == agent_uid
 
 
 class BrokerError(RuntimeError):
@@ -588,7 +616,7 @@ def _proxy(conn: socket.socket, child) -> None:
                 pass
 
 
-def _handle(conn: socket.socket) -> None:
+def _handle(conn: socket.socket, route_issuer=None) -> None:
     """Service one relay connection: handshake -> spawn -> proxy.
 
     Every failure before the proxy phase is reported back to the relay as a
@@ -603,9 +631,26 @@ def _handle(conn: socket.socket) -> None:
     try:
         try:
             line = read_line(conn.recv)
+            route_request = decode_route_request(line)
+            if route_request is not None:
+                if not _route_peer_is_agent(conn):
+                    raise HttpProxyError(
+                        403,
+                        "Remote MCP proxy route capability requires an agent process.",
+                    )
+                if route_issuer is None:
+                    raise HttpProxyError(
+                        503, "Remote MCP proxy route capability is unavailable."
+                    )
+                entry_id, consumer = route_request
+                conn.sendall(encode_route_reply(route_issuer(entry_id, consumer)))
+                return
             server, project_key, requested_cwd, catalog_id, consumer = (
                 decode_request_details(line)
             )
+        except HttpProxyError as exc:
+            conn.sendall(encode_reply(False, str(exc)))
+            return
         except ProtocolError as exc:
             conn.sendall(encode_reply(False, f"bad handshake: {exc}"))
             return
@@ -731,6 +776,22 @@ def serve(path: Optional[str] = None, stop_event: Optional[threading.Event] = No
     """
     path = path or socket_path()
     sock = _bind_socket(path)
+    remove_proxy_port()
+    http_server = None
+    try:
+        http_server = create_http_proxy_server(secrets_dir=_secrets_dir())
+        publish_proxy_port(http_server.server_address[1])
+    except HttpProxyError as exc:
+        if http_server is not None:
+            http_server.server_close()
+        sock.close()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise BrokerError(str(exc)) from exc
+    http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+    http_thread.start()
 
     stopping = stop_event or threading.Event()
 
@@ -766,9 +827,13 @@ def serve(path: Optional[str] = None, stop_event: Optional[threading.Event] = No
                     stopping.set()
                     break
                 threading.Thread(
-                    target=_handle, args=(conn,), daemon=True
+                    target=_handle, args=(conn, http_server.issue_route), daemon=True
                 ).start()
     finally:
+        remove_proxy_port()
+        http_server.shutdown()
+        http_server.server_close()
+        http_thread.join(timeout=2)
         try:
             sel.close()
         except OSError:

@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from mcp import activation, cli, lifecycle  # noqa: E402
 from mcp.catalog import add_entry, add_remote_entry, load_catalog, update_entry  # noqa: E402
+from mcp.secrets import global_secrets_path, store_header_secret  # noqa: E402
 
 
 class Probe(activation.DockerProbe):
@@ -46,6 +47,11 @@ class Probe(activation.DockerProbe):
 class MissingCommandProbe(Probe):
     def command_path(self, container, command, user):
         return None
+
+
+class MissingSecretProbe(Probe):
+    def credential_present(self, container, project_key, server_name, key, user):
+        return False
 
 
 class CatalogLifecycleIsolationTest(unittest.TestCase):
@@ -145,6 +151,72 @@ class CatalogLifecycleIsolationTest(unittest.TestCase):
             ["boxa allow mcp.dozzle.example.test"],
         )
         self.assertEqual(row["executionMode"], "none")
+
+    def test_remote_secret_header_status_is_not_ready_and_proxied(self):
+        remote = add_remote_entry(
+            "secure-remote",
+            "https://remote.example.test/api",
+            secret_header_keys=["Authorization"],
+        )
+        status = lifecycle.catalog_project_status(
+            self.projects[0], MissingSecretProbe(set())
+        )
+        row = next(
+            entry for entry in status["entries"] if entry["id"] == remote["id"]
+        )
+        self.assertEqual(row["readiness"]["state"], "not-ready")
+        self.assertEqual(row["isolationStatus"], "proxied")
+        self.assertIn("secret value missing", row["readiness"]["checks"][0]["detail"])
+        self.assertTrue(
+            any(
+                hint.startswith("Next: boxa mcp secret set secure-remote")
+                for hint in row["readiness"]["hints"]
+            )
+        )
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli.main(["catalog-json"])
+        self.assertEqual(rc, 0)
+        catalog_entry = next(
+            entry for entry in json.loads(stdout.getvalue())["entries"]
+            if entry["id"] == remote["id"]
+        )
+        self.assertEqual(catalog_entry["isolationStatus"], "proxied")
+        self.assertEqual(
+            catalog_entry["readiness"]["summary"], "secret-value-missing"
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_catalog_effective_list(
+                ["--project", self.projects[0]], as_json=False
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn("secret value missing for header Authorization", stdout.getvalue())
+        self.assertIn("proxied", stdout.getvalue())
+
+    def test_catalog_status_reads_secret_header_store_state(self):
+        remote = add_remote_entry(
+            "secure-remote",
+            "https://remote.example.test/api",
+            secret_header_keys=["Authorization"],
+        )
+        store_header_secret(
+            global_secrets_path(), remote["id"], "authorization", "Bearer present"
+        )
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli.main(["catalog-json"])
+
+        self.assertEqual(rc, 0)
+        catalog_entry = next(
+            entry for entry in json.loads(stdout.getvalue())["entries"]
+            if entry["id"] == remote["id"]
+        )
+        self.assertEqual(
+            catalog_entry["readiness"]["summary"], "no-runtime-readiness"
+        )
 
     def test_pending_status_names_state_and_stored_blocking_reason(self):
         pending_project = os.path.join(self.tmp.name, "pending")

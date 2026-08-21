@@ -88,6 +88,7 @@ Subcommands:
   remove      Destroy one catalog identity and cascade its activations.
   reload      Re-stage changed MCP secrets into running Container(s) without a
               stop/start (host-initiated momentary root exec; no restart).
+  secret      Set a declared remote HTTP secret header via a hidden prompt.
 
 Mental model and common flow:
   1. 'add' records a durable user-wide catalog definition; it does not install
@@ -189,6 +190,7 @@ Install (materialize) path:
 Add (record a new server) path:
   boxa mcp add <name> [--json] -- <command spec...>
   boxa mcp add <name> [--json] --url <http(s)-url>
+      [--header <name=value>]... [--secret-header-key <name>]...
       Add a service-isolated command definition or a remote HTTP definition.
       This never activates, starts, installs, or probes the server. The
       returned opaque ID survives rename/updates.
@@ -202,6 +204,8 @@ Execution mode:
 Catalog update:
   boxa mcp update <entry> [--name <new-name>] [--description <text>]
       [--url <http(s)-url>]
+      [--header <name=value>]... [--secret-header-key <name>]...
+      [--clear-headers] [--clear-secret-header-keys]
       [--json] [-- <command spec...>]
       Rename/cosmetic changes preserve stable identity and trust. Runtime
       changes preflight every activated Project, then atomically switch the
@@ -232,6 +236,12 @@ Reload (re-stage secrets into a running Container) path:
       that Project's Container only; --global targets every running Container.
       Run this after an 'import --apply' / 'add' that copied a secret value into
       a scope whose Container is already running (the command tells you when).
+
+Secret header path:
+  boxa mcp secret set <entry> <header> [--json]
+      Prompt interactively for a declared secretHeaderKeys value. The value is
+      read from the terminal, never from argv, and stored in the host-only MCP
+      secret store. A running Container receives it after 'boxa mcp reload'.
 
 Scope flags (import / list):
   (default)                 Current Project record + global Claude config.
@@ -1884,7 +1894,7 @@ _add_scope_picker() {
 cmd_add() {
     local json=false is_global=false
     local project_token="" name="" remote_url="" saw_dashdash=false
-    local -a spec=()
+    local -a spec=() remote_header_args=()
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -h|--help) _usage; return 0 ;;
@@ -1899,6 +1909,19 @@ cmd_add() {
                 remote_url="$1"
                 ;;
             --url=*) remote_url="${1#--url=}" ;;
+            --header|--secret-header-key)
+                local remote_option="$1"
+                shift
+                if [ "$#" -eq 0 ]; then
+                    echo "'mcp add $remote_option' requires a value." >&2
+                    return 2
+                fi
+                remote_header_args+=("$remote_option" "$1")
+                ;;
+            --header=*) remote_header_args+=("--header" "${1#--header=}") ;;
+            --secret-header-key=*)
+                remote_header_args+=("--secret-header-key" "${1#--secret-header-key=}")
+                ;;
             --global) is_global=true ;;
             --project)
                 shift
@@ -1948,6 +1971,10 @@ cmd_add() {
         echo "'mcp add' requires either --url <http(s)-url> or a command spec after '--'." >&2
         return 2
     fi
+    if [ -z "$remote_url" ] && [ "${#remote_header_args[@]}" -gt 0 ]; then
+        echo "'mcp add': header options require --url." >&2
+        return 2
+    fi
     if [ -n "$remote_url" ] && { [ "$is_global" = true ] || [ -n "$project_token" ]; }; then
         echo "'mcp add --url' records a catalog entry and does not accept legacy scope flags." >&2
         return 2
@@ -1959,13 +1986,15 @@ cmd_add() {
     if [ "$is_global" != true ] && [ -z "$project_token" ]; then
         if [ "$json" = true ]; then
             if [ -n "$remote_url" ]; then
-                _run_py catalog-add-json "$name" --url "$remote_url"
+                _run_py catalog-add-json "$name" --url "$remote_url" \
+                    "${remote_header_args[@]}"
             else
                 _run_py catalog-add-json "$name" -- "${spec[@]}"
             fi
         else
             if [ -n "$remote_url" ]; then
-                _run_py catalog-add-text "$name" --url "$remote_url"
+                _run_py catalog-add-text "$name" --url "$remote_url" \
+                    "${remote_header_args[@]}"
             else
                 _run_py catalog-add-text "$name" -- "${spec[@]}"
             fi
@@ -2173,6 +2202,57 @@ cmd_readiness() {
 
 _mcp_interactive() {
     [ "${BOXA_MCP_TEST_INTERACTIVE:-}" = "1" ] || { [ -t 0 ] && [ -t 1 ]; }
+}
+
+cmd_secret() {
+    local action="${1:-}" json=false token="" header="" value="" py_cmd
+    [ "$#" -gt 0 ] && shift
+    if [ "$action" != "set" ]; then
+        echo "Usage: boxa mcp secret set <entry> <header> [--json]" >&2
+        return 2
+    fi
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --json) json=true ;;
+            -h|--help) _usage; return 0 ;;
+            -*) echo "Unknown flag for 'mcp secret set': $1" >&2; return 2 ;;
+            *)
+                if [ -z "$token" ]; then
+                    token="$1"
+                elif [ -z "$header" ]; then
+                    header="$1"
+                else
+                    echo "'mcp secret set' takes one catalog entry and header name." >&2
+                    return 2
+                fi
+                ;;
+        esac
+        shift
+    done
+    if [ -z "$token" ] || [ -z "$header" ]; then
+        echo "Usage: boxa mcp secret set <entry> <header> [--json]" >&2
+        return 2
+    fi
+    if ! _mcp_interactive; then
+        echo "'mcp secret set' requires an interactive terminal." >&2
+        return 2
+    fi
+    printf "Secret value for header '%s' on '%s': " "$header" "$token" >&2
+    IFS= read -r -s value || value=""
+    echo >&2
+    if [ -z "$value" ]; then
+        echo "Secret header value must not be empty; nothing changed." >&2
+        return 2
+    fi
+    py_cmd="secret-set-text"
+    [ "$json" = true ] && py_cmd="secret-set-json"
+    _run_py_secret_write "$py_cmd" "$token" "$header" <<< "$value" || {
+        local rc=$?
+        value=""
+        return "$rc"
+    }
+    value=""
+    _finish_secret_write
 }
 
 cmd_activation() {
@@ -2417,6 +2497,7 @@ main() {
         update) cmd_update "$@" ;;
         mode) cmd_mode "$@" ;;
         readiness|ready) cmd_readiness "$@" ;;
+        secret)  cmd_secret "$@" ;;
         activate) cmd_activation activate "$@" ;;
         deactivate) cmd_activation deactivate "$@" ;;
         import)  cmd_import "$@" ;;

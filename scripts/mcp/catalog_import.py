@@ -67,6 +67,10 @@ def _entry(
             "name": cand.name,
             "type": "http",
             "url": cand.url,
+            "headers": dict(sorted(cand.headers.items())),
+            "secretHeaderKeys": sorted(
+                set(cand.secret_header_keys), key=str.casefold
+            ),
             "readiness": {"summary": REMOTE_READINESS_SUMMARY},
         }
     env = read_nonsecret_values(cand) if include_source_values else {}
@@ -93,13 +97,25 @@ def _definition(entry: dict[str, Any]) -> str:
 def _dedup_key(entry: dict[str, Any]) -> tuple[str, object]:
     """Catalog identity for discovery dedup: command/args or remote URL."""
     if entry.get("type") == "http":
-        return ("http", entry.get("url"))
+        return (
+            "http",
+            (
+                entry.get("url"),
+                tuple(sorted(entry.get("headers", {}).items())),
+                tuple(
+                    sorted(entry.get("secretHeaderKeys", []), key=str.casefold)
+                ),
+            ),
+        )
     return ("stdio", tuple(entry.get("command", {}).get("argv", [])))
 
 
 def _safe_diff(current: dict[str, Any], proposed: dict[str, Any]) -> list[dict[str, Any]]:
     """Return a secret-free definition diff for an inherited name collision."""
-    fields = ("type", "url", "command", "envKeys", "secretEnvKeys", "runtimeKind")
+    fields = (
+        "type", "url", "headers", "secretHeaderKeys", "command", "envKeys",
+        "secretEnvKeys", "runtimeKind",
+    )
     return [
         {"field": field, "catalog": current.get(field), "candidate": proposed.get(field)}
         for field in fields

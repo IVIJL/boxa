@@ -95,6 +95,13 @@ class EntrypointBrokerTests(unittest.TestCase):
             r"install -d -o boxa-mcp -g boxa-bridge -m 2770 /run/boxa-bridge",
         )
 
+    def test_public_broker_state_directory_is_agent_read_only(self):
+        self.assertRegex(
+            self.text,
+            r"install -d -o boxa-mcp -g boxa-mcp -m 0755 "
+            r"/run/boxa-mcp-public",
+        )
+
     def test_boxa_mcp_runtime_root_is_owner_only(self):
         # The boxa-mcp runtime root holds secrets + the gated profile mount and
         # must stay 0700 OWNER-only — node never traverses it (the bridge socket

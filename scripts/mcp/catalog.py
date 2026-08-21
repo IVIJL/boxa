@@ -172,6 +172,7 @@ def _validate_string_list(value: Any, label: str) -> None:
 
 
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _URL_SECRET_NAME_HINTS = {
     "key", "token", "secret", "password", "passwd", "credential", "auth",
     "private", "session",
@@ -278,6 +279,51 @@ def _validate_http_url(value: Any, label: str = "url") -> str:
     return value
 
 
+def _validate_http_headers(entry_id: str, entry: dict[str, Any]) -> None:
+    headers = entry.get("headers", {})
+    secret_keys = entry.get("secretHeaderKeys", [])
+    if not isinstance(headers, dict) or any(
+        not isinstance(name, str) or not isinstance(value, str)
+        for name, value in headers.items()
+    ):
+        raise CatalogError(
+            f"malformed catalog (http entry {entry_id!r} headers is not a string map)"
+        )
+    _validate_string_list(
+        secret_keys, f"http entry {entry_id!r} secretHeaderKeys"
+    )
+    if secret_keys and urlsplit(str(entry.get("url", ""))).scheme.lower() != "https":
+        raise CatalogError(
+            f"malformed catalog (http entry {entry_id!r} secret headers require HTTPS)"
+        )
+    all_names = [*headers, *secret_keys]
+    if any(not _HEADER_NAME.fullmatch(name) for name in all_names):
+        raise CatalogError(
+            f"malformed catalog (http entry {entry_id!r} contains an invalid header name)"
+        )
+    folded_headers = {name.casefold() for name in headers}
+    folded_secrets = {name.casefold() for name in secret_keys}
+    if len(folded_headers) != len(headers) or len(folded_secrets) != len(secret_keys):
+        raise CatalogError(
+            f"malformed catalog (http entry {entry_id!r} contains a duplicate header name)"
+        )
+    if folded_headers & folded_secrets:
+        raise CatalogError(
+            f"malformed catalog (http entry {entry_id!r} stores secret header values)"
+        )
+    for name, value in headers.items():
+        if "\r" in value or "\n" in value or "\x00" in value:
+            raise CatalogError(
+                f"malformed catalog (http entry {entry_id!r} header {name!r} "
+                "has an invalid value)"
+            )
+        if _url_parameter_name_marks_secret(name) or _url_value_has_embedded_secret(value):
+            raise CatalogError(
+                f"malformed catalog (http entry {entry_id!r} non-secret header "
+                f"{name!r} looks like a secret)"
+            )
+
+
 def _validate_entry(entry_id: str, entry: Any) -> None:
     if not isinstance(entry, dict):
         raise CatalogError(f"malformed catalog (entry {entry_id!r} is not an object)")
@@ -302,6 +348,7 @@ def _validate_entry(entry_id: str, entry: Any) -> None:
         )
     if entry["type"] == "http":
         _validate_http_url(entry.get("url"), f"entry {entry_id!r} url")
+        _validate_http_headers(entry_id, entry)
         forbidden = [
             field
             for field in ("command", "executionMode", "runtimeKind")
@@ -313,7 +360,10 @@ def _validate_entry(entry_id: str, entry: Any) -> None:
                 + ", ".join(forbidden)
                 + ")"
             )
-        allowed = {"id", "name", "type", "url", "readiness", "description"}
+        allowed = {
+            "id", "name", "type", "url", "headers", "secretHeaderKeys",
+            "readiness", "description",
+        }
         unknown = set(entry) - allowed
         if unknown:
             raise CatalogError(
@@ -333,6 +383,15 @@ def _validate_entry(entry_id: str, entry: Any) -> None:
         )
     if "url" in entry:
         raise CatalogError(f"malformed catalog (stdio entry {entry_id!r} has forbidden url)")
+    forbidden_headers = [
+        field for field in ("headers", "secretHeaderKeys") if field in entry
+    ]
+    if forbidden_headers:
+        raise CatalogError(
+            f"malformed catalog (stdio entry {entry_id!r} has forbidden "
+            + ", ".join(forbidden_headers)
+            + ")"
+        )
     for field in ("executionMode", "runtimeKind"):
         if not isinstance(entry.get(field), str) or not entry[field]:
             raise CatalogError(f"malformed catalog (entry {entry_id!r} has invalid {field})")
@@ -513,6 +572,12 @@ def degradation_status(entry: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def isolation_status(entry: dict[str, Any]) -> str:
+    if entry.get("type") == "http":
+        return "proxied" if entry.get("secretHeaderKeys") else "not-applicable"
+    return degradation_status(entry) or "isolated"
+
+
 def entries_sorted(catalog: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     catalog = catalog if catalog is not None else load_catalog()
     return sorted(
@@ -535,6 +600,8 @@ def add_remote_entry(
     name: str,
     url: str,
     *,
+    headers: Optional[dict[str, str]] = None,
+    secret_header_keys: Optional[list[str]] = None,
     id_factory: Callable[[], uuid.UUID] = uuid.uuid4,
 ) -> dict[str, Any]:
     with mutation_lock():
@@ -552,6 +619,8 @@ def add_remote_entry(
             "name": name,
             "type": "http",
             "url": url,
+            "headers": dict(headers or {}),
+            "secretHeaderKeys": list(secret_header_keys or []),
             "readiness": {"summary": REMOTE_READINESS_SUMMARY},
         }
         catalog["entries"][entry_id] = entry
@@ -695,6 +764,13 @@ def updated_catalog_entry(
         if current["type"] != "http":
             raise CatalogError("stdio catalog entries do not accept a URL")
         updated["url"] = changes.pop("url")
+    for field in ("headers", "secretHeaderKeys"):
+        if field in changes:
+            if current["type"] != "http":
+                raise CatalogError(
+                    f"stdio catalog entries do not accept {field}"
+                )
+            updated[field] = changes.pop(field)
     for field in (
         "envKeys", "secretEnvKeys", "env", "readiness", "prerequisites",
         "description",

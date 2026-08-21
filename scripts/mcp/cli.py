@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess  # noqa: S404 - the Boxa Project registry is Docker-backed
 import sys
 from typing import Optional
@@ -59,7 +60,7 @@ from .catalog import (
     CATALOG_VERSION,
     CatalogError,
     definition_changes_from_spec,
-    degradation_status,
+    isolation_status,
 )
 from .catalog import (
     add_entry as catalog_add_entry,
@@ -76,6 +77,7 @@ from .catalog import (
 from .catalog import (
     mode_preview as catalog_mode_preview,
 )
+from .catalog import mutation_lock as catalog_mutation_lock
 from .catalog import (
     resolve_entry as catalog_resolve,
 )
@@ -136,6 +138,7 @@ from .readiness import (
 )
 from .runner import RunnerError
 from .runner import run as runner_run
+from .secrets import global_secrets_path, read_header_secrets, store_header_secret
 
 
 def _emit(payload: dict) -> int:
@@ -328,6 +331,13 @@ def _render_text(merged: list[MergedCandidate]) -> int:
             sys.stdout.write(
                 "    secrets  : "
                 f"{', '.join(cand.command.secret_env_keys)} (values not shown)\n"
+            )
+        if cand.type == "http" and cand.headers:
+            sys.stdout.write(f"    headers  : {', '.join(cand.headers)}\n")
+        if cand.type == "http" and cand.secret_header_keys:
+            sys.stdout.write(
+                "    secret headers: "
+                f"{', '.join(cand.secret_header_keys)} (values not shown)\n"
             )
         if m.conflict:
             sys.stdout.write(
@@ -716,14 +726,26 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
         imported_item = next(iter(imported.values()))
         candidate = selected_by_id[imported_item.import_id].candidate
         if candidate.type != "http":
-            sys.stdout.write(f"Next: boxa mcp install {imported_item.catalog_name}\n")
             sys.stdout.write(
-                f"Then: boxa mcp activate {imported_item.catalog_name} "
+                "Next: boxa mcp install "
+                f"{shlex.quote(imported_item.catalog_name)}\n"
+            )
+            sys.stdout.write(
+                "Then: boxa mcp activate "
+                f"{shlex.quote(imported_item.catalog_name)} "
                 "--project <path> --for claude|codex\n"
             )
         else:
+            for header in candidate.secret_header_keys:
+                sys.stdout.write(
+                    "Next: boxa mcp secret set "
+                    f"{shlex.quote(imported_item.catalog_name)} "
+                    f"{shlex.quote(header)}\n"
+                )
             sys.stdout.write(
-                f"Next: boxa mcp activate {imported_item.catalog_name} "
+                f"{'Then' if candidate.secret_header_keys else 'Next'}: "
+                "boxa mcp activate "
+                f"{shlex.quote(imported_item.catalog_name)} "
                 "--project <path> --for claude|codex\n"
             )
     elif imported:
@@ -1641,11 +1663,17 @@ def _catalog_payload() -> dict[str, object]:
     entries = catalog_entries_sorted()
     activations = load_activations()
     for entry in entries:
-        entry["isolationStatus"] = (
-            "not-applicable"
-            if entry["type"] == "http"
-            else degradation_status(entry) or "isolated"
-        )
+        entry["isolationStatus"] = isolation_status(entry)
+        if entry.get("secretHeaderKeys"):
+            stored = read_header_secrets(
+                global_secrets_path(), str(entry["id"])
+            ) or {}
+            missing = any(
+                not stored.get(str(name).casefold())
+                for name in entry["secretHeaderKeys"]
+            )
+            if missing:
+                entry["readiness"] = {"summary": "secret-value-missing"}
         projects = _entry_activations(activations, str(entry["id"]))
         entry["activationEverywhere"] = str(entry["id"]) in activations["everywhere"]
         entry["activationProjects"] = [row["projectKey"] for row in projects]
@@ -1675,7 +1703,7 @@ def _render_catalog_text(
                 if entry["activationProjectCount"]
                 else "-"
             ),
-            "not-applicable" if entry["type"] == "http" else degradation_status(entry) or "isolated",
+            isolation_status(entry),
             str(entry["readiness"]["summary"]),  # type: ignore[index]
         )
         for entry in entries
@@ -1811,6 +1839,19 @@ def _parse_catalog_mutation(argv: list[str], command: str) -> Optional[tuple[str
     return before[0], spec
 
 
+def _parse_header_assignment(value: str) -> tuple[str, str]:
+    if "=" in value:
+        name, header_value = value.split("=", 1)
+    elif ":" in value:
+        name, header_value = value.split(":", 1)
+        header_value = header_value.lstrip(" ")
+    else:
+        raise CatalogError(
+            "--header requires NAME=VALUE or 'NAME: VALUE'"
+        )
+    return name, header_value
+
+
 def _cmd_catalog_add(argv: list[str], as_json: bool) -> int:
     if not argv:
         sys.stderr.write("mcp.cli: catalog add requires an entry name\n")
@@ -1818,13 +1859,41 @@ def _cmd_catalog_add(argv: list[str], as_json: bool) -> int:
     name = argv[0]
     rest = argv[1:]
     url: Optional[str] = None
-    if len(rest) == 2 and rest[0] == "--url":
-        url = rest[1]
-        spec: list[str] = []
-    elif rest and rest[0] == "--":
-        spec = rest[1:]
+    headers: dict[str, str] = {}
+    secret_header_keys: list[str] = []
+    if "--" in rest:
+        marker = rest.index("--")
+        options, spec = rest[:marker], rest[marker + 1:]
     else:
-        spec = []
+        options, spec = rest, []
+    i = 0
+    try:
+        while i < len(options):
+            option = options[i]
+            if option not in {"--url", "--header", "--secret-header-key"} or i + 1 >= len(options):
+                raise CatalogError(
+                    "catalog add accepts --url <http(s)-url>, --header "
+                    "<name=value>, and --secret-header-key <name>"
+                )
+            value = options[i + 1]
+            if option == "--url":
+                if url is not None:
+                    raise CatalogError("catalog add accepts --url only once")
+                url = value
+            elif option == "--header":
+                header_name, header_value = _parse_header_assignment(value)
+                headers[header_name] = header_value
+            else:
+                secret_header_keys.append(value)
+            i += 2
+    except CatalogError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 2
+    if spec and options:
+        sys.stderr.write(
+            "mcp.cli: command catalog entries do not accept remote header options\n"
+        )
+        return 2
     if (url is None and not spec) or (url is not None and spec):
         sys.stderr.write(
             "mcp.cli: catalog add requires either --url <http(s)-url> "
@@ -1833,7 +1902,12 @@ def _cmd_catalog_add(argv: list[str], as_json: bool) -> int:
         return 2
     try:
         entry = (
-            catalog_add_remote_entry(name, url)
+            catalog_add_remote_entry(
+                name,
+                url,
+                headers=headers,
+                secret_header_keys=secret_header_keys,
+            )
             if url is not None
             else catalog_add_entry(name, spec)
         )
@@ -1848,13 +1922,17 @@ def _cmd_catalog_add(argv: list[str], as_json: bool) -> int:
         sys.stdout.write(f"  url      : {entry['url']}\n")
         sys.stdout.write("  readiness: no runtime readiness\n")
         sys.stdout.write(
-            f"Next: boxa mcp activate {entry['name']} --project <path> "
+            "Next: boxa mcp activate "
+            f"{shlex.quote(str(entry['name']))} --project <path> "
             "--for claude|codex\n"
         )
     else:
         sys.stdout.write(f"  mode     : {entry['executionMode']}\n")
         sys.stdout.write(f"  runtime  : {entry['runtimeKind']}\n")
-        sys.stdout.write(f"Next: boxa mcp install {entry['name']} --project <path>\n")
+        sys.stdout.write(
+            "Next: boxa mcp install "
+            f"{shlex.quote(str(entry['name']))} --project <path>\n"
+        )
     sys.stdout.write("Catalog membership does not activate or start the server.\n")
     return 0
 
@@ -1908,18 +1986,50 @@ def _cmd_catalog_update(argv: list[str], as_json: bool) -> int:
     else:
         options, spec = rest, []
     changes: dict[str, object] = {}
+    headers: Optional[dict[str, str]] = None
+    secret_header_keys: Optional[list[str]] = None
     i = 0
     while i < len(options):
         option = options[i]
-        if option not in {"--name", "--description", "--url"} or i + 1 >= len(options):
+        if option in {"--clear-headers", "--clear-secret-header-keys"}:
+            if option == "--clear-headers":
+                headers = {}
+            else:
+                secret_header_keys = []
+            i += 1
+            continue
+        if option not in {
+            "--name", "--description", "--url", "--header",
+            "--secret-header-key",
+        } or i + 1 >= len(options):
             sys.stderr.write(
                 "mcp.cli: catalog update accepts --name <name>, "
-                "--description <text>, --url <http(s)-url>, and an optional "
-                "command spec after '--'\n"
+                "--description <text>, --url <http(s)-url>, --header "
+                "<name=value>, --secret-header-key <name>, clear-header "
+                "flags, and an optional command spec after '--'\n"
             )
             return 2
-        changes[option[2:]] = options[i + 1]
+        value = options[i + 1]
+        if option == "--header":
+            if headers is None:
+                headers = {}
+            try:
+                header_name, header_value = _parse_header_assignment(value)
+            except CatalogError as exc:
+                sys.stderr.write(f"mcp.cli: {exc}\n")
+                return 2
+            headers[header_name] = header_value
+        elif option == "--secret-header-key":
+            if secret_header_keys is None:
+                secret_header_keys = []
+            secret_header_keys.append(value)
+        else:
+            changes[option[2:]] = value
         i += 2
+    if headers is not None:
+        changes["headers"] = headers
+    if secret_header_keys is not None:
+        changes["secretHeaderKeys"] = secret_header_keys
     try:
         _entry_id, current = catalog_resolve(catalog_load(), token)
         if spec:
@@ -1944,6 +2054,14 @@ def _cmd_catalog_update(argv: list[str], as_json: bool) -> int:
         payload["liveConnectionsTerminated"] = False
         return _emit(payload)
     kind = "runtime-affecting" if result.runtime_affecting else "cosmetic"
+    previous_secret_headers = {
+        str(header).casefold() for header in current.get("secretHeaderKeys", [])
+    }
+    new_secret_headers = [
+        str(header)
+        for header in result.entry.get("secretHeaderKeys", [])
+        if str(header).casefold() not in previous_secret_headers
+    ]
     sys.stdout.write(
         f"Updated MCP catalog entry {result.entry['name']!r} "
         f"({result.entry['id']}); {kind} update.\n"
@@ -1953,6 +2071,14 @@ def _cmd_catalog_update(argv: list[str], as_json: bool) -> int:
             f"  affected: {affected['projectKey']} "
             f"({', '.join(affected['consumers'])})\n"
         )
+    for header in new_secret_headers:
+        sys.stdout.write(
+            "Next: boxa mcp secret set "
+            f"{shlex.quote(str(result.entry['name']))} "
+            f"{shlex.quote(header)}\n"
+        )
+    if new_secret_headers and not result.affected:
+        sys.stdout.write("Then: boxa mcp reload\n")
     if result.affected:
         sys.stdout.write(
             "The runtime snapshot was switched transactionally. "
@@ -2132,8 +2258,9 @@ def _cmd_activate(argv: list[str], as_json: bool) -> int:
                     f"{result.pending_reason}.\n"
                 )
                 sys.stdout.write(
-                    f"Next: boxa mcp readiness {result.entry['name']} "
-                    f"--project {result.project_key}\n"
+                    "Next: boxa mcp readiness "
+                    f"{shlex.quote(str(result.entry['name']))} "
+                    f"--project {shlex.quote(result.project_key)}\n"
                 )
             else:
                 sys.stdout.write(
@@ -2229,7 +2356,7 @@ def _cmd_activation_degradation(argv: list[str], as_json: bool) -> int:
     except CatalogError as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return 1
-    status = degradation_status(entry) or "isolated"
+    status = isolation_status(entry)
     if as_json:
         return _emit({"isolationStatus": status})
     sys.stdout.write(status + "\n")
@@ -2252,7 +2379,12 @@ def _cmd_readiness(argv: list[str], as_json: bool) -> int:
     if as_json:
         _emit(report.to_dict())
     else:
-        if not report.has_runtime_readiness:
+        if not report.ready:
+            sys.stdout.write(
+                f"MCP catalog entry {report.entry['name']!r} is not ready for "
+                f"Project {report.project_key}.\n"
+            )
+        elif not report.has_runtime_readiness:
             sys.stdout.write(
                 f"MCP catalog entry {report.entry['name']!r} has no runtime "
                 f"readiness for Project {report.project_key}.\n"
@@ -2265,10 +2397,65 @@ def _cmd_readiness(argv: list[str], as_json: bool) -> int:
             )
         for check in report.checks:
             marker = "ok" if check.ready else "missing"
-            sys.stdout.write(f"  {marker:7} {check.kind}: {check.label}\n")
+            detail = (
+                f" ({check.detail})"
+                if not check.ready and check.kind == "secret-header"
+                else ""
+            )
+            sys.stdout.write(
+                f"  {marker:7} {check.kind}: {check.label}{detail}\n"
+            )
         for hint in report.hints:
             sys.stdout.write(f"  hint   : {hint}\n")
     return 0 if report.ready else 1
+
+
+def _cmd_secret_set(argv: list[str], as_json: bool) -> int:
+    """Store one declared secret header value read exclusively from stdin."""
+    if len(argv) != 2:
+        sys.stderr.write(
+            "mcp.cli: secret set requires one catalog entry and header name\n"
+        )
+        return 2
+    token, requested_header = argv
+    value = sys.stdin.readline()
+    if value.endswith("\n"):
+        value = value[:-1]
+    if not value or any(char in value for char in ("\r", "\n", "\x00")):
+        sys.stderr.write("mcp.cli: secret header value must be one non-empty line\n")
+        return 2
+    try:
+        with catalog_mutation_lock():
+            _entry_id, entry = catalog_resolve(catalog_load(), token)
+            if entry.get("type") != "http":
+                raise CatalogError("secret headers apply only to http catalog entries")
+            declared = {
+                str(name).casefold(): str(name)
+                for name in entry.get("secretHeaderKeys", [])
+            }
+            header_name = declared.get(requested_header.casefold())
+            if header_name is None:
+                raise CatalogError(
+                    f"header {requested_header!r} is not declared in secretHeaderKeys"
+                )
+            store_header_secret(
+                global_secrets_path(), str(entry["id"]), header_name, value
+            )
+    except (CatalogError, OSError, ValueError) as exc:
+        sys.stderr.write(f"mcp.cli: cannot store secret header value: {exc}\n")
+        return 1
+    _emit_secret_scopes([("global", "")])
+    if as_json:
+        return _emit({
+            "entry": {"id": entry["id"], "name": entry["name"]},
+            "header": header_name,
+            "stored": True,
+        })
+    sys.stdout.write(
+        f"Stored secret value for header {header_name!r} on MCP catalog "
+        f"entry {entry['name']!r}.\n"
+    )
+    return 0
 
 
 def _cmd_catalog_install(argv: list[str], as_json: bool) -> int:
@@ -2298,13 +2485,15 @@ def _cmd_catalog_install(argv: list[str], as_json: bool) -> int:
         sys.stdout.write(f"  missing {check.kind}: {check.label}\n")
     if report.readiness.ready:
         sys.stdout.write(
-            f"Next: boxa mcp activate {report.entry['name']} "
-            f"--project {report.project_key} --for claude|codex\n"
+            "Next: boxa mcp activate "
+            f"{shlex.quote(str(report.entry['name']))} "
+            f"--project {shlex.quote(report.project_key)} --for claude|codex\n"
         )
     else:
         sys.stdout.write(
-            f"Next: boxa mcp readiness {report.entry['name']} "
-            f"--project {report.project_key}\n"
+            "Next: boxa mcp readiness "
+            f"{shlex.quote(str(report.entry['name']))} "
+            f"--project {shlex.quote(report.project_key)}\n"
         )
     return 0 if report.readiness.ready else 1
 
@@ -2398,6 +2587,12 @@ def _cmd_catalog_effective_list(argv: list[str], as_json: bool) -> int:
         for row in rows:
             sys.stdout.write("  ".join(str(row[i]).ljust(widths[i]) for i in range(len(headers))).rstrip() + "\n")
         for entry in entries:
+            for check in entry["readiness"].get("checks", []):
+                if check.get("kind") == "secret-header" and not check.get("ready"):
+                    sys.stdout.write(
+                        f"Reason for {entry['name']}: secret value missing for "
+                        f"header {check['label']}.\n"
+                    )
             for hint in entry["readiness"].get("hints", []):
                 sys.stdout.write(f"Hint for {entry['name']}: {hint}\n")
             if entry["activation"] == "pending":
@@ -2830,6 +3025,10 @@ def main(argv: list[str]) -> int:
         return _cmd_readiness(rest, as_json=True)
     if command == "readiness-text":
         return _cmd_readiness(rest, as_json=False)
+    if command == "secret-set-json":
+        return _cmd_secret_set(rest, as_json=True)
+    if command == "secret-set-text":
+        return _cmd_secret_set(rest, as_json=False)
     if command == "catalog-install-json":
         return _cmd_catalog_install(rest, as_json=True)
     if command == "catalog-install-text":

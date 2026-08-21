@@ -17,7 +17,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from mcp import activation, cli, readiness  # noqa: E402
-from mcp.catalog import add_entry, add_remote_entry, load_catalog, update_entry  # noqa: E402
+from mcp.catalog import (  # noqa: E402
+    add_entry,
+    add_remote_entry,
+    catalog_path,
+    load_catalog,
+    update_entry,
+)
+from mcp.secrets import (  # noqa: E402
+    file_mode,
+    global_secrets_path,
+    read_header_secrets,
+)
 
 
 class LocalState:
@@ -49,6 +60,9 @@ class Probe(readiness.ProjectProbe):
 
     def credential_present(self, container, project_key, server_name, key, user):
         return key in self.state.credentials
+
+    def header_secret_present(self, entry_id, header_name):
+        return header_name in self.state.credentials
 
     def image_exists(self, container, engine, image):
         return image in self.state.images
@@ -146,6 +160,84 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(
             readiness.readiness(entry["id"], self.project).hints, []
         )
+
+    def test_http_secret_header_is_not_ready_until_value_exists(self) -> None:
+        entry = add_remote_entry(
+            "secure-remote",
+            "https://remote.example/mcp",
+            secret_header_keys=["Authorization"],
+        )
+        probe = Probe(self.project, self.state, running=False)
+        report = readiness.readiness(entry["id"], self.project, probe)
+        self.assertFalse(report.ready)
+        self.assertEqual(
+            [(check.kind, check.label, check.detail) for check in report.missing],
+            [("secret-header", "Authorization", "secret value missing")],
+        )
+        self.assertIn(
+            "Next: boxa mcp secret set secure-remote Authorization",
+            report.hints,
+        )
+        self.assertIn(
+            "The broker uses the same Boxa Allowlist as direct remote entries.",
+            report.hints,
+        )
+        stdout = io.StringIO()
+        with mock.patch.object(cli, "catalog_readiness", return_value=report), \
+                contextlib.redirect_stdout(stdout):
+            rc = cli._cmd_readiness(
+                [entry["id"], "--project", self.project], as_json=False
+            )
+        self.assertEqual(rc, 1)
+        self.assertIn("secret value missing", stdout.getvalue())
+        self.assertIn("Next: boxa mcp secret set secure-remote", stdout.getvalue())
+        self.state.credentials.add("Authorization")
+        self.assertTrue(
+            readiness.readiness(entry["id"], self.project, probe).ready
+        )
+
+    def test_secret_header_set_updates_store_and_real_readiness(self) -> None:
+        entry = add_remote_entry(
+            "secure-remote",
+            "https://remote.example/mcp",
+            secret_header_keys=["Authorization"],
+        )
+        secret = "Bearer value-that-must-not-leak"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(secret + "\n")), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = cli._cmd_secret_set(
+                [entry["id"], "authorization"], as_json=True
+            )
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+        self.assertEqual(file_mode(global_secrets_path()), 0o600)
+        self.assertEqual(
+            read_header_secrets(global_secrets_path(), entry["id"]),
+            {"authorization": secret},
+        )
+        self.assertTrue(readiness.readiness(entry["id"], self.project).ready)
+        self.assertNotIn(
+            "secret value missing",
+            json.dumps(readiness.readiness(entry["id"], self.project).to_dict()),
+        )
+
+        updated = "Bearer rotated-value-that-must-not-leak"
+        with mock.patch("sys.stdin", io.StringIO(updated + "\n")), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                cli._cmd_secret_set(
+                    [entry["name"], "Authorization"], as_json=False
+                ),
+                0,
+            )
+        self.assertEqual(
+            read_header_secrets(global_secrets_path(), entry["id"]),
+            {"authorization": updated},
+        )
+        with open(catalog_path(), encoding="utf-8") as fh:
+            self.assertNotIn(updated, fh.read())
 
     def test_http_activation_succeeds_with_stopped_project(self) -> None:
         entry = add_remote_entry("remote", "https://remote.example/mcp")

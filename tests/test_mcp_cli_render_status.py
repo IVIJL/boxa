@@ -63,6 +63,20 @@ class NoRenderDispatchTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(any("render" in call for call in proc.calls))
 
+    def test_secret_set_value_never_enters_python_argv(self):
+        secret = "Bearer argv-leak-regression"
+        proc = _run(
+            "export BOXA_MCP_TEST_INTERACTIVE=1; "
+            f"cmd_secret set remote Authorization <<< {secret!r}"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.calls, ["secret-set-text"])
+        self.assertEqual(
+            proc.arg_calls,
+            ["secret-set-text remote Authorization"],
+        )
+        self.assertNotIn(secret, "\n".join(proc.arg_calls))
+
     def test_everywhere_activation_reaches_python_without_project_resolution(self):
         proc = _run("cmd_activation activate ctx7 --everywhere --for claude")
         self.assertEqual(proc.returncode, 0, proc.stderr)

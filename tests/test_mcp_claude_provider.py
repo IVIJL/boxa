@@ -72,6 +72,10 @@ _FIXTURE = {
                 "gmail-connector": {
                     "type": "http",
                     "url": "https://mcp.claude.ai/gmail",
+                    "headers": {
+                        "Authorization": "Bearer " + _SECRET_VALUE,
+                        "X-Tenant": "engineering",
+                    },
                 },
             }
         },
@@ -228,6 +232,16 @@ class ClaudeProviderTest(unittest.TestCase):
         self.assertEqual(cand.type, "http")
         self.assertTrue(cand.url)
         self.assertTrue(cand.classification.reasons)
+
+    def test_http_headers_are_classified_without_copying_secret_values(self) -> None:
+        cand = next(
+            c
+            for c in self.provider.discover_project(_TM_PROJECT)
+            if c.name == "gmail-connector"
+        )
+        self.assertEqual(cand.headers, {"X-Tenant": "engineering"})
+        self.assertEqual(cand.secret_header_keys, ["Authorization"])
+        self.assertNotIn(_SECRET_VALUE, json.dumps(cand.to_dict()))
 
     def test_stdio_candidate_not_excluded(self) -> None:
         cand = next(

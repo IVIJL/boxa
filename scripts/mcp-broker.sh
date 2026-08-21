@@ -10,7 +10,9 @@ set -euo pipefail
 # unix socket; the `boxa-mcp-run` relay (run as `node`) connects to it, names
 # the server it wants, and the broker spawns that MCP server as `boxa-mcp` so
 # the agent never sees the server's environment (credential isolation — see
-# ADR 0014). The broker ALWAYS runs, even with an empty/missing profile.
+# ADR 0014). It also serves the loopback-only pinned HTTP proxy used by remote
+# entries with secret headers (ADR 0030). The broker ALWAYS runs, even with an
+# empty/missing profile.
 #
 # This is a thin shell front-end: all socket/stdio/spawn logic lives in the
 # unit-tested Python core (`mcp.broker`). The wrapper only locates that core and

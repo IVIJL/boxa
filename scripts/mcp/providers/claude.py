@@ -31,9 +31,10 @@ non-stdio ``type`` (``http`` / ``sse`` / ``remote``) and/or a ``url`` field.
 Read-only and secret-safe
 -------------------------
 The provider only reads the file. It records env-variable *names* (the keys of
-the ``env`` object) and never the values, so no secret can enter a Candidate
-or the JSON envelope. HTTP servers carry their URL as importable Container-
-session candidates. Other remote transports are surfaced as ``excluded``.
+the ``env`` object) and never the values. HTTP header values are copied only
+when neither their name nor value looks secret; secret headers contribute
+names only. HTTP servers carry their URL as importable Container-session
+candidates. Other remote transports are surfaced as ``excluded``.
 """
 
 from __future__ import annotations
@@ -177,6 +178,11 @@ def _name_marks_secret(stem: str) -> bool:
 
 def _is_secret_env_name(name: str) -> bool:
     return _name_marks_secret(name.upper())
+
+
+def _is_secret_header_name(name: str) -> bool:
+    """Apply the env-name heuristic to case-insensitive HTTP header names."""
+    return _name_marks_secret(name.upper().replace("-", "_"))
 
 
 # A CLI flag NAME whose VALUE is a credential (matched case-insensitively after
@@ -431,6 +437,22 @@ def _candidate_from_spec(
         # (issue 04 owns that), so leave it neutral/unknown.
         classification = Classification(placement="unknown")
 
+    headers: dict[str, str] = {}
+    secret_header_keys: list[str] = []
+    source_headers = spec.get("headers")
+    if is_http and isinstance(source_headers, dict):
+        for header_name, header_value in source_headers.items():
+            if not isinstance(header_name, str) or not isinstance(header_value, str):
+                continue
+            if (
+                _is_secret_header_name(header_name)
+                or _looks_like_secret_value(header_value)
+                or _contains_embedded_secret(header_value)
+            ):
+                secret_header_keys.append(header_name)
+            else:
+                headers[header_name] = header_value
+
     return Candidate(
         provider=PROVIDER,
         source_path=source_path,
@@ -439,6 +461,8 @@ def _candidate_from_spec(
         name=name,
         type=type_str,
         url=http_url if is_http else None,
+        headers=headers,
+        secret_header_keys=secret_header_keys,
         command=_command_from_spec(spec),
         classification=classification,
     )

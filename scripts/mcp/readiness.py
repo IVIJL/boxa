@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -11,7 +12,12 @@ from urllib.parse import urlsplit
 from .catalog import CatalogError, load_catalog, resolve_entry, update_entry
 from .install import _docker_image_from_argv, _npm_binary_name, _parse_npx
 from .docker_adapter import DockerAdapterError, parse_declared_run
-from .secrets import project_secrets_path, read_server_secrets
+from .secrets import (
+    global_secrets_path,
+    project_secrets_path,
+    read_header_secrets,
+    read_server_secrets,
+)
 
 
 class ReadinessError(RuntimeError):
@@ -210,6 +216,11 @@ class ProjectProbe:
         block = read_server_secrets(project_secrets_path(project_key), server_name)
         return bool(block and block.get(key))
 
+    def header_secret_present(self, entry_id: str, header_name: str) -> bool:
+        """Check the global catalog-header namespace; never return its value."""
+        block = read_header_secrets(global_secrets_path(), entry_id)
+        return bool(block and block.get(header_name.casefold()))
+
     def image_exists(self, container: str, engine: str, image: str) -> bool:
         return self._run(
             container, [engine, "image", "inspect", image], user="node"
@@ -309,9 +320,45 @@ def readiness_for_entry(
     prove the proposed runtime before any host-owned state changes.
     """
     if entry.get("type") == "http":
-        hint = remote_allowlist_hint(entry)
+        probe = probe or ProjectProbe()
+        checks = []
+        for key in entry.get("secretHeaderKeys", []):
+            if hasattr(probe, "header_secret_present"):
+                present = probe.header_secret_present(str(entry["id"]), key)
+            else:
+                # Compatibility for existing injected readiness probes. The
+                # concrete ProjectProbe above reads the dedicated header
+                # namespace; older test/adapter probes expose presence through
+                # the generic credential seam.
+                present = probe.credential_present(
+                    "", project_key, str(entry["id"]), key, "boxa-mcp"
+                )
+            checks.append(
+                Check(
+                    "secret-header",
+                    key,
+                    present,
+                    "present" if present else "secret value missing",
+                )
+            )
+        hints = []
+        for check in checks:
+            if not check.ready:
+                hints.append(
+                    "Next: boxa mcp secret set "
+                    + shlex.quote(str(entry["name"]))
+                    + " "
+                    + shlex.quote(check.label)
+                )
+        allowlist_hint = remote_allowlist_hint(entry)
+        if allowlist_hint:
+            hints.append(allowlist_hint)
+            if entry.get("secretHeaderKeys"):
+                hints.append(
+                    "The broker uses the same Boxa Allowlist as direct remote entries."
+                )
         return ReadinessReport(
-            dict(entry), project_key, "", [], [hint] if hint else []
+            dict(entry), project_key, "", checks, hints
         )
     probe = probe or ProjectProbe()
     container = probe.find_running(project_key)

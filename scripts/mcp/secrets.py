@@ -11,11 +11,11 @@ separate secret store, scoped exactly like the profile:
 (local-plan-mcp.md decision 25). The store file is always created/maintained
 with mode ``0600``: only the owner may read the secrets it holds.
 
-Layout: ``{ "version": 1, "servers": { "<name>": { "<ENV_KEY>": "<value>" } } }``.
-The profile references env-variable NAMES; this store maps those names to the
-copied values for one scoped server. Removing a server's secrets removes only
-that server's block — global secrets are never touched by a project operation
-and vice versa.
+Layout: ``{ "version": 1, "servers": { ... }, "headers": { ... } }``.
+``servers`` maps a scoped server name to secret environment values. ``headers``
+maps a catalog entry ID to secret HTTP header values, keyed directly by header
+name (ADR 0030; there is no separate store-key field). Removing one namespace
+never disturbs the other.
 
 CRITICAL: nothing in this module is ever logged, printed, or returned to the
 text/JSON output paths. Callers report which KEYS were copied (names only); the
@@ -57,7 +57,7 @@ def secrets_path(scope: str, project_key: Optional[str]) -> str:
 
 
 def _empty_store() -> dict[str, Any]:
-    return {"version": SECRETS_VERSION, "servers": {}}
+    return {"version": SECRETS_VERSION, "servers": {}, "headers": {}}
 
 
 def load_secrets(path: str) -> dict[str, Any]:
@@ -81,6 +81,13 @@ def load_secrets(path: str) -> dict[str, Any]:
         # any secrets the user already copied.
         raise ValueError(
             f"malformed secret store ('servers' is not an object): {path}"
+        )
+    headers = data.get("headers")
+    if "headers" not in data:
+        data["headers"] = {}
+    elif not isinstance(headers, dict):
+        raise ValueError(
+            f"malformed secret store ('headers' is not an object): {path}"
         )
     return data
 
@@ -194,6 +201,38 @@ def read_server_secrets(path: str, server_name: str) -> Optional[dict[str, str]]
     if not isinstance(block, dict):
         return None
     return {str(k): str(v) for k, v in block.items()}
+
+
+def store_header_secret(
+    path: str, entry_id: str, header_name: str, value: str
+) -> None:
+    """Set one catalog entry's secret header value without replacing peers."""
+    store = load_secrets(path)
+    block = store["headers"].setdefault(entry_id, {})
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"malformed secret store (header block is not an object): {path}"
+        )
+    folded_name = header_name.casefold()
+    for existing_name in list(block):
+        if str(existing_name).casefold() == folded_name:
+            del block[existing_name]
+    block[folded_name] = value
+    save_secrets(path, store)
+
+
+def read_header_secrets(path: str, entry_id: str) -> Optional[dict[str, str]]:
+    """Return one catalog entry's secret header block, or None if absent."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        store = load_secrets(path)
+    except PermissionError:
+        return None
+    block = store["headers"].get(entry_id)
+    if not isinstance(block, dict):
+        return None
+    return {str(k).casefold(): str(v) for k, v in block.items()}
 
 
 def restore_server_secrets(

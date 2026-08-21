@@ -123,6 +123,9 @@ if [ "$(id -u)" = "0" ]; then
     # here, never from the node-owned profile mount.
     if id boxa-mcp >/dev/null 2>&1; then
         install -d -o boxa-mcp -g boxa-bridge -m 2770 /run/boxa-bridge
+        # Agent-readable broker discovery state lives in an owner-writable
+        # directory, so node can read publications but cannot replace them.
+        install -d -o boxa-mcp -g boxa-mcp -m 0755 /run/boxa-mcp-public
         install -d -o boxa-mcp -g boxa-mcp -m 0700 /run/boxa-mcp
         install -d -o boxa-mcp -g boxa-mcp -m 0700 /run/boxa-mcp/secrets
         # docker-run mounts the secret-free host authorization snapshot as its

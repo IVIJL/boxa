@@ -868,7 +868,7 @@ def apply_doctor_fixes(report: DoctorReport) -> FixResult:
 def catalog_project_status(project: str, probe: Optional[object] = None) -> dict[str, Any]:
     """Unified catalog, readiness, activation, mode, and isolation snapshot."""
     from .activation import _entry_activations, canonical_project, load_activations
-    from .catalog import degradation_status, load_catalog
+    from .catalog import isolation_status, load_catalog
     from .catalog_import import catalog_verdicts
     from .classify import classify_candidate
     from .merge import merge_candidates
@@ -888,9 +888,11 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
             ready_report = readiness_for_entry(entry, key, local_probe, secret_name=str(entry.get("secretStoreKey") or entry["name"]))
             readiness = {
                 "state": (
-                    "no-runtime-readiness"
+                    "not-ready"
+                    if not ready_report.ready
+                    else "no-runtime-readiness"
                     if not ready_report.has_runtime_readiness
-                    else "ready" if ready_report.ready else "not-ready"
+                    else "ready"
                 ),
                 "container": ready_report.container,
                 "checks": [check.to_dict() for check in ready_report.checks],
@@ -950,11 +952,7 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
                 else "node" if entry["executionMode"] == "agent-trusted"
                 else "boxa-mcp"
             ),
-            "isolationStatus": (
-                "not-applicable"
-                if entry["type"] == "http"
-                else degradation_status(entry) or "isolated"
-            ),
+            "isolationStatus": isolation_status(entry),
             "agentIdentityTrustScope": (
                 "every-project"
                 if isinstance(everywhere, dict)
