@@ -215,7 +215,8 @@ def _codex_rendered(project: str, rendered_name: str, server: str) -> bool:
         import tomllib
         with open(activation.codex_config_path(project), "rb") as fh:
             data = tomllib.load(fh)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
+        # ENOTDIR: `.codex` is a stale plain-file placeholder — no render.
         return False
     except (OSError, ValueError) as exc:
         raise MigrationError(f"cannot inspect rendered Codex config for {project}: {exc}") from exc
@@ -514,7 +515,9 @@ def _read_text(path: str) -> Optional[str]:
     try:
         with open(path, encoding="utf-8", newline="") as fh:
             return fh.read()
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
+        # ENOTDIR: a path component (e.g. a stale zero-byte `.codex`
+        # bind-mount placeholder) is a plain file — no legacy config there.
         return None
     except (OSError, UnicodeError) as exc:
         raise MigrationError(f"cannot read migration target {path}: {exc}") from exc

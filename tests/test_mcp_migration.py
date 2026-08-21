@@ -339,6 +339,21 @@ class MigrationCleanupTest(unittest.TestCase):
         self.assertEqual(set(os.listdir(self.project)), before)
         self.assertEqual(activation.load_activations()["projects"], {})
 
+    def test_stale_codex_placeholder_file_does_not_break_migration(self):
+        # A zero-byte `.codex` plain file (leftover bind-mount placeholder)
+        # makes `.codex/config.toml` raise ENOTDIR; migration must treat it
+        # as "nothing rendered there" instead of failing.
+        with open(os.path.join(self.project, ".codex"), "w", encoding="utf-8"):
+            pass
+        save_profile(project_profile_path(self.project), {
+            "version": 1,
+            "projectKey": self.project,
+            "servers": {"legacy": _server(["/bin/cat"])},
+        })
+        result = migration.migrate_legacy()
+        self.assertTrue(result["changed"])
+        self.assertEqual(len(load_catalog()["entries"]), 1)
+
     def test_complete_migration_purges_profile_and_is_idempotent(self):
         path = global_profile_path()
         save_profile(path, {
@@ -603,6 +618,20 @@ class MigrationCleanupTest(unittest.TestCase):
         self.assertEqual(
             load_secrets(secret_path)["servers"][entry_id], {"TOKEN": "secret"}
         )
+
+
+class ReadTextTargetTests(unittest.TestCase):
+    def test_plain_file_path_component_reads_as_missing_target(self):
+        # A stale zero-byte `.codex` bind-mount placeholder file makes
+        # `.codex/config.toml` raise ENOTDIR; that means "no legacy config
+        # here", not a migration failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            placeholder = os.path.join(tmp, ".codex")
+            with open(placeholder, "w", encoding="utf-8"):
+                pass
+            self.assertIsNone(
+                migration._read_text(os.path.join(placeholder, "config.toml"))
+            )
 
 
 if __name__ == "__main__":
