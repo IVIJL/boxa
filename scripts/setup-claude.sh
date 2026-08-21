@@ -520,28 +520,116 @@ bootstrap_agent_browser_cli() {
 }
 
 # Every-start. ~/.local/bin/claude lives in the image layer and docker run
-# resets it; re-link to the highest version under ~/.local/share/claude/versions.
-# That dir is the RO host bind mount on Linux/WSL2 and the shared
-# boxa-mac-claude-bin named volume on macOS — either way it holds Linux
-# binaries, so this relink is OS-agnostic and needs no change.
+# resets it; regenerate the Container-only launch wrapper there. The wrapper
+# resolves the highest mounted version on every invocation, so a host update is
+# visible without restarting the Container, and injects only this Project's
+# runtime-snapshot MCP profile.
 repair_claude_bin() {
-    [ -d /home/node/.local/share/claude/versions ] || return 0
-    local latest
-    latest=$(find /home/node/.local/share/claude/versions/ -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null \
-        | sort -V | tail -1)
-    [ -n "$latest" ] || return 0
-    ln -sf "/home/node/.local/share/claude/versions/$latest" /home/node/.local/bin/claude
-    echo "Claude symlink -> $latest"
+    local wrapper_path="/home/node/.local/bin/claude"
+    local wrapper_tmp mcp_dev_dir
+    wrapper_tmp=$(mktemp "/home/node/.local/bin/.claude-wrapper.XXXXXX")
+    mcp_dev_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+
+    printf '#!/bin/bash\nreadonly _MCP_DEV_DIR=%q\n' "$mcp_dev_dir" > "$wrapper_tmp"
+    cat >> "$wrapper_tmp" <<'CLAUDE_WRAPPER'
+set -u
+
+readonly _CLAUDE_VERSIONS_DIR="/home/node/.local/share/claude/versions"
+readonly _EMPTY_MCP_CONFIG='{"mcpServers":{}}'
+readonly _MCP_SHARE_DIR="/usr/local/share/boxa"
+
+latest_version="$(
+    find "$_CLAUDE_VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type f \
+        -executable -printf '%f\n' 2>/dev/null | sort -V | tail -n 1
+)"
+claude_bin="$_CLAUDE_VERSIONS_DIR/$latest_version"
+
+if [ -d "$_MCP_SHARE_DIR/mcp" ]; then
+    MCP_PY_DIR="$_MCP_SHARE_DIR"
+else
+    # Dev/test fallback: setup-claude.sh lives beside the mcp package.
+    MCP_PY_DIR="$_MCP_DEV_DIR"
+fi
+
+if mcp_config="$(
+    PYTHONPATH="$MCP_PY_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m mcp.cli claude-launch-profile 2>/dev/null
+)" && [ -n "$mcp_config" ]; then
+    :
+else
+    mcp_config="$_EMPTY_MCP_CONFIG"
+    printf '%s\n' \
+        'boxa: warning: cannot derive MCP launch profile; starting with no MCP servers' \
+        >&2
+fi
+
+exec "$claude_bin" \
+    --strict-mcp-config "--mcp-config=$mcp_config" "$@"
+CLAUDE_WRAPPER
+    chmod 0755 "$wrapper_tmp"
+    mv -f "$wrapper_tmp" "$wrapper_path"
+    echo "Claude launch wrapper ready"
 }
 
-# Every-start. The runtime snapshot is node-readable; convergence never needs
-# the gated host MCP store and a stale render must not block Container setup.
-converge_mcp_state() {
-    # Pre-convergence images lack the wrapper; that is a rebuild, not a fault.
-    command -v boxa-mcp-converge >/dev/null 2>&1 || return 0
-    if ! boxa-mcp-converge --quiet; then
-        WARNINGS+=("MCP convergence incomplete — run 'boxa-mcp-converge' inside the Container for details")
+# Every-start. npm upgrades restore this canonical path as a symlink, so replace
+# it with the Container-only wrapper after bootstrap on every Container start.
+# The wrapper invokes the package entry point directly to avoid recursion.
+repair_codex_bin() {
+    local wrapper_path="/usr/local/share/npm-global/bin/codex"
+    local wrapper_tmp mcp_dev_dir
+    wrapper_tmp=$(mktemp "/usr/local/share/npm-global/bin/.codex-wrapper.XXXXXX")
+    mcp_dev_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+
+    printf '#!/bin/bash\nreadonly _MCP_DEV_DIR=%q\n' "$mcp_dev_dir" > "$wrapper_tmp"
+    cat >> "$wrapper_tmp" <<'CODEX_WRAPPER'
+set -u
+
+readonly _CODEX_ENTRY_POINT="/usr/local/share/npm-global/lib/node_modules/@openai/codex/bin/codex.js"
+readonly _CODEX_NODE="/usr/local/bin/node"
+readonly _MCP_SHARE_DIR="/usr/local/share/boxa"
+
+if [ -d "$_MCP_SHARE_DIR/mcp" ]; then
+    MCP_PY_DIR="$_MCP_SHARE_DIR"
+else
+    # Dev/test fallback: setup-claude.sh lives beside the mcp package.
+    MCP_PY_DIR="$_MCP_DEV_DIR"
+fi
+
+codex_args=()
+if mcp_overrides="$(
+    PYTHONPATH="$MCP_PY_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m mcp.cli codex-launch-profile 2>/dev/null
+)"; then
+    while IFS= read -r override; do
+        [ -z "$override" ] || codex_args+=("-c" "$override")
+    done <<< "$mcp_overrides"
+else
+    codex_args=("-c" "mcp_servers={}")
+    printf '%s\n' \
+        'boxa: warning: cannot derive MCP launch profile; starting with no MCP servers' \
+        >&2
+fi
+
+# Codex resolves duplicate -c keys last. Keep Boxa's complete MCP profile after
+# caller options so no user/skill override can re-enable an unverified server,
+# but insert it before `--` so Codex still parses the injected overrides.
+launch_args=()
+profile_injected=0
+for arg in "$@"; do
+    if [ "$profile_injected" -eq 0 ] && [ "$arg" = "--" ]; then
+        launch_args+=("${codex_args[@]}")
+        profile_injected=1
     fi
+    launch_args+=("$arg")
+done
+if [ "$profile_injected" -eq 0 ]; then
+    launch_args+=("${codex_args[@]}")
+fi
+exec "$_CODEX_NODE" "$_CODEX_ENTRY_POINT" "${launch_args[@]}"
+CODEX_WRAPPER
+    chmod 0755 "$wrapper_tmp"
+    mv -f "$wrapper_tmp" "$wrapper_path"
+    echo "Codex launch wrapper ready"
 }
 
 print_summary() {
@@ -572,7 +660,7 @@ main() {
     bootstrap_codex_cli
     bootstrap_agent_browser_cli
     repair_claude_bin
-    converge_mcp_state
+    repair_codex_bin
     print_summary
 }
 

@@ -100,63 +100,10 @@ class CasFileTest(unittest.TestCase):
 
         self.assertEqual(self._read(), b"before\n")
 
-    def test_append_rule_is_written_once(self):
-        self._write(b"build/\n")
 
-        first = casfile.append_rule(self.path, "/.mcp.json")
-        second = casfile.append_rule(self.path, "/.mcp.json")
 
-        self.assertIsNotNone(first)
-        self.assertIsNone(second)
-        self.assertEqual(self._read(), b"build/\n/.mcp.json\n")
 
-    def test_append_rollback_removes_only_boxas_line(self):
-        self._write(b"build/\n")
 
-        with casfile.transaction() as txn:
-            casfile.append_rule(self.path, "/.mcp.json")
-            # Git or the user appends its own rule after Boxa's.
-            with open(self.path, "ab") as fh:
-                fh.write(b"secrets.env\n")
-            errors, concurrent = txn.rollback()
-
-        self.assertEqual((errors, concurrent), ([], []))
-        self.assertEqual(self._read(), b"build/\nsecrets.env\n")
-
-    def test_append_rollback_removes_a_file_it_created(self):
-        with casfile.transaction() as txn:
-            casfile.append_rule(self.path, "/.mcp.json")
-            txn.rollback()
-
-        self.assertFalse(os.path.exists(self.path))
-
-    def test_append_keeps_an_edit_landing_after_the_snapshot(self):
-        """Git may rewrite info/exclude between the read and Boxa's append."""
-        self._write(b"build/\n")
-        real_snapshot = casfile.snapshot
-
-        def snapshot_then_foreign_edit(path: str):
-            captured = real_snapshot(path)
-            if path == self.path:
-                with open(self.path, "ab") as fh:
-                    fh.write(b"secrets.env\n")
-            return captured
-
-        casfile.snapshot = snapshot_then_foreign_edit
-        self.addCleanup(setattr, casfile, "snapshot", real_snapshot)
-
-        casfile.append_rule(self.path, "/.mcp.json")
-
-        self.assertEqual(
-            self._read(), b"build/\nsecrets.env\n/.mcp.json\n"
-        )
-
-    def test_append_terminates_a_line_the_foreign_edit_left_open(self):
-        self._write(b"build/")
-
-        casfile.append_rule(self.path, "/.mcp.json")
-
-        self.assertEqual(self._read(), b"build/\n/.mcp.json\n")
 
     def test_swap_does_not_recreate_a_file_deleted_concurrently(self):
         """An empty pre-image is an EMPTY FILE, never a missing one."""
@@ -294,40 +241,7 @@ class CasFileTest(unittest.TestCase):
         # Nothing restored and no rollback temp residue left behind.
         self.assertEqual(os.listdir(self.tmp.name), ["file.json"])
 
-    def test_append_undo_refuses_an_edit_landing_in_the_rewrite_window(self):
-        """Git may rewrite info/exclude while the undo prepares its temp file."""
-        self._write(b"build/\n")
 
-        with casfile.transaction() as txn:
-            casfile.append_rule(self.path, "/.mcp.json")
-            with self._edit_while_the_temp_file_is_written(b"rewritten\n"):
-                errors, concurrent = txn.rollback()
-
-        self.assertEqual(errors, [])
-        self.assertEqual(concurrent, [self.path])
-        self.assertEqual(self._read(), b"rewritten\n")
-        self.assertEqual(os.listdir(self.tmp.name), ["file.json"])
-
-    def test_append_undo_does_not_unlink_a_file_edited_in_the_window(self):
-        """The removal of a file the append created is conditional too."""
-        real_restore = casfile.restore
-
-        def restore_after_a_foreign_edit(entry):
-            # The edit lands after the undo read the file and decided to remove
-            # it, in the instant before the removal itself.
-            self._write(b"git-wrote-this\n")
-            return real_restore(entry)
-
-        with casfile.transaction() as txn:
-            casfile.append_rule(self.path, "/.mcp.json")
-            with mock.patch.object(
-                casfile, "restore", side_effect=restore_after_a_foreign_edit
-            ):
-                errors, concurrent = txn.rollback()
-
-        self.assertEqual(errors, [])
-        self.assertEqual(concurrent, [self.path])
-        self.assertEqual(self._read(), b"git-wrote-this\n")
 
     def test_record_journals_a_bespoke_write(self):
         self._write(b"before\n")

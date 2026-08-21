@@ -11,9 +11,14 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-from mcp.activation import activation_path, render_state_path, runtime_path  # noqa: E402
+from mcp.activation import activation_path, runtime_path  # noqa: E402
+from mcp.migration import render_state_path  # noqa: E402
 from mcp.catalog import load_catalog  # noqa: E402
-from mcp.catalog_import import CatalogImportConflictError, import_definitions  # noqa: E402
+from mcp.catalog_import import (  # noqa: E402
+    CatalogImportConflictError,
+    catalog_verdicts,
+    import_definitions,
+)
 from mcp.candidate import Candidate, Classification, Command  # noqa: E402
 from mcp.merge import merge_candidates  # noqa: E402
 from mcp.providers.claude import render_target_path  # noqa: E402
@@ -28,6 +33,18 @@ def _candidate(name, argv, *, scope="global", project=None):
         name=name,
         type="stdio",
         command=Command(argv=list(argv)),
+        classification=Classification(placement="container", confidence="high"),
+    )
+
+
+def _remote_candidate(name, url):
+    return Candidate(
+        provider="fixture",
+        source_path="/does/not/exist",
+        source_scope="global",
+        name=name,
+        type="http",
+        url=url,
         classification=Classification(placement="container", confidence="high"),
     )
 
@@ -76,6 +93,18 @@ class CatalogImportTest(unittest.TestCase):
         self.assertTrue(any(item.changed for item in first.imported))
         self.assertTrue(all(not item.changed for item in second.imported))
 
+    def test_http_import_writes_url_without_local_runtime_fields(self):
+        import_definitions(
+            merge_candidates(
+                [_remote_candidate("dozzle", "https://dozzle.example.test/mcp")]
+            )
+        )
+        entry = next(iter(load_catalog()["entries"].values()))
+        self.assertEqual(entry["type"], "http")
+        self.assertEqual(entry["url"], "https://dozzle.example.test/mcp")
+        self.assertNotIn("command", entry)
+        self.assertNotIn("executionMode", entry)
+
     def test_same_scope_name_conflict_is_refused_before_write(self):
         selected = merge_candidates([
             _candidate("dup", ["npx", "one"]),
@@ -84,6 +113,58 @@ class CatalogImportTest(unittest.TestCase):
         with self.assertRaises(CatalogImportConflictError):
             import_definitions(selected)
         self.assertEqual(load_catalog()["entries"], {})
+
+    def test_discovery_marks_identical_definition_already_cataloged(self):
+        original = merge_candidates([_candidate("original", ["/bin/echo"])])
+        imported = import_definitions(original).imported[0]
+
+        rediscovered = catalog_verdicts(
+            merge_candidates([_candidate("alias", ["/bin/echo"])])
+        )[0]
+
+        self.assertEqual(rediscovered.catalog_status, "already-cataloged")
+        self.assertEqual(rediscovered.catalog_id, imported.catalog_id)
+        self.assertTrue(rediscovered.to_dict()["alreadyCataloged"])
+
+    def test_same_name_catalog_conflict_diff_supports_skip_and_update(self):
+        original = import_definitions(
+            merge_candidates([_candidate("tool", ["/bin/echo", "old"])])
+        ).imported[0]
+        conflicting = catalog_verdicts(
+            merge_candidates([_candidate("tool", ["/bin/echo", "new"])])
+        )[0]
+        self.assertEqual(conflicting.catalog_status, "conflict")
+        self.assertEqual(conflicting.catalog_id, original.catalog_id)
+        self.assertEqual(conflicting.catalog_diff[0]["field"], "command")
+
+        skipped = import_definitions(
+            [conflicting], catalog_conflicts={conflicting.import_id: "skip"}
+        )
+        self.assertEqual(skipped.imported, [])
+        entry = load_catalog()["entries"][original.catalog_id]
+        self.assertEqual(entry["command"]["argv"], ["/bin/echo", "old"])
+
+        updated = import_definitions(
+            [conflicting], catalog_conflicts={conflicting.import_id: "update"}
+        )
+        self.assertEqual(updated.imported[0].catalog_id, original.catalog_id)
+        entry = load_catalog()["entries"][original.catalog_id]
+        self.assertEqual(entry["command"]["argv"], ["/bin/echo", "new"])
+
+    def test_host_only_candidate_requires_explicit_force(self):
+        candidate = merge_candidates([_candidate("desktop", ["npx", "desktop-mcp"])])[0]
+        candidate.candidate.classification = Classification(
+            placement="host-only",
+            confidence="high",
+            reasons=["needs host desktop"],
+        )
+
+        skipped = import_definitions([candidate])
+        self.assertEqual(skipped.imported, [])
+        self.assertIn("host-only", skipped.skipped[0]["reason"])
+
+        imported = import_definitions([candidate], force_host_only=True)
+        self.assertEqual(len(imported.imported), 1)
 
 
 if __name__ == "__main__":

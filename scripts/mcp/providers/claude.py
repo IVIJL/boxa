@@ -32,8 +32,8 @@ Read-only and secret-safe
 -------------------------
 The provider only reads the file. It records env-variable *names* (the keys of
 the ``env`` object) and never the values, so no secret can enter a Candidate
-or the JSON envelope. Remote/connector servers are surfaced as ``excluded``
-candidates (ADR 0013 / local-plan-mcp.md core question 9) rather than dropped.
+or the JSON envelope. HTTP servers carry their URL as importable Container-
+session candidates. Other remote transports are surfaced as ``excluded``.
 """
 
 from __future__ import annotations
@@ -52,9 +52,8 @@ _REDACTED = "<redacted>"
 PROVIDER = "claude-code"
 
 # Server types that denote a Claude hosted/remote connector (Gmail, Calendar,
-# Drive, and similar). These are not importable Container MCP servers in v1;
-# they are surfaced as excluded for visibility (ADR 0013 / local-plan-mcp.md
-# core question 9), not silently dropped.
+# Drive, and similar). HTTP is handled explicitly as an importable transport;
+# the remaining types stay excluded for visibility.
 _REMOTE_TYPES = {"http", "sse", "remote", "ws", "websocket"}
 
 # Substrings (case-insensitive) in an env-var NAME that mark its VALUE as
@@ -402,12 +401,22 @@ def _candidate_from_spec(
 ) -> Candidate:
     server_type = spec.get("type")
     type_str = server_type if isinstance(server_type, str) else None
+    url = spec.get("url") or spec.get("httpUrl")
+    http_url = url if isinstance(url, str) and url else None
+    is_http = (
+        isinstance(type_str, str) and type_str.lower() == "http"
+    ) or (http_url is not None and not spec.get("command") and not spec.get("sseUrl"))
 
-    if _is_remote_connector(spec):
-        # Hosted/remote connector: surfaced as excluded, never importable in
-        # v1. confidence "high" — we are certain it cannot be a Container MCP
-        # server here. We still keep argv/env-key metadata (names only) for
-        # transparency.
+    if is_http and http_url:
+        type_str = "http"
+        classification = Classification(
+            placement="container",
+            confidence="high",
+            reasons=["HTTP MCP server connects from the Container agent session"],
+        )
+    elif _is_remote_connector(spec):
+        # Unsupported remote transport: surfaced as excluded, never silently
+        # dropped. We still keep argv/env-key metadata (names only).
         classification = Classification(
             placement="excluded",
             confidence="high",
@@ -429,6 +438,7 @@ def _candidate_from_spec(
         source_project=source_project,
         name=name,
         type=type_str,
+        url=http_url if is_http else None,
         command=_command_from_spec(spec),
         classification=classification,
     )

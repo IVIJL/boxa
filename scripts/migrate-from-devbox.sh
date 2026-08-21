@@ -263,8 +263,8 @@ fi
 # user to external mode. macOS needs nothing here: its /etc/resolver/<tld> file
 # is named by TLD, not by tool, so it survives the rename untouched.
 #
-# Gated on the `boxa` CLI being present (same convention as the MCP re-render
-# below): a pre-install migration leaves the resolver to install.sh.
+# Gated on the `boxa` CLI being present: a pre-install migration leaves the
+# resolver to install.sh.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOXA_DIR="$(dirname "$SCRIPT_DIR")"
 legacy_dropins=(
@@ -406,26 +406,18 @@ if [ "${#leftovers[@]}" -gt 0 ]; then
     echo "      sudo userdel -r devbox-agent ; sudo userdel -r devbox-mcp ; sudo groupdel devbox-bridge"
 fi
 
-# --- MCP re-render (only if an MCP profile exists) ---------------------------
-# Rendered MCP entries live in the SHARED ~/.claude / ~/.codex agent configs,
-# not under ~/.config, so moving the config dir cannot reach them. They still
-# carry `devbox-*` entries that invoke the removed `devbox-mcp-run` wrapper; a
-# render strips the legacy prefix (scripts/mcp/render.py is_managed_or_legacy)
-# and rewrites them as `boxa-*`. Run it automatically when the `boxa` CLI is
-# already installed (this script may run after install.sh); otherwise remind.
+# --- MCP migration and retired shared-file cleanup ---------------------------
 if [ -d "$NEW_CFG/mcp" ]; then
     if command -v boxa >/dev/null 2>&1; then
-        say "Re-rendering MCP entries (devbox-* → boxa-*)…"
-        if boxa mcp render >/dev/null 2>&1; then
-            did "re-rendered managed MCP entries"
+        say "Migrating MCP catalog and cleaning retired shared-file entries…"
+        if boxa mcp migrate >/dev/null 2>&1; then
+            did "migrated MCP catalog and cleaned retired shared-file entries"
         else
-            warn "boxa mcp render failed — run 'boxa mcp render' by hand once the CLI works"
+            warn "boxa mcp migrate needs attention — run it by hand for details"
         fi
     else
         say "MCP follow-up (required — you have an MCP profile):"
-        echo "    Shared ~/.claude / ~/.codex configs still hold stale 'devbox-*'"
-        echo "    MCP entries calling the removed 'devbox-mcp-run'. After install,"
-        echo "    run:  boxa mcp render   (strips legacy, re-renders as boxa-*)."
+        echo "    After install, run:  boxa mcp migrate"
     fi
 fi
 

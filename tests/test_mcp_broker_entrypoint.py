@@ -370,6 +370,27 @@ class DockerRunMountTests(unittest.TestCase):
         # selects non-secret profile files for o+r must prune them explicitly.
         self.assertRegex(self.text, r"!\s+-name '\*\.secrets\.json'")
 
+    def test_pending_activations_rechecked_after_runtime_setup_on_every_start(self):
+        setup = (
+            "'/usr/local/bin/start-rootless-docker.sh && "
+            "/usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'"
+        )
+        self.assertEqual(self.text.count("reevaluate_pending_mcp \""), 2)
+        self.assertIn(
+            'mcp_project_path="$(_boxa::container_project_path "$name")"',
+            self.text,
+        )
+        restart_setup = self.text.find(setup)
+        restart_recheck = self.text.find(
+            'reevaluate_pending_mcp "$mcp_project_path"', restart_setup
+        )
+        create_setup = self.text.find(setup, restart_setup + len(setup))
+        create_recheck = self.text.find(
+            'reevaluate_pending_mcp "$PROJECT_PATH"', create_setup
+        )
+        self.assertGreater(restart_recheck, restart_setup)
+        self.assertGreater(create_recheck, create_setup)
+
 
 class DockerRunStorePermLogicTests(unittest.TestCase):
     """Functional regression of the store-perm normalization algorithm.

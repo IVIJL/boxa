@@ -149,6 +149,8 @@ Treat these as separate states:
 
 Catalog definitions, installed runtimes, and execution modes survive Container and host restarts. Catalog membership is never global activation. For another Project, reuse the existing catalog entry and add a separate activation.
 
+Activation writes only Boxa's host-owned store and secret-free runtime snapshot. It never writes a Project or shared agent config; Container-only Claude and Codex launch wrappers inject the selected profile into each new agent session.
+
 Run all `boxa mcp ...` commands on the host. When operating inside a Container, inspect local prerequisites if useful, then give the user the exact host commands.
 
 #### Delegate from Claude to trusted Codex

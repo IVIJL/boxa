@@ -1,42 +1,13 @@
-"""One compare-and-swap primitive for every Boxa-owned config write.
+"""Compare-and-swap writes and compensating transactions for MCP state.
 
-Boxa renders derived state into files it does not own alone: a Project's
-``.mcp.json`` and ``.claude/settings.local.json`` are edited by Claude Code
-too, ``.git/info/exclude`` by Git and by the user. Boxa's mutation lock only
-serializes Boxa processes, so a plan built from a pre-image can be stale by the
-time it is written. Every render write therefore goes through :func:`swap`,
-which arms a CONDITIONAL REPLACE: the file is re-read inside the atomic writer,
-after the temporary file is complete and immediately before ``os.replace``, and
-:class:`ConcurrentModification` is raised instead of clobbering a foreign edit.
-The only window left is the replace syscall itself — an edit landing while the
-temporary file is being written is caught, not overwritten.
+Migration uses conditional replacement while removing retired Boxa content
+from shared Project files. A target is re-read immediately before replace, so
+a concurrent user edit is refused rather than overwritten. Boxa-private stores
+use the same journal for exact multi-file compensation.
 
-The same journal that makes the check possible also makes compensation exact:
-:func:`transaction` records what Boxa actually wrote (pre-image + post-image)
-and :meth:`Transaction.rollback` restores a path only while its current bytes
-still equal Boxa's own post-image. The compensation path arms that post-image
-the same way, so the comparison is again the last thing before the replace: an
-edit landing while the rollback's temporary file is written is reported as a
-conflict, never overwritten with stale bytes. A rollback conflict is reported
-alongside — never instead of — the failure that triggered the rollback.
-
-``.git/info/exclude`` is append-oriented and shared with Git, so it is written
-with :func:`append_rule`, which appends through ``O_APPEND`` — no read-modify-
-write window at all — and whose compensation removes only Boxa's own appended
-line and leaves every concurrent edit in place; that removal is itself
-conditional on the exact bytes it was computed from, so a Git or user edit
-landing during the undo leaves the file untouched.
-
-An expected pre-image is existence-aware: ``None`` means "the file did not
-exist" and never compares equal to ``b""``, the pre-image of an existing empty
-file. Callers must therefore encode a missing file as ``None`` (see
-:func:`preimage`), so a file deleted concurrently is not recreated from a stale
-empty pre-image, and an empty file created concurrently is not overwritten by a
-render planned from a missing one.
-
-Callers decide what a :class:`ConcurrentModification` means — a bounded retry
-(convergence) or an aborted batch reported as skipped/failed (host renders).
-The primitive never retries on its own.
+An expected pre-image is existence-aware: ``None`` means that the file did not
+exist and never compares equal to ``b""``, the pre-image of an existing empty
+file. The primitive never retries on its own.
 """
 
 from __future__ import annotations
@@ -77,7 +48,6 @@ class WriteRecord:
 
     preimage: FileSnapshot
     postimage: Optional[bytes]
-    appended: Optional[str] = None
 
     @property
     def path(self) -> str:
@@ -131,7 +101,7 @@ def snapshot(path: str) -> FileSnapshot:
 
 
 def restore(entry: FileSnapshot) -> None:
-    """Restore exact pre-mutation bytes/existence without a render write.
+    """Restore exact pre-mutation bytes/existence without a journalled write.
 
     Like the atomic writers, this HONOURS a pre-image armed by :func:`_arm`
     (compensation arms Boxa's own post-image) and checks it as the last thing
@@ -363,8 +333,6 @@ def undo(entry: WriteRecord) -> bool:
     conflict instead of being overwritten with stale bytes.
     """
     current = read_bytes(entry.path)
-    if entry.appended is not None:
-        return _undo_append(entry, current)
     if _mismatch(current, entry.postimage):
         return False
     return _restore_if_unchanged(entry.preimage, entry.postimage)
@@ -382,39 +350,6 @@ def _restore_if_unchanged(
     return True
 
 
-def _undo_append(entry: WriteRecord, current: Optional[bytes]) -> bool:
-    """Remove only Boxa's own appended line, preserving concurrent edits.
-
-    The rewrite (or the removal of a file the append created) is conditional on
-    exactly the ``current`` bytes the removal was computed from, so an edit made
-    by Git or the user meanwhile is left in place and reported.
-    """
-    if current is None:
-        return True
-    try:
-        text = current.decode("utf-8")
-    except UnicodeError:
-        return False
-    lines = text.splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        if line.rstrip("\n") == entry.appended:
-            del lines[index]
-            break
-    else:
-        return True
-    remainder = "".join(lines)
-    if not remainder and not entry.preimage.existed:
-        return _restore_if_unchanged(
-            FileSnapshot(path=entry.path, existed=False), current
-        )
-    try:
-        with _arm(entry.path, current):
-            atomic_text(entry.path, remainder)
-    except ConcurrentModification:
-        return False
-    return True
-
-
 # -- compare-and-swap writes --------------------------------------------------
 
 
@@ -422,7 +357,7 @@ def concurrent_conflict(exc: BaseException) -> Optional[ConcurrentModification]:
     """The CAS refusal behind ``exc``, if any — following translated errors.
 
     A caller that translates :class:`ConcurrentModification` into its own public
-    error type (``RenderWriteError``) chains the original as ``__cause__``. Batch
+    public lifecycle error type chains the original as ``__cause__``. Batch
     compensation still has to recognize the refusal to report it as "nothing was
     written", so it asks here instead of matching the type directly.
     """
@@ -466,7 +401,7 @@ def swap(
         (writer or atomic_text)(path, text)
     if not armed.checked:
         raise WriteError(
-            f"render writer for {path} bypassed the compare-and-swap replace"
+            f"conditional writer for {path} bypassed the compare-and-swap replace"
         )
     postimage = read_bytes(path)
     if postimage == preimage.image:
@@ -506,45 +441,3 @@ def remove(path: str, expected: Optional[bytes]) -> Optional[WriteRecord]:
     except FileNotFoundError:
         return None
     return _journal(WriteRecord(preimage=preimage, postimage=None))
-
-
-def append_rule(path: str, rule: str) -> Optional[WriteRecord]:
-    """Append ``rule`` once to an append-oriented shared file.
-
-    Used for ``.git/info/exclude``: the file belongs to Git and the user, so
-    Boxa never rewrites it wholesale. The rule is written with a single
-    ``O_APPEND`` write — the kernel makes that atomic for a regular file, so a
-    concurrent edit landing between the read and the write is appended to, never
-    replaced, and the file keeps its inode and mode. Compensation (see
-    :func:`undo`) removes only this line and keeps any edit made meanwhile.
-    """
-    before = snapshot(path)
-    if rule in before.data.decode("utf-8", "replace").splitlines():
-        return None
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, mode=0o755, exist_ok=True)
-    try:
-        # O_RDWR (not O_WRONLY) so the trailing byte can be re-read through the
-        # very descriptor the append goes to; O_APPEND still forces every write
-        # to the current end of file.
-        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
-    except OSError as exc:
-        raise WriteError(f"cannot append to {path}: {exc}") from exc
-    try:
-        # Re-read the final byte through the same descriptor, so the newline
-        # separator reflects the file as it is now rather than as snapshotted.
-        size = os.fstat(fd).st_size
-        tail = os.pread(fd, 1, size - 1) if size else b"\n"
-        payload = ("" if tail == b"\n" else "\n") + rule + "\n"
-        os.write(fd, payload.encode("utf-8"))
-        os.fsync(fd)
-    except OSError as exc:
-        raise WriteError(f"cannot append to {path}: {exc}") from exc
-    finally:
-        os.close(fd)
-    # No post-image: an append is compensated line-level (see ``_undo_append``),
-    # never by restoring a whole-file image that would drop concurrent edits.
-    return _journal(
-        WriteRecord(preimage=before, postimage=None, appended=rule)
-    )

@@ -20,6 +20,7 @@ from mcp.catalog import (  # noqa: E402
     CATALOG_VERSION,
     CatalogError,
     add_entry,
+    add_remote_entry,
     catalog_path,
     entries_sorted,
     load_catalog,
@@ -126,6 +127,48 @@ class CatalogTest(unittest.TestCase):
         add_entry("alpha", ["npx", "a"])
         self.assertEqual([e["name"] for e in entries_sorted()], ["alpha", "Zulu"])
 
+    def test_http_entry_requires_url_and_forbids_local_runtime_fields(self) -> None:
+        entry = add_remote_entry("dozzle", "https://dozzle.example.test/mcp")
+        self.assertEqual(
+            set(entry), {"id", "name", "type", "url", "readiness"}
+        )
+        self.assertEqual(entry["readiness"]["summary"], "no-runtime-readiness")
+        with self.assertRaisesRegex(CatalogError, "valid HTTP"):
+            add_remote_entry("bad", "ftp://example.test/mcp")
+        with self.assertRaisesRegex(CatalogError, "command argv"):
+            update_entry(entry["id"], argv=["echo"])
+
+    def test_http_entry_rejects_credential_like_query_and_fragment_keys(self) -> None:
+        urls = (
+            "https://example.test/mcp?token=secret",
+            "https://example.test/mcp?apiKey=secret",
+            "https://example.test/mcp?auth=secret",
+            "https://example.test/mcp?authToken=secret",
+            "https://example.test/mcp?auth_token=secret",
+            "https://example.test/mcp?authorization=Bearer%20secret",
+            "https://example.test/mcp?value=sk-ant-api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            "https://example.test/mcp?header=Bearer%20sk-ant-api03-XXXXXXXXXXXXXXXXXXXX",
+            "https://example.test/mcp#access_token=secret",
+            "https://example.test/mcp#Authorization=secret",
+        )
+        for index, url in enumerate(urls):
+            with self.subTest(url=url):
+                with self.assertRaisesRegex(CatalogError, "valid HTTP"):
+                    add_remote_entry(f"remote-{index}", url)
+
+        benign_url = (
+            "https://example.test/mcp?timeout=10&locale=sk-SK&monkey=1"
+            "&author=smith&authority=x#section"
+        )
+        entry = add_remote_entry("benign", benign_url)
+        self.assertEqual(entry["url"], benign_url)
+
+    def test_http_entry_url_update_preserves_remote_shape(self) -> None:
+        entry = add_remote_entry("remote", "https://one.example/mcp")
+        updated = update_entry(entry["id"], url="https://two.example/mcp")
+        self.assertEqual(updated["url"], "https://two.example/mcp")
+        self.assertNotIn("executionMode", updated)
+
     def test_catalog_does_not_touch_legacy_profile(self) -> None:
         profile = {"version": 1, "servers": {"legacy": {"name": "legacy"}}}
         save_profile(global_profile_path(), profile)
@@ -149,6 +192,35 @@ class CatalogTest(unittest.TestCase):
         expected = dict(added)
         expected["isolationStatus"] = "isolated"
         self.assertEqual(listed, [expected])
+
+    def test_cli_add_and_update_remote_url(self) -> None:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli.main(
+                [
+                    "catalog-add-json",
+                    "dozzle",
+                    "--url",
+                    "https://one.example/mcp",
+                ]
+            )
+        self.assertEqual(rc, 0, stderr.getvalue())
+        entry = json.loads(stdout.getvalue())["entry"]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli.main(
+                [
+                    "catalog-update-json",
+                    entry["id"],
+                    "--url",
+                    "https://two.example/mcp",
+                ]
+            )
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertEqual(
+            json.loads(stdout.getvalue())["entry"]["url"],
+            "https://two.example/mcp",
+        )
 
 
 if __name__ == "__main__":

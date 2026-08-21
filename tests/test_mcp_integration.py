@@ -22,6 +22,7 @@ from mcp import activation, catalog, lifecycle, migration, trusted  # noqa: E402
 from mcp.catalog import add_entry, load_catalog, save_catalog, set_execution_mode, update_entry  # noqa: E402
 from mcp.docker_adapter import build_plan as build_docker_plan  # noqa: E402
 from mcp.profile import project_profile_path, save_profile  # noqa: E402
+from mcp.providers.claude import render_target_path  # noqa: E402
 from mcp.readiness import ProjectProbe  # noqa: E402
 from mcp.secrets import project_secrets_path, store_server_secrets  # noqa: E402
 
@@ -81,7 +82,7 @@ class CatalogOperatingPathIntegrationTest(unittest.TestCase):
                 os.environ[key] = value
 
     def _write_legacy_render(self):
-        path = activation.render_target_path()
+        path = render_target_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump({"projects": {self.project: {"mcpServers": {"boxa-legacy": {
@@ -136,22 +137,18 @@ class CatalogOperatingPathIntegrationTest(unittest.TestCase):
 
         status = lifecycle.catalog_project_status(self.project, self.probe)
         by_name = {row["name"]: row for row in status["entries"]}
-        self.assertEqual(by_name["direct"]["renders"], {"claude": "rendered", "codex": "rendered"})
+        self.assertEqual(by_name["direct"]["consumers"], ["claude", "codex"])
         self.assertEqual(by_name["codex-delegate"]["executionUser"], "node")
         self.assertEqual(by_name["docker-fixture"]["executionUser"], "boxa-mcp")
         self.assertTrue(all(row["activation"] == "inactive" for row in lifecycle.catalog_project_status(self.other, self.probe)["entries"]))
 
-        # Doctor repairs derived drift only and never creates cross-Project state.
-        claude_path = activation.claude_config_path(self.project)
-        with open(claude_path, encoding="utf-8") as fh:
-            claude = json.load(fh)
-        del claude["mcpServers"]["boxa-codex-delegate"]
-        with open(claude_path, "w", encoding="utf-8") as fh:
-            json.dump(claude, fh)
+        # Doctor repairs only the host-owned runtime snapshot and never creates
+        # cross-Project state.
+        os.unlink(activation.runtime_path())
         report = lifecycle.DoctorReport(False, lifecycle._catalog_doctor_findings(self.probe))
-        self.assertIn("catalog-claude-render-drift", {finding.code for finding in report.findings})
+        self.assertIn("catalog-runtime-drift", {finding.code for finding in report.findings})
         fixed = lifecycle.apply_doctor_fixes(report)
-        self.assertTrue(any("Claude" in action for action in fixed.actions))
+        self.assertIn("refreshed the secret-free MCP runtime snapshot", fixed.actions)
         self.assertNotIn(self.other, activation.load_activations()["projects"])
 
         # Deactivation blocks new launches; removal destroys stable identity.

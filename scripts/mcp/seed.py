@@ -85,7 +85,7 @@ def rearm() -> dict[str, Any]:
 def find_entry() -> Optional[dict[str, Any]]:
     """The existing Codex delegation entry, matched by command (not name)."""
     for entry in load_catalog()["entries"].values():
-        if is_codex_delegate_argv(entry["command"]["argv"]):
+        if is_codex_delegate_argv(entry.get("command", {}).get("argv", [])):
             return dict(entry)
     return None
 

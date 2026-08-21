@@ -65,23 +65,24 @@ _usage() {
     cat <<'EOF'
 Usage: boxa mcp <subcommand> [args]
 
-Manage the user-wide MCP catalog and explicit per-Project activations (ADR 0021).
-Catalog membership, runtime readiness, activation, consumer render, and
+Manage the user-wide MCP catalog, Project activations, and durable everywhere
+marks (ADR 0021, ADR 0029).
+Catalog membership, runtime readiness, activation, launch-time injection, and
 execution identity are separate states. Catalog membership exposes nothing.
 
 Subcommands:
   migrate     Migrate legacy profiles into catalog + explicit activations.
   catalog     List prepared MCP catalog definitions (never activates them).
   readiness   Check whether one entry can run in a running Project.
-  activate    Activate one ready catalog entry for a running Project.
-  deactivate  Remove a Project activation without killing a live server.
+  activate    Activate one entry for a Project or mark it everywhere.
+  deactivate  Deactivate in one Project; everywhere opt-outs are sticky.
   mode        Change a catalog entry's execution identity (host-only).
   update      Rename or transactionally update one catalog definition.
   import      Discover Inherited MCP servers from agent config and classify
               them as import candidates (dry-run; no writes).
-  list        Show catalog/readiness/activation/render/mode for one Project.
+  list        Show catalog/readiness/activation/injection/mode for one Project.
   status      Show the same effective Project state, including isolation status.
-  doctor      Diagnose catalog, readiness, activation and derived render state.
+  doctor      Diagnose catalog, readiness, activation and launch profile state.
   add         Add a service-isolated definition to the user-wide MCP catalog.
   install     Prepare one catalog runtime in a running Project; never activate.
   remove      Destroy one catalog identity and cascade its activations.
@@ -94,9 +95,11 @@ Mental model and common flow:
   2. 'install' prepares runtimes that need materialization. Direct commands
      already present in the Container (for example 'codex') need no install.
   3. 'readiness' verifies the entry against one running Project.
-  4. 'activate' exposes it only to selected consumers in that Project.
+  4. 'activate' exposes it to selected consumers in one Project, or in every
+     present and future Project only when explicitly marked --everywhere.
   Catalog definitions and execution mode survive Container and host restarts.
-  To reuse a prepared entry elsewhere, start that Project and activate it there.
+  To reuse a prepared entry elsewhere, activate it there or deliberately mark
+  it --everywhere.
 
 Trusted Codex delegation to Claude (run on the host):
   Fresh installs and 'boxa update' offer to seed the 'codex-delegate' entry
@@ -127,29 +130,30 @@ Trusted Codex delegation to Claude (run on the host):
 
 Activation:
   boxa mcp activate <entry> [--project <p>] --for claude|codex|claude,codex
-      [--allow-tracked-codex-config]
-      [--allow-tracked-mcp-json]
       [--accept-degraded-secret-isolation] [--json]
-      Render only the selected Project consumers. Claude writes
-      <Project>/.mcp.json; Codex writes the managed region in
-      <Project>/.codex/config.toml. Untracked configs are locally excluded.
-      A tracked consumer config requires its corresponding explicit opt-in.
-  boxa mcp deactivate <entry> [--project <p>]
-      [--allow-tracked-codex-config] [--allow-tracked-mcp-json] [--json]
-      Remove this Project activation and its selected managed consumer entries.
-      A tracked consumer config is changed only with its explicit opt-in flag.
+      Record the selected consumers in the host-owned activation store. New
+      Container sessions receive them from the launch wrapper and runtime snapshot.
+  boxa mcp activate <entry> --everywhere --for claude|codex|claude,codex
+      [--yes] [--accept-degraded-secret-isolation] [--json]
+      Activate in every known Project and inherit into future Projects. --yes
+      explicitly accepts future-Project trust when the entry is agent-trusted.
+  boxa mcp activate <entry> --no-everywhere [--json]
+      Stop future inheritance without changing existing Project activations.
+  boxa mcp deactivate <entry> [--project <p>] [--json]
+      Remove this Project activation from future launch-time profiles and keep
+      a sticky opt-out if the entry is or later becomes marked everywhere.
 
 Status and doctor:
   boxa mcp list|status [--project <p>] [--json]
       Show catalog membership, readiness, activation, selected consumers,
-      render drift, execution mode/concrete user, and isolation distinctly.
+      execution mode/concrete user, and isolation distinctly.
   boxa mcp doctor [--fix] [--json]
       Diagnose stopped targets, missing prerequisites, stale references,
-      forbidden agent-trusted secrets, render/runtime drift, and degraded
-      Docker isolation. --fix may repair only Boxa-owned directories/wrapper,
-      the secret-free runtime snapshot, and untracked Claude/Codex renders.
+      forbidden agent-trusted secrets, runtime-snapshot drift, and degraded
+      Docker isolation. --fix may repair only Boxa-owned directories/wrapper
+      and the secret-free runtime snapshot.
       It never installs, starts, activates, grants trust, accepts a degradation,
-      or modifies a tracked .mcp.json or Codex config without authorization.
+      or modifies a Project file.
 
 Definition import (write) path:
   boxa mcp import --apply [scope]             Import selected definitions.
@@ -159,16 +163,23 @@ Definition import (write) path:
                             ambiguity — use --import-id instead).
         --import-id <id>    Apply by stable import id (repeatable).
         --all-applicable    Apply every applicable (container) candidate.
+        --conflict update|skip
+                            Resolve same-named catalog definition conflicts.
+        --force             Import an explicitly selected host-only candidate.
+  boxa mcp import --activate --project <p> --for claude|codex|claude,codex
+      [selection] [--conflict update|skip] [--yes] [--json]
+      Import, check readiness, and activate in one command. --yes with no
+      selection accepts every applicable proposal for non-interactive use.
   Import adds secret-free, service-isolated catalog definitions only. It never
-  installs a runtime, creates a Project activation, renders agent config, copies
-  credential values, or infers agent trust. Host-only, unknown, and excluded
-  candidates are shown but not imported. Install and activate are later,
-  separately confirmed steps.
+  installs a runtime, copies credential values, or infers agent trust. The
+  default --apply path creates no activation; --activate is the explicit
+  one-shot exception. Host-only candidates require --force; unknown and
+  excluded candidates remain non-importable.
 
 Install (materialize) path:
   boxa mcp install <entry> [--project <p>] [--allow-for <min>] [--keep-window] [--json]
       Prepare a catalog entry in one RUNNING Project, then re-check readiness.
-      It never starts the Project, activates the entry, or renders agent config.
+      It never starts the Project or activates the entry.
       npm/npx
       servers install into the persistent npm-global prefix; Docker-backed
       servers pull into Project-scoped rootless Docker state.
@@ -177,10 +188,10 @@ Install (materialize) path:
 
 Add (record a new server) path:
   boxa mcp add <name> [--json] -- <command spec...>
-      Add a service-isolated catalog definition. This never activates, starts,
-      installs, or renders the server. <name> labels the catalog entry; only
-      the command spec after '--' is executed. The returned opaque ID survives
-      rename/updates.
+  boxa mcp add <name> [--json] --url <http(s)-url>
+      Add a service-isolated command definition or a remote HTTP definition.
+      This never activates, starts, installs, or probes the server. The
+      returned opaque ID survives rename/updates.
 
 Execution mode:
   boxa mcp mode <entry> service-isolated|agent-trusted [--yes] [--json]
@@ -190,25 +201,23 @@ Execution mode:
 
 Catalog update:
   boxa mcp update <entry> [--name <new-name>] [--description <text>]
-      [--allow-tracked-codex-config] [--allow-tracked-mcp-json]
+      [--url <http(s)-url>]
       [--json] [-- <command spec...>]
       Rename/cosmetic changes preserve stable identity and trust. Runtime
       changes preflight every activated Project, then atomically switch the
-      catalog, broker runtime snapshot, and all selected consumer configs.
-  boxa mcp remove <entry> [--allow-tracked-codex-config]
-      [--allow-tracked-mcp-json] [--json]
-      Cascade every activation and managed consumer entry. A tracked consumer
-      config is changed only with its explicit opt-in flag.
+      catalog and broker runtime snapshot.
+  boxa mcp remove <entry> [--json]
+      Cascade every activation and update future launch-time profiles.
 
 Migration:
-  boxa mcp migrate [--allow-tracked-mcp-json] [--json]
+  boxa mcp migrate [--allow-tracked-mcp-json]
+      [--allow-tracked-codex-config] [--json]
       Copy legacy definitions into the catalog once. Former global definitions
       get no activation; Project definitions retain only originally rendered
-      consumers. Migration never infers agent trust and retains source files.
-      Like every other lifecycle path it refuses the whole batch when any
-      Project would need tracked '.mcp.json' or '.claude/settings.local.json'
-      bytes changed; --allow-tracked-mcp-json authorizes this batch only and
-      records no durable per-Project consent.
+      consumers. Then surgically remove recorded Boxa content from the retired
+      shared Project files and local Git excludes. Migration never infers agent
+      trust, retains legacy source profiles, and refuses tracked cleanup unless
+      the matching one-shot consent flag is supplied.
 
 Reload (re-stage secrets into a running Container) path:
   boxa mcp reload [--global | --project <p>] [--json]
@@ -357,8 +366,12 @@ cmd_import() {
     local json=false
     local all=false
     local apply=false
+    local activate=false
     local all_applicable=false
-    local no_render=false
+    local yes=false
+    local force=false
+    local consumer=""
+    local conflict=""
     local -a projects=()
     local -a servers=()
     local -a import_ids=()
@@ -367,8 +380,22 @@ cmd_import() {
             --json) json=true ;;
             --all) all=true ;;
             --apply) apply=true ;;
+            --activate) apply=true; activate=true ;;
             --all-applicable) all_applicable=true ;;
-            --no-render) no_render=true ;;
+            --yes) yes=true ;;
+            --force) force=true ;;
+            --for)
+                shift
+                [ "$#" -gt 0 ] || { echo "'mcp import --for' requires a consumer." >&2; return 2; }
+                consumer="$1"
+                ;;
+            --for=*) consumer="${1#--for=}" ;;
+            --conflict)
+                shift
+                [ "$#" -gt 0 ] || { echo "'mcp import --conflict' requires update or skip." >&2; return 2; }
+                conflict="$1"
+                ;;
+            --conflict=*) conflict="${1#--conflict=}" ;;
             --project)
                 shift
                 if [ "$#" -eq 0 ]; then
@@ -423,12 +450,9 @@ cmd_import() {
     # dry-run rather than silently ignoring the user's choice.
     if [ "$apply" != true ]; then
         if [ "${#servers[@]}" -gt 0 ] || [ "${#import_ids[@]}" -gt 0 ] \
-            || [ "$all_applicable" = true ]; then
-            echo "--server/--import-id/--all-applicable require --apply." >&2
-            return 2
-        fi
-        if [ "$no_render" = true ]; then
-            echo "--no-render only applies to 'mcp import --apply'." >&2
+            || [ "$all_applicable" = true ] || [ "$yes" = true ] \
+            || [ "$force" = true ] || [ -n "$consumer" ] || [ -n "$conflict" ]; then
+            echo "Selection, acceptance, force, and activation flags require --apply or --activate." >&2
             return 2
         fi
         if [ "$json" = true ]; then
@@ -440,7 +464,25 @@ cmd_import() {
         return $?
     fi
 
-    cmd_import_apply "$json" "$all_applicable" "$no_render" \
+    if [ "$activate" = true ]; then
+        if [ "$all" = true ] || [ "${#projects[@]}" -ne 1 ]; then
+            echo "'mcp import --activate' requires exactly one --project target." >&2
+            return 2
+        fi
+        [ -n "$consumer" ] || {
+            echo "'mcp import --activate' requires --for claude, codex, or both." >&2
+            return 2
+        }
+    elif [ -n "$consumer" ]; then
+        echo "'mcp import --for' requires --activate." >&2
+        return 2
+    fi
+    if [ "$yes" = true ] && [ "${#servers[@]}" -eq 0 ] \
+        && [ "${#import_ids[@]}" -eq 0 ] && [ "$all_applicable" != true ]; then
+        all_applicable=true
+    fi
+    cmd_import_apply "$json" "$all_applicable" "$activate" "$yes" \
+        "$force" "$consumer" "$conflict" "${projects[0]:-}" \
         scope_args servers import_ids
 }
 
@@ -452,13 +494,27 @@ cmd_import() {
 #   * non-interactive with no selection -> fail with examples (no writes).
 # Array arguments are passed BY NAME (nameref) to avoid re-quoting issues.
 cmd_import_apply() {
-    local json="$1" all_applicable="$2" no_render="$3"
-    # Import is definition-only in ADR 0021. Keep accepting --no-render as a
-    # harmless compatibility flag; rendering is never attempted either way.
-    : "$no_render"
-    local -n _scope_args="$4"
-    local -n _servers="$5"
-    local -n _import_ids="$6"
+    local json="$1" all_applicable="$2"
+    local activate=false yes=false force=false consumer="" conflict="" target_project=""
+    local scope_name servers_name import_ids_name
+    if [ "$#" -eq 5 ]; then
+        scope_name="$3"
+        servers_name="$4"
+        import_ids_name="$5"
+    else
+        activate="$3"
+        yes="$4"
+        force="$5"
+        consumer="$6"
+        conflict="$7"
+        target_project="$8"
+        scope_name="$9"
+        servers_name="${10}"
+        import_ids_name="${11}"
+    fi
+    local -n _scope_args="$scope_name"
+    local -n _servers="$servers_name"
+    local -n _import_ids="$import_ids_name"
 
     local -a sel_args=()
     local s
@@ -469,6 +525,8 @@ cmd_import_apply() {
         sel_args+=("--import-id" "$s")
     done
     [ "$all_applicable" = true ] && sel_args+=("--all-applicable")
+    [ "$force" = true ] && sel_args+=("--force")
+    [ -n "$conflict" ] && sel_args+=("--conflict" "$conflict")
 
     local have_selection=false
     [ "${#sel_args[@]}" -gt 0 ] && have_selection=true
@@ -507,11 +565,18 @@ cmd_import_apply() {
         fi
     fi
 
-    if [ "$json" = true ]; then
+    if [ "$activate" = true ]; then
+        local command="import-activate-text"
+        [ "$json" = true ] && command="import-activate-json"
+        local -a flow_args=(--target-project "$target_project" --for "$consumer")
+        [ "$yes" = true ] && flow_args+=(--yes)
+        _run_py "$command" "${flow_args[@]}" "${_scope_args[@]}" "${sel_args[@]}"
+    elif [ "$json" = true ]; then
         _run_py apply-json "${_scope_args[@]}" "${sel_args[@]}"
         return $?
+    else
+        _run_py apply-text "${_scope_args[@]}" "${sel_args[@]}"
     fi
-    _run_py apply-text "${_scope_args[@]}" "${sel_args[@]}"
 }
 
 cmd_migrate() {
@@ -521,6 +586,7 @@ cmd_migrate() {
         case "$1" in
             --json) json=true ;;
             --allow-tracked-mcp-json) mig_args+=("$1") ;;
+            --allow-tracked-codex-config) mig_args+=("$1") ;;
             -h|--help) _usage; return 0 ;;
             *) echo "Unknown argument for 'mcp migrate': $1" >&2; return 2 ;;
         esac
@@ -531,32 +597,6 @@ cmd_migrate() {
     else
         _run_py migrate-text "${mig_args[@]}"
     fi
-}
-
-# Auto-render after a successful apply (ADR 0013, issue 07). A mutating profile
-# command re-renders the boxa-managed agent entries so the new server is
-# usable immediately, unless the user passed --no-render. Render is idempotent
-# and owns only boxa- entries, so re-rendering the full surface here is safe.
-#   $1  no_render flag ("true" to skip)
-#   $2  json ("true" to suppress the human note; JSON consumers parse render
-#       output separately, so we stay quiet on the apply path's stdout)
-_maybe_auto_render() {
-    local no_render="$1" json="$2"
-    if [ "$no_render" = true ]; then
-        if [ "$json" != true ]; then
-            echo "Skipped auto-render (--no-render); run 'boxa mcp render' to apply." >&2
-        fi
-        return 0
-    fi
-    if [ "$json" = true ]; then
-        # Keep the apply JSON the sole stdout payload; render quietly, surfacing
-        # only a hard failure.
-        _run_py render-write-json >/dev/null || return $?
-        return 0
-    fi
-    echo >&2
-    echo "Auto-rendering boxa-managed agent entries..." >&2
-    _run_py render-write-text >&2
 }
 
 # =============================================================================
@@ -717,7 +757,10 @@ _wizard_select() {
     local -n _names="$2"
     local -n _scopes="$3"
     local -n _pkeys="$4"
-    shift 4
+    local -n _catalog_statuses="$5"
+    local -n _placements="$6"
+    local -n _reasons="$7"
+    shift 7
 
     local applicable
     applicable="$(_run_py list-applicable-wizard "$@")"
@@ -731,16 +774,23 @@ _wizard_select() {
     # candidate (an import id has no spaces, but the TAB scheme is shared with
     # the project picker, whose key — a host path — can contain spaces).
     local -a all_ids=() all_names=() all_scopes=() all_pkeys=()
+    local -a all_catalog_statuses=() all_placements=() all_reasons=()
     local -a menu=()
-    local id name scope pkey
-    while IFS=$'\t' read -r id name scope pkey; do
+    local id name scope pkey catalog_status placement reason
+    while IFS=$'\t' read -r id name scope pkey catalog_status placement reason; do
         [ -n "$id" ] || continue
         all_ids+=("$id")
         all_names+=("$name")
         all_scopes+=("$scope")
         all_pkeys+=("$pkey")
-        menu+=("$(printf '%-24s %-8s' "$name" "$scope")"$'\t'"$id")
+        all_catalog_statuses+=("$catalog_status")
+        all_placements+=("${placement:-container}")
+        all_reasons+=("$reason")
+        menu+=("$(printf '%-24s %-8s %s %s' "$name" "$scope" \
+            "${placement:-container}" "$catalog_status")"$'\t'"$id")
     done <<< "$applicable"
+
+    echo "Found ${#all_ids[@]} MCP server(s) in your agent config — add them?" >/dev/tty
 
     local picked
     picked="$(printf '%s\n' "${menu[@]}" | picker::many \
@@ -762,7 +812,8 @@ _wizard_select() {
 
     # Map each chosen id back to its row, de-duplicating while preserving order.
     local i seen
-    _ids=(); _names=(); _scopes=(); _pkeys=()
+    _ids=(); _names=(); _scopes=(); _pkeys=(); _catalog_statuses=()
+    _placements=(); _reasons=()
     for cid in "${chosen_ids[@]}"; do
         seen=false
         for id in "${_ids[@]+"${_ids[@]}"}"; do
@@ -775,6 +826,9 @@ _wizard_select() {
                 _names+=("${all_names[$i]}")
                 _scopes+=("${all_scopes[$i]}")
                 _pkeys+=("${all_pkeys[$i]}")
+                _catalog_statuses+=("${all_catalog_statuses[$i]}")
+                _placements+=("${all_placements[$i]}")
+                _reasons+=("${all_reasons[$i]}")
                 break
             fi
         done
@@ -880,8 +934,10 @@ _wizard_project_picker() {
 # interaction is on /dev/tty. Returns non-zero on a hard error or a cancel.
 _apply_wizard() {
     local -a sel_ids=() sel_names=() sel_scopes=() sel_pkeys=()
+    local -a sel_catalog_statuses=() sel_placements=() sel_reasons=()
     local rc
-    _wizard_select sel_ids sel_names sel_scopes sel_pkeys "$@"
+    _wizard_select sel_ids sel_names sel_scopes sel_pkeys sel_catalog_statuses \
+        sel_placements sel_reasons "$@"
     rc=$?
     if [ "$rc" -ne 0 ]; then
         # rc 1 = no applicable candidates; rc 2 = empty/cancelled selection.
@@ -893,16 +949,35 @@ _apply_wizard() {
     fi
 
     local -a out_args=()
-    local i id name inherited pkey chosen_scope chosen_key
+    local i id name inherited pkey chosen_scope chosen_key conflict_reply force_reply
     for i in "${!sel_ids[@]}"; do
         id="${sel_ids[$i]}"
         name="${sel_names[$i]}"
         inherited="${sel_scopes[$i]}"
         pkey="${sel_pkeys[$i]}"
 
+        if [ "${sel_placements[$i]}" = "host-only" ]; then
+            printf "'%s' is host-only: %s. Force import anyway? [y/N] " \
+                "$name" "${sel_reasons[$i]}" >/dev/tty
+            _tty_read force_reply ''
+            case "$force_reply" in
+                y|Y|yes|YES) out_args+=("--force") ;;
+                *) continue ;;
+            esac
+        fi
+
         chosen_scope="$(_wizard_scope_toggle "$inherited" "$name")"
 
         out_args+=("--import-id" "$id")
+        if [ "${sel_catalog_statuses[$i]}" = "conflict" ]; then
+            printf "'%s' differs from the same-named catalog entry. Update it? [y/N] " \
+                "$name" >/dev/tty
+            _tty_read conflict_reply ''
+            case "$conflict_reply" in
+                y|Y|yes|YES) out_args+=("--catalog-conflict" "$id" "update") ;;
+                *) out_args+=("--catalog-conflict" "$id" "skip") ;;
+            esac
+        fi
 
         if [ "$chosen_scope" = "global" ]; then
             # An override is needed only when the scope actually changed.
@@ -1006,85 +1081,6 @@ cmd_list() {
     _run_py list-text "${scope_args[@]}"
 }
 
-cmd_render() {
-    # Render (issue 07): `--dry-run` previews the planned Claude Code / Codex
-    # config WITHOUT writing (issue 06 behaviour, preserved); a bare
-    # `boxa mcp render` now WRITES the boxa-managed entries into the agent
-    # config trees. Both paths read only the canonical profile + agent config;
-    # the write path owns only `boxa-` entries and leaves inherited/manual
-    # entries untouched.
-    local dry_run=false
-    local json=false
-    local -a projects=()
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --dry-run) dry_run=true ;;
-            --json) json=true ;;
-            --project)
-                shift
-                if [ "$#" -eq 0 ]; then
-                    echo "'mcp render --project' requires a name or path." >&2
-                    return 2
-                fi
-                projects+=("$1")
-                ;;
-            --project=*) projects+=("${1#--project=}") ;;
-            -h|--help) _usage; return 0 ;;
-            -*)
-                echo "Unknown flag for 'mcp render': $1" >&2
-                return 2
-                ;;
-            *)
-                echo "Unexpected argument for 'mcp render': $1" >&2
-                return 2
-                ;;
-        esac
-        shift
-    done
-
-    # --project scopes the DRY-RUN preview only (to focus its output). The real
-    # WRITE path always renders the FULL boxa-managed surface — the writers own
-    # every boxa- entry and rewrite the whole set, so a scoped write would drop
-    # other projects' already-rendered entries. Reject --project on the write
-    # path with a clear pointer to the preview.
-    if [ "$dry_run" != true ] && [ "${#projects[@]}" -gt 0 ]; then
-        echo "'boxa mcp render' writes the full boxa-managed surface and does not accept --project." >&2
-        echo "A scoped write would drop other projects' rendered entries." >&2
-        echo "To preview one project: boxa mcp render --dry-run --project <name-or-path>" >&2
-        return 2
-    fi
-
-    # Resolve explicit --project tokens to Claude record keys; the preview then
-    # reads the matching project profile(s). With no --project, every project
-    # profile is used. --all/--no-global are not meaningful here.
-    local -a scope_args=()
-    if [ "${#projects[@]}" -gt 0 ]; then
-        local token key
-        for token in "${projects[@]}"; do
-            if ! key="$(_resolve_project_key "$token")"; then
-                return 1
-            fi
-            scope_args+=("--project" "$key")
-        done
-    fi
-
-    # Dry-run preview (write-free) vs the real write path.
-    local py_cmd_json py_cmd_text
-    if [ "$dry_run" = true ]; then
-        py_cmd_json="render-json"
-        py_cmd_text="render-text"
-    else
-        py_cmd_json="render-write-json"
-        py_cmd_text="render-write-text"
-    fi
-
-    if [ "$json" = true ]; then
-        _run_py "$py_cmd_json" "${scope_args[@]+"${scope_args[@]}"}"
-        return $?
-    fi
-    _run_py "$py_cmd_text" "${scope_args[@]+"${scope_args[@]}"}"
-}
-
 # Parse the shared scope flags for the lifecycle commands (enable / disable /
 # remove). Resolves an optional `--project <name-or-path>` token to a Claude
 # record key and validates mutual exclusion with `--global`. Outputs, one per
@@ -1173,14 +1169,13 @@ _read_lines_into() {
 }
 
 cmd_enable() {
-    local json=false no_render=false
+    local json=false
     local -a raw=()
     local a
     for a in "$@"; do
         case "$a" in
             -h|--help) _usage; return 0 ;;
             --json) json=true ;;
-            --no-render) no_render=true ;;
             *) raw+=("$a") ;;
         esac
     done
@@ -1191,23 +1186,20 @@ cmd_enable() {
     local -a args=()
     _read_lines_into args "$out"
     if [ "$json" = true ]; then
-        _run_py enable-json "${args[@]}" || return $?
-        _maybe_auto_render "$no_render" true
+        _run_py enable-json "${args[@]}"
         return $?
     fi
-    _run_py enable-text "${args[@]}" || return $?
-    _maybe_auto_render "$no_render" false
+    _run_py enable-text "${args[@]}"
 }
 
 cmd_disable() {
-    local json=false no_render=false
+    local json=false
     local -a raw=()
     local a
     for a in "$@"; do
         case "$a" in
             -h|--help) _usage; return 0 ;;
             --json) json=true ;;
-            --no-render) no_render=true ;;
             *) raw+=("$a") ;;
         esac
     done
@@ -1218,26 +1210,20 @@ cmd_disable() {
     local -a args=()
     _read_lines_into args "$out"
     if [ "$json" = true ]; then
-        _run_py disable-json "${args[@]}" || return $?
-        _maybe_auto_render "$no_render" true
+        _run_py disable-json "${args[@]}"
         return $?
     fi
-    _run_py disable-text "${args[@]}" || return $?
-    _maybe_auto_render "$no_render" false
+    _run_py disable-text "${args[@]}"
 }
 
 cmd_remove() {
-    local json=false no_render=false
-    local allow_tracked_codex=false allow_tracked_mcp=false
+    local json=false
     local -a raw=()
     local a
     for a in "$@"; do
         case "$a" in
             -h|--help) _usage; return 0 ;;
             --json) json=true ;;
-            --no-render) no_render=true ;;
-            --allow-tracked-codex-config) allow_tracked_codex=true ;;
-            --allow-tracked-mcp-json) allow_tracked_mcp=true ;;
             *) raw+=("$a") ;;
         esac
     done
@@ -1251,18 +1237,12 @@ cmd_remove() {
             return 2
         fi
         local -a catalog_args=("${raw[0]}")
-        [ "$allow_tracked_codex" = false ] || catalog_args+=(--allow-tracked-codex-config)
-        [ "$allow_tracked_mcp" = false ] || catalog_args+=(--allow-tracked-mcp-json)
         if [ "$json" = true ]; then
             _run_py catalog-remove-json "${catalog_args[@]}"
         else
             _run_py catalog-remove-text "${catalog_args[@]}"
         fi
         return $?
-    fi
-    if [ "$allow_tracked_codex" = true ] || [ "$allow_tracked_mcp" = true ]; then
-        echo "Tracked-config consent flags apply only to catalog removal." >&2
-        return 2
     fi
     local out rc
     out="$(_lifecycle_collect "mcp remove" true "${raw[@]+"${raw[@]}"}")"
@@ -1305,12 +1285,10 @@ cmd_remove() {
     fi
 
     if [ "$json" = true ]; then
-        _run_py remove-json "${args[@]}" || return $?
-        _maybe_auto_render "$no_render" true
+        _run_py remove-json "${args[@]}"
         return $?
     fi
-    _run_py remove-text "${args[@]}" || return $?
-    _maybe_auto_render "$no_render" false
+    _run_py remove-text "${args[@]}"
 }
 
 # --- reload (re-stage secrets into running Containers) -----------------------
@@ -1849,15 +1827,23 @@ _add_scope_picker() {
 }
 
 cmd_add() {
-    local json=false no_render=false is_global=false
-    local project_token="" name="" saw_dashdash=false
+    local json=false is_global=false
+    local project_token="" name="" remote_url="" saw_dashdash=false
     local -a spec=()
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -h|--help) _usage; return 0 ;;
             --) saw_dashdash=true; shift; spec=("$@"); break ;;
             --json) json=true ;;
-            --no-render) no_render=true ;;
+            --url)
+                shift
+                if [ "$#" -eq 0 ]; then
+                    echo "'mcp add --url' requires an HTTP(S) URL." >&2
+                    return 2
+                fi
+                remote_url="$1"
+                ;;
+            --url=*) remote_url="${1#--url=}" ;;
             --global) is_global=true ;;
             --project)
                 shift
@@ -1898,9 +1884,17 @@ cmd_add() {
         echo "'mcp add': --global and --project are mutually exclusive." >&2
         return 2
     fi
-    if [ "$saw_dashdash" != true ] || [ "${#spec[@]}" -eq 0 ]; then
-        echo "'mcp add' requires a command spec after '--'." >&2
-        echo "Example: boxa mcp add context7 --global -- npx -y @upstash/context7-mcp@latest" >&2
+    if [ -n "$remote_url" ]; then
+        if [ "$saw_dashdash" = true ]; then
+            echo "'mcp add' accepts either --url or a command spec, not both." >&2
+            return 2
+        fi
+    elif [ "$saw_dashdash" != true ] || [ "${#spec[@]}" -eq 0 ]; then
+        echo "'mcp add' requires either --url <http(s)-url> or a command spec after '--'." >&2
+        return 2
+    fi
+    if [ -n "$remote_url" ] && { [ "$is_global" = true ] || [ -n "$project_token" ]; }; then
+        echo "'mcp add --url' records a catalog entry and does not accept legacy scope flags." >&2
         return 2
     fi
 
@@ -1909,9 +1903,17 @@ cmd_add() {
     # a profile and never triggers agent rendering.
     if [ "$is_global" != true ] && [ -z "$project_token" ]; then
         if [ "$json" = true ]; then
-            _run_py catalog-add-json "$name" -- "${spec[@]}"
+            if [ -n "$remote_url" ]; then
+                _run_py catalog-add-json "$name" --url "$remote_url"
+            else
+                _run_py catalog-add-json "$name" -- "${spec[@]}"
+            fi
         else
-            _run_py catalog-add-text "$name" -- "${spec[@]}"
+            if [ -n "$remote_url" ]; then
+                _run_py catalog-add-text "$name" --url "$remote_url"
+            else
+                _run_py catalog-add-text "$name" -- "${spec[@]}"
+            fi
         fi
         return $?
     fi
@@ -1966,19 +1968,12 @@ cmd_add() {
 
     if [ "$json" = true ]; then
         _run_py_secret_write "$py_cmd" "${scope_args[@]}" "$name" -- "${spec[@]}" || return $?
-        # Capture the render status BEFORE the cleanup so a failed auto-render is
-        # surfaced (the cleanup's own exit status would otherwise mask it and the
-        # JSON path would falsely report success).
-        _maybe_auto_render "$no_render" true
-        local render_rc=$?
         _finish_secret_write
-        return "$render_rc"
+        return 0
     fi
     _run_py_secret_write "$py_cmd" "${scope_args[@]}" "$name" -- "${spec[@]}" || return $?
-    _maybe_auto_render "$no_render" false
-    local render_rc=$?
     _finish_secret_write
-    return "$render_rc"
+    return 0
 }
 
 cmd_catalog() {
@@ -2116,7 +2111,8 @@ cmd_activation() {
     local action="$1"
     shift
     local json=false project="" consumer="" token="" accept_degraded=false
-    local allow_tracked_codex=false allow_tracked_mcp=false
+    local everywhere=false no_everywhere=false yes=false
+    local import_offer_id=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --json) json=true ;;
@@ -2132,9 +2128,10 @@ cmd_activation() {
                 consumer="$1"
                 ;;
             --for=*) consumer="${1#--for=}" ;;
-            --allow-tracked-codex-config) allow_tracked_codex=true ;;
-            --allow-tracked-mcp-json) allow_tracked_mcp=true ;;
             --accept-degraded-secret-isolation) accept_degraded=true ;;
+            --everywhere) everywhere=true ;;
+            --no-everywhere) no_everywhere=true ;;
+            --yes) yes=true ;;
             -h|--help) _usage; return 0 ;;
             -*) echo "Unknown flag for 'mcp $action': $1" >&2; return 2 ;;
             *)
@@ -2145,7 +2142,39 @@ cmd_activation() {
         shift
     done
     if [ -z "$token" ]; then
-        if [ -t 0 ] && [ -t 1 ]; then
+        if [ "$action" = "activate" ] && [ "$everywhere" != true ] \
+            && [ "$no_everywhere" != true ]; then
+            [ -n "$project" ] || project="$PWD"
+            project="$(_resolve_project_key "$project")" || return 2
+            if [ "$yes" = true ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+                local -a import_args=(--activate --yes --project "$project")
+                [ "$json" = true ] && import_args+=(--json)
+                [ -n "$consumer" ] && import_args+=(--for "$consumer")
+                cmd_import "${import_args[@]}"
+                return $?
+            fi
+            if [ -t 0 ] && [ -t 1 ]; then
+                local offers offer_count offer_reply
+                offers="$(_run_py list-applicable --project "$project")"
+                offer_count="$(printf '%s\n' "$offers" | awk 'NF { count++ } END { print count + 0 }')"
+                if [ "$offer_count" -gt 0 ]; then
+                    printf 'Found %s MCP server(s) in your agent config — add one? [y/N] ' \
+                        "$offer_count" >&2
+                    IFS= read -r offer_reply || offer_reply=""
+                    case "$offer_reply" in
+                        y|Y|yes|YES)
+                            local picked_offer
+                            picked_offer="$(printf '%s\n' "$offers" | picker::one \
+                                --prompt "Select inherited MCP server: ")" || return 1
+                            import_offer_id="${picked_offer%%$'\t'*}"
+                            ;;
+                    esac
+                fi
+            fi
+        fi
+        if [ -n "$import_offer_id" ]; then
+            token="$import_offer_id"
+        elif [ -t 0 ] && [ -t 1 ]; then
             local picked
             picked="$(_run_py catalog-picker | picker::one --prompt "Select MCP catalog entry: ")" || return 1
             token="${picked%%$'\t'*}"
@@ -2155,66 +2184,127 @@ cmd_activation() {
             return 2
         fi
     fi
-    if [ -z "$project" ]; then
-        project="$PWD"
+    if [ "$everywhere" = true ] && [ "$no_everywhere" = true ]; then
+        echo "'mcp activate' accepts only one of --everywhere and --no-everywhere." >&2
+        return 2
     fi
-    project="$(_resolve_project_key "$project")" || return 2
-    local -a args=("$token" --project "$project")
+    if { [ "$everywhere" = true ] || [ "$no_everywhere" = true ]; } && [ -n "$project" ]; then
+        echo "--everywhere/--no-everywhere cannot be combined with --project." >&2
+        return 2
+    fi
+    if [ "$action" != "activate" ] && { [ "$everywhere" = true ] || [ "$no_everywhere" = true ] || [ "$yes" = true ]; }; then
+        echo "'mcp deactivate' does not accept everywhere flags or --yes." >&2
+        return 2
+    fi
+    local -a args=("$token")
+    if [ "$everywhere" = true ]; then
+        args+=(--everywhere)
+    elif [ "$no_everywhere" = true ]; then
+        args+=(--no-everywhere)
+    else
+        if [ -z "$project" ]; then
+            project="$PWD"
+        fi
+        project="$(_resolve_project_key "$project")" || return 2
+        args+=(--project "$project")
+    fi
     if [ "$action" = "activate" ]; then
-        if [ -z "$consumer" ]; then
-            if [ -t 0 ] && [ -t 1 ]; then
-                consumer="$(printf '%s\n' claude codex claude,codex | picker::one --prompt "Activate for consumer: ")" || return 1
-            else
-                echo "Non-interactive 'mcp activate' requires --for claude, codex, or both." >&2
+        if [ "$no_everywhere" = true ]; then
+            if [ -n "$consumer" ] || [ "$accept_degraded" = true ] || [ "$yes" = true ]; then
+                echo "'mcp activate --no-everywhere' does not accept activation or acknowledgement flags." >&2
                 return 2
             fi
-        fi
-        args+=(--for "$consumer")
-        [ "$allow_tracked_codex" = false ] || args+=(--allow-tracked-codex-config)
-        [ "$allow_tracked_mcp" = false ] || args+=(--allow-tracked-mcp-json)
-        if [ "$accept_degraded" = true ]; then
-            args+=(--accept-degraded-secret-isolation)
-        elif [ -t 0 ] && [ -t 1 ] \
-            && [ "$(_run_py activation-degradation-text "$token" --project "$project")" = "degraded-secret-isolation" ]; then
-            printf '%s\n' "WARNING: degraded-secret-isolation: node owns the Docker daemon and can inspect this server's container environment." >&2
-            printf 'Accept this temporary secret-isolation limitation? [y/N] ' >&2
-            local degraded_reply
-            IFS= read -r degraded_reply || degraded_reply=""
-            case "$degraded_reply" in
-                y|Y|yes|YES) args+=(--accept-degraded-secret-isolation) ;;
-                *)
-                    echo "Cancelled; no MCP activation, acknowledgement, or agent config changed." >&2
-                    return 1
-                    ;;
-            esac
-        fi
-        # An interactive user may explicitly compose the otherwise separate
-        # install and activation operations. Cancellation returns before any
-        # activation/config mutation. Non-interactive callers get the normal
-        # readiness refusal and must run install themselves.
-        if [ -t 0 ] && [ -t 1 ] \
-            && ! _run_py readiness-json "$token" --project "$project" >/dev/null 2>&1; then
-            printf "Entry is not ready. Install it in this running Project, re-check, and activate? [y/N] " >&2
-            local reply
-            IFS= read -r reply || reply=""
-            case "$reply" in
-                y|Y|yes|YES)
-                    cmd_install "$token" --project "$project" || return $?
-                    _run_py readiness-json "$token" --project "$project" >/dev/null || return $?
-                    ;;
-                *)
-                    echo "Cancelled; no MCP activation or agent config changed." >&2
-                    return 1
-                    ;;
-            esac
+        else
+            if [ -z "$consumer" ]; then
+                if [ -t 0 ] && [ -t 1 ]; then
+                    consumer="$(printf '%s\n' claude codex claude,codex | picker::one --prompt "Activate for consumer: ")" || return 1
+                else
+                    echo "Non-interactive 'mcp activate' requires --for claude, codex, or both." >&2
+                    return 2
+                fi
+            fi
+            args+=(--for "$consumer")
+            if [ -n "$import_offer_id" ]; then
+                local import_command="import-activate-text"
+                [ "$json" = true ] && import_command="import-activate-json"
+                local -a offered_args=(
+                    --target-project "$project" --for "$consumer"
+                    --project "$project" --import-id "$import_offer_id"
+                )
+                [ "$yes" = true ] && offered_args+=(--yes)
+                _run_py "$import_command" "${offered_args[@]}"
+                return $?
+            fi
+            if [ "$accept_degraded" = true ]; then
+                args+=(--accept-degraded-secret-isolation)
+            elif [ -t 0 ] && [ -t 1 ] \
+                && [ "$(_run_py activation-degradation-text "$token" --project "${project:-$PWD}")" = "degraded-secret-isolation" ]; then
+                printf '%s\n' "WARNING: degraded-secret-isolation: node owns the Docker daemon and can inspect this server's container environment." >&2
+                printf 'Accept this temporary secret-isolation limitation? [y/N] ' >&2
+                local degraded_reply
+                IFS= read -r degraded_reply || degraded_reply=""
+                case "$degraded_reply" in
+                    y|Y|yes|YES) args+=(--accept-degraded-secret-isolation) ;;
+                    *)
+                        echo "Cancelled; no MCP activation, acknowledgement, or agent config changed." >&2
+                        return 1
+                        ;;
+                esac
+            fi
+            if [ "$everywhere" = true ] \
+                && [ "$(_run_py activation-agent-trusted-text "$token")" = "true" ]; then
+                printf '%s\n' "WARNING: agent-identity trust will extend to every present and future Project." >&2
+                if [ "$yes" != true ]; then
+                    if [ ! -t 0 ] || [ ! -t 1 ]; then
+                        echo "Non-interactive agent-trusted everywhere activation requires explicit --yes." >&2
+                        return 2
+                    fi
+                    printf 'Extend agent-identity trust to every future Project? [y/N] ' >&2
+                    local trust_reply
+                    IFS= read -r trust_reply || trust_reply=""
+                    case "$trust_reply" in
+                        y|Y|yes|YES) ;;
+                        *) echo "Cancelled; the everywhere mark and Project activations are unchanged." >&2; return 1 ;;
+                    esac
+                fi
+                args+=(--yes)
+            elif [ "$yes" = true ]; then
+                args+=(--yes)
+            fi
+            # An interactive user may explicitly compose the otherwise separate
+            # install and activation operations. Cancellation returns before any
+            # activation/config mutation. Non-interactive callers get the normal
+            # readiness refusal and must run install themselves.
+            if [ "$everywhere" != true ] && [ -t 0 ] && [ -t 1 ]; then
+                local readiness_error=""
+                if ! readiness_error="$(_run_py readiness-json "$token" --project "$project" 2>&1 >/dev/null)"; then
+                    case "$readiness_error" in
+                        *"is not running; readiness never starts it implicitly"*)
+                            # The Python activation core records this exact state as
+                            # pending; install cannot run until the Container starts.
+                            ;;
+                        *)
+                            printf "Entry is not ready. Install it in this running Project, re-check, and activate? [y/N] " >&2
+                            local reply
+                            IFS= read -r reply || reply=""
+                            case "$reply" in
+                                y|Y|yes|YES)
+                                    cmd_install "$token" --project "$project" || return $?
+                                    _run_py readiness-json "$token" --project "$project" >/dev/null || return $?
+                                    ;;
+                                *)
+                                    echo "Cancelled; no MCP activation or agent config changed." >&2
+                                    return 1
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                fi
+            fi
         fi
     elif [ -n "$consumer" ] || [ "$accept_degraded" = true ]; then
         echo "'mcp deactivate' does not accept activation flags." >&2
         return 2
-    fi
-    if [ "$action" = "deactivate" ]; then
-        [ "$allow_tracked_codex" = false ] || args+=(--allow-tracked-codex-config)
-        [ "$allow_tracked_mcp" = false ] || args+=(--allow-tracked-mcp-json)
     fi
     if [ "$json" = true ]; then
         _run_py "${action}-json" "${args[@]}"
@@ -2245,7 +2335,6 @@ main() {
         migrate) cmd_migrate "$@" ;;
         list)    cmd_list "$@" ;;
         status)  cmd_list "$@" ;;
-        render)  cmd_render "$@" ;;
         enable)  cmd_enable "$@" ;;
         disable) cmd_disable "$@" ;;
         remove)  cmd_remove "$@" ;;

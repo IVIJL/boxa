@@ -1,48 +1,36 @@
-"""ADR 0021 issue 08: safe legacy migration and definition-only import."""
+"""ADR 0028: state-driven cleanup of retired shared MCP artifacts."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
-import stat
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from mcp import activation, migration  # noqa: E402
-from mcp.catalog import catalog_path, load_catalog  # noqa: E402
-from mcp.profile import (  # noqa: E402
-    global_profile_path,
-    project_profile_path,
-    save_profile,
-)
-from mcp.render import build_render_plan  # noqa: E402
-from mcp.runner import RunnerError, _resolve_env  # noqa: E402
-from mcp.secrets import (  # noqa: E402
-    project_secrets_path,
-    read_server_secrets,
-    store_server_secrets,
-)
+from mcp.catalog import load_catalog  # noqa: E402
+from mcp.profile import project_profile_path, save_profile  # noqa: E402
 
 
-def _server(argv, *, enabled=True, secrets=None):
+def _server(argv):
     return {
         "name": "ignored",
         "type": "stdio",
         "command": {"argv": list(argv)},
-        "envKeys": list(secrets or []),
-        "secretEnvKeys": list(secrets or []),
-        "enabled": enabled,
+        "envKeys": [],
+        "secretEnvKeys": [],
+        "enabled": True,
         "source": {"provider": "legacy", "importId": "imp-old"},
     }
 
 
-class MigrationTest(unittest.TestCase):
+class MigrationCleanupTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -53,6 +41,7 @@ class MigrationTest(unittest.TestCase):
         os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(self.tmp.name, ".claude")
         self.project = os.path.realpath(os.path.join(self.tmp.name, "project"))
         os.makedirs(self.project)
+        subprocess.run(["git", "-C", self.project, "init", "-q"], check=True)
 
     def _restore(self):
         for key, value in self.old.items():
@@ -61,489 +50,281 @@ class MigrationTest(unittest.TestCase):
             else:
                 os.environ[key] = value
 
-    def _write_project(self, project, servers):
-        save_profile(project_profile_path(project), {
-            "version": 1, "projectKey": project, "servers": servers,
-        })
-
-    def _write_claude(self, projects, *, global_entries=None):
-        path = activation.render_target_path()
+    def _write(self, relative, text):
+        path = os.path.join(self.project, relative)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump({
-                "mcpServers": global_entries or {},
-                "projects": projects,
-            }, fh)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
         return path
 
     @staticmethod
-    def _state(paths):
-        result = {}
-        for path in paths:
-            if os.path.exists(path):
-                with open(path, "rb") as fh:
-                    result[path] = (True, fh.read(), stat.S_IMODE(os.stat(path).st_mode))
-            else:
-                result[path] = (False, b"", 0)
-        return result
+    def _bytes(path):
+        with open(path, "rb") as fh:
+            return fh.read()
 
-    def test_mixed_profiles_keep_only_actually_rendered_project_consumer(self):
-        save_profile(global_profile_path(), {
-            "version": 1, "servers": {"global": _server(["npx", "global"])},
-        })
-        self._write_project(self.project, {
-            "active": _server(["npx", "active"]),
-            "disabled": _server(["npx", "disabled"], enabled=False),
-        })
-        legacy_global = {"command": "boxa-mcp-run", "args": ["global"]}
-        claude_path = self._write_claude({
-            self.project: {
-                "mcpServers": {
-                    "boxa-active": {
-                        "type": "stdio", "command": "boxa-mcp-run",
-                        "args": ["--project", self.project, "active"],
-                    },
-                    "manual": {"command": "manual-server"},
+    def _seed_artifacts(self):
+        state_path = migration.render_state_path()
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "projects": {
+                    self.project: {
+                        "boxa-echo": {"command": "boxa-mcp-run"},
+                    }
+                },
+                "seeded": {self.project: ["boxa-echo"]},
+            }, fh)
+        mcp = self._write(
+            ".mcp.json",
+            '{\n  "before": "KEEP-A",\n  "mcpServers": {\n'
+            '    "boxa-echo": {"command":"boxa-mcp-run"},\n'
+            '    "manual": { "command" : "KEEP-MANUAL" }\n'
+            '  },\n  "after": "KEEP-B"\n}\n',
+        )
+        settings = self._write(
+            ".claude/settings.local.json",
+            '{\n  "theme": { "exact" : true },\n'
+            '  "enabledMcpjsonServers": ["manual","boxa-echo"],\n'
+            '  "disabledMcpjsonServers": ["foreign"]\n}\n',
+        )
+        codex = self._write(
+            ".codex/config.toml",
+            'model = "KEEP"\n\n# >>> boxa managed MCP servers >>>\n'
+            '[mcp_servers.boxa-echo]\ncommand = "boxa-mcp-run"\n'
+            '# <<< boxa managed MCP servers <<<\n\n[manual]\nvalue = "KEEP"\n',
+        )
+        exclude = os.path.join(self.project, ".git", "info", "exclude")
+        with open(exclude, "w", encoding="utf-8") as fh:
+            fh.write("# KEEP\n/.mcp.json\n/.claude/settings.local.json\n/.codex/config.toml\n/manual\n")
+        return mcp, settings, codex, exclude
+
+    def test_cleanup_all_four_artifacts_preserves_foreign_content_and_is_idempotent(self):
+        mcp, settings, codex, exclude = self._seed_artifacts()
+        result = migration.migrate_legacy()
+        self.assertTrue(result["changed"])
+
+        with open(mcp, encoding="utf-8") as fh:
+            mcp_text = fh.read()
+        self.assertNotIn("boxa-echo", mcp_text)
+        self.assertIn('"manual": { "command" : "KEEP-MANUAL" }', mcp_text)
+        self.assertIn('"before": "KEEP-A"', mcp_text)
+        self.assertIn('"after": "KEEP-B"', mcp_text)
+
+        with open(settings, encoding="utf-8") as fh:
+            settings_text = fh.read()
+        self.assertNotIn("boxa-echo", settings_text)
+        self.assertIn('"theme": { "exact" : true }', settings_text)
+        self.assertIn('"manual"', settings_text)
+        self.assertIn('"foreign"', settings_text)
+
+        with open(codex, encoding="utf-8") as fh:
+            codex_text = fh.read()
+        self.assertEqual(codex_text, 'model = "KEEP"\n\n[manual]\nvalue = "KEEP"\n')
+        with open(exclude, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "# KEEP\n/manual\n")
+        self.assertFalse(os.path.exists(migration.render_state_path()))
+
+        before = {path: self._bytes(path) for path in (mcp, settings, codex, exclude)}
+        second = migration.migrate_legacy()
+        self.assertFalse(second["changed"])
+        after = {path: self._bytes(path) for path in before}
+        self.assertEqual(after, before)
+
+    def test_tracked_claude_cleanup_refuses_and_names_file(self):
+        mcp, settings, codex, exclude = self._seed_artifacts()
+        subprocess.run(["git", "-C", self.project, "add", "-f", ".mcp.json"], check=True)
+        with self.assertRaises(migration.MigrationError) as refused:
+            migration.migrate_legacy()
+        self.assertIn(mcp, str(refused.exception))
+        self.assertIn("--allow-tracked-mcp-json", str(refused.exception))
+        self.assertTrue(os.path.exists(migration.render_state_path()))
+        self.assertFalse(os.path.exists(migration.cleanup_marker_path()))
+
+        migration.migrate_legacy(allow_tracked_mcp_json=True)
+        with open(mcp, encoding="utf-8") as fh:
+            self.assertNotIn("boxa-echo", fh.read())
+        self.assertTrue(os.path.exists(settings))
+        self.assertTrue(os.path.exists(codex))
+        self.assertTrue(os.path.exists(exclude))
+
+    def test_cleanup_preserves_changed_mcp_entry_and_its_approval_seeds(self):
+        mcp, settings, _codex, _exclude = self._seed_artifacts()
+        self._write(
+            ".mcp.json",
+            '{"mcpServers":{"boxa-echo":{"command":"user-owned"}}}\n',
+        )
+        self._write(
+            ".claude/settings.local.json",
+            '{"enabledMcpjsonServers":["boxa-echo"],'
+            '"disabledMcpjsonServers":["boxa-echo"]}\n',
+        )
+
+        migration.migrate_legacy()
+
+        with open(mcp, encoding="utf-8") as fh:
+            self.assertEqual(
+                json.load(fh)["mcpServers"]["boxa-echo"],
+                {"command": "user-owned"},
+            )
+        with open(settings, encoding="utf-8") as fh:
+            settings_data = json.load(fh)
+        self.assertEqual(settings_data["enabledMcpjsonServers"], ["boxa-echo"])
+        self.assertEqual(settings_data["disabledMcpjsonServers"], ["boxa-echo"])
+
+    def test_remove_mcp_members_reports_existing_names_without_definitions(self):
+        original = '{"mcpServers":{"untouched":{"command":"manual"}}}\n'
+
+        rendered, removed, existing = migration._remove_mcp_members(original, {})
+
+        self.assertEqual(rendered, original)
+        self.assertEqual(removed, set())
+        self.assertEqual(existing, {"untouched"})
+        self.assertEqual(
+            migration._remove_mcp_members("not-json", {}),
+            ("not-json", set(), set()),
+        )
+
+    def test_cleanup_leaves_malformed_mcp_file_without_owned_definitions(self):
+        state_path = migration.render_state_path()
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as fh:
+            json.dump({"projects": {self.project: []}, "seeded": {}}, fh)
+        mcp = self._write(".mcp.json", '{"mcpServers":')
+        before = self._bytes(mcp)
+
+        migration.migrate_legacy()
+
+        self.assertEqual(self._bytes(mcp), before)
+
+    def test_cleanup_leaves_non_object_mcp_file_without_owned_definitions(self):
+        state_path = migration.render_state_path()
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        for foreign in ('[]', 'null', '"servers"'):
+            with self.subTest(foreign=foreign):
+                with open(state_path, "w", encoding="utf-8") as fh:
+                    json.dump({"projects": {self.project: []}, "seeded": {}}, fh)
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(migration.cleanup_marker_path())
+                mcp = self._write(".mcp.json", foreign)
+                before = self._bytes(mcp)
+
+                migration.migrate_legacy()
+
+                self.assertEqual(self._bytes(mcp), before)
+
+    def test_name_only_state_preserves_approval_seed_for_retained_server(self):
+        _mcp, settings, _codex, _exclude = self._seed_artifacts()
+        with open(migration.render_state_path(), "w", encoding="utf-8") as fh:
+            json.dump({
+                "projects": {self.project: ["boxa-echo"]},
+                "seeded": {self.project: ["boxa-echo"]},
+            }, fh)
+        self._write(
+            ".mcp.json",
+            '{"mcpServers":{"boxa-echo":{"command":"user-owned"}}}\n',
+        )
+
+        migration.migrate_legacy()
+
+        with open(settings, encoding="utf-8") as fh:
+            settings_data = json.load(fh)
+        self.assertIn("boxa-echo", settings_data["enabledMcpjsonServers"])
+
+    def test_cleanup_removes_approval_seed_when_mcp_member_is_absent(self):
+        _mcp, settings, _codex, _exclude = self._seed_artifacts()
+        self._write(".mcp.json", '{"mcpServers":{"manual":{}}}\n')
+
+        migration.migrate_legacy()
+
+        with open(settings, encoding="utf-8") as fh:
+            settings_data = json.load(fh)
+        self.assertEqual(settings_data["enabledMcpjsonServers"], ["manual"])
+
+    def test_name_only_render_state_requires_durable_ownership_proof(self):
+        entry_id = "entry-id"
+        entry = {
+            "id": entry_id,
+            "name": "echo",
+            "type": "stdio",
+        }
+        state = {
+            "projects": {self.project: ["boxa-echo"]},
+            "seeded": {},
+        }
+        activations = {
+            "projects": {
+                self.project: {
+                    entry_id: {
+                        "catalogId": entry_id,
+                        "consumers": ["claude"],
+                        "enabled": True,
+                    }
                 }
             }
-        }, global_entries={"boxa-global": legacy_global, "manual-global": {"command": "keep"}})
-        legacy_profile = self._state([global_profile_path(), project_profile_path(self.project)])
-
-        result = migration.migrate_legacy()
-
-        self.assertTrue(result["changed"])
-        entries = load_catalog()["entries"]
-        self.assertEqual(len(entries), 3)
-        self.assertTrue(all(e["executionMode"] == "service-isolated" for e in entries.values()))
-        acts = activation.load_activations()["projects"]
-        self.assertEqual(len(acts[self.project]), 1)
-        record = next(iter(acts[self.project].values()))
-        self.assertEqual(record["consumers"], ["claude"])
-        self.assertEqual(self._state([global_profile_path(), project_profile_path(self.project)]), legacy_profile)
-        with open(claude_path, encoding="utf-8") as fh:
-            claude = json.load(fh)
-        self.assertNotIn("boxa-global", claude["mcpServers"])
-        self.assertIn("manual-global", claude["mcpServers"])
-        self.assertIn("manual", claude["projects"][self.project]["mcpServers"])
-        self.assertNotIn("boxa-active", claude["projects"][self.project]["mcpServers"])
-        with open(
-            activation.claude_config_path(self.project), encoding="utf-8"
-        ) as fh:
-            project_render = json.load(fh)
-        self.assertIn("boxa-active", project_render["mcpServers"])
-        self.assertTrue(result["legacyRetained"])
-        self.assertNotIn("secret", json.dumps(result).lower())
-
-    def test_duplicate_name_different_definition_has_audited_conflict_and_scoped_secrets(self):
-        other = os.path.realpath(os.path.join(self.tmp.name, "other"))
-        os.makedirs(other)
-        self._write_project(self.project, {"dup": _server(["npx", "one"], secrets=["TOKEN"])})
-        self._write_project(other, {"dup": _server(["uvx", "two"], secrets=["TOKEN"])})
-        store_server_secrets(project_secrets_path(self.project), "dup", {"TOKEN": "one-value"})
-        store_server_secrets(project_secrets_path(other), "dup", {"TOKEN": "two-value"})
-        rendered = {
-            entry.project_key: entry.rendered_name
-            for entry in build_render_plan().claude.planned
-            if entry.source_name == "dup"
         }
-        self._write_claude({
-            project: {"mcpServers": {rendered[project]: {
-                "command": "boxa-mcp-run", "args": ["--project", project, "dup"],
-            }}}
-            for project in (self.project, other)
-        })
 
-        result = migration.migrate_legacy()
-
-        rows = [row for row in result["definitions"] if row["legacyName"] == "dup"]
-        self.assertEqual(len({row["catalogId"] for row in rows}), 2)
-        renamed = next(row for row in rows if row["nameConflict"])
-        self.assertTrue(renamed["catalogName"].startswith("dup-migrated-"))
-        expected = "one-value" if renamed["project"] == self.project else "two-value"
-        self.assertEqual(
-            read_server_secrets(project_secrets_path(renamed["project"]), renamed["catalogId"]),
-            {"TOKEN": expected},
-        )
-        # A later activation of the identity that retained the original display
-        # name cannot inherit this Project's legacy name-keyed credential.
-        original_name = next(row for row in rows if not row["nameConflict"])
-        self.assertNotEqual(original_name["catalogId"], renamed["catalogId"])
-        renamed_entry = load_catalog()["entries"][renamed["catalogId"]]
-        original_entry = load_catalog()["entries"][original_name["catalogId"]]
-        self.assertEqual(renamed_entry["secretStoreKey"], renamed["catalogId"])
-        self.assertEqual(original_entry["secretStoreKey"], original_name["catalogId"])
-        self.assertIsNone(
-            read_server_secrets(
-                project_secrets_path(renamed["project"]), original_name["catalogId"]
-            )
-        )
-        spec = {
-            "envKeys": ["TOKEN"], "secretEnvKeys": ["TOKEN"], "env": {},
-        }
-        secret_path = project_secrets_path(renamed["project"])
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(
-                _resolve_env(spec, secret_path, renamed_entry["secretStoreKey"]),
-                {"TOKEN": expected},
-            )
-            with self.assertRaises(RunnerError):
-                _resolve_env(spec, secret_path, original_entry["secretStoreKey"])
-        with open(migration.migration_path(), encoding="utf-8") as fh:
-            manifest = fh.read()
-        self.assertNotIn("one-value", manifest)
-        self.assertNotIn("two-value", manifest)
-
-    def test_malformed_partial_profile_preserved_without_publication(self):
-        path = global_profile_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        raw = b'{"version":1,"servers":{"broken":{"command":{}}}}\n'
-        with open(path, "wb") as fh:
-            fh.write(raw)
-        with self.assertRaises(migration.MigrationError):
-            migration.migrate_legacy()
-        self.assertFalse(os.path.exists(catalog_path()))
-        self.assertFalse(os.path.exists(migration.migration_path()))
-        with open(path, "rb") as fh:
-            self.assertEqual(fh.read(), raw)
-
-    def test_failure_rolls_back_exact_and_retry_is_idempotent(self):
-        self._write_project(self.project, {
-            "echo": _server(["/bin/echo"], secrets=["TOKEN"]),
-        })
-        secret_path = project_secrets_path(self.project)
-        store_server_secrets(secret_path, "echo", {"TOKEN": "rollback-value"})
-        self._write_claude({self.project: {"mcpServers": {"boxa-echo": {
-            "command": "boxa-mcp-run", "args": ["--project", self.project, "echo"],
-        }}}})
-        paths = [catalog_path(), activation.activation_path(), activation.runtime_path(),
-                 activation.render_target_path(), activation.render_state_path(),
-                 activation.claude_config_path(self.project),
-                 migration.migration_path(), secret_path]
-        before = self._state(paths)
-        with mock.patch.object(activation, "render_claude_activations", side_effect=OSError("injected")):
-            with self.assertRaises(OSError):
-                migration.migrate_legacy()
-        self.assertEqual(self._state(paths), before)
-        first = migration.migrate_legacy()
-        second = migration.migrate_legacy()
-        self.assertTrue(first["changed"])
-        self.assertFalse(second["changed"])
-        self.assertEqual(first["definitions"], second["definitions"])
-
-    def test_missing_previously_rendered_project_does_not_block_migration(self):
-        missing = os.path.realpath(os.path.join(self.tmp.name, "missing"))
-        self._write_project(self.project, {"echo": _server(["/bin/echo"])})
-        self._write_claude({self.project: {"mcpServers": {"boxa-echo": {
-            "command": "boxa-mcp-run",
-            "args": ["--project", self.project, "echo"],
-        }}}})
-        state_path = activation.render_state_path()
-        os.makedirs(os.path.dirname(state_path), exist_ok=True)
-        with open(state_path, "w", encoding="utf-8") as fh:
-            json.dump({"projects": {missing: ["boxa-stale"]}}, fh)
-
-        result = migration.migrate_legacy()
-
-        self.assertEqual(result["status"], "complete")
-        record = next(iter(
-            activation.load_activations()["projects"][self.project].values()
-        ))
-        self.assertEqual(record["consumers"], ["claude"])
-        with open(
-            activation.claude_config_path(self.project), encoding="utf-8"
-        ) as fh:
-            self.assertIn("boxa-echo", json.load(fh)["mcpServers"])
-
-    def _git(self, project, *args):
-        return subprocess.run(
-            ["git", "-C", project, *args],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env={**os.environ, "LC_ALL": "C"},
-        ).stdout.strip()
-
-    def _init_git(self, project):
-        self._git(project, "init", "-q")
-        self._git(project, "config", "user.email", "boxa@example.invalid")
-        self._git(project, "config", "user.name", "Boxa Tests")
-
-    def _track(self, project, relative, content):
-        path = os.path.join(project, relative)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        self._git(project, "add", "-f", "--", relative)
-        self._git(project, "commit", "-q", "-m", "track")
-        return path
-
-    def _legacy_claude_project(self, project, name="echo"):
-        self._write_project(project, {name: _server(["/bin/echo", name])})
-        return {project: {"mcpServers": {f"boxa-{name}": {
-            "command": "boxa-mcp-run",
-            "args": ["--project", project, name],
-        }}}}
-
-    def test_tracked_mcp_json_refuses_whole_migration_without_consent(self):
-        other = os.path.realpath(os.path.join(self.tmp.name, "other"))
-        os.makedirs(other)
-        rendered = self._legacy_claude_project(self.project)
-        rendered.update(self._legacy_claude_project(other, "sibling"))
-        self._write_claude(rendered)
-        self._init_git(self.project)
-        tracked = self._track(
-            self.project, ".mcp.json", '{"mcpServers":{}}\n'
-        )
-        paths = [
-            catalog_path(), activation.activation_path(),
-            activation.runtime_path(), activation.render_target_path(),
-            activation.render_state_path(), migration.migration_path(),
-            tracked,
-            activation.claude_config_path(other),
-        ]
-        before = self._state(paths)
-
-        with self.assertRaises(migration.MigrationError) as ctx:
-            migration.migrate_legacy()
-
-        self.assertIn(tracked, str(ctx.exception))
-        self.assertIn("--allow-tracked-mcp-json", str(ctx.exception))
-        # Whole-batch semantics: the untracked sibling Project is not written
-        # either, and no legacy state was consumed.
-        self.assertEqual(self._state(paths), before)
-
-    def test_tracked_settings_local_json_refuses_migration_without_consent(self):
-        self._write_claude(self._legacy_claude_project(self.project))
-        self._init_git(self.project)
-        tracked = self._track(
+        definitions = migration._recorded_mcp_definitions(
+            state,
             self.project,
-            os.path.join(".claude", "settings.local.json"),
-            '{"enabledMcpjsonServers":[]}\n',
+            activations,
+            {"entries": {entry_id: entry}},
         )
 
-        with self.assertRaises(migration.MigrationError) as ctx:
+        self.assertEqual(
+            definitions["boxa-echo"]["command"],
+            "boxa-mcp-run",
+        )
+        self.assertEqual(
+            migration._recorded_mcp_definitions(
+                state, self.project, {"projects": {}}, {"entries": {}}
+            ),
+            {},
+        )
+
+    def test_unavailable_project_defers_cleanup_marker_and_retries(self):
+        mcp, _settings, _codex, _exclude = self._seed_artifacts()
+        unavailable = self.project + "-unavailable"
+        os.rename(self.project, unavailable)
+        try:
             migration.migrate_legacy()
+            self.assertFalse(os.path.exists(migration.cleanup_marker_path()))
+            self.assertTrue(os.path.exists(migration.render_state_path()))
+        finally:
+            os.rename(unavailable, self.project)
 
-        self.assertIn(tracked, str(ctx.exception))
-        self.assertFalse(os.path.exists(catalog_path()))
+        migration.migrate_legacy()
 
-    def test_migration_flag_authorizes_batch_without_durable_consent(self):
-        self._write_claude(self._legacy_claude_project(self.project))
-        self._init_git(self.project)
-        tracked = self._track(
-            self.project, ".mcp.json", '{"mcpServers":{}}\n'
+        self.assertTrue(os.path.exists(migration.cleanup_marker_path()))
+        self.assertFalse(os.path.exists(migration.render_state_path()))
+        with open(mcp, encoding="utf-8") as fh:
+            self.assertNotIn("boxa-echo", fh.read())
+
+    def test_tracked_codex_cleanup_uses_separate_consent(self):
+        _mcp, _settings, codex, _exclude = self._seed_artifacts()
+        subprocess.run(["git", "-C", self.project, "add", "-f", ".codex/config.toml"], check=True)
+        with self.assertRaises(migration.MigrationError) as refused:
+            migration.migrate_legacy(allow_tracked_mcp_json=True)
+        self.assertIn(codex, str(refused.exception))
+        self.assertIn("--allow-tracked-codex-config", str(refused.exception))
+        migration.migrate_legacy(
+            allow_tracked_mcp_json=True,
+            allow_tracked_codex_config=True,
         )
+        with open(codex, encoding="utf-8") as fh:
+            self.assertNotIn("boxa managed MCP", fh.read())
 
-        result = migration.migrate_legacy(allow_tracked_mcp_json=True)
-
-        self.assertEqual(result["status"], "complete")
-        with open(tracked, encoding="utf-8") as fh:
-            self.assertIn("boxa-echo", json.load(fh)["mcpServers"])
-        # A catalog-wide batch flag never records new durable Project consent.
-        self.assertEqual(
-            activation.load_activations().get("trackedMcpJson", {}), {}
-        )
-
-    def test_durable_project_consent_authorizes_migration(self):
-        self._write_claude(self._legacy_claude_project(self.project))
-        self._init_git(self.project)
-        tracked = self._track(
-            self.project, ".mcp.json", '{"mcpServers":{}}\n'
-        )
-        store = activation.empty_activations()
-        store["trackedMcpJson"][self.project] = True
-        activation.save_activation_store(store)
-
+    def test_legacy_definition_migrates_without_creating_project_artifacts(self):
+        save_profile(project_profile_path(self.project), {
+            "version": 1,
+            "projectKey": self.project,
+            "servers": {"legacy": _server(["/bin/cat"])},
+        })
+        before = set(os.listdir(self.project))
         result = migration.migrate_legacy()
-
-        self.assertEqual(result["status"], "complete")
-        with open(tracked, encoding="utf-8") as fh:
-            self.assertIn("boxa-echo", json.load(fh)["mcpServers"])
-
-    def test_byte_identical_tracked_render_does_not_need_migration_consent(self):
-        self._write_claude(self._legacy_claude_project(self.project))
-        self._init_git(self.project)
-        # Render once with consent, then commit exactly those bytes. A repeat
-        # migration over the tracked-but-identical file must not refuse.
-        migration.migrate_legacy(allow_tracked_mcp_json=True)
-        with open(
-            activation.claude_config_path(self.project), encoding="utf-8"
-        ) as fh:
-            rendered_bytes = fh.read()
-        self._track(self.project, ".mcp.json", rendered_bytes)
-        with open(migration.migration_path(), encoding="utf-8") as fh:
-            manifest = json.load(fh)
-        manifest["status"] = "prepared"
-        with open(migration.migration_path(), "w", encoding="utf-8") as fh:
-            json.dump(manifest, fh)
-
-        result = migration.migrate_legacy()
-
-        self.assertEqual(result["status"], "complete")
-        with open(
-            activation.claude_config_path(self.project), encoding="utf-8"
-        ) as fh:
-            self.assertEqual(fh.read(), rendered_bytes)
-
-    def test_vanished_project_still_does_not_block_migration_consent(self):
-        missing = os.path.realpath(os.path.join(self.tmp.name, "missing"))
-        self._write_claude(self._legacy_claude_project(self.project))
-        state_path = activation.render_state_path()
-        os.makedirs(os.path.dirname(state_path), exist_ok=True)
-        with open(state_path, "w", encoding="utf-8") as fh:
-            json.dump({"projects": {missing: ["boxa-stale"]}}, fh)
-
-        result = migration.migrate_legacy()
-
-        self.assertEqual(result["status"], "complete")
-
-    def _runtime_snapshot(self):
-        with open(activation.runtime_path(), encoding="utf-8") as fh:
-            return json.load(fh)
-
-    def _legacy_claude_render(self, name="echo"):
-        """Recreate the pre-ADR-0022 rendered state in the retired file."""
-        os.unlink(migration.render_target_marker_path())
-        os.unlink(activation.claude_config_path(self.project))
-        self._write_claude({self.project: {"mcpServers": {f"boxa-{name}": {
-            "command": "boxa-mcp-run",
-            "args": ["--project", self.project, name],
-        }}}})
-
-    def test_completed_manifest_still_retires_the_claude_render_target(self):
-        self._write_claude(self._legacy_claude_project(self.project))
-        self.assertTrue(migration.migrate_legacy()["changed"])
-        self._legacy_claude_render()
-
-        result = migration.migrate_legacy()
-
         self.assertTrue(result["changed"])
-        self.assertEqual(result["status"], "complete")
-        with open(activation.render_target_path(), encoding="utf-8") as fh:
-            claude = json.load(fh)
-        self.assertEqual(
-            claude["projects"][self.project]["mcpServers"], {}
-        )
-        with open(
-            activation.claude_config_path(self.project), encoding="utf-8"
-        ) as fh:
-            self.assertIn("boxa-echo", json.load(fh)["mcpServers"])
-        # Idempotent: the durable marker keeps the upgrade one-shot.
-        self.assertFalse(migration.migrate_legacy()["changed"])
-
-    def test_render_target_retirement_runs_without_any_legacy_profile(self):
-        # No legacy profile ever existed, so migration is "not-needed" — but
-        # the ADR 0021 catalog render still lives in the retired file.
-        self._write_claude({self.project: {"mcpServers": {"boxa-echo": {
-            "command": "boxa-mcp-run",
-            "args": ["--project", self.project, "echo"],
-        }}}})
-
-        result = migration.migrate_legacy()
-
-        self.assertEqual(result["status"], "not-needed")
-        self.assertTrue(result["changed"])
-        with open(activation.render_target_path(), encoding="utf-8") as fh:
-            self.assertEqual(
-                json.load(fh)["projects"][self.project]["mcpServers"], {}
-            )
-        self.assertFalse(migration.migrate_legacy()["changed"])
-
-    def test_retirement_leaves_a_pristine_install_untouched(self):
-        result = migration.migrate_legacy()
-
-        self.assertEqual(result["status"], "not-needed")
-        self.assertFalse(result["changed"])
-        self.assertFalse(
-            os.path.exists(migration.render_target_marker_path())
-        )
-        self.assertFalse(os.path.exists(activation.runtime_path()))
-
-    def test_retirement_refuses_tracked_mcp_json_without_consent(self):
-        self._write_claude(self._legacy_claude_project(self.project))
-        self._init_git(self.project)
-        migration.migrate_legacy(allow_tracked_mcp_json=True)
-        self._legacy_claude_render()
-        tracked = self._track(
-            self.project, ".mcp.json", '{"mcpServers":{}}\n'
-        )
-        paths = [
-            tracked,
-            activation.render_target_path(),
-            activation.render_state_path(),
-            activation.runtime_path(),
-        ]
-        before = self._state(paths)
-
-        with self.assertRaises(migration.MigrationError) as ctx:
-            migration.migrate_legacy()
-
-        self.assertIn(tracked, str(ctx.exception))
-        self.assertIn("--allow-tracked-mcp-json", str(ctx.exception))
-        self.assertEqual(self._state(paths), before)
-        self.assertFalse(
-            os.path.exists(migration.render_target_marker_path())
-        )
-
-    def test_migration_publishes_seeded_approvals_in_runtime_state(self):
-        self._write_claude(self._legacy_claude_project(self.project))
-
-        migration.migrate_legacy()
-
-        self.assertEqual(
-            self._runtime_snapshot()["seededApprovals"],
-            {self.project: ["boxa-echo"]},
-        )
-
-    def test_retirement_publishes_seeded_approvals_in_runtime_state(self):
-        self._write_claude(self._legacy_claude_project(self.project))
-        migration.migrate_legacy()
-        self._legacy_claude_render()
-        # Drop the published seeds the way a pre-ADR-0022 snapshot would.
-        snapshot = self._runtime_snapshot()
-        snapshot.pop("seededApprovals")
-        with open(activation.runtime_path(), "w", encoding="utf-8") as fh:
-            json.dump(snapshot, fh)
-
-        migration.migrate_legacy()
-
-        self.assertEqual(
-            self._runtime_snapshot()["seededApprovals"],
-            {self.project: ["boxa-echo"]},
-        )
-
-    def test_retirement_does_not_reformat_a_foreign_claude_config(self):
-        self._write_claude(self._legacy_claude_project(self.project))
-        migration.migrate_legacy()
-        os.unlink(migration.render_target_marker_path())
-        path = activation.render_target_path()
-        foreign = '{"projects": {}, "mcpServers": {"manual":  {"command": "x"}}}'
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(foreign)
-
-        migration.migrate_legacy()
-
-        with open(path, encoding="utf-8") as fh:
-            self.assertEqual(fh.read(), foreign)
-
-    def test_crash_after_partial_publication_resumes_from_prepared_manifest(self):
-        self._write_project(self.project, {"echo": _server(["/bin/echo"])})
-        self._write_claude({self.project: {"mcpServers": {"boxa-echo": {
-            "command": "boxa-mcp-run", "args": ["--project", self.project, "echo"],
-        }}}})
-        with mock.patch.object(activation, "render_claude_activations", side_effect=KeyboardInterrupt):
-            with self.assertRaises(KeyboardInterrupt):
-                migration.migrate_legacy()
-        with open(migration.migration_path(), encoding="utf-8") as fh:
-            self.assertEqual(json.load(fh)["status"], "prepared")
-
-        resumed = migration.migrate_legacy()
-
-        self.assertEqual(resumed["status"], "complete")
-        record = next(iter(activation.load_activations()["projects"][self.project].values()))
-        self.assertEqual(record["consumers"], ["claude"])
         self.assertEqual(len(load_catalog()["entries"]), 1)
+        self.assertEqual(set(os.listdir(self.project)), before)
+        self.assertEqual(activation.load_activations()["projects"], {})
 
 
 if __name__ == "__main__":

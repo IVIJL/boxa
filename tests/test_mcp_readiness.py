@@ -14,7 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from mcp import activation, readiness  # noqa: E402
-from mcp.catalog import add_entry, load_catalog, update_entry  # noqa: E402
+from mcp.catalog import add_entry, add_remote_entry, load_catalog, update_entry  # noqa: E402
 
 
 class LocalState:
@@ -121,6 +121,41 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(readiness.readiness(entry["id"], self.project, Probe(self.project, self.state)).ready)
         with self.assertRaisesRegex(readiness.ReadinessError, "not running"):
             readiness.readiness(entry["id"], self.project, Probe(self.project, self.state, running=False))
+
+    def test_http_has_no_runtime_readiness_and_only_reports_allowlist_hint(self) -> None:
+        entry = add_remote_entry(
+            "dozzle", "https://mcp.dozzle.example.test/api"
+        )
+        report = readiness.readiness(
+            entry["id"], self.project, Probe(self.project, self.state, running=False)
+        )
+        self.assertTrue(report.ready)
+        self.assertFalse(report.has_runtime_readiness)
+        self.assertEqual(report.container, "")
+        self.assertEqual(report.hints, ["boxa allow mcp.dozzle.example.test"])
+
+        allowlist = os.path.join(
+            self.tmp.name, ".config", "boxa", "allowed-domains.conf"
+        )
+        os.makedirs(os.path.dirname(allowlist), exist_ok=True)
+        with open(allowlist, "w", encoding="utf-8") as fh:
+            fh.write("*.example.test\n")
+        self.assertEqual(
+            readiness.readiness(entry["id"], self.project).hints, []
+        )
+
+    def test_http_activation_succeeds_with_stopped_project(self) -> None:
+        entry = add_remote_entry("remote", "https://remote.example/mcp")
+        result = activation.activate(
+            entry["id"],
+            self.project,
+            ["claude", "codex"],
+            Probe(self.project, self.state, running=False),
+        )
+        self.assertTrue(result.changed)
+        with open(activation.runtime_path(), encoding="utf-8") as fh:
+            snapshot = json.load(fh)
+        self.assertEqual(snapshot["entries"][entry["id"]]["url"], entry["url"])
 
     def test_npx_install_materializes_persistent_runtime_without_activation(self) -> None:
         entry = add_entry("context7", ["npx", "-y", "@upstash/context7-mcp@latest", "--stdio"])
@@ -241,7 +276,9 @@ class ReadinessTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "unsupported readiness probes"):
             update_entry(entry["id"], prerequisites={"probes": ["curl-service"]})
 
-    def _interactive_activation(self, answer: str) -> subprocess.CompletedProcess[str]:
+    def _interactive_activation(
+        self, answer: str, *, stopped: bool = False
+    ) -> subprocess.CompletedProcess[str]:
         cli = os.path.join(ROOT, "scripts", "mcp-cli.sh")
         argv0 = os.path.join(ROOT, "scripts", "_readiness_harness.sh")
         log_path = os.path.join(self.tmp.name, "interactive.log")
@@ -253,7 +290,11 @@ class ReadinessTest(unittest.TestCase):
                 printf 'PY:%s\n' "$*" >> {shlex.quote(log_path)}
                 if [ "$1" = readiness-json ]; then
                     readiness_calls=$((readiness_calls + 1))
-                    [ "$readiness_calls" -gt 1 ]
+                    if [ {str(stopped).lower()} = true ]; then
+                        printf '%s\n' 'mcp.cli: target Boxa for /work/project is not running; readiness never starts it implicitly' >&2
+                        return 1
+                    fi
+                    grep -q '^INSTALL:' {shlex.quote(log_path)}
                     return
                 fi
                 return 0
@@ -290,6 +331,16 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("INSTALL:context7 --project /work/project", result.stdout)
         self.assertGreaterEqual(result.stdout.count("PY:readiness-json"), 2)
+        self.assertIn(
+            "PY:activate-text context7 --project /work/project --for claude",
+            result.stdout,
+        )
+
+    def test_interactive_stopped_activation_skips_install_and_records_pending(self) -> None:
+        result = self._interactive_activation("", stopped=True)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("INSTALL:", result.stdout)
+        self.assertNotIn("Entry is not ready", result.stdout)
         self.assertIn(
             "PY:activate-text context7 --project /work/project --for claude",
             result.stdout,

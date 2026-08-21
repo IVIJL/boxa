@@ -217,14 +217,16 @@ class ClaudeProviderTest(unittest.TestCase):
 
     # -- remote connector exclusion -----------------------------------------
 
-    def test_remote_connector_excluded(self) -> None:
+    def test_http_remote_connector_is_importable(self) -> None:
         cand = next(
             c
             for c in self.provider.discover_project(_TM_PROJECT)
             if c.name == "gmail-connector"
         )
-        self.assertEqual(cand.classification.placement, "excluded")
+        self.assertEqual(cand.classification.placement, "container")
         self.assertEqual(cand.classification.confidence, "high")
+        self.assertEqual(cand.type, "http")
+        self.assertTrue(cand.url)
         self.assertTrue(cand.classification.reasons)
 
     def test_stdio_candidate_not_excluded(self) -> None:

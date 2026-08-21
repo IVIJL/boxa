@@ -2,8 +2,8 @@
 
 This is the single place that turns a discovered `Candidate` into a placement
 decision. Providers (issue 02-03) only normalize config into the candidate
-shape; they classify nothing except the one thing they can be certain about
-from the transport alone — a Claude hosted/remote connector is ``excluded``.
+shape; they classify only transport facts: supported HTTP is ``container`` and
+other Claude hosted/remote connectors are ``excluded``.
 Everything else arrives here as ``unknown`` and this module assigns the real
 placement, confidence, and human-readable reasons.
 
@@ -323,8 +323,8 @@ def classify(candidate: Candidate) -> Classification:
 
     Does not mutate the candidate. Order of decision (strongest signal first):
 
-      1. Already excluded (remote/hosted connector) -> keep as-is. Providers
-         own that decision because it is certain from the transport alone.
+      1. Supported HTTP -> container; other provider-excluded remote/hosted
+         connectors remain excluded.
       2. Windows/WSL2 host path -> host-only (high). Wrong OS boundary.
       3. Desktop/browser/clipboard/OS indicator -> host-only (high). Needs host
          state the Container cannot see.
@@ -338,6 +338,13 @@ def classify(candidate: Candidate) -> Classification:
          (low). Needs manual confirmation or a dry-run probe (future slice).
     """
     cls = candidate.classification
+    if (candidate.type or "").strip().lower() == "http" and candidate.url:
+        return Classification(
+            placement="container",
+            confidence="high",
+            reasons=list(cls.reasons)
+            or ["HTTP MCP server connects from the Container agent session"],
+        )
     # 1. Respect a provider-assigned exclusion (remote/hosted connectors).
     if cls.placement == "excluded":
         return Classification(

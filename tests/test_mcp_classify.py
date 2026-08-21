@@ -384,6 +384,16 @@ class HostOnlyTest(unittest.TestCase):
 
 
 class ExcludedTest(unittest.TestCase):
+    def test_http_remote_is_container_importable(self) -> None:
+        cand = _candidate(
+            name="dozzle",
+            type="http",
+        )
+        cand.url = "https://dozzle.example.test/mcp"
+        cls = classify(cand)
+        self.assertEqual(cls.placement, "container")
+        self.assertEqual(cls.confidence, "high")
+
     def test_remote_connector_excluded_is_preserved(self) -> None:
         cand = _candidate(
             classification=Classification(

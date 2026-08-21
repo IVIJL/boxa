@@ -6,6 +6,7 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from .catalog import CatalogError, load_catalog, resolve_entry, update_entry
 from .install import _docker_image_from_argv, _npm_binary_name, _parse_npx
@@ -41,10 +42,17 @@ class ReadinessReport:
     project_key: str
     container: str
     checks: list[Check] = field(default_factory=list)
+    hints: list[str] = field(default_factory=list)
 
     @property
     def ready(self) -> bool:
-        return bool(self.container) and all(check.ready for check in self.checks)
+        return (
+            self.entry.get("type") == "http" or bool(self.container)
+        ) and all(check.ready for check in self.checks)
+
+    @property
+    def has_runtime_readiness(self) -> bool:
+        return self.entry.get("type") != "http"
 
     @property
     def missing(self) -> list[Check]:
@@ -56,9 +64,50 @@ class ReadinessReport:
             "projectKey": self.project_key,
             "container": self.container,
             "ready": self.ready,
+            "runtimeReadiness": self.has_runtime_readiness,
             "checks": [check.to_dict() for check in self.checks],
             "missing": [check.to_dict() for check in self.missing],
+            "hints": list(self.hints),
         }
+
+
+def remote_domain(entry: dict[str, Any]) -> str:
+    if entry.get("type") != "http":
+        return ""
+    return (urlsplit(str(entry.get("url", ""))).hostname or "").lower()
+
+
+def _host_allowlist_path() -> str:
+    return os.path.join(
+        os.path.expanduser("~"), ".config", "boxa", "allowed-domains.conf"
+    )
+
+
+def _allowed_domains(path: Optional[str] = None) -> list[str]:
+    try:
+        with open(path or _host_allowlist_path(), encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+    domains: list[str] = []
+    for line in lines:
+        value = line.split("#", 1)[0].strip().lower()
+        if value:
+            domains.append(value.removeprefix("*."))
+    return domains
+
+
+def remote_allowlist_hint(
+    entry: dict[str, Any], *, allowlist_path: Optional[str] = None
+) -> Optional[str]:
+    domain = remote_domain(entry)
+    if not domain:
+        return None
+    allowed = any(
+        domain == base or domain.endswith("." + base)
+        for base in _allowed_domains(allowlist_path)
+    )
+    return None if allowed else f"boxa allow {domain}"
 
 
 @dataclass
@@ -259,6 +308,11 @@ def readiness_for_entry(
     Catalog lifecycle preflight uses this seam so every activated Project can
     prove the proposed runtime before any host-owned state changes.
     """
+    if entry.get("type") == "http":
+        hint = remote_allowlist_hint(entry)
+        return ReadinessReport(
+            dict(entry), project_key, "", [], [hint] if hint else []
+        )
     probe = probe or ProjectProbe()
     container = probe.find_running(project_key)
     if not container:
@@ -311,6 +365,15 @@ def install(
         _entry_id, entry = resolve_entry(load_catalog(), token)
     except CatalogError as exc:
         raise ReadinessError(str(exc)) from exc
+    if entry.get("type") == "http":
+        report = readiness_for_entry(entry, project_key, probe)
+        return InstallReport(
+            dict(entry),
+            project_key,
+            "",
+            ["remote HTTP entry has no runtime to install"],
+            report,
+        )
     probe = probe or ProjectProbe()
     container = probe.find_running(project_key)
     if not container:

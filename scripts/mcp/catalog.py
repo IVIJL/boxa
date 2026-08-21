@@ -10,13 +10,14 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import stat
 import threading
 import time
 import uuid
-import re
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
+from urllib.parse import parse_qsl, urlsplit
 
 from . import casfile
 from .add import AddError, build_candidate, parse_spec
@@ -34,6 +35,7 @@ AGENT_TRUSTED_FIXED_ENV_KEYS = {
     "DOCKER_HOST", "SSH_AUTH_SOCK",
 }
 READINESS_SUMMARY = "requires-project"
+REMOTE_READINESS_SUMMARY = "no-runtime-readiness"
 # The exact access boundaries shown before a mode grant. Shared by the
 # `boxa mcp mode` preview and the codex-delegate seed offer (mcp.seed) so the
 # user always confirms against one canonical wording.
@@ -170,6 +172,55 @@ def _validate_string_list(value: Any, label: str) -> None:
 
 
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_URL_SECRET_NAME_HINTS = {
+    "key", "token", "secret", "password", "passwd", "credential", "auth",
+    "private", "session",
+}
+# URL values need an embedded scan, unlike standalone argv values. Keep these
+# shapes high-confidence and length-bounded so locale-like values such as
+# `sk-SK` remain valid. `parse_qsl` percent-decodes each value before this scan.
+_URL_SECRET_VALUE_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{8,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._-]{12,}"),
+    re.compile(
+        r"(?i)\b\w*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH"
+        r"|PRIVATE|SESSION)\w*\s*[:=]\s*\S{8,}"
+    ),
+)
+
+
+def _url_parameter_name_marks_secret(name: str) -> bool:
+    """Flag credential names at delimiters or common compound boundaries."""
+    # Token boundaries avoid treating unrelated words such as `monkey` as a
+    # secret name while retaining conventional api_key/apiKey/authToken forms.
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    tokens = [token.lower() for token in re.split(r"[_-]+", camel_split) if token]
+    if any(token in _URL_SECRET_NAME_HINTS for token in tokens):
+        return True
+    if any(
+        token == "authorization"
+        or (
+            token.startswith("auth")
+            and token[len("auth") :] in _URL_SECRET_NAME_HINTS
+        )
+        for token in tokens
+    ):
+        return True
+    compact = "".join(tokens)
+    return any(
+        compact == prefix + hint
+        for prefix in ("api", "access")
+        for hint in _URL_SECRET_NAME_HINTS
+    )
+
+
+def _url_value_has_embedded_secret(value: str) -> bool:
+    """Detect high-confidence credential shapes anywhere in a decoded URL value."""
+    return any(pattern.search(value) for pattern in _URL_SECRET_VALUE_PATTERNS)
 
 
 def _validate_os_string(value: str, label: str, *, allow_empty: bool = False) -> None:
@@ -195,6 +246,38 @@ def _validate_new_docker_policy(entry: dict[str, Any]) -> None:
             raise CatalogError(str(exc)) from exc
 
 
+def _validate_http_url(value: Any, label: str = "url") -> str:
+    if not isinstance(value, str) or not value or value.strip() != value or "\x00" in value:
+        raise CatalogError(f"malformed catalog ({label} is not a valid HTTP(S) URL)")
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise CatalogError(
+            f"malformed catalog ({label} is not a valid HTTP(S) URL)"
+        ) from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or any(char.isspace() for char in value)
+    ):
+        raise CatalogError(f"malformed catalog ({label} is not a valid HTTP(S) URL)")
+    parameters = (
+        (name, parameter_value)
+        for component in (parsed.query, parsed.fragment)
+        for name, parameter_value in parse_qsl(component, keep_blank_values=True)
+    )
+    if any(
+        _url_parameter_name_marks_secret(name)
+        or _url_value_has_embedded_secret(parameter_value)
+        for name, parameter_value in parameters
+    ):
+        raise CatalogError(f"malformed catalog ({label} is not a valid HTTP(S) URL)")
+    return value
+
+
 def _validate_entry(entry_id: str, entry: Any) -> None:
     if not isinstance(entry, dict):
         raise CatalogError(f"malformed catalog (entry {entry_id!r} is not an object)")
@@ -204,7 +287,7 @@ def _validate_entry(entry_id: str, entry: Any) -> None:
         uuid.UUID(entry_id)
     except (ValueError, TypeError, AttributeError) as exc:
         raise CatalogError(f"malformed catalog (entry id {entry_id!r} is not opaque UUID)") from exc
-    for field in ("name", "type", "executionMode", "runtimeKind"):
+    for field in ("name", "type"):
         if not isinstance(entry.get(field), str) or not entry[field]:
             raise CatalogError(f"malformed catalog (entry {entry_id!r} has invalid {field})")
     if "description" in entry and not isinstance(entry["description"], str):
@@ -217,6 +300,42 @@ def _validate_entry(entry_id: str, entry: Any) -> None:
         raise CatalogError(
             f"malformed catalog (entry {entry_id!r} has invalid secretStoreKey)"
         )
+    if entry["type"] == "http":
+        _validate_http_url(entry.get("url"), f"entry {entry_id!r} url")
+        forbidden = [
+            field
+            for field in ("command", "executionMode", "runtimeKind")
+            if field in entry and entry[field] is not None
+        ]
+        if forbidden:
+            raise CatalogError(
+                f"malformed catalog (http entry {entry_id!r} has forbidden "
+                + ", ".join(forbidden)
+                + ")"
+            )
+        allowed = {"id", "name", "type", "url", "readiness", "description"}
+        unknown = set(entry) - allowed
+        if unknown:
+            raise CatalogError(
+                f"malformed catalog (http entry {entry_id!r} has unsupported fields: "
+                + ", ".join(sorted(unknown))
+                + ")"
+            )
+        readiness = entry.get("readiness")
+        if readiness != {"summary": REMOTE_READINESS_SUMMARY}:
+            raise CatalogError(
+                f"malformed catalog (http entry {entry_id!r} has invalid readiness)"
+            )
+        return
+    if entry["type"] != "stdio":
+        raise CatalogError(
+            f"malformed catalog (entry {entry_id!r} has unsupported type)"
+        )
+    if "url" in entry:
+        raise CatalogError(f"malformed catalog (stdio entry {entry_id!r} has forbidden url)")
+    for field in ("executionMode", "runtimeKind"):
+        if not isinstance(entry.get(field), str) or not entry[field]:
+            raise CatalogError(f"malformed catalog (entry {entry_id!r} has invalid {field})")
     if entry["executionMode"] not in EXECUTION_MODES:
         raise CatalogError(
             f"malformed catalog (entry {entry_id!r} has unsupported executionMode)"
@@ -412,6 +531,34 @@ def add_entry(
         return _add_entry_locked(name, spec_argv, id_factory=id_factory)
 
 
+def add_remote_entry(
+    name: str,
+    url: str,
+    *,
+    id_factory: Callable[[], uuid.UUID] = uuid.uuid4,
+) -> dict[str, Any]:
+    with mutation_lock():
+        if not name or name.strip() != name:
+            raise CatalogError(
+                "catalog entry name must be non-empty without surrounding space"
+            )
+        _validate_http_url(url)
+        catalog = load_catalog()
+        if any(entry["name"] == name for entry in catalog["entries"].values()):
+            raise CatalogError(f"catalog entry named {name!r} already exists")
+        entry_id = str(id_factory())
+        entry: dict[str, Any] = {
+            "id": entry_id,
+            "name": name,
+            "type": "http",
+            "url": url,
+            "readiness": {"summary": REMOTE_READINESS_SUMMARY},
+        }
+        catalog["entries"][entry_id] = entry
+        save_catalog(catalog)
+        return dict(entry)
+
+
 def add_entry_trusted(
     name: str,
     spec_argv: list[str],
@@ -516,6 +663,19 @@ def updated_catalog_entry(
     entry_id, current = resolve_entry(catalog, token)
     updated = dict(current)
     changes = dict(changes)
+    if "definition" in changes:
+        definition = changes.pop("definition")
+        if not isinstance(definition, dict):
+            raise CatalogError("replacement catalog definition must be an object")
+        updated = dict(definition)
+        updated["id"] = entry_id
+        updated["name"] = current["name"]
+        if "description" in current and "description" not in updated:
+            updated["description"] = current["description"]
+        if updated.get("type") == "stdio" and current.get("type") == "stdio":
+            updated["executionMode"] = current["executionMode"]
+            if "secretStoreKey" in current:
+                updated["secretStoreKey"] = current["secretStoreKey"]
     if "name" in changes:
         name = changes.pop("name")
         if not isinstance(name, str) or not name:
@@ -524,13 +684,19 @@ def updated_catalog_entry(
             raise CatalogError(f"catalog entry named {name!r} already exists")
         updated["name"] = name
     if "argv" in changes:
+        if current["type"] == "http":
+            raise CatalogError("http catalog entries do not accept command argv")
         argv = changes.pop("argv")
         if not isinstance(argv, list) or not argv or any(not isinstance(v, str) for v in argv):
             raise CatalogError("updated argv must be a non-empty string list")
         updated["command"] = {"argv": list(argv)}
         updated["runtimeKind"] = runtime_kind(argv)
+    if "url" in changes:
+        if current["type"] != "http":
+            raise CatalogError("stdio catalog entries do not accept a URL")
+        updated["url"] = changes.pop("url")
     for field in (
-        "envKeys", "secretEnvKeys", "env", "type", "readiness", "prerequisites",
+        "envKeys", "secretEnvKeys", "env", "readiness", "prerequisites",
         "description",
     ):
         if field in changes:
@@ -585,8 +751,6 @@ def update_entry(
     token: str,
     *,
     probe: Optional[object] = None,
-    allow_tracked_codex_config: bool = False,
-    allow_tracked_mcp_json: bool = False,
     **changes: Any,
 ) -> dict[str, Any]:
     """Transactionally update a definition while preserving identity/mode."""
@@ -596,8 +760,6 @@ def update_entry(
         token,
         changes,
         probe=probe,
-        allow_tracked_codex_config=allow_tracked_codex_config,
-        allow_tracked_mcp_json=allow_tracked_mcp_json,
     ).entry
 
 
@@ -605,29 +767,26 @@ def remove_entry(
     token: str,
     *,
     activation_count: int = 0,
-    allow_tracked_codex_config: bool = False,
-    allow_tracked_mcp_json: bool = False,
 ) -> dict[str, Any]:
     if activation_count:
         raise CatalogError("cannot remove a catalog entry while activations exist")
     from .activation import remove_catalog_entry
 
-    return remove_catalog_entry(
-        token,
-        allow_tracked_codex_config=allow_tracked_codex_config,
-        allow_tracked_mcp_json=allow_tracked_mcp_json,
-    ).entry
+    return remove_catalog_entry(token).entry
 
 
 def _activation_count(entry_id: str) -> int:
-    # Local import avoids making catalog reads depend on activation rendering.
+    # Local import avoids making catalog reads depend on activation state.
     from .activation import load_activations
 
-    return sum(
+    activations = load_activations()
+    project_count = sum(
         1
-        for records in load_activations()["projects"].values()
-        if entry_id in records
+        for records in activations["projects"].values()
+        if isinstance(records.get(entry_id), dict)
+        and records[entry_id].get("optedOut") is not True
     )
+    return project_count + int(entry_id in activations.get("everywhere", {}))
 
 
 def _stored_secret_keys(entry: dict[str, Any]) -> list[str]:
@@ -676,6 +835,8 @@ def mode_preview(token: str, mode: str) -> dict[str, Any]:
             "execution mode must be service-isolated or agent-trusted"
         )
     entry_id, entry = resolve_entry(load_catalog(), token)
+    if entry["type"] == "http":
+        raise CatalogError("http catalog entries have no execution mode")
     argv = list(entry["command"]["argv"])
     image: Optional[str] = None
     if entry["runtimeKind"] == "docker":
@@ -721,6 +882,8 @@ def set_execution_mode(token: str, mode: str) -> dict[str, Any]:
 def _set_execution_mode_locked(token: str, mode: str) -> dict[str, Any]:
     catalog = load_catalog()
     entry_id, entry = resolve_entry(catalog, token)
+    if entry["type"] == "http":
+        raise CatalogError("http catalog entries have no execution mode")
     if mode not in EXECUTION_MODES:
         raise CatalogError(
             "execution mode must be service-isolated or agent-trusted"

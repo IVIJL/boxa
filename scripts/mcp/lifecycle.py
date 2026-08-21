@@ -14,9 +14,9 @@ hand-editing JSON:
     disable override; it NEVER mutates the global entry);
   * ``remove_server`` — delete ONLY a boxa-managed profile entry for one
     scope; runtime/secret purge is explicit (``purge=True``), never implicit;
-  * ``run_doctor`` — diagnose profile / render / runtime problems and emit
+  * ``run_doctor`` — diagnose profile / runtime problems and emit
     concrete repair commands;
-  * ``apply_doctor_fixes`` — perform ONLY safe local fixes (re-render, create
+  * ``apply_doctor_fixes`` — perform ONLY safe local fixes (create
     missing MCP dirs, repair the wrapper symlink). Never installs packages,
     allows domains, purges runtime, or enables host-only servers.
 
@@ -29,9 +29,6 @@ from __future__ import annotations
 
 import os
 import json
-import shutil
-import subprocess
-import tomllib
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -43,12 +40,7 @@ from .profile import (
     project_profile_path,
     save_profile,
 )
-from .render import (
-    WRAPPER_COMMAND,
-    build_render_plan,
-    is_boxa_managed,
-    rendered_name,
-)
+from .launch_profile import WRAPPER_COMMAND, rendered_name
 from .secrets import (
     global_secrets_path,
     load_secrets,
@@ -504,11 +496,8 @@ def remove_server(
 ) -> RemoveResult:
     """Remove a boxa-managed profile entry for ONE scope.
 
-    Removes ONLY the boxa profile entry — it never touches inherited/manual
-    agent config (that is owned by the agent, and re-render only ever rewrites
-    ``boxa-`` entries, so dropping the profile entry then re-rendering cleanly
-    removes the rendered ``boxa-`` entry too). The agent's own non-boxa MCP
-    entries are out of boxa's reach entirely.
+    Removes only the Boxa profile entry. Agent-owned configuration is outside
+    this legacy profile operation and remains untouched.
 
     Secret purge is NOT implicit: a server's copied secret block is deleted only
     when ``purge=True``. Without it, the secret block is LEFT in place (the
@@ -717,304 +706,8 @@ def _profile_validity_findings() -> list[Finding]:
     return findings
 
 
-def _render_drift_findings(plan) -> list[Finding]:
-    """Compare planned boxa-managed entries against what is rendered.
-
-    Drift = the set of boxa-managed names ALREADY in an agent config differs
-    from the set the current profile would render. Reported as a warning with a
-    re-render repair, which ``--fix`` can perform safely.
-    """
-    from collections import Counter
-
-    findings: list[Finding] = []
-    for agent_plan in (plan.claude, plan.codex):
-        if not agent_plan.supported:
-            findings.append(
-                Finding(
-                    severity=SEVERITY_INFO,
-                    code="render-unsupported",
-                    message=(
-                        f"{agent_plan.agent} render is unsupported here: "
-                        f"{agent_plan.unsupported_reason}"
-                    ),
-                    repair="",
-                    fixable=False,
-                )
-            )
-            continue
-
-        # Compare as MULTISETS keyed by rendered name AND placement (scope +
-        # project record), not by name alone. Two cases this guards:
-        #   * a project disable override adds a SECOND planned entry with the
-        #     same rendered name as the global one but a different record;
-        #   * a project server re-scoped from one project to another keeps the
-        #     same rendered name but moves records.
-        # A name-only comparison would call both "already rendered" and skip the
-        # re-render, leaving Claude config wrong. Placement keys catch them.
-        #
-        # Claude exposes per-record placement; Codex has a SINGLE global table
-        # (no project records), so its existing entries are all global and the
-        # planned set is global-only — a name multiset is exact there.
-        if agent_plan.agent == "claude-code":
-            planned_counts = Counter(
-                _claude_placement_key(e.rendered_name, e.scope, e.project_key)
-                for e in agent_plan.planned
-            )
-            existing_counts = Counter(
-                _claude_existing_placement_keys(agent_plan.config_path)
-            )
-        else:
-            planned_counts = Counter(e.rendered_name for e in agent_plan.planned)
-            existing_counts = Counter(agent_plan.managed_existing)
-
-        if planned_counts != existing_counts:
-            missing = sorted(
-                _drift_label(k) for k in (planned_counts - existing_counts).elements()
-            )
-            stale = sorted(
-                _drift_label(k) for k in (existing_counts - planned_counts).elements()
-            )
-            detail_parts = []
-            if missing:
-                detail_parts.append(f"not yet rendered: {', '.join(missing)}")
-            if stale:
-                detail_parts.append(f"stale rendered: {', '.join(stale)}")
-            findings.append(
-                Finding(
-                    severity=SEVERITY_WARN,
-                    code="render-drift",
-                    message=(
-                        f"{agent_plan.agent} rendered boxa- entries are out of "
-                        f"sync with the profile ({'; '.join(detail_parts)})."
-                    ),
-                    repair="boxa mcp render",
-                    fixable=True,
-                )
-            )
-    return findings
-
-
-def _claude_placement_key(name: str, scope: str, project_key: str) -> str:
-    """Stable placement key for a Claude boxa entry: name @ record location."""
-    if scope == "project" and project_key:
-        return f"{name}@project:{project_key}"
-    return f"{name}@global"
-
-
-def _drift_label(key) -> str:
-    """Human-readable label for a drift element (name, or name@placement)."""
-    return str(key)
-
-
-def _claude_existing_placement_keys(config_path: str) -> list[str]:
-    """Placement keys for the boxa-managed entries already in Claude config.
-
-    Reads the top-level ``mcpServers`` block (global placement) and every
-    project record's ``mcpServers`` block (project placement, keyed by the record
-    key), returning a placement key per boxa-managed entry. READ-ONLY; any
-    IO/parse error degrades to an empty list (the validity check already flags a
-    malformed profile, and a malformed AGENT config is surfaced as drift simply
-    by yielding no existing entries).
-    """
-    import json as _json
-
-    if not os.path.isfile(config_path):
-        return []
-    try:
-        with open(config_path, "r", encoding="utf-8") as fh:
-            data = _json.load(fh)
-    except (OSError, ValueError):
-        return []
-    if not isinstance(data, dict):
-        return []
-    keys: list[str] = []
-    block = data.get("mcpServers")
-    if isinstance(block, dict):
-        for n in block:
-            if is_boxa_managed(str(n)):
-                keys.append(_claude_placement_key(str(n), "global", ""))
-    projects = data.get("projects")
-    if isinstance(projects, dict):
-        for record_key, record in projects.items():
-            if not isinstance(record, dict):
-                continue
-            pblock = record.get("mcpServers")
-            if isinstance(pblock, dict):
-                for n in pblock:
-                    if is_boxa_managed(str(n)):
-                        keys.append(
-                            _claude_placement_key(
-                                str(n), "project", str(record_key)
-                            )
-                        )
-    return keys
-
-
-def _missing_env_findings(plan) -> list[Finding]:
-    """Flag enabled servers whose required env NAMES have no resolvable value.
-
-    Mirrors the wrapper's resolution rule (decision 23: required env exists)
-    WITHOUT reading any secret value: a key resolves if it is in the current
-    environment, OR carried as a non-secret value in the profile, OR present in
-    the scoped secret store. We only ever check for PRESENCE, never read a value.
-    Names only in the finding.
-    """
-    findings: list[Finding] = []
-    for srv in plan.renderable_servers:
-        missing = _missing_env_keys(srv)
-        if missing:
-            findings.append(
-                Finding(
-                    severity=SEVERITY_WARN,
-                    code="missing-env",
-                    message=(
-                        f"MCP server {srv.name!r} "
-                        f"({srv.scope}) is missing env value(s): "
-                        f"{', '.join(missing)} (values never shown)."
-                    ),
-                    repair=(
-                        "Set the variable(s) in the environment or re-import the "
-                        "server so boxa copies the credential into its 0600 "
-                        "secret store."
-                    ),
-                    fixable=False,
-                )
-            )
-    return findings
-
-
-def _missing_env_keys(srv) -> list[str]:
-    """Names of a profile server's declared env keys with no resolvable value.
-
-    PRESENCE-ONLY: never reads a secret value. A key is satisfied when it is in
-    ``os.environ``, recorded as a non-secret value in the profile ``env`` map,
-    or present (by name) in the scoped secret store.
-    """
-    path = (
-        project_profile_path(srv.project_key)
-        if srv.scope == "project" and srv.project_key
-        else global_profile_path()
-    )
-    try:
-        profile = load_profile(path)
-    except (OSError, ValueError):
-        return []
-    spec = profile.get("servers", {}).get(srv.name)
-    if not isinstance(spec, dict):
-        return []
-    env_keys = spec.get("envKeys")
-    secret_env_keys = spec.get("secretEnvKeys")
-    env_keys = [str(k) for k in env_keys] if isinstance(env_keys, list) else []
-    secret_keys = (
-        {str(k) for k in secret_env_keys}
-        if isinstance(secret_env_keys, list)
-        else set()
-    )
-    all_keys = list(dict.fromkeys([*env_keys, *sorted(secret_keys)]))
-    if not all_keys:
-        return []
-    profile_env = spec.get("env")
-    profile_env = profile_env if isinstance(profile_env, dict) else {}
-
-    s_path = (
-        project_secrets_path(srv.project_key)
-        if srv.scope == "project" and srv.project_key
-        else global_secrets_path()
-    )
-    stored_keys: set[str] = set()
-    if os.path.isfile(s_path):
-        try:
-            store = load_secrets(s_path)
-            block = store.get("servers", {}).get(srv.name)
-            if isinstance(block, dict):
-                stored_keys = {str(k) for k in block}
-        except (OSError, ValueError):
-            stored_keys = set()
-
-    missing: list[str] = []
-    for key in all_keys:
-        if key in os.environ:
-            continue
-        if key in profile_env:
-            continue
-        if key in stored_keys:
-            continue
-        missing.append(key)
-    return missing
-
-
-def _server_launcher(srv) -> str:
-    """The launch command (argv[0]) for a renderable profile server, or "".
-
-    Reads NAMES/command shape only from the scope-correct profile (no secrets).
-    """
-    path = (
-        project_profile_path(srv.project_key)
-        if srv.scope == "project" and srv.project_key
-        else global_profile_path()
-    )
-    try:
-        profile = load_profile(path)
-    except (OSError, ValueError):
-        return ""
-    spec = profile.get("servers", {}).get(srv.name)
-    if not isinstance(spec, dict):
-        return ""
-    command = spec.get("command")
-    argv = command.get("argv") if isinstance(command, dict) else None
-    if isinstance(argv, list) and argv:
-        return str(argv[0])
-    return ""
-
-
-def _missing_launcher_findings(plan) -> list[Finding]:
-    """Flag enabled servers whose launch command (argv[0]) is not on PATH.
-
-    Decision 23: doctor should verify the runtime command exists or is
-    launchable. A relative/bare command is resolved via ``shutil.which``; an
-    absolute path is checked for existence + executability. A missing launcher
-    is a warning (the runtime may be installable later via 'boxa mcp install',
-    a future slice), not a hard error — but it must be visible so a server that
-    will fail at launch is not declared healthy. NEVER installs anything.
-    """
-    findings: list[Finding] = []
-    for srv in plan.renderable_servers:
-        launcher = _server_launcher(srv)
-        if not launcher:
-            continue
-        if os.path.isabs(launcher):
-            available = os.path.isfile(launcher) and os.access(launcher, os.X_OK)
-        else:
-            available = shutil.which(launcher) is not None
-        if not available:
-            findings.append(
-                Finding(
-                    severity=SEVERITY_WARN,
-                    code="missing-launcher",
-                    message=(
-                        f"MCP server {srv.name!r} ({srv.scope}) launch command "
-                        f"{launcher!r} is not available on PATH; the wrapper "
-                        "would fail to launch it."
-                    ),
-                    repair=(
-                        f"Install {launcher!r} in the Container (add it to the "
-                        "Dockerfile), or materialize the server runtime once "
-                        "'boxa mcp install' is available."
-                    ),
-                    fixable=False,
-                )
-            )
-    return findings
-
-
 def run_doctor() -> DoctorReport:
-    """Diagnose MCP profile / render / runtime problems (READ-ONLY, SECRET-FREE).
-
-    Checks (decision 23): host vs Container context, wrapper availability,
-    canonical profile validity, render drift (profile vs rendered config),
-    and required env presence. Never reads or emits a secret value, never
-    installs anything, never writes any config.
-    """
+    """Diagnose MCP catalog, activation, launch, and runtime snapshot state."""
     inside = identity.inside_container()
     report = DoctorReport(inside_container=inside)
 
@@ -1031,8 +724,7 @@ def run_doctor() -> DoctorReport:
                 code="not-in-container",
                 message=(
                     "Not running inside a boxa Container; the boxa-mcp-run "
-                    "wrapper refuses to launch MCP servers on the host. Render "
-                    "and profile checks still apply."
+                    "wrapper refuses to launch MCP servers on the host."
                 ),
                 repair="Start an agent inside a boxa Container to launch MCP "
                 "servers.",
@@ -1047,55 +739,14 @@ def run_doctor() -> DoctorReport:
                 severity=SEVERITY_WARN if inside else SEVERITY_INFO,
                 code="wrapper-missing",
                 message=(
-                    f"The {WRAPPER_COMMAND!r} wrapper is not on PATH; rendered "
-                    "agent entries call it and would fail to launch."
+                    f"The {WRAPPER_COMMAND!r} wrapper is not on PATH; launch-time "
+                    "MCP profiles would fail to start servers."
                 ),
                 repair=(
                     "Run 'boxa mcp doctor --fix' to repair the wrapper "
                     "symlink, or reinstall boxa so the wrapper is on PATH."
                 ),
                 fixable=True,
-            )
-        )
-
-    # A completed one-way migration deliberately retains legacy profiles only
-    # for recovery. They must never become an authoritative render source again.
-    migrated = False
-    try:
-        from .migration import migration_path
-        with open(migration_path(), encoding="utf-8") as fh:
-            migrated = json.load(fh).get("status") == "complete"
-    except (OSError, ValueError, AttributeError):
-        pass
-    if migrated:
-        return report
-
-    # Profile validity. A malformed profile blocks render drift / env checks for
-    # that file, so collect those findings and skip the plan-based checks if any
-    # profile cannot be read (build_render_plan would also raise).
-    validity = _profile_validity_findings()
-    report.findings.extend(validity)
-    if any(f.code == "profile-malformed" for f in validity):
-        return report
-
-    plan = build_render_plan(None)
-    report.findings.extend(_render_drift_findings(plan))
-    report.findings.extend(_missing_env_findings(plan))
-    report.findings.extend(_missing_launcher_findings(plan))
-
-    # Skipped (non-renderable) profile servers are an actionable info finding.
-    for srv in plan.skipped:
-        report.findings.append(
-            Finding(
-                severity=SEVERITY_WARN,
-                code="server-skipped",
-                message=(
-                    f"MCP server {srv.name!r} cannot be rendered: "
-                    f"{srv.skip_reason}"
-                ),
-                repair="Re-import the server for its project so boxa records a "
-                "resolvable project key.",
-                fixable=False,
             )
         )
 
@@ -1184,210 +835,45 @@ def _repair_wrapper_symlink() -> list[str]:
         return []
     return [f"linked {WRAPPER_COMMAND} -> {wrapper_src} in {target_dir}"]
 
-
 def apply_doctor_fixes(report: DoctorReport) -> FixResult:
-    """Apply ONLY safe local fixes for a doctor report (decision 23).
-
-    Safe fixes: create missing MCP directories, repair the wrapper symlink, and
-    re-render when render drift is detected. NEVER installs packages, allows
-    domains, purges runtime, or enables host-only servers. Findings that are not
-    safely fixable are returned in ``remaining`` so the user still sees them.
-    """
+    """Apply safe fixes without editing any Project-owned file."""
     result = FixResult()
-    render_failures: list[Finding] = []
-
-    # 1. Always ensure the config dirs exist (cheap, idempotent).
+    failures: list[Finding] = []
     result.actions.extend(_ensure_mcp_dirs())
-
-    # 2. Repair the wrapper symlink if a wrapper finding is present.
     if any(f.code == "wrapper-missing" for f in report.findings):
         result.actions.extend(_repair_wrapper_symlink())
-
-    # 3. Re-render when drift was detected. This rewrites only boxa- entries.
     if any(
-        f.code == "render-drift" and f.fixable for f in report.findings
+        finding.code == "catalog-runtime-drift" and finding.fixable
+        for finding in report.findings
     ):
-        from .writer import RenderWriteError, write_plan
-
-        plan = build_render_plan(None)
+        from .catalog import mutation_lock
         try:
-            written = write_plan(plan.claude, plan.codex)
-            result.actions.append(
-                "re-rendered boxa-managed entries into: "
-                + (", ".join(written) if written else "no agents")
-            )
-        except RenderWriteError as exc:
-            render_failures.append(
+            with mutation_lock():
+                from .activation import refresh_runtime
+                refresh_runtime()
+            result.actions.append("refreshed the secret-free MCP runtime snapshot")
+        except (OSError, ValueError, RuntimeError) as exc:
+            failures.append(
                 Finding(
-                    severity=SEVERITY_ERROR,
-                    code="render-failed",
-                    message=f"re-render failed: {exc}",
-                    repair="Inspect the agent config and re-run "
-                    "'boxa mcp render'.",
-                    fixable=False,
+                    SEVERITY_ERROR,
+                    "catalog-runtime-fix-failed",
+                    f"runtime snapshot repair failed: {exc}",
+                    "Run 'boxa mcp doctor --fix' again after fixing the catalog/activation store.",
                 )
             )
-
-    # Catalog activation renders and the secret-free runtime snapshot are
-    # derived state. Repairing them is safe, but a tracked consumer config is
-    # an explicit repository mutation and therefore never enters this branch.
-    catalog_codes = {f.code for f in report.findings if f.fixable}
-    # These repairs rewrite the very Project files and runtime snapshot an
-    # in-Container convergence reads, so take the same host mutation lock every
-    # other lifecycle write takes. That also publishes the mutation window
-    # convergence observes, so a repair cannot be half-observed (ADR 0022).
-    from .catalog import mutation_lock
-    with mutation_lock():
-        _apply_catalog_doctor_fixes(
-            report, result, render_failures, catalog_codes
-        )
-    # Re-run doctor to capture what remains after the fixes, so the user sees the
-    # honest post-fix state (e.g. a still-missing env var, or a wrapper we could
-    # not relink). A render write that hard-failed is surfaced on top of the
-    # fresh report so it is never lost.
-    after = run_doctor()
-    result.remaining = render_failures + list(after.findings)
+    result.remaining = failures + list(run_doctor().findings)
     return result
 
 
-def _apply_catalog_doctor_fixes(
-    report: DoctorReport,
-    result: FixResult,
-    render_failures: list[Finding],
-    catalog_codes: set[str],
-) -> None:
-    if "catalog-runtime-drift" in catalog_codes:
-        try:
-            from .activation import refresh_runtime
-            refresh_runtime()
-            result.actions.append("refreshed the secret-free MCP runtime snapshot")
-        except (OSError, ValueError, RuntimeError) as exc:
-            render_failures.append(Finding(SEVERITY_ERROR, "catalog-runtime-fix-failed", f"runtime snapshot repair failed: {exc}", "Run 'boxa mcp doctor --fix' again after fixing the catalog/activation store."))
-    claude_projects = {
-        finding.project for finding in report.findings
-        if finding.code == "catalog-claude-render-drift"
-        and finding.fixable
-        and finding.project
-    }
-    if claude_projects:
-        try:
-            from .activation import render_claude_activations
-            render_claude_activations(projects=claude_projects)
-            result.actions.append("restored Claude Code activation renders")
-        except (OSError, ValueError, RuntimeError) as exc:
-            render_failures.append(Finding(SEVERITY_ERROR, "catalog-render-fix-failed", f"Claude render repair failed: {exc}", "Inspect the Claude config and re-run 'boxa mcp doctor --fix'."))
-        else:
-            try:
-                from .activation import refresh_runtime
-                refresh_runtime()
-                runtime_action = (
-                    "refreshed the secret-free MCP runtime snapshot"
-                )
-                if runtime_action not in result.actions:
-                    result.actions.append(runtime_action)
-            except (OSError, ValueError, RuntimeError) as exc:
-                render_failures.append(Finding(SEVERITY_ERROR, "catalog-runtime-fix-failed", f"runtime snapshot repair failed after Claude render: {exc}", "Run 'boxa mcp doctor --fix' again after fixing the catalog/activation store."))
-    if "catalog-codex-render-drift" in catalog_codes:
-        try:
-            from .activation import _render_codex_activation, load_activations
-            data = load_activations()
-            for project, records in data.get("projects", {}).items():
-                if any("codex" in record.get("consumers", []) for record in records.values()):
-                    _render_codex_activation(data, project, allow_tracked=False)
-            result.actions.append("restored untracked Codex activation renders")
-        except (OSError, ValueError, RuntimeError) as exc:
-            render_failures.append(Finding(SEVERITY_ERROR, "catalog-render-fix-failed", f"Codex render repair failed: {exc}", "Inspect the Codex config and re-run 'boxa mcp doctor --fix'."))
-
-
-def _catalog_render_state(
-    project: str,
-    entry_id: str,
-    entry: dict[str, Any],
-    consumer: str,
-    claude_status: Optional[object] = None,
-    claude_status_unknown: bool = False,
-) -> tuple[str, bool, bool]:
-    """Return (state, tracked, requires_consent) for one derived consumer record.
-
-    ``tracked`` is the repository fact reported by status/doctor JSON and the
-    CLI ``:tracked`` marker. ``requires_consent`` is the narrower fixability
-    question: a tracked companion file that is already byte-identical does not
-    block ``doctor --fix`` (ADR 0022), so the two must not be collapsed.
-    """
-    from .activation import claude_config_path, codex_config_path
-
-    name = rendered_name(str(entry["name"]))
-    expected_args = ["--catalog-id", entry_id, "--consumer", consumer, "--project", project, entry["name"]]
-    if consumer == "claude":
-        path = claude_config_path(project)
-        try:
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            value = data.get("mcpServers", {}).get(name)
-        except (OSError, ValueError, AttributeError):
-            value = None
-        tracked = bool(
-            claude_status is not None
-            and (
-                getattr(claude_status, "mcp_json_tracked", False)
-                or getattr(claude_status, "settings_tracked", False)
-            )
-        )
-        requires_consent = claude_status_unknown or bool(
-            claude_status is not None
-            and getattr(claude_status, "requires_consent", False)
-        )
-        approval_drift = bool(
-            claude_status is not None
-            and name in getattr(
-                claude_status, "settings_changed_names", frozenset()
-            )
-        )
-        ok = (
-            isinstance(value, dict)
-            and value.get("command") == WRAPPER_COMMAND
-            and value.get("args") == expected_args
-            and not approval_drift
-        )
-        return ("rendered" if ok else "drift"), tracked, requires_consent
-
-    path = codex_config_path(project)
-    try:
-        with open(path, "rb") as fh:
-            data = tomllib.load(fh)
-        value = data.get("mcp_servers", {}).get(name)
-    except (OSError, ValueError, AttributeError):
-        value = None
-    from .activation import git_metadata_path
-
-    try:
-        relative = os.path.relpath(path, project)
-        returncode = subprocess.run(
-            ["git", "-C", project, "ls-files", "--error-unmatch", "--", relative],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-        ).returncode
-    except OSError:
-        returncode = None
-    if returncode == 0:
-        tracked = True
-    elif returncode == 1:
-        tracked = False
-    else:
-        # Only a definitive "not tracked" answer may unlock an automatic
-        # rewrite. An inspection failure with Git metadata present (unusable
-        # gitdir, damaged repository) stays consent-gated; a Project with no
-        # Git metadata at all is genuinely untracked.
-        tracked = git_metadata_path(project) is not None
-    ok = isinstance(value, dict) and value.get("command") == WRAPPER_COMMAND and value.get("args") == expected_args
-    # Codex has no in-sync exemption: a tracked config always needs consent.
-    return ("rendered" if ok else "drift"), tracked, tracked
-
-
 def catalog_project_status(project: str, probe: Optional[object] = None) -> dict[str, Any]:
-    """Unified catalog -> readiness -> activation -> render -> mode snapshot."""
-    from . import activation
+    """Unified catalog, readiness, activation, mode, and isolation snapshot."""
     from .activation import canonical_project, load_activations
     from .catalog import degradation_status, load_catalog
+    from .catalog_import import catalog_verdicts
+    from .classify import classify_candidate
+    from .merge import merge_candidates
+    from .providers.claude import ClaudeProvider
+    from .providers.codex import CodexProvider
     from .readiness import ProjectProbe, ReadinessError, readiness_for_entry
 
     key = canonical_project(project)
@@ -1396,73 +882,116 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
     records = activations.get("projects", {}).get(key, {})
     rows: list[dict[str, Any]] = []
     local_probe = probe if probe is not None else ProjectProbe()
-    claude_status = None
-    claude_status_unknown = False
-    if any(
-        "claude" in record.get("consumers", [])
-        for record in records.values()
-        if isinstance(record, dict)
-    ):
-        try:
-            claude_status = activation.claude_render_status(
-                key,
-                activations=activations,
-                catalog=catalog,
-            )
-        except (OSError, activation.ActivationError):
-            # Unknown tracked state must not read as "untracked, safe to fix".
-            claude_status_unknown = True
     for entry_id, entry in sorted(catalog["entries"].items(), key=lambda item: (item[1]["name"].casefold(), item[0])):
         record = records.get(entry_id)
         try:
             ready_report = readiness_for_entry(entry, key, local_probe, secret_name=str(entry.get("secretStoreKey") or entry["name"]))
             readiness = {
-                "state": "ready" if ready_report.ready else "not-ready",
+                "state": (
+                    "no-runtime-readiness"
+                    if not ready_report.has_runtime_readiness
+                    else "ready" if ready_report.ready else "not-ready"
+                ),
                 "container": ready_report.container,
                 "checks": [check.to_dict() for check in ready_report.checks],
+                "hints": list(ready_report.hints),
             }
         except ReadinessError as exc:
             readiness = {"state": "target-stopped", "container": "", "checks": [], "message": str(exc)}
-        consumers = list(record.get("consumers", [])) if isinstance(record, dict) else []
-        renders = {}
-        tracked_codex = False
-        tracked_claude = False
-        consent_required: dict[str, bool] = {}
-        for consumer in consumers:
-            state, is_tracked, needs_consent = _catalog_render_state(
-                key,
-                entry_id,
-                entry,
-                consumer,
-                claude_status,
-                claude_status_unknown=claude_status_unknown,
-            )
-            renders[consumer] = state
-            consent_required[consumer] = needs_consent
-            if consumer == "codex":
-                tracked_codex = tracked_codex or is_tracked
-            elif consumer == "claude":
-                tracked_claude = tracked_claude or is_tracked
+        opted_out = bool(record and record.get("optedOut") is True)
+        consumers = (
+            list(record.get("consumers", []))
+            if isinstance(record, dict) and not opted_out
+            else []
+        )
+        pending = bool(
+            record
+            and not opted_out
+            and record.get("enabled", True) is False
+        )
+        everywhere = activations.get("everywhere", {}).get(entry_id)
         rows.append({
             "id": entry_id,
             "name": entry["name"],
             "catalogMember": True,
-            "runtimeKind": entry["runtimeKind"],
+            "runtimeKind": entry.get("runtimeKind", "remote-http"),
             "readiness": readiness,
-            "activation": "activated" if record and record.get("enabled", True) else "inactive",
+            "activation": (
+                "opted-out"
+                if opted_out
+                else "pending"
+                if pending
+                else "activated"
+                if record
+                else "inactive"
+            ),
+            "pendingReason": (
+                str(record.get("pendingReason", ""))
+                if pending and isinstance(record, dict)
+                else ""
+            ),
             "consumers": consumers,
-            "renders": renders,
-            "executionMode": entry["executionMode"],
-            "executionUser": "node" if entry["executionMode"] == "agent-trusted" else "boxa-mcp",
-            "isolationStatus": degradation_status(entry) or "isolated",
+            "everywhere": isinstance(everywhere, dict),
+            "everywhereConsumers": (
+                list(everywhere.get("consumers", []))
+                if isinstance(everywhere, dict)
+                else []
+            ),
+            "optedOut": opted_out,
+            "executionMode": entry.get("executionMode", "none"),
+            "executionUser": (
+                "-" if entry["type"] == "http"
+                else "node" if entry["executionMode"] == "agent-trusted"
+                else "boxa-mcp"
+            ),
+            "isolationStatus": (
+                "not-applicable"
+                if entry["type"] == "http"
+                else degradation_status(entry) or "isolated"
+            ),
+            "agentIdentityTrustScope": (
+                "every-project"
+                if isinstance(everywhere, dict)
+                and entry.get("executionMode") == "agent-trusted"
+                else "project"
+                if record
+                and not opted_out
+                and entry.get("executionMode") == "agent-trusted"
+                else "none"
+            ),
             "degradedSecretIsolationAcknowledged": activations.get("acknowledgements", {}).get(key, {}).get(entry_id) is True,
-            "trackedCodexConfig": tracked_codex,
-            "trackedMcpJson": tracked_claude,
-            # Tracked is the repository fact; consent is the fixability
-            # question, and an in-sync tracked file needs none (ADR 0022).
-            "renderRequiresConsent": consent_required,
         })
-    return {"projectKey": key, "entries": rows}
+    inherited_raw = []
+    for provider in (ClaudeProvider(), CodexProvider()):
+        inherited_raw.extend(provider.discover(
+            project_keys=[key], include_global=True, all_projects=False
+        ))
+    for candidate in inherited_raw:
+        classify_candidate(candidate)
+    inherited = catalog_verdicts(merge_candidates(inherited_raw), catalog)
+    proposals = [
+        candidate
+        for candidate in inherited
+        if candidate.candidate.classification.placement == "container"
+        and candidate.catalog_status in {"proposal", "conflict"}
+    ]
+    return {
+        "projectKey": key,
+        "entries": rows,
+        "everywhereOptOuts": [
+            entry_id
+            for entry_id, record in sorted(records.items())
+            if record.get("optedOut") is True
+        ],
+        "inheritedCandidates": [candidate.to_dict() for candidate in inherited],
+        "importProposalCount": len(proposals),
+        "importNudge": (
+            f"Found {len(proposals)} importable MCP server(s) in your agent config; "
+            "run 'boxa mcp import --project <p>' to review and import."
+            if proposals
+            else ""
+        ),
+    }
 
 
 def _catalog_doctor_findings(probe: Optional[object] = None) -> list[Finding]:
@@ -1522,35 +1051,13 @@ def _catalog_doctor_findings(probe: Optional[object] = None) -> list[Finding]:
                 continue
             if row["readiness"]["state"] == "target-stopped":
                 findings.append(Finding(SEVERITY_WARN, "activation-target-stopped", f"Activated MCP {row['name']!r} targets stopped Project {project}; readiness cannot be evaluated.", f"Start the Project, then run 'boxa mcp readiness {row['id']} --project {project}'."))
-            elif row["readiness"]["state"] != "ready":
+            elif row["readiness"]["state"] not in {"ready", "no-runtime-readiness"}:
                 missing = ", ".join(check["label"] for check in row["readiness"]["checks"] if not check["ready"])
                 findings.append(Finding(SEVERITY_WARN, "activation-not-ready", f"Activated MCP {row['name']!r} is not ready in Project {project}: {missing}.", f"Run 'boxa mcp install {row['id']} --project {project}', satisfy prerequisites, then re-check readiness."))
             if row["executionMode"] == "agent-trusted" and catalog["entries"][row["id"]].get("secretEnvKeys"):
                 findings.append(Finding(SEVERITY_ERROR, "trusted-secrets-forbidden", f"Agent-trusted MCP {row['name']!r} declares forbidden MCP-store secrets.", "Deactivate it and remove the secret contract/value before granting agent trust."))
             if row["isolationStatus"] == "degraded-secret-isolation":
                 findings.append(Finding(SEVERITY_WARN, "degraded-secret-isolation", f"MCP server {row['name']!r} in Project {project} has degraded-secret-isolation: node owns the Docker daemon and can inspect its container environment.", "Use a secret-free image or wait for Docker execution and per-server credential isolation."))
-            for consumer, render_state in row["renders"].items():
-                if render_state == "rendered":
-                    continue
-                # Fixability follows consent, not the bare tracked fact: a
-                # tracked companion file that is already byte-identical must
-                # not block 'doctor --fix'.
-                needs_consent = bool(
-                    row.get("renderRequiresConsent", {}).get(consumer)
-                )
-                code = f"catalog-{consumer}-render-drift"
-                flag = (
-                    "--allow-tracked-codex-config"
-                    if consumer == "codex"
-                    else "--allow-tracked-mcp-json"
-                )
-                repair = (
-                    f"Re-run activation with {flag} after reviewing the repository change."
-                    if needs_consent else "boxa mcp doctor --fix"
-                )
-                tracked_label = "Codex config" if consumer == "codex" else ".mcp.json"
-                findings.append(Finding(SEVERITY_WARN, code, f"{consumer} render drift for activated MCP {row['name']!r} in Project {project}." + (f" The {tracked_label} is tracked." if needs_consent else ""), repair, not needs_consent, project))
-
     from .activation import runtime_payload
     expected = runtime_payload(activations, catalog)
     try:

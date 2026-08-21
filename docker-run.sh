@@ -3025,8 +3025,21 @@ refresh_mac_claude_bin_volume() {
 
 # Restart an exited boxa container and re-run init scripts
 # Returns 1 if restart fails (stale mounts after reboot) — caller should recreate
+reevaluate_pending_mcp() {
+    local project_path="$1"
+    [ -n "$project_path" ] || return 0
+    if ! PYTHONPATH="$BOXA_DIR/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m mcp.cli reevaluate-pending --project "$project_path"; then
+        echo "boxa: WARNING: pending MCP activations could not be re-evaluated; they remain excluded from new sessions." >&2
+    fi
+}
+
 restart_exited_container() {
     local name="$1" project_path="${2:-}" cli_memory="${3:-}" cli_memory_swap="${4:-}"
+    local mcp_project_path="$project_path"
+    if [ -z "$mcp_project_path" ]; then
+        mcp_project_path="$(_boxa::container_project_path "$name")"
+    fi
     echo "Restarting exited container: $name"
     # Containers created before the DNS upstream bind mount existed (ADR 0015)
     # would have DNS_UPSTREAM_CONTAINER_FILE absent after a plain `docker start`,
@@ -3076,6 +3089,7 @@ restart_exited_container() {
     # setup as node.
     docker exec -u node "$name" bash -c \
         '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
+    reevaluate_pending_mcp "$mcp_project_path"
     warn_if_dns_broken "$name"
     # Re-apply port routes
     apply_port_routes "$name"
@@ -6730,6 +6744,7 @@ fi
 # ownership) is handled by the entrypoint on every container start.
 docker exec -u node "$CONTAINER_NAME" bash -c \
     '/usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh'
+reevaluate_pending_mcp "$PROJECT_PATH"
 
 warn_if_dns_broken "$CONTAINER_NAME"
 

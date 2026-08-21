@@ -1,120 +1,80 @@
-#!/usr/bin/env python3
-"""Tests for `mcp-cli.sh` --json render-status propagation (issue 18).
-
-Run with:
-
-    python3 -m unittest tests.test_mcp_cli_render_status   # from repo root
-    python3 tests/test_mcp_cli_render_status.py            # standalone
-
-`boxa mcp add ... --json` runs a secret write and auto-render. ADR 0021 changed
-`boxa mcp import --apply --json` to definition-only catalog import, so it must
-not invoke render at all. The bug fixed in
-issue 18: the JSON branch returned the cleanup's exit status, which masked a
-failed auto-render and made the command falsely report success. These tests
-drive the bash cmd_* functions directly (sourcing mcp-cli.sh, which only runs
-`main` when executed, not when sourced) with the Python-calling helpers stubbed
-so the auto-render call fails. The command must then exit non-zero, matching the
-text path.
-"""
+"""The shell MCP mutation paths no longer invoke a render command."""
 
 from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 import unittest
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_CLI = os.path.join(_REPO_ROOT, "scripts", "mcp-cli.sh")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CLI = os.path.join(ROOT, "scripts", "mcp-cli.sh")
 
 
-def _run_harness(call: str, *, render_fails: bool) -> subprocess.CompletedProcess:
-    """Source mcp-cli.sh and run `call` with the Python helpers stubbed.
-
-    The secret write and cleanup are stubbed to succeed (return 0); _run_py is
-    stubbed so that `render-write-json` fails when render_fails is true and
-    succeeds otherwise. _maybe_auto_render and _finish_secret_write themselves
-    are NOT stubbed: they are the real functions under test.
-    """
-    render_rc = "1" if render_fails else "0"
-    # Override the boundary helpers AFTER sourcing so the real cmd_* /
-    # _maybe_auto_render / _finish_secret_write are exercised end to end.
-    script = f"""
+def _run(call: str) -> subprocess.CompletedProcess:
+    script = f'''
         set -uo pipefail
-        source "{_CLI}"
-
-        # Secret write always succeeds (we are testing the render branch only).
-        _run_py_secret_write() {{ _LAST_SECRET_SCOPES_FILE=""; return 0; }}
-        # Cleanup always succeeds -> if its status leaked it would mask render.
+        source "{CLI}"
+        _run_py_secret_write() {{ printf '%s\n' "$1" >> "$CALLS"; _LAST_SECRET_SCOPES_FILE=""; return 0; }}
         _finish_secret_write() {{ return 0; }}
-        # The Python core: only the render call's status matters here.
-        _run_py() {{
-            case "$1" in
-                render-write-json) return {render_rc} ;;
-                *) return 0 ;;
-            esac
-        }}
-
+        _run_py() {{ printf '%s\n' "$1" >> "$CALLS"; return 0; }}
         {call}
-    """
-    # Pass a $0 that lives in scripts/ (a sibling of mcp-cli.sh) so the script's
-    # `readlink -f "$0"` resolves BOXA_DIR and its lib/ sourcing correctly even
-    # though we run it via `bash -c`. It must NOT equal BASH_SOURCE[0] (the
-    # sourced file) so the source-vs-execute guard keeps `main` from running.
-    argv0 = os.path.join(_REPO_ROOT, "scripts", "_harness_argv0.sh")
-    return subprocess.run(
-        ["bash", "-c", script, argv0],
+    '''
+    descriptor, calls = tempfile.mkstemp()
+    os.close(descriptor)
+    env = dict(os.environ, CALLS=calls)
+    proc = subprocess.run(
+        ["bash", "-c", script, os.path.join(ROOT, "scripts", "_harness.sh")],
+        cwd=ROOT,
+        env=env,
         capture_output=True,
         text=True,
-        cwd=_REPO_ROOT,
     )
+    try:
+        with open(calls, encoding="utf-8") as fh:
+            proc.calls = fh.read().splitlines()
+    finally:
+        os.unlink(calls)
+    return proc
 
 
-# A non-interactive cmd_import_apply call with an explicit selection so it skips
-# the wizard and goes straight to the JSON write/render/cleanup branch.
-_APPLY_JSON_CALL = (
-    "scope=(--global); servers=(ctx7); imps=(); "
-    'cmd_import_apply true false false scope servers imps'
-)
-# Non-interactive add to global with an explicit command spec.
-_ADD_JSON_CALL = "cmd_add --json --global ctx7 -- npx -y @upstash/context7-mcp@latest"
+class NoRenderDispatchTest(unittest.TestCase):
+    def test_definition_import_has_no_render_followup(self):
+        proc = _run("scope=(--global); servers=(ctx7); imps=(); cmd_import_apply true false scope servers imps")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(any("render" in call for call in proc.calls))
 
-
-class JsonRenderStatusTest(unittest.TestCase):
-    def test_apply_json_is_definition_only_and_ignores_render_seam(self) -> None:
-        proc = _run_harness(_APPLY_JSON_CALL, render_fails=True)
-        self.assertEqual(
-            proc.returncode,
-            0,
-            msg=f"definition-only apply --json must not invoke render; "
-            f"got 0\nstdout={proc.stdout}\nstderr={proc.stderr}",
+    def test_yes_one_shot_routes_to_machine_import_activation(self):
+        proc = _run(
+            "scope=(--project /work/app); servers=(); imps=(); "
+            "cmd_import_apply true true true true false claude '' /work/app "
+            "scope servers imps"
         )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.calls, ["import-activate-json"])
 
-    def test_apply_json_succeeds_when_render_ok(self) -> None:
-        proc = _run_harness(_APPLY_JSON_CALL, render_fails=False)
-        self.assertEqual(
-            proc.returncode,
-            0,
-            msg=f"apply --json should exit 0 on render success\n"
-            f"stdout={proc.stdout}\nstderr={proc.stderr}",
-        )
+    def test_legacy_add_has_no_render_followup(self):
+        proc = _run("cmd_add --json --global ctx7 -- npx -y @upstash/context7-mcp@latest")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(any("render" in call for call in proc.calls))
 
-    def test_add_json_propagates_render_failure(self) -> None:
-        proc = _run_harness(_ADD_JSON_CALL, render_fails=True)
-        self.assertNotEqual(
-            proc.returncode,
-            0,
-            msg=f"add --json should exit non-zero on render failure; "
-            f"got 0\nstdout={proc.stdout}\nstderr={proc.stderr}",
-        )
+    def test_everywhere_activation_reaches_python_without_project_resolution(self):
+        proc = _run("cmd_activation activate ctx7 --everywhere --for claude")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("activation-agent-trusted-text", proc.calls)
+        self.assertIn("activate-text", proc.calls)
 
-    def test_add_json_succeeds_when_render_ok(self) -> None:
-        proc = _run_harness(_ADD_JSON_CALL, render_fails=False)
-        self.assertEqual(
-            proc.returncode,
-            0,
-            msg=f"add --json should exit 0 on render success\n"
-            f"stdout={proc.stdout}\nstderr={proc.stderr}",
+    def test_no_everywhere_reaches_python_without_activation_flags(self):
+        proc = _run("cmd_activation activate ctx7 --no-everywhere")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.calls, ["activate-text"])
+
+    def test_everywhere_and_project_are_mutually_exclusive(self):
+        proc = _run(
+            "cmd_activation activate ctx7 --everywhere --project /work/app --for claude"
         )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("cannot be combined", proc.stderr)
 
 
 if __name__ == "__main__":

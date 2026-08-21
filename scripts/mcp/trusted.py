@@ -83,28 +83,6 @@ def parse_runtime_snapshot(raw: bytes) -> dict[str, Any]:
     projects = data.get("projects")
     if not isinstance(entries, dict) or not isinstance(projects, dict):
         raise TrustedAuthorizationError("MCP runtime snapshot has invalid maps")
-    tracked_mcp_json = data.get("trackedMcpJson", {})
-    if not isinstance(tracked_mcp_json, dict) or any(
-        not isinstance(project, str)
-        or not project
-        or not isinstance(value, bool)
-        for project, value in tracked_mcp_json.items()
-    ):
-        raise TrustedAuthorizationError(
-            "MCP runtime snapshot has malformed tracked .mcp.json consent"
-        )
-    seeded_approvals = data.get("seededApprovals", {})
-    if not isinstance(seeded_approvals, dict) or any(
-        not isinstance(project, str)
-        or not project
-        or not isinstance(names, list)
-        or any(not isinstance(name, str) for name in names)
-        for project, names in seeded_approvals.items()
-    ):
-        raise TrustedAuthorizationError(
-            "MCP runtime snapshot has malformed seeded approvals"
-        )
-    data.setdefault("seededApprovals", seeded_approvals)
     try:
         for entry_id, entry in entries.items():
             _validate_entry(entry_id, entry)
@@ -130,6 +108,19 @@ def parse_runtime_snapshot(raw: bytes) -> dict[str, Any]:
             if "enabled" in record and not isinstance(record["enabled"], bool):
                 raise TrustedAuthorizationError(
                     "MCP runtime snapshot has malformed activation enabled flag"
+                )
+            if "pendingReason" in record and not isinstance(
+                record["pendingReason"], str
+            ):
+                raise TrustedAuthorizationError(
+                    "MCP runtime snapshot has malformed activation pending reason"
+                )
+            if (
+                "pendingReason" in record
+                and record.get("enabled", True) is not False
+            ):
+                raise TrustedAuthorizationError(
+                    "MCP runtime snapshot has effective activation pending reason"
                 )
     return data
 

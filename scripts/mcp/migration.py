@@ -1,16 +1,16 @@
-"""Legacy MCP profile -> stable-ID catalog migration (ADR 0021, issue 08)."""
+"""Legacy catalog migration and shared MCP render cleanup (ADR 0028)."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import tomllib
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from . import activation
+from . import activation, casfile
 from .catalog import (
     EXECUTION_MODE,
     READINESS_SUMMARY,
@@ -19,23 +19,20 @@ from .catalog import (
     runtime_kind,
     save_catalog,
 )
-from . import casfile
+from .launch_profile import claude_server_definition, rendered_name
 from .profile import PROFILE_VERSION, config_root, global_profile_path, load_profile
 from .providers.claude import render_target_path
 from .providers.codex import default_config_path as codex_global_config_path
-from .render import WRAPPER_COMMAND, build_render_plan, is_managed_or_legacy
 from .secrets import load_secrets, project_secrets_path, save_secrets
-from .writer import _strip_boxa_tables, _swap_write
 
 
 MIGRATION_VERSION = 1
+CLEANUP_VERSION = 1
 _NAMESPACE = uuid.UUID("eaf81ab8-f607-4ed0-a47a-e3898950acc9")
-
-# ADR 0022 retires ~/.claude/.claude.json as a render target. That upgrade is
-# independent of the ADR 0021 legacy-profile migration, so it carries its own
-# durable marker: an install whose legacy manifest is already `complete` (or
-# that never had legacy profiles at all) must still receive it exactly once.
-CLAUDE_RENDER_TARGET = "project-mcp-json"
+_BOXA_PREFIXES = ("boxa-", "devbox-")
+_WRAPPER_COMMANDS = ("boxa-mcp-run", "devbox-mcp-run")
+_CODEX_BEGIN = "# >>> boxa managed MCP servers >>>"
+_CODEX_END = "# <<< boxa managed MCP servers <<<"
 
 
 class MigrationError(RuntimeError):
@@ -46,8 +43,20 @@ def migration_path() -> str:
     return os.path.join(config_root(), "migration-v1.json")
 
 
+def render_state_path() -> str:
+    return os.path.join(config_root(), "claude-activation-render-state.json")
+
+
+def legacy_render_state_path() -> str:
+    return os.path.join(config_root(), "claude-render-state.json")
+
+
 def render_target_marker_path() -> str:
     return os.path.join(config_root(), "claude-render-target.json")
+
+
+def cleanup_marker_path() -> str:
+    return os.path.join(config_root(), "shared-render-cleanup.json")
 
 
 @dataclass
@@ -58,6 +67,28 @@ class LegacyDefinition:
     entry: dict[str, Any]
     source_path: str
     consumers: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _JsonMember:
+    key: str
+    leading_start: int
+    key_start: int
+    key_end: int
+    value_start: int
+    value_end: int
+    comma_after: Optional[int]
+
+
+@dataclass(frozen=True)
+class _JsonObject:
+    start: int
+    close: int
+    members: tuple[_JsonMember, ...]
+
+
+_JSON_DECODER = json.JSONDecoder()
+_JSON_WHITESPACE = " \t\r\n"
 
 
 def _canonical(value: Any) -> str:
@@ -103,6 +134,16 @@ def _catalog_entry(name: str, legacy: dict[str, Any]) -> dict[str, Any]:
     return entry
 
 
+def _load_legacy_profile(path: str) -> dict[str, Any]:
+    try:
+        profile = load_profile(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise MigrationError(f"cannot migrate malformed legacy profile {path}: {exc}") from exc
+    if profile.get("version") != PROFILE_VERSION or not isinstance(profile.get("servers"), dict):
+        raise MigrationError(f"unsupported legacy profile schema in {path}")
+    return profile
+
+
 def _project_profiles() -> list[tuple[str, str]]:
     root = os.path.join(config_root(), "projects")
     try:
@@ -122,51 +163,60 @@ def _project_profiles() -> list[tuple[str, str]]:
     return result
 
 
-def _load_legacy_profile(path: str) -> dict[str, Any]:
-    try:
-        profile = load_profile(path)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        raise MigrationError(f"cannot migrate malformed legacy profile {path}: {exc}") from exc
-    if profile.get("version") != PROFILE_VERSION or not isinstance(profile.get("servers"), dict):
-        raise MigrationError(f"unsupported legacy profile schema in {path}")
-    return profile
+def _is_managed(name: str) -> bool:
+    return name.startswith(_BOXA_PREFIXES)
 
 
-def _claude_rendered(project: str, rendered_name: str, server: str) -> bool:
-    try:
-        with open(render_target_path(), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
+def _rendered_name(name: str) -> str:
+    return f"boxa-{name}"
+
+
+def _server_definition_matches(value: Any, project: str, server: str) -> bool:
+    if not isinstance(value, dict) or value.get("command") not in _WRAPPER_COMMANDS:
         return False
-    except (OSError, ValueError) as exc:
-        raise MigrationError(f"cannot inspect rendered Claude config: {exc}") from exc
-    record = data.get("projects", {}).get(project, {}) if isinstance(data, dict) else {}
-    block = record.get("mcpServers", {}) if isinstance(record, dict) else {}
-    value = block.get(rendered_name) if isinstance(block, dict) else None
-    disabled = record.get("disabledMcpServers", []) if isinstance(record, dict) else []
-    return bool(
-        isinstance(value, dict)
-        and value.get("command") == WRAPPER_COMMAND
-        and value.get("args") == ["--project", project, server]
-        and rendered_name not in disabled
+    args = value.get("args")
+    return isinstance(args, list) and (
+        args == ["--project", project, server]
+        or ("--project" in args and project in args and server in args)
     )
 
 
+def _claude_rendered(project: str, rendered_name: str, server: str) -> bool:
+    paths = [activation.claude_config_path(project), render_target_path()]
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise MigrationError(f"cannot inspect rendered Claude config {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            continue
+        candidates = [data.get("mcpServers", {})]
+        record = data.get("projects", {}).get(project, {}) if isinstance(data.get("projects"), dict) else {}
+        if isinstance(record, dict):
+            candidates.append(record.get("mcpServers", {}))
+        if any(
+            isinstance(block, dict)
+            and _server_definition_matches(block.get(rendered_name), project, server)
+            for block in candidates
+        ):
+            return True
+    return False
+
+
 def _codex_rendered(project: str, rendered_name: str, server: str) -> bool:
-    path = activation.codex_config_path(project)
     try:
-        with open(path, "rb") as fh:
+        import tomllib
+        with open(activation.codex_config_path(project), "rb") as fh:
             data = tomllib.load(fh)
     except FileNotFoundError:
         return False
     except (OSError, ValueError) as exc:
-        raise MigrationError(f"cannot inspect rendered Codex config {path}: {exc}") from exc
+        raise MigrationError(f"cannot inspect rendered Codex config for {project}: {exc}") from exc
     table = data.get("mcp_servers", {}).get(rendered_name) if isinstance(data, dict) else None
-    return bool(
-        isinstance(table, dict)
-        and table.get("command") == WRAPPER_COMMAND
-        and table.get("args") == ["--project", project, server]
-    )
+    return _server_definition_matches(table, project, server)
 
 
 def _inventory() -> list[LegacyDefinition]:
@@ -180,12 +230,6 @@ def _inventory() -> list[LegacyDefinition]:
                     continue
                 raise MigrationError(f"malformed legacy MCP definition {name!r} in {global_path}")
             definitions.append(LegacyDefinition("global", "", str(name), _catalog_entry(str(name), value), global_path))
-
-    plans = build_render_plan()
-    planned = {
-        (entry.scope, entry.project_key, entry.source_name): entry.rendered_name
-        for entry in plans.claude.planned
-    }
     for path, project in _project_profiles():
         profile = _load_legacy_profile(path)
         for name, value in sorted(profile["servers"].items()):
@@ -195,8 +239,8 @@ def _inventory() -> list[LegacyDefinition]:
                 raise MigrationError(f"malformed legacy MCP definition {name!r} in {path}")
             name = str(name)
             consumers: list[str] = []
-            rendered = planned.get(("project", project, name))
-            if value.get("enabled", True) is not False and rendered:
+            rendered = _rendered_name(name)
+            if value.get("enabled", True) is not False:
                 if _claude_rendered(project, rendered, name):
                     consumers.append("claude")
                 if _codex_rendered(project, rendered, name):
@@ -232,6 +276,431 @@ def _load_manifest() -> Optional[dict[str, Any]]:
     return value
 
 
+def _load_render_state() -> dict[str, Any]:
+    path = render_state_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            value = json.load(fh)
+    except FileNotFoundError:
+        return {"projects": {}, "seeded": {}}
+    except (OSError, ValueError) as exc:
+        raise MigrationError(f"cannot read legacy MCP render state {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise MigrationError(f"malformed legacy MCP render state: {path}")
+    projects = value.get("projects", {})
+    seeded = value.get("seeded", {})
+    if not isinstance(projects, dict) or not isinstance(seeded, dict):
+        raise MigrationError(f"malformed legacy MCP render state: {path}")
+    if any(
+        not isinstance(project, str)
+        or not (
+            isinstance(definitions, list)
+            and all(isinstance(name, str) for name in definitions)
+            or isinstance(definitions, dict)
+            and all(
+                isinstance(name, str) and isinstance(definition, dict)
+                for name, definition in definitions.items()
+            )
+        )
+        for project, definitions in projects.items()
+    ) or any(
+        not isinstance(project, str)
+        or not isinstance(names, list)
+        or any(not isinstance(name, str) for name in names)
+        for project, names in seeded.items()
+    ):
+        raise MigrationError(f"malformed legacy MCP render state: {path}")
+    return {"projects": projects, "seeded": seeded}
+
+
+def _cleanup_complete() -> bool:
+    try:
+        with open(cleanup_marker_path(), encoding="utf-8") as fh:
+            value = json.load(fh)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as exc:
+        raise MigrationError(f"cannot read shared-render cleanup marker: {exc}") from exc
+    return isinstance(value, dict) and value.get("version") == CLEANUP_VERSION
+
+
+def _skip_json_whitespace(text: str, position: int) -> int:
+    while position < len(text) and text[position] in _JSON_WHITESPACE:
+        position += 1
+    return position
+
+
+def _scan_json_object(text: str, start: int) -> _JsonObject:
+    if start >= len(text) or text[start] != "{":
+        raise ValueError("JSON value is not an object")
+    members: list[_JsonMember] = []
+    position = start + 1
+    while True:
+        leading_start = position
+        position = _skip_json_whitespace(text, position)
+        if position >= len(text):
+            raise ValueError("unterminated JSON object")
+        if text[position] == "}":
+            return _JsonObject(start, position, tuple(members))
+        key_start = position
+        key, key_end = _JSON_DECODER.raw_decode(text, position)
+        if not isinstance(key, str):
+            raise ValueError("JSON object member name is not a string")
+        position = _skip_json_whitespace(text, key_end)
+        if position >= len(text) or text[position] != ":":
+            raise ValueError("JSON object member has no colon")
+        value_start = _skip_json_whitespace(text, position + 1)
+        _value, value_end = _JSON_DECODER.raw_decode(text, value_start)
+        position = _skip_json_whitespace(text, value_end)
+        comma_after: Optional[int] = None
+        if position < len(text) and text[position] == ",":
+            comma_after = position
+            position += 1
+        elif position >= len(text) or text[position] != "}":
+            raise ValueError("JSON object member has no separator")
+        members.append(_JsonMember(key, leading_start, key_start, key_end, value_start, value_end, comma_after))
+
+
+def _delete_json_member(text: str, object_start: int, index: int) -> str:
+    scanned = _scan_json_object(text, object_start)
+    member = scanned.members[index]
+    if len(scanned.members) == 1:
+        return text[:scanned.start + 1] + text[scanned.close:]
+    if index == 0:
+        if member.comma_after is None:
+            raise ValueError("first JSON member has no following comma")
+        return text[:member.leading_start] + text[member.comma_after + 1:]
+    previous = scanned.members[index - 1]
+    return text[:previous.value_end] + text[member.value_end:]
+
+
+def _remove_mcp_members(
+    original: str, definitions: dict[str, dict[str, Any]]
+) -> tuple[str, set[str], set[str]]:
+    try:
+        parsed = json.loads(original)
+    except (TypeError, ValueError) as exc:
+        # Without a recorded definition Boxa has no ownership claim on this
+        # malformed file, so its foreign content must remain untouched.
+        if not definitions:
+            return original, set(), set()
+        raise MigrationError("cannot clean malformed .mcp.json") from exc
+    if not isinstance(parsed, dict):
+        # Same ownership rule as the malformed case: a foreign non-object
+        # top level is only an error while Boxa still owns definitions here.
+        if not definitions:
+            return original, set(), set()
+        raise MigrationError("cannot clean .mcp.json that is not an object")
+    block = parsed.get("mcpServers")
+    existing = set(block) if isinstance(block, dict) else set()
+    if not definitions:
+        return original, set(), existing
+    effective = (
+        {
+            name
+            for name, definition in definitions.items()
+            if block.get(name) == definition
+        }
+        if isinstance(block, dict)
+        else set()
+    )
+    if not effective:
+        return original, set(), existing
+    try:
+        text = original
+        root = _scan_json_object(text, _skip_json_whitespace(text, 0))
+        top = next(member for member in root.members if member.key == "mcpServers")
+        nested = _scan_json_object(text, top.value_start)
+        if len({member.key for member in nested.members}) != len(nested.members):
+            raise ValueError("duplicate MCP server names")
+        for name in effective:
+            root = _scan_json_object(text, _skip_json_whitespace(text, 0))
+            top = next(member for member in root.members if member.key == "mcpServers")
+            nested = _scan_json_object(text, top.value_start)
+            index = next(i for i, member in enumerate(nested.members) if member.key == name)
+            text = _delete_json_member(text, nested.start, index)
+        data = json.loads(text)
+        remaining = data.get("mcpServers")
+        if remaining == {}:
+            root = _scan_json_object(text, _skip_json_whitespace(text, 0))
+            index = next(i for i, member in enumerate(root.members) if member.key == "mcpServers")
+            text = _delete_json_member(text, root.start, index)
+        if json.loads(text) == {}:
+            return "", effective, existing
+        return text, effective, existing
+    except (StopIteration, TypeError, ValueError) as exc:
+        raise MigrationError("cannot surgically clean .mcp.json") from exc
+
+
+def _replace_top_level_value(original: str, key: str, value: Any) -> str:
+    root = _scan_json_object(original, _skip_json_whitespace(original, 0))
+    matches = [member for member in root.members if member.key == key]
+    if len(matches) != 1:
+        raise ValueError(f"expected one {key!r} member")
+    member = matches[0]
+    rendered = json.dumps(value, separators=(",", ":"))
+    return original[:member.value_start] + rendered + original[member.value_end:]
+
+
+def _remove_approval_seeds(original: str, names: set[str]) -> str:
+    if not names:
+        return original
+    try:
+        data = json.loads(original)
+    except ValueError as exc:
+        raise MigrationError("cannot clean malformed Claude Project settings") from exc
+    if not isinstance(data, dict):
+        raise MigrationError("cannot clean Claude Project settings that is not an object")
+    text = original
+    for key in ("enabledMcpjsonServers", "disabledMcpjsonServers"):
+        current = data.get(key)
+        if current is None:
+            continue
+        if not isinstance(current, list) or any(not isinstance(name, str) for name in current):
+            raise MigrationError(f"cannot clean malformed Claude Project settings member {key}")
+        retained = [name for name in current if name not in names]
+        if retained != current:
+            try:
+                text = _replace_top_level_value(text, key, retained)
+            except (StopIteration, TypeError, ValueError) as exc:
+                raise MigrationError("cannot surgically clean Claude Project settings") from exc
+    return text
+
+
+def _strip_codex_region(text: str, path: str) -> str:
+    begins = [match.start() for match in re.finditer(re.escape(_CODEX_BEGIN), text)]
+    ends = [match.start() for match in re.finditer(re.escape(_CODEX_END), text)]
+    if not begins and not ends:
+        return text
+    if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
+        raise MigrationError(f"malformed Boxa managed region in Codex config: {path}")
+    begin = begins[0]
+    if begin and text[begin - 1] == "\n":
+        begin -= 1
+    end = ends[0] + len(_CODEX_END)
+    if end < len(text) and text[end] == "\n":
+        end += 1
+    return text[:begin] + text[end:]
+
+
+_TABLE_HEADER = re.compile(
+    r'''^\s*\[\s*(?:mcp_servers\s*\.\s*"(?P<dquoted>(?:\\.|[^"\\])+)"|mcp_servers\s*\.\s*(?P<bare>[A-Za-z0-9_.\-]+)|"mcp_servers\.(?P<quoted>(?:\\.|[^"\\])+)"\s*)\]\s*(?:\#.*)?$'''
+)
+_ANY_HEADER = re.compile(r"^\s*\[\[?[^\]]+\]\]?\s*(?:#.*)?$")
+
+
+def _strip_legacy_codex_tables(text: str) -> str:
+    out: list[str] = []
+    lines = text.splitlines(keepends=True)
+    index = 0
+    while index < len(lines):
+        match = _TABLE_HEADER.match(lines[index])
+        name = None if match is None else match.group("dquoted") or match.group("bare") or match.group("quoted")
+        if name is not None and _is_managed(name):
+            index += 1
+            while index < len(lines) and not _ANY_HEADER.match(lines[index]):
+                index += 1
+            continue
+        out.append(lines[index])
+        index += 1
+    return "".join(out)
+
+
+def _read_text(path: str) -> Optional[str]:
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise MigrationError(f"cannot read migration target {path}: {exc}") from exc
+
+
+def _swap_text(path: str, expected: str, rendered: str) -> None:
+    if rendered == expected:
+        return
+    try:
+        if not rendered:
+            casfile.remove(path, casfile.preimage(expected))
+        else:
+            casfile.swap(
+                path,
+                casfile.preimage(expected),
+                rendered,
+                writer=lambda target, payload: casfile.atomic_text(target, payload),
+            )
+    except casfile.WriteError as exc:
+        raise MigrationError(str(exc)) from exc
+
+
+def _remove_exclude_rules(path: str, rules: set[str]) -> bool:
+    existing = _read_text(path)
+    if existing is None:
+        return False
+    lines = existing.splitlines(keepends=True)
+    rendered = "".join(line for line in lines if line.rstrip("\r\n") not in rules)
+    if rendered == existing:
+        return False
+    _swap_text(path, existing, rendered)
+    return True
+
+
+def _tracked(project: str, path: str) -> tuple[bool, Optional[tuple[str, str, str]]]:
+    try:
+        git_paths = activation._claude_git_paths(project, path=path)
+        return (
+            git_paths is not None and activation._codex_is_tracked(project, git_paths[0]),
+            git_paths,
+        )
+    except activation.ActivationError as exc:
+        raise MigrationError(str(exc)) from exc
+
+
+def _cleanup_projects(state: dict[str, Any], activations: dict[str, Any], manifest: Optional[dict[str, Any]]) -> list[str]:
+    projects = set(state["projects"]) | set(state["seeded"]) | set(activations.get("projects", {}))
+    if manifest is not None:
+        projects.update(
+            row["project"]
+            for row in manifest.get("definitions", [])
+            if isinstance(row, dict) and isinstance(row.get("project"), str)
+        )
+    return sorted(projects)
+
+
+def _recorded_mcp_definitions(
+    state: dict[str, Any],
+    project: str,
+    activations: dict[str, Any],
+    catalog: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    recorded = state["projects"].get(project, {})
+    if isinstance(recorded, dict):
+        return recorded
+
+    # Legacy state recorded names only. Reconstruct an exact definition only
+    # while the matching durable activation and catalog identity still exist;
+    # otherwise ownership is ambiguous and cleanup must preserve the member.
+    names = set(recorded)
+    definitions: dict[str, dict[str, Any]] = {}
+    records = activations.get("projects", {}).get(project, {})
+    for entry_id, record in records.items():
+        entry = catalog.get("entries", {}).get(entry_id)
+        if (
+            not isinstance(record, dict)
+            or record.get("enabled", True) is False
+            or "claude" not in record.get("consumers", [])
+            or not isinstance(entry, dict)
+        ):
+            continue
+        name = rendered_name(entry["name"])
+        if name in names:
+            definitions[name] = claude_server_definition(entry_id, project, entry)
+    return definitions
+
+
+def _cleanup_shared_renders(
+    activations: dict[str, Any],
+    manifest: Optional[dict[str, Any]],
+    *,
+    allow_tracked_mcp_json: bool,
+    allow_tracked_codex_config: bool,
+) -> bool:
+    if _cleanup_complete():
+        return False
+    state = _load_render_state()
+    catalog = load_catalog()
+    projects = _cleanup_projects(state, activations, manifest)
+    plans: list[tuple[str, str, str]] = []
+    exclude_plans: dict[str, set[str]] = {}
+    refusals: list[str] = []
+    unavailable_projects: list[str] = []
+    for project in projects:
+        if not os.path.isdir(project):
+            unavailable_projects.append(project)
+            continue
+        rendered_definitions = _recorded_mcp_definitions(
+            state, project, activations, catalog
+        )
+        rendered_names = set(state["projects"].get(project, []))
+        seeded_names = set(state["seeded"].get(project, []))
+        mcp_path = activation.claude_config_path(project)
+        existing = _read_text(mcp_path)
+        removed_mcp_names: set[str] = set()
+        existing_mcp_names: set[str] = set()
+        if existing is not None:
+            rendered, removed_mcp_names, existing_mcp_names = _remove_mcp_members(
+                existing, rendered_definitions
+            )
+            if rendered != existing:
+                tracked, git_paths = _tracked(project, mcp_path)
+                if tracked and not allow_tracked_mcp_json:
+                    refusals.append(mcp_path)
+                else:
+                    plans.append((mcp_path, existing, rendered))
+        if rendered_names:
+            _tracked_state, git_paths = _tracked(project, mcp_path)
+            if git_paths is not None:
+                exclude_plans.setdefault(git_paths[1], set()).add("/" + git_paths[0])
+        settings_path = activation.claude_settings_path(project)
+        existing = _read_text(settings_path)
+        if existing is not None:
+            removable_seeds = seeded_names - (
+                existing_mcp_names - removed_mcp_names
+            )
+            rendered = _remove_approval_seeds(existing, removable_seeds)
+            if rendered != existing:
+                tracked, git_paths = _tracked(project, settings_path)
+                if tracked and not allow_tracked_mcp_json:
+                    refusals.append(settings_path)
+                else:
+                    plans.append((settings_path, existing, rendered))
+        if seeded_names:
+            _tracked_state, git_paths = _tracked(project, settings_path)
+            if git_paths is not None:
+                exclude_plans.setdefault(git_paths[1], set()).add("/" + git_paths[0])
+        codex_path = activation.codex_config_path(project)
+        existing = _read_text(codex_path)
+        if existing is not None:
+            rendered = _strip_codex_region(existing, codex_path)
+            if rendered != existing:
+                tracked, git_paths = _tracked(project, codex_path)
+                if tracked and not allow_tracked_codex_config:
+                    refusals.append(codex_path)
+                else:
+                    plans.append((codex_path, existing, rendered))
+                if git_paths is not None:
+                    exclude_plans.setdefault(git_paths[1], set()).add("/" + git_paths[0])
+    if refusals:
+        flags = []
+        if any(path.endswith(".codex/config.toml") for path in refusals):
+            flags.append("--allow-tracked-codex-config")
+        if any(not path.endswith(".codex/config.toml") for path in refusals):
+            flags.append("--allow-tracked-mcp-json")
+        raise MigrationError(
+            "tracked MCP cleanup requires " + " and ".join(flags) + " for: " + ", ".join(sorted(refusals))
+        )
+    changed = bool(plans or exclude_plans)
+    with casfile.transaction() as txn:
+        try:
+            for path, existing, rendered in plans:
+                _swap_text(path, existing, rendered)
+            for path, rules in exclude_plans.items():
+                changed = _remove_exclude_rules(path, rules) or changed
+            if not unavailable_projects:
+                for path in (render_state_path(), legacy_render_state_path(), render_target_marker_path()):
+                    try:
+                        existing = casfile.read_bytes(path)
+                    except casfile.WriteError as exc:
+                        raise MigrationError(str(exc)) from exc
+                    if existing is not None:
+                        casfile.remove(path, existing)
+                        changed = True
+                activation._atomic_json(cleanup_marker_path(), {"version": CLEANUP_VERSION}, 0o600)
+        except Exception as exc:
+            _compensate(txn, "shared MCP render cleanup", exc)
+    return changed
+
+
 def _load_legacy_claude_config() -> Optional[dict[str, Any]]:
     path = render_target_path()
     try:
@@ -246,40 +715,16 @@ def _load_legacy_claude_config() -> Optional[dict[str, Any]]:
     return data
 
 
-def _has_legacy_claude_entries() -> bool:
-    """True when the retired render target still holds Boxa-written entries."""
-    data = _load_legacy_claude_config()
-    if data is None:
-        return False
-    block = data.get("mcpServers")
-    if isinstance(block, dict) and any(is_managed_or_legacy(name) for name in block):
-        return True
-    projects = data.get("projects")
-    if isinstance(projects, dict):
-        for record in projects.values():
-            if not isinstance(record, dict):
-                continue
-            servers = record.get("mcpServers")
-            if isinstance(servers, dict) and any(
-                is_managed_or_legacy(name) for name in servers
-            ):
-                return True
-    return False
-
-
-def _remove_legacy_claude_entries() -> None:
+def _remove_legacy_claude_entries() -> bool:
     path = render_target_path()
     data = _load_legacy_claude_config()
     if data is None:
-        return
+        return False
     existing = casfile.read_bytes(path)
     changed = False
     block = data.get("mcpServers")
     if isinstance(block, dict):
-        retained = {
-            name: value for name, value in block.items()
-            if not is_managed_or_legacy(name)
-        }
+        retained = {name: value for name, value in block.items() if not _is_managed(name)}
         if retained != block:
             data["mcpServers"] = retained
             changed = True
@@ -289,239 +734,113 @@ def _remove_legacy_claude_entries() -> None:
             if not isinstance(record, dict):
                 continue
             servers = record.get("mcpServers")
-            if isinstance(servers, dict):
-                removed = {name for name in servers if is_managed_or_legacy(name)}
-                if removed:
-                    record["mcpServers"] = {
-                        name: value for name, value in servers.items() if name not in removed
-                    }
+            if not isinstance(servers, dict):
+                continue
+            removed = {name for name in servers if _is_managed(name)}
+            if removed:
+                record["mcpServers"] = {name: value for name, value in servers.items() if name not in removed}
+                changed = True
+            disabled = record.get("disabledMcpServers")
+            if isinstance(disabled, list):
+                retained_disabled = [name for name in disabled if name not in removed]
+                if retained_disabled != disabled:
+                    record["disabledMcpServers"] = retained_disabled
                     changed = True
-                disabled = record.get("disabledMcpServers")
-                if isinstance(disabled, list):
-                    retained_disabled = [name for name in disabled if name not in removed]
-                    if retained_disabled != disabled:
-                        record["disabledMcpServers"] = retained_disabled
-                        changed = True
-    # Claude Code owns this file. Rewriting it when nothing was removed would
-    # reformat foreign content for no reason, so only write on a real removal —
-    # and only while the bytes this purge was derived from still hold.
     if changed:
         casfile.swap_json(path, existing, data, 0o600)
+    return changed
 
 
-def _remove_legacy_global_codex_entries() -> None:
+def _remove_legacy_global_codex_entries() -> bool:
     path = codex_global_config_path()
-    try:
-        with open(path, encoding="utf-8", newline="") as fh:
-            existing = fh.read()
-    except FileNotFoundError:
-        return
-    stripped = _strip_boxa_tables(existing)
-    if stripped != existing:
-        _swap_write(path, existing, stripped)
-
-
-def _render_target_retired() -> bool:
-    path = render_target_marker_path()
-    try:
-        with open(path, encoding="utf-8") as fh:
-            value = json.load(fh)
-    except FileNotFoundError:
+    existing = _read_text(path)
+    if existing is None:
         return False
-    except (OSError, ValueError) as exc:
-        raise MigrationError(
-            f"cannot read Claude render-target marker {path}: {exc}"
-        ) from exc
-    return isinstance(value, dict) and value.get("target") == CLAUDE_RENDER_TARGET
-
-
-def _write_render_target_marker() -> None:
-    activation._atomic_json(
-        render_target_marker_path(),
-        {"version": MIGRATION_VERSION, "target": CLAUDE_RENDER_TARGET},
-        0o600,
-    )
-
-
-def _batch_consent(
-    activations: dict[str, Any],
-    claude_projects: list[str],
-    allow_tracked_mcp_json: bool,
-) -> frozenset[str]:
-    """Durable per-Project consent plus this one batch's flag (ADR 0022)."""
-    durable_consented = {
-        consented_project
-        for consented_project, allowed
-        in activations.get("trackedMcpJson", {}).items()
-        if allowed is True
-    }
-    return frozenset(
-        durable_consented
-        | (set(claude_projects) if allow_tracked_mcp_json else set())
-    )
-
-
-def _compensate(
-    txn: casfile.Transaction, label: str, exc: BaseException
-) -> None:
-    """Take back a failed migration batch and report why it failed.
-
-    Restores only paths whose bytes are still Boxa's own, so a foreign edit
-    made after Boxa's write is reported rather than erased. Always raises.
-    """
-    errors, concurrent = txn.rollback()
-    problems = list(errors)
-    if concurrent:
-        problems.append(
-            "concurrent writes left in place for " + ", ".join(concurrent)
-        )
-    if problems:
-        raise MigrationError(
-            f"{label} failed and rollback was incomplete: "
-            + "; ".join(problems)
-        ) from exc
-    # The refusal may arrive translated into a writer's public error type, so
-    # follow the cause chain rather than matching the type directly.
-    conflict = casfile.concurrent_conflict(exc)
-    if conflict is not None:
-        raise MigrationError(
-            f"{label} refused: {conflict.path} changed on disk while Boxa was "
-            "rendering it; nothing was written — re-run the command"
-        ) from exc
-    raise exc
-
-
-def _preflight_claude_batch(
-    catalog: dict[str, Any],
-    activations: dict[str, Any],
-    state: dict[str, Any],
-    consented: frozenset[str],
-    claude_projects: list[str],
-) -> None:
-    try:
-        activation._preflight_claude_lifecycle(
-            catalog,
-            activations,
-            state,
-            consented=consented,
-            projects=claude_projects,
-        )
-    except activation.ActivationError as exc:
-        raise MigrationError(
-            f"{exc}, or re-run 'boxa mcp migrate "
-            "--allow-tracked-mcp-json' to authorize this migration batch"
-        ) from exc
-
-
-def _upgrade_claude_render_target(*, allow_tracked_mcp_json: bool = False) -> bool:
-    """Retire ~/.claude/.claude.json on an install that already migrated.
-
-    ADR 0022 arrived after the legacy migration shipped, so a manifest that is
-    already ``complete`` — or an install that never had legacy profiles — would
-    otherwise keep its entries in the retired file while convergence renders the
-    same servers into ``.mcp.json``. Idempotent: a durable marker records the
-    retirement, and the work itself is a plain re-render.
-    """
-    if _render_target_retired():
+    rendered = _strip_legacy_codex_tables(existing)
+    if rendered == existing:
         return False
-    catalog = load_catalog()
-    activations = activation.load_activations()
-    state = activation._load_render_state()
-    claude_projects = activation._claude_render_projects(activations, state)
-    if not claude_projects and not _has_legacy_claude_entries():
-        # Nothing was ever rendered anywhere; leave no marker so a later
-        # install that does render is still upgraded exactly once.
-        return False
-    consented = _batch_consent(activations, claude_projects, allow_tracked_mcp_json)
-    _preflight_claude_batch(
-        catalog, activations, state, consented, claude_projects
-    )
-    # Every write below journals into this batch, so compensation restores
-    # exactly the bytes Boxa wrote and never a foreign edit made since.
-    with casfile.transaction() as txn:
-        try:
-            _remove_legacy_claude_entries()
-            activation.render_claude_activations(
-                activations, consented=consented
-            )
-            # The render records the seeded approval set, so publish the
-            # runtime snapshot only after it: convergence must not read a
-            # snapshot that still omits a name Boxa has already seeded.
-            activation.refresh_runtime(activations)
-            _write_render_target_marker()
-        except Exception as exc:
-            _compensate(txn, "Claude render-target retirement", exc)
+    _swap_text(path, existing, rendered)
     return True
 
 
-def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
-    """Migrate once, atomically; legacy source files remain recoverable."""
+def _compensate(txn: casfile.Transaction, label: str, exc: BaseException) -> None:
+    errors, concurrent = txn.rollback()
+    problems = list(errors)
+    if concurrent:
+        problems.append("concurrent writes left in place for " + ", ".join(concurrent))
+    if problems:
+        raise MigrationError(f"{label} failed and rollback was incomplete: " + "; ".join(problems)) from exc
+    conflict = casfile.concurrent_conflict(exc)
+    if conflict is not None:
+        raise MigrationError(f"{label} refused: {conflict.path} changed on disk; nothing was written — re-run the command") from exc
+    if isinstance(exc, MigrationError):
+        raise exc
+    raise MigrationError(f"{label} failed: {exc}") from exc
+
+
+def migrate_legacy(
+    *,
+    allow_tracked_mcp_json: bool = False,
+    allow_tracked_codex_config: bool = False,
+) -> dict[str, Any]:
+    """Migrate legacy definitions, then remove every recorded shared render."""
     with mutation_lock():
         prior_manifest = _load_manifest()
+        catalog = load_catalog()
+        activations = activation.load_activations()
         if prior_manifest is not None and prior_manifest.get("status") == "complete":
-            # The legacy migration is done, but the ADR 0022 render-target
-            # retirement may still be pending on this upgraded install.
-            result = dict(prior_manifest)
-            result["changed"] = _upgrade_claude_render_target(
-                allow_tracked_mcp_json=allow_tracked_mcp_json
+            cleanup_changed = _cleanup_shared_renders(
+                activations,
+                prior_manifest,
+                allow_tracked_mcp_json=allow_tracked_mcp_json,
+                allow_tracked_codex_config=allow_tracked_codex_config,
             )
+            result = dict(prior_manifest)
+            result["changed"] = cleanup_changed
             return result
 
-        # The inventory reads the retired file to learn which legacy servers
-        # were actually rendered, so it must run before any retirement.
         legacy = _inventory()
         if not legacy and prior_manifest is None:
+            cleanup_changed = _cleanup_shared_renders(
+                activations,
+                None,
+                allow_tracked_mcp_json=allow_tracked_mcp_json,
+                allow_tracked_codex_config=allow_tracked_codex_config,
+            )
             return {
                 "version": MIGRATION_VERSION,
                 "status": "not-needed",
                 "legacyRetained": True,
                 "definitions": [],
-                "changed": _upgrade_claude_render_target(
-                    allow_tracked_mcp_json=allow_tracked_mcp_json
-                ),
+                "changed": cleanup_changed,
             }
-        catalog = load_catalog()
-        activations = activation.load_activations()
+
         used_names = {entry["name"] for entry in catalog["entries"].values()}
         by_definition = {
             _definition_key(entry["name"], entry): entry_id
             for entry_id, entry in catalog["entries"].items()
         }
+        prepared_by_source = {
+            (row.get("scope"), row.get("project", ""), row.get("legacyName"), row.get("source")): row
+            for row in (prior_manifest or {}).get("definitions", [])
+            if isinstance(row, dict)
+        }
         audit: list[dict[str, Any]] = []
-        codex_projects: set[str] = set()
-        prepared_by_source = {}
-        if prior_manifest is not None:
-            prepared_by_source = {
-                (row.get("scope"), row.get("project", ""), row.get("legacyName"), row.get("source")): row
-                for row in prior_manifest.get("definitions", [])
-                if isinstance(row, dict)
-            }
         secret_updates: dict[str, dict[str, Any]] = {}
-        for item in sorted(legacy, key=lambda d: (d.name.casefold(), d.scope, d.project, d.source_path)):
+        for item in sorted(legacy, key=lambda value: (value.name.casefold(), value.scope, value.project, value.source_path)):
             original_key = _definition_key(item.name, item.entry)
             prepared = prepared_by_source.get((item.scope, item.project, item.name, item.source_path))
             if prepared is not None:
-                item.consumers = [
-                    value for value in prepared.get("consumers", [])
-                    if value in {"claude", "codex"}
-                ]
+                item.consumers = [value for value in prepared.get("consumers", []) if value in {"claude", "codex"}]
             deterministic_id = str(uuid.uuid5(_NAMESPACE, original_key))
-            entry_id = (
-                str(prepared.get("catalogId"))
-                if prepared is not None
-                else by_definition.get(original_key)
-            )
+            entry_id = str(prepared.get("catalogId")) if prepared is not None else by_definition.get(original_key)
             if entry_id not in catalog["entries"]:
                 entry_id = by_definition.get(original_key)
             conflict = bool(prepared and prepared.get("nameConflict"))
             if entry_id is None:
                 fingerprint = hashlib.sha256(_canonical(item.entry).encode()).hexdigest()
                 prepared_name = prepared.get("catalogName") if prepared is not None else None
-                name = (
-                    str(prepared_name)
-                    if isinstance(prepared_name, str) and prepared_name
-                    else _unique_name(item.name, fingerprint, used_names)
-                )
+                name = str(prepared_name) if isinstance(prepared_name, str) and prepared_name else _unique_name(item.name, fingerprint, used_names)
                 conflict = name != item.name
                 entry = dict(item.entry)
                 entry["name"] = name
@@ -529,10 +848,6 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
                 if entry_id in catalog["entries"] and catalog["entries"][entry_id] != {"id": entry_id, **entry}:
                     raise MigrationError("deterministic migration identity collision")
                 entry["id"] = entry_id
-                # Catalog runtime credentials for migrated identities are keyed
-                # by stable ID, never the legacy display name. The old name
-                # block remains recoverable but cannot be inherited by another
-                # same-name catalog identity.
                 entry["secretStoreKey"] = entry_id
                 catalog["entries"][entry_id] = entry
                 by_definition[original_key] = entry_id
@@ -543,8 +858,6 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
                 prior = records.get(entry_id)
                 consumers = sorted(set(item.consumers) | set(prior.get("consumers", []) if isinstance(prior, dict) else []))
                 records[entry_id] = {"catalogId": entry_id, "consumers": consumers, "enabled": True}
-                if "codex" in consumers:
-                    codex_projects.add(item.project)
             if item.scope == "project" and entry.get("secretEnvKeys"):
                 secret_path = project_secrets_path(item.project)
                 if secret_path not in secret_updates:
@@ -558,10 +871,7 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
                 target_block = store["servers"].get(target_key)
                 if source_block is not None:
                     if target_block is not None and target_block != source_block:
-                        raise MigrationError(
-                            f"cannot safely map legacy credentials for {item.name!r} "
-                            f"to stable identity {entry_id!r} in {secret_path}"
-                        )
+                        raise MigrationError(f"cannot safely map legacy credentials for {item.name!r} to stable identity {entry_id!r} in {secret_path}")
                     store["servers"][target_key] = dict(source_block)
             audit.append({
                 "scope": item.scope,
@@ -580,26 +890,8 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
             "legacyRetained": True,
             "definitions": audit,
         }
-        state = activation._load_render_state()
-        claude_projects = activation._claude_render_projects(activations, state)
-        # Migration is a lifecycle write like any other: it may not touch a
-        # tracked .mcp.json or .claude/settings.local.json without consent.
-        # It has no single explicitly mutated Project, so — as for a
-        # catalog-wide mutation (ADR 0022) — its flag authorizes this batch
-        # only and records no new durable Project consent.
-        consented = _batch_consent(
-            activations, claude_projects, allow_tracked_mcp_json
-        )
-        _preflight_claude_batch(
-            catalog, activations, state, consented, claude_projects
-        )
-        # Every store, render and marker write below journals into this
-        # batch, so compensation is derived from what Boxa actually wrote.
         with casfile.transaction() as txn:
             try:
-                # A crash can bypass compensating rollback. Publish the secret-free
-                # plan first so retry retains the original rendered-consumer facts
-                # and chosen conflict identities even after partial config writes.
                 activation._atomic_json(migration_path(), manifest, 0o600)
                 save_catalog(catalog)
                 for path, store in secret_updates.items():
@@ -607,22 +899,17 @@ def migrate_legacy(*, allow_tracked_mcp_json: bool = False) -> dict[str, Any]:
                 activation.save_activation_store(activations)
                 _remove_legacy_claude_entries()
                 _remove_legacy_global_codex_entries()
-                activation.render_claude_activations(
-                    activations, consented=consented
-                )
-                for project in sorted(codex_projects):
-                    activation._render_codex_activation(activations, project, allow_tracked=True)
-                # The Claude render is what records the seeded approval set, so the
-                # runtime snapshot is published only after it. Publishing earlier
-                # would ship a snapshot without `seededApprovals`, and convergence
-                # would then treat an already-seeded name as new and re-enable a
-                # server the user had removed from the Project approval settings.
                 activation.refresh_runtime(activations)
-                _write_render_target_marker()
                 manifest["status"] = "complete"
                 activation._atomic_json(migration_path(), manifest, 0o600)
             except Exception as exc:
                 _compensate(txn, "migration", exc)
+        _cleanup_shared_renders(
+            activations,
+            manifest,
+            allow_tracked_mcp_json=allow_tracked_mcp_json,
+            allow_tracked_codex_config=allow_tracked_codex_config,
+        )
         result = dict(manifest)
         result["changed"] = True
         return result

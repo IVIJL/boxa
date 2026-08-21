@@ -1,6 +1,6 @@
 # ADR 0022 — Durable Claude MCP render and approval
 
-- **Status:** accepted
+- **Status:** superseded by ADR 0028
 - **Date:** 2026-07-28
 - **Revises:** ADR 0021's Claude half of "Consumer rendering"; ADR 0013's
   render-into-agent-config semantics for Claude Code

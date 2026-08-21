@@ -135,11 +135,12 @@ class Candidate:
     name: str
     source_project: Optional[str] = None
     type: Optional[str] = None
+    url: Optional[str] = None
     command: Command = field(default_factory=Command)
     classification: Classification = field(default_factory=Classification)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "provider": self.provider,
             "sourcePath": self.source_path,
             "sourceScope": self.source_scope,
@@ -149,6 +150,9 @@ class Candidate:
             "command": self.command.to_dict(),
             "classification": self.classification.to_dict(),
         }
+        if self.url is not None:
+            result["url"] = self.url
+        return result
 
 
 def _merged_dicts(candidates: Optional[list[Any]]) -> list[dict[str, Any]]:

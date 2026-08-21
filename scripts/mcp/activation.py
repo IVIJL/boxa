@@ -4,18 +4,14 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import stat
 import subprocess
-import tomllib
-from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from . import casfile
 from .catalog import (
     CatalogError,
-    catalog_path,
     degradation_status,
     load_catalog,
     mutation_lock,
@@ -23,31 +19,22 @@ from .catalog import (
     save_catalog,
     updated_catalog_entry,
 )
-from .providers.claude import render_target_path
 from .profile import config_root
-from .render import (
-    LEGACY_MANAGED_PREFIX,
-    WRAPPER_COMMAND,
-    is_managed_or_legacy,
-    rendered_name,
-)
+from .projects import VolumeProbe, enumerate_project_targets
 from .readiness import (
     ProjectProbe,
     ReadinessError,
+    ReadinessReport,
     readiness,
     readiness_for_entry,
 )
 from .secrets import global_secrets_path, load_secrets, save_secrets
-
 
 ACTIVATION_VERSION = 1
 RUNTIME_VERSION = 1
 CONSUMERS = {"claude", "codex"}
 _FILE_MODE = 0o600
 _RUNTIME_MODE = 0o644
-_CODEX_BEGIN = "# >>> boxa managed MCP servers >>>"
-_CODEX_END = "# <<< boxa managed MCP servers <<<"
-_LEGACY_WRAPPER_COMMAND = "devbox-mcp-run"
 
 
 class ActivationError(RuntimeError):
@@ -104,10 +91,6 @@ def runtime_path() -> str:
     return os.path.join(_root(), "runtime", "catalog-runtime.json")
 
 
-def render_state_path() -> str:
-    return os.path.join(_root(), "claude-activation-render-state.json")
-
-
 def canonical_project(path: str) -> str:
     if not path:
         raise ActivationError("Project path must be non-empty")
@@ -118,8 +101,8 @@ def empty_activations() -> dict[str, Any]:
     return {
         "version": ACTIVATION_VERSION,
         "projects": {},
+        "everywhere": {},
         "acknowledgements": {},
-        "trackedMcpJson": {},
     }
 
 
@@ -145,11 +128,32 @@ def load_activations(path: Optional[str] = None) -> dict[str, Any]:
         for entry_id, record in records.items():
             if not isinstance(record, dict) or record.get("catalogId") != entry_id:
                 raise ActivationError("malformed MCP activation record")
+            if record.get("optedOut") is True:
+                if set(record) != {"catalogId", "optedOut"}:
+                    raise ActivationError("malformed MCP activation opt-out")
+                continue
             consumers = record.get("consumers")
             if not isinstance(consumers, list) or not consumers or any(c not in CONSUMERS for c in consumers):
                 raise ActivationError("malformed MCP activation consumers")
             if "enabled" in record and not isinstance(record["enabled"], bool):
                 raise ActivationError("malformed MCP activation enabled flag")
+            if "pendingReason" in record and not isinstance(record["pendingReason"], str):
+                raise ActivationError("malformed MCP activation pending reason")
+            if "pendingReason" in record and record.get("enabled", True) is not False:
+                raise ActivationError("malformed effective MCP activation pending reason")
+    everywhere = data.get("everywhere", {})
+    if not isinstance(everywhere, dict):
+        raise ActivationError("malformed MCP everywhere activation store")
+    for entry_id, record in everywhere.items():
+        if not isinstance(record, dict) or record.get("catalogId") != entry_id:
+            raise ActivationError("malformed MCP everywhere activation record")
+        consumers = record.get("consumers")
+        if not isinstance(consumers, list) or not consumers or any(c not in CONSUMERS for c in consumers):
+            raise ActivationError("malformed MCP everywhere activation consumers")
+        if "degradedSecretIsolationAcknowledged" in record and record[
+            "degradedSecretIsolationAcknowledged"
+        ] is not True:
+            raise ActivationError("malformed MCP everywhere activation acknowledgement")
     acknowledgements = data.get("acknowledgements", {})
     if not isinstance(acknowledgements, dict):
         raise ActivationError("malformed MCP activation acknowledgements")
@@ -159,17 +163,10 @@ def load_activations(path: Optional[str] = None) -> dict[str, Any]:
         if any(not isinstance(entry_id, str) or value is not True for entry_id, value in records.items()):
             raise ActivationError("malformed MCP activation acknowledgement")
     data.setdefault("acknowledgements", acknowledgements)
-    tracked_mcp_json = data.get("trackedMcpJson", {})
-    if not isinstance(tracked_mcp_json, dict):
-        raise ActivationError("malformed MCP tracked .mcp.json consent")
-    if any(
-        not isinstance(project, str)
-        or canonical_project(project) != project
-        or value is not True
-        for project, value in tracked_mcp_json.items()
-    ):
-        raise ActivationError("malformed MCP tracked .mcp.json consent")
-    data.setdefault("trackedMcpJson", tracked_mcp_json)
+    data.setdefault("everywhere", everywhere)
+    # ADR 0028 retired durable consent for shared render writes. Tolerate the
+    # old field while upgrading, but never publish or persist it again.
+    data.pop("trackedMcpJson", None)
     return data
 
 
@@ -177,34 +174,6 @@ def _atomic_json(path: str, data: dict[str, Any], mode: int) -> None:
     """Write a Boxa-private JSON store, journalled for exact compensation."""
     with casfile.record(path):
         casfile.atomic_json(path, data, mode)
-
-
-_FileSnapshot = casfile.FileSnapshot
-
-
-@dataclass(frozen=True)
-class ClaudeRenderStatus:
-    names: tuple[str, ...]
-    mcp_json_path: str
-    mcp_json_changes: bool
-    mcp_json_tracked: bool
-    settings_path: str
-    settings_changes: bool
-    settings_tracked: bool
-    settings_changed_names: frozenset[str]
-    requires_consent: bool
-
-
-def _snapshot_file(path: str) -> _FileSnapshot:
-    try:
-        return casfile.snapshot(path)
-    except casfile.WriteError as exc:
-        raise ActivationError(str(exc)) from exc
-
-
-def _restore_file(snapshot: _FileSnapshot) -> None:
-    """Restore exact pre-mutation bytes/existence without using render writes."""
-    casfile.restore(snapshot)
 
 
 def _compensate(
@@ -231,24 +200,10 @@ def _compensate(
     conflict = casfile.concurrent_conflict(exc)
     if conflict is not None:
         raise ActivationError(
-            f"{label} refused: {conflict.path} changed on disk while Boxa was "
-            "rendering it; nothing was written — re-run the command"
+            f"{label} refused: {conflict.path} changed on disk; "
+            "nothing was written — re-run the command"
         ) from exc
     raise exc
-
-
-def _git_output(project: str, *args: str) -> str:
-    proc = subprocess.run(
-        ["git", "-C", project, *args], stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, check=False, env=_git_env(),
-    )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip()
-        raise ActivationError(
-            f"Codex activation requires a Git repository for Project {project}"
-            + (f": {detail}" if detail else "")
-        )
-    return proc.stdout.strip()
 
 
 def codex_config_path(project: str) -> str:
@@ -261,25 +216,6 @@ def claude_config_path(project: str) -> str:
 
 def claude_settings_path(project: str) -> str:
     return os.path.join(project, ".claude", "settings.local.json")
-
-
-def _project_directory_exists(project: str) -> bool:
-    return os.path.isdir(project)
-
-
-def _codex_git_paths(project: str) -> tuple[str, str, str]:
-    top = os.path.realpath(_git_output(project, "rev-parse", "--show-toplevel"))
-    config = codex_config_path(project)
-    try:
-        relative = os.path.relpath(config, top)
-    except ValueError as exc:
-        raise ActivationError(f"Codex config is outside the Project Git repository: {config}") from exc
-    if relative == ".." or relative.startswith(".." + os.sep):
-        raise ActivationError(f"Codex config is outside the Project Git repository: {config}")
-    exclude = _git_output(
-        project, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"
-    )
-    return relative.replace(os.sep, "/"), os.path.realpath(exclude), config
 
 
 def _codex_is_tracked(project: str, relative: str) -> bool:
@@ -397,242 +333,11 @@ def _claude_git_paths(
     )
 
 
-def claude_tracked_state(project: str) -> bool:
-    """Return whether either derived Claude Project file is tracked."""
-    for path in (
-        claude_config_path(project),
-        claude_settings_path(project),
-    ):
-        git_paths = _claude_git_paths(project, path=path)
-        if (
-            git_paths is not None
-            and _codex_is_tracked(project, git_paths[0])
-        ):
-            return True
-    return False
-
-
-def _toml_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t")
-
-
-def _codex_header(name: str) -> str:
-    if re.fullmatch(r"[A-Za-z0-9_-]+", name):
-        return f"[mcp_servers.{name}]"
-    return f'[mcp_servers."{_toml_escape(name)}"]'
-
-
-def _split_codex_region(text: str, path: str) -> tuple[str, str]:
-    begins = [m.start() for m in re.finditer(re.escape(_CODEX_BEGIN), text)]
-    ends = [m.start() for m in re.finditer(re.escape(_CODEX_END), text)]
-    if not begins and not ends:
-        return text, ""
-    if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
-        raise ActivationError(f"malformed Boxa managed region in Codex config: {path}")
-    begin = begins[0]
-    if begin and text[begin - 1] == "\n":
-        begin -= 1
-    end = ends[0] + len(_CODEX_END)
-    if end < len(text) and text[end] == "\n":
-        end += 1
-    return text[:begin], text[end:]
-
-
-def _codex_region(project: str, records: dict[str, Any], catalog: dict[str, Any]) -> str:
-    tables: list[str] = []
-    for entry_id, record in sorted(records.items()):
-        if record.get("enabled", True) is False or "codex" not in record["consumers"]:
-            continue
-        entry = catalog["entries"].get(entry_id)
-        if not isinstance(entry, dict):
-            continue
-        args = [
-            "--catalog-id", entry_id, "--consumer", "codex",
-            "--project", project, entry["name"],
-        ]
-        rendered_args = ", ".join(f'"{_toml_escape(value)}"' for value in args)
-        tables.append(
-            f"{_codex_header(rendered_name(entry['name']))}\n"
-            'command = "boxa-mcp-run"\n'
-            f"args = [{rendered_args}]\n"
-        )
-    if not tables:
-        return ""
-    return f"{_CODEX_BEGIN}\n" + "\n".join(tables) + f"{_CODEX_END}\n"
-
-
-def _codex_render_plan(
-    activations: dict[str, Any],
-    project: str,
-    catalog: dict[str, Any],
-) -> tuple[str, str, str, bool, Optional[str], str, str]:
-    relative, exclude_path, path = _codex_git_paths(project)
-    tracked = _codex_is_tracked(project, relative)
-    records = activations["projects"].get(project, {})
-    existing: Optional[str]
-    try:
-        with open(path, encoding="utf-8", newline="") as fh:
-            existing = fh.read()
-    except FileNotFoundError:
-        existing = None
-    except (OSError, UnicodeError) as exc:
-        raise ActivationError(f"cannot read Codex config {path}: {exc}") from exc
-    prefix, suffix = _split_codex_region(_plan_text(existing), path)
-    region = _codex_region(project, records, catalog)
-    if region:
-        rendered = prefix + ("\n" if prefix else "") + region + suffix
-    else:
-        rendered = prefix + suffix
-    if rendered:
-        try:
-            tomllib.loads(rendered)
-        except (tomllib.TOMLDecodeError, ValueError) as exc:
-            raise ActivationError(f"cannot render invalid Codex TOML {path}: {exc}") from exc
-    return relative, exclude_path, path, tracked, existing, rendered, region
-
-
-def _render_codex_activation(
-    activations: dict[str, Any], project: str, *, allow_tracked: bool,
-    catalog: Optional[dict[str, Any]] = None,
-) -> None:
-    (
-        relative, exclude_path, path, tracked, existing, rendered, region,
-    ) = _codex_render_plan(activations, project, catalog or load_catalog())
-    if tracked and rendered != _plan_text(existing) and not allow_tracked:
-        raise ActivationError(
-            f"tracked Codex config {path} requires --allow-tracked-codex-config"
-        )
-    if rendered != _plan_text(existing):
-        if not rendered and not os.path.exists(path):
-            return
-        _swap_text(path, existing, rendered)
-    if not tracked and region:
-        _ensure_local_exclude(exclude_path, relative)
-
-
-def _atomic_text(path: str, text: str) -> None:
-    """Low-level atomic replace; render writes must use :func:`_swap_text`."""
-    casfile.atomic_text(path, text)
-
-
-def _plan_text(preimage: Optional[str]) -> str:
-    """Render-plan view of a possibly absent file: absence reads as empty text.
-
-    Planning and change detection treat "no file" and "empty file" alike (both
-    render the same content). The compare-and-swap must NOT: it keeps the
-    ``None`` pre-image, so a concurrent create/delete is caught.
-    """
-    return "" if preimage is None else preimage
-
-
-def _swap_text(path: str, expected: Optional[str], text: str) -> None:
-    """Replace a rendered file only while it still holds its planned pre-image.
-
-    ``expected`` is the text the render plan was derived from, or ``None`` when
-    the plan was derived from a MISSING file (distinct from an empty one). A
-    foreign edit (Claude Code, the user) that landed since raises
-    ``casfile.ConcurrentModification`` instead of being clobbered.
-    """
-    casfile.swap(
-        path,
-        casfile.preimage(expected),
-        text,
-        writer=lambda target, payload: _atomic_text(target, payload),
-    )
-
-
-def _ensure_local_exclude(path: str, relative: str) -> None:
-    """Append Boxa's ignore rule once; never rewrite Git's shared file."""
-    casfile.append_rule(path, "/" + relative)
-
-
-def _commit_activation_render(
-    data: dict[str, Any], project: str, *, allow_tracked_codex_config: bool = False,
-    allow_tracked_mcp_json: bool = False,
-    render_codex: bool = False,
-) -> None:
-    """Atomically expose activation + runtime + Claude-derived state as a set.
-
-    The files cannot share a filesystem-level rename transaction, so take
-    exact pre-images and compensate on any failed write/read in the sequence.
-    Rollback deliberately bypasses ``_atomic_json``: tests and real failures may
-    make that render writer itself the failing component.
-    """
-    catalog = load_catalog()
-    state = _load_render_state()
-    durable_consented = {
-        consented_project
-        for consented_project, allowed
-        in data.get("trackedMcpJson", {}).items()
-        if allowed is True
-    }
-    consented = frozenset(
-        durable_consented
-        | ({project} if allow_tracked_mcp_json else set())
-    )
-    _preflight_claude_lifecycle(
-        catalog,
-        data,
-        state,
-        consented=consented,
-    )
-    tracked_mcp_json = data.setdefault("trackedMcpJson", {})
-    for claude_project in _claude_render_projects(data, state):
-        if not _project_directory_exists(claude_project):
-            if not data["projects"].get(claude_project):
-                tracked_mcp_json.pop(claude_project, None)
-            continue
-        (
-            _path,
-            _exclude,
-            _relative,
-            tracked,
-            _existing,
-            _rendered,
-            names,
-        ) = _claude_render_plan(data, claude_project, catalog, state)
-        retire = _claude_seeded_names(state, claude_project) - set(names)
-        settings_plan = _claude_settings_plan(
-            claude_project, names, state, retire=retire
-        )
-        settings_tracked = False
-        settings_path = claude_settings_path(claude_project)
-        if settings_plan is not None or (
-            names and os.path.exists(settings_path)
-        ):
-            settings_git_paths = _claude_git_paths(
-                claude_project, path=settings_path
-            )
-            settings_tracked = (
-                settings_git_paths is not None
-                and _codex_is_tracked(
-                    claude_project, settings_git_paths[0]
-                )
-            )
-        if not names or not (tracked or settings_tracked):
-            tracked_mcp_json.pop(claude_project, None)
-        elif allow_tracked_mcp_json and claude_project == project:
-            tracked_mcp_json[claude_project] = True
-    if render_codex:
-        _preflight_codex_lifecycle(
-            catalog,
-            data,
-            [project],
-            allow_tracked=allow_tracked_codex_config,
-        )
-    # Every store and render below writes through the journal, so the batch is
-    # compensated from what Boxa actually wrote — no path list to keep in sync.
+def _commit_activation_state(data: dict[str, Any]) -> None:
+    """Atomically publish host-owned activation state and runtime snapshot."""
     with casfile.transaction() as txn:
         try:
             save_activation_store(data)
-            render_claude_activations(data, consented=consented)
-            if render_codex:
-                _render_codex_activation(
-                    data,
-                    project,
-                    allow_tracked=allow_tracked_codex_config,
-                    catalog=catalog,
-                )
             refresh_runtime(data)
         except Exception as exc:
             _compensate(txn, "MCP activation mutation", exc)
@@ -654,29 +359,19 @@ def runtime_payload(
 ) -> dict[str, Any]:
     """Build the normalized secret-free runtime snapshot payload."""
     catalog = catalog if catalog is not None else load_catalog()
-    state = _load_render_state()
-    seeded = state.get("seeded", {})
-    seeded_approvals = {}
-    if isinstance(seeded, dict):
-        for project, names in seeded.items():
-            if (
-                not isinstance(project, str)
-                or not project
-                or not isinstance(names, list)
-            ):
-                continue
-            normalized = sorted({
-                name for name in names if isinstance(name, str)
-            })
-            if normalized:
-                seeded_approvals[project] = normalized
+    projects = {
+        project: {
+            entry_id: record
+            for entry_id, record in records.items()
+            if record.get("optedOut") is not True
+        }
+        for project, records in activations["projects"].items()
+    }
     return {
         "version": RUNTIME_VERSION,
         "catalogVersion": catalog["version"],
         "entries": catalog["entries"],
-        "projects": activations["projects"],
-        "trackedMcpJson": activations.get("trackedMcpJson", {}),
-        "seededApprovals": seeded_approvals,
+        "projects": {project: records for project, records in projects.items() if records},
     }
 
 
@@ -729,9 +424,78 @@ class ActivationResult:
     project_key: str
     consumers: list[str]
     changed: bool
+    pending: bool = False
+    pending_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"entry": self.entry, "projectKey": self.project_key, "consumers": self.consumers, "changed": self.changed}
+        return {
+            "entry": self.entry,
+            "projectKey": self.project_key,
+            "consumers": self.consumers,
+            "changed": self.changed,
+            "pending": self.pending,
+            "pendingReason": self.pending_reason,
+        }
+
+
+@dataclass
+class PendingActivationAttempt:
+    entry: dict[str, Any]
+    ready: bool
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entry": self.entry,
+            "ready": self.ready,
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class PendingReevaluationResult:
+    project_key: str
+    attempts: list[PendingActivationAttempt]
+    changed: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "projectKey": self.project_key,
+            "attempts": [attempt.to_dict() for attempt in self.attempts],
+            "changed": self.changed,
+        }
+
+
+@dataclass
+class EverywhereProjectOutcome:
+    project_key: str
+    outcome: str
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "projectKey": self.project_key,
+            "outcome": self.outcome,
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class EverywhereActivationResult:
+    entry: dict[str, Any]
+    consumers: list[str]
+    marked: bool
+    changed: bool
+    projects: list[EverywhereProjectOutcome]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entry": self.entry,
+            "consumers": self.consumers,
+            "everywhere": self.marked,
+            "changed": self.changed,
+            "projects": [project.to_dict() for project in self.projects],
+        }
 
 
 @dataclass
@@ -757,957 +521,12 @@ class CatalogRemovalResult:
         return {"removed": self.entry, "affected": self.affected}
 
 
-def _load_render_state() -> dict[str, Any]:
-    try:
-        with open(render_state_path(), encoding="utf-8") as fh:
-            value = json.load(fh)
-        return value if isinstance(value, dict) else {"projects": {}}
-    except (OSError, ValueError):
-        return {"projects": {}}
-
-
-def _claude_render_projects(
-    activations: dict[str, Any], state: dict[str, Any]
-) -> list[str]:
-    old = state.get("projects") if isinstance(state.get("projects"), dict) else {}
-    seeded = state.get("seeded") if isinstance(state.get("seeded"), dict) else {}
-    return sorted(set(activations["projects"]) | set(old) | set(seeded))
-
-
-def _json_document(data: dict[str, Any]) -> str:
-    return json.dumps(data, indent=2) + "\n"
-
-
-@dataclass(frozen=True)
-class _JsonMember:
-    key: str
-    leading_start: int
-    key_start: int
-    key_end: int
-    value_start: int
-    value_end: int
-    comma_after: Optional[int]
-
-
-@dataclass(frozen=True)
-class _JsonObject:
-    start: int
-    close: int
-    members: tuple[_JsonMember, ...]
-
-
-_JSON_DECODER = json.JSONDecoder()
-_JSON_WHITESPACE = " \t\r\n"
-
-
-def _skip_json_whitespace(text: str, position: int) -> int:
-    while position < len(text) and text[position] in _JSON_WHITESPACE:
-        position += 1
-    return position
-
-
-def _scan_json_object(text: str, start: int) -> _JsonObject:
-    """Locate object members without changing their original representation."""
-    if start >= len(text) or text[start] != "{":
-        raise ValueError("JSON value is not an object")
-    members: list[_JsonMember] = []
-    position = start + 1
-    while True:
-        leading_start = position
-        position = _skip_json_whitespace(text, position)
-        if position >= len(text):
-            raise ValueError("unterminated JSON object")
-        if text[position] == "}":
-            return _JsonObject(start, position, tuple(members))
-
-        key_start = position
-        key, key_end = _JSON_DECODER.raw_decode(text, position)
-        if not isinstance(key, str):
-            raise ValueError("JSON object member name is not a string")
-        position = _skip_json_whitespace(text, key_end)
-        if position >= len(text) or text[position] != ":":
-            raise ValueError("JSON object member has no colon")
-        value_start = _skip_json_whitespace(text, position + 1)
-        _value, value_end = _JSON_DECODER.raw_decode(text, value_start)
-        position = _skip_json_whitespace(text, value_end)
-        comma_after: Optional[int] = None
-        if position < len(text) and text[position] == ",":
-            comma_after = position
-            position += 1
-        elif position >= len(text) or text[position] != "}":
-            raise ValueError("JSON object member has no separator")
-        members.append(
-            _JsonMember(
-                key,
-                leading_start,
-                key_start,
-                key_end,
-                value_start,
-                value_end,
-                comma_after,
-            )
-        )
-
-
-def _line_indent(text: str, position: int) -> str:
-    line_start = max(
-        text.rfind("\n", 0, position),
-        text.rfind("\r", 0, position),
-    ) + 1
-    line = text[line_start:position]
-    length = 0
-    while length < len(line) and line[length] in " \t":
-        length += 1
-    return line[:length]
-
-
-def _member_indent(text: str, member: _JsonMember) -> str:
-    return _line_indent(text, member.key_start)
-
-
-def _object_member_style(
-    text: str,
-    scanned: _JsonObject,
-) -> tuple[str, str, str, _JsonMember]:
-    """Return separator, colon spacing, member indent, and a value exemplar."""
-    exemplar = scanned.members[-1]
-    if len(scanned.members) > 1:
-        previous = scanned.members[-2]
-        separator = text[previous.value_end:exemplar.key_start]
-    else:
-        separator = "," + text[scanned.start + 1:exemplar.key_start]
-    colon = text[exemplar.key_end:exemplar.value_start]
-    return separator, colon, _member_indent(text, exemplar), exemplar
-
-
-def _indent_unit(text: str, scanned: _JsonObject, member_indent: str) -> str:
-    parent_indent = _line_indent(text, scanned.start)
-    if (
-        member_indent.startswith(parent_indent)
-        and len(member_indent) > len(parent_indent)
-    ):
-        return member_indent[len(parent_indent):]
-    return "  "
-
-
-def _render_json_value(
-    value: Any,
-    text: str,
-    scanned: _JsonObject,
-    exemplar: _JsonMember,
-    member_indent: str,
-) -> str:
-    original_value = text[exemplar.value_start:exemplar.value_end]
-    if "\n" not in original_value and "\r" not in original_value:
-        return json.dumps(value, separators=(",", ":"))
-    unit = _indent_unit(text, scanned, member_indent)
-    rendered = json.dumps(value, indent=unit)
-    return rendered.replace("\n", "\n" + member_indent)
-
-
-def _delete_json_member(text: str, object_start: int, index: int) -> str:
-    scanned = _scan_json_object(text, object_start)
-    member = scanned.members[index]
-    if len(scanned.members) == 1:
-        return text[:scanned.start + 1] + text[scanned.close:]
-    if index == 0:
-        if member.comma_after is None:
-            raise ValueError("first JSON member has no following comma")
-        return text[:member.leading_start] + text[member.comma_after + 1:]
-    previous = scanned.members[index - 1]
-    return text[:previous.value_end] + text[member.value_end:]
-
-
-def _append_json_member(
-    text: str,
-    object_start: int,
-    key: str,
-    value: Any,
-) -> str:
-    scanned = _scan_json_object(text, object_start)
-    if scanned.members:
-        separator, colon, member_indent, exemplar = _object_member_style(
-            text, scanned
-        )
-        rendered = _render_json_value(
-            value, text, scanned, exemplar, member_indent
-        )
-        addition = separator + json.dumps(key) + colon + rendered
-        insertion = scanned.members[-1].value_end
-        return text[:insertion] + addition + text[insertion:]
-
-    # Empty objects have no neighbour to copy. Preserve existing inner
-    # whitespace when it already establishes a multiline style; otherwise use
-    # the documented two-space fallback.
-    inner = text[scanned.start + 1:scanned.close]
-    parent_indent = _line_indent(text, scanned.start)
-    if "\n" in inner or "\r" in inner:
-        leading = inner + "  "
-        member_indent = parent_indent + "  "
-        newline = (
-            "\r\n" if "\r\n" in inner
-            else "\r" if "\r" in inner
-            else "\n"
-        )
-        closing = newline + parent_indent
-    else:
-        leading = "\n" + parent_indent + "  "
-        member_indent = parent_indent + "  "
-        closing = "\n" + parent_indent
-    rendered = json.dumps(value, indent=2).replace("\n", "\n" + member_indent)
-    addition = leading + json.dumps(key) + ": " + rendered + closing
-    return text[:scanned.start + 1] + addition + text[scanned.close:]
-
-
-def _fallback_mcp_document(
-    original: str,
-    upserts: dict[str, dict[str, Any]],
-    deletes: set[str],
-) -> str:
-    data = json.loads(original) if original else {}
-    block = data.get("mcpServers")
-    if not isinstance(block, dict):
-        block = {}
-    for name in deletes:
-        block.pop(name, None)
-    block.update(upserts)
-    if block:
-        data["mcpServers"] = block
-    else:
-        data.pop("mcpServers", None)
-    return _json_document(data) if data else ""
-
-
-def _render_mcp_json(
-    original: str,
-    upserts: dict[str, dict[str, Any]],
-    deletes: set[str],
-) -> str:
-    """Patch only Boxa-owned ``mcpServers`` members in an existing document."""
-    if not original:
-        return _fallback_mcp_document(original, upserts, deletes)
-
-    parsed = json.loads(original)
-    block = parsed.get("mcpServers")
-    current = block if isinstance(block, dict) else {}
-    effective_deletes = {name for name in deletes if name in current}
-    changed_upserts = {
-        name: value
-        for name, value in upserts.items()
-        if current.get(name) != value
-    }
-    if not effective_deletes and not changed_upserts:
-        return original
-
-    intended = json.loads(json.dumps(parsed))
-    intended_block = intended.get("mcpServers")
-    if not isinstance(intended_block, dict):
-        intended_block = {}
-    for name in effective_deletes:
-        intended_block.pop(name, None)
-    intended_block.update(upserts)
-    if intended_block:
-        intended["mcpServers"] = intended_block
-    else:
-        intended.pop("mcpServers", None)
-
-    try:
-        text = original
-        root = _scan_json_object(text, _skip_json_whitespace(text, 0))
-        top_members = [
-            member for member in root.members if member.key == "mcpServers"
-        ]
-        if len(top_members) > 1:
-            raise ValueError("duplicate top-level mcpServers members")
-        if not top_members:
-            text = _append_json_member(
-                text, root.start, "mcpServers", intended_block
-            )
-        elif not intended_block:
-            index = root.members.index(top_members[0])
-            text = _delete_json_member(text, root.start, index)
-            if not intended:
-                return ""
-        else:
-            top = top_members[0]
-            nested = _scan_json_object(text, top.value_start)
-            keys = [member.key for member in nested.members]
-            if len(keys) != len(set(keys)):
-                raise ValueError("duplicate mcpServers members")
-            for name in effective_deletes:
-                nested = _scan_json_object(text, top.value_start)
-                index = next(
-                    index for index, member in enumerate(nested.members)
-                    if member.key == name
-                )
-                text = _delete_json_member(text, top.value_start, index)
-            for name, value in upserts.items():
-                root = _scan_json_object(text, _skip_json_whitespace(text, 0))
-                top = next(
-                    member for member in root.members
-                    if member.key == "mcpServers"
-                )
-                nested = _scan_json_object(text, top.value_start)
-                member = next(
-                    (item for item in nested.members if item.key == name),
-                    None,
-                )
-                if member is None:
-                    text = _append_json_member(
-                        text, nested.start, name, value
-                    )
-                elif json.loads(text[member.value_start:member.value_end]) != value:
-                    indent = _member_indent(text, member)
-                    rendered = _render_json_value(
-                        value, text, nested, member, indent
-                    )
-                    text = (
-                        text[:member.value_start]
-                        + rendered
-                        + text[member.value_end:]
-                    )
-        if json.loads(text) != intended:
-            raise ValueError("positional MCP render produced wrong JSON")
-        return text
-    except (StopIteration, TypeError, ValueError):
-        return _fallback_mcp_document(original, upserts, deletes)
-
-
-def claude_server_definition(
-    entry_id: str,
-    project: str,
-    entry: dict[str, Any],
-) -> dict[str, Any]:
-    """Build the single Claude render shape shared by host and Container."""
-    return {
-        "type": "stdio",
-        "command": "boxa-mcp-run",
-        "args": [
-            "--catalog-id", entry_id, "--consumer", "claude",
-            "--project", project, entry["name"],
-        ],
-    }
-
-
-def _claude_seeded_names(state: dict[str, Any], project: str) -> set[str]:
-    seeded = state.get("seeded") if isinstance(state.get("seeded"), dict) else {}
-    names = seeded.get(project, [])
-    if not isinstance(names, list):
-        return set()
-    return {name for name in names if isinstance(name, str)}
-
-
-def _observed_claude_decisions(project: str) -> tuple[set[str], set[str]]:
-    """Read Claude Code's Project decision without making its config authoritative."""
-    try:
-        with open(render_target_path(), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, UnicodeError, ValueError):
-        return set(), set()
-    if not isinstance(data, dict):
-        return set(), set()
-    projects = data.get("projects")
-    if not isinstance(projects, dict):
-        return set(), set()
-
-    canonical = canonical_project(project)
-    missing = object()
-    record = projects.get(project, missing)
-    if record is missing:
-        record = projects.get(canonical, missing)
-    if record is missing:
-        for key, candidate in projects.items():
-            if os.path.realpath(key) == canonical:
-                record = candidate
-                break
-    if record is missing:
-        return set(), set()
-    if not isinstance(record, dict):
-        return set(), set()
-
-    enabled = record.get("enabledMcpjsonServers", [])
-    disabled = record.get("disabledMcpjsonServers", [])
-    if not isinstance(enabled, list) or not isinstance(disabled, list):
-        return set(), set()
-    approved = {name for name in enabled if isinstance(name, str)}
-    rejected = {name for name in disabled if isinstance(name, str)}
-    return approved - rejected, rejected
-
-
-def _claude_settings_plan(
-    project: str,
-    rendered_names: list[str],
-    state: dict[str, Any],
-    *,
-    retire: Optional[set[str]] = None,
-    existing_document: Optional[tuple[bool, str]] = None,
-) -> Optional[tuple[str, Optional[str], str]]:
-    approved, rejected = _observed_claude_decisions(project)
-
-    path = claude_settings_path(project)
-    # ``existing`` is the CAS pre-image: ``None`` means the file was absent,
-    # which must not collapse into the empty document.
-    existing: Optional[str]
-    if existing_document is not None and not existing_document[0]:
-        exists = False
-        existing = None
-        data = {}
-    else:
-        try:
-            if existing_document is None:
-                with open(path, encoding="utf-8") as fh:
-                    existing = fh.read()
-            else:
-                existing = existing_document[1]
-            exists = True
-            data = json.loads(existing)
-        except FileNotFoundError:
-            exists = False
-            existing = None
-            data = {}
-        except (OSError, ValueError) as exc:
-            raise ActivationError(
-                f"cannot read Claude Project settings {path}: {exc}"
-            ) from exc
-    if not isinstance(data, dict):
-        raise ActivationError(f"Claude Project settings is not an object: {path}")
-
-    to_seed = (
-        set(rendered_names)
-        if not exists
-        else set(rendered_names) - _claude_seeded_names(state, project)
-    )
-    enabled = data.get("enabledMcpjsonServers", [])
-    if not (
-        isinstance(enabled, list)
-        and all(isinstance(name, str) for name in enabled)
-    ):
-        raise ActivationError(
-            f"Claude Project settings enabledMcpjsonServers is not a list of strings: {path}"
-        )
-    disabled = data.get("disabledMcpjsonServers", [])
-    if not (
-        isinstance(disabled, list)
-        and all(isinstance(name, str) for name in disabled)
-    ):
-        raise ActivationError(
-            f"Claude Project settings disabledMcpjsonServers is not a list of strings: {path}"
-        )
-
-    new_enabled = [
-        name for name in enabled
-        if name not in (retire or set())
-    ]
-    new_disabled = list(disabled)
-    for name in sorted(to_seed):
-        if name not in new_enabled:
-            new_enabled.append(name)
-    new_disabled = [name for name in new_disabled if name not in to_seed]
-
-    for name in sorted(approved):
-        if name not in new_enabled:
-            new_enabled.append(name)
-    new_disabled = [name for name in new_disabled if name not in approved]
-
-    new_enabled = [name for name in new_enabled if name not in rejected]
-    for name in sorted(rejected):
-        if name not in new_disabled:
-            new_disabled.append(name)
-
-    changed = new_enabled != enabled or new_disabled != disabled
-    if not changed:
-        return None
-    data["enabledMcpjsonServers"] = new_enabled
-    if new_disabled or "disabledMcpjsonServers" in data:
-        data["disabledMcpjsonServers"] = new_disabled
-    return path, existing, _json_document(data)
-
-
-def mirror_claude_decisions(project: str) -> bool:
-    """Persist Claude Code's recorded decisions for one arbitrary Project."""
-    project = canonical_project(project)
-    plan = _claude_settings_plan(project, [], {})
-    if plan is None:
-        return False
-    path, existing, rendered = plan
-    git_paths = _claude_git_paths(project, path=path)
-    tracked = False
-    if git_paths is not None:
-        relative, exclude_path, _path = git_paths
-        tracked = _codex_is_tracked(project, relative)
-    consented = (
-        load_activations().get("trackedMcpJson", {}).get(project) is True
-    )
-    if tracked and rendered != _plan_text(existing) and not consented:
-        raise ActivationError(
-            "tracked Claude Project file refused for: "
-            f"{path}; grant consent by activating in that Project with "
-            "--allow-tracked-mcp-json"
-        )
-    # This entry point writes outside a compensating batch, so translate the CAS
-    # refusal into its declared error type rather than leaking it to the caller.
-    try:
-        _swap_text(path, existing, rendered)
-    except casfile.ConcurrentModification as exc:
-        raise ActivationError(
-            f"Claude decision mirroring refused: {exc.path} changed on disk "
-            "while Boxa was rendering it; nothing was written — re-run the "
-            "command"
-        ) from exc
-    if git_paths is not None and not tracked:
-        _ensure_local_exclude(exclude_path, relative)
-    return True
-
-
-def _claude_render_plan(
-    activations: dict[str, Any],
-    project: str,
-    catalog: dict[str, Any],
-    state: dict[str, Any],
-) -> tuple[str, Optional[str], Optional[str], bool, Optional[str], str, list[str]]:
-    path = claude_config_path(project)
-    if not _project_directory_exists(project):
-        return path, None, None, False, "", "", []
-    existing: Optional[str]
-    try:
-        with open(path, encoding="utf-8") as fh:
-            existing = fh.read()
-        data = json.loads(existing)
-    except FileNotFoundError:
-        existing = None
-        data = {}
-    except (OSError, ValueError) as exc:
-        raise ActivationError(f"cannot read Claude MCP config {path}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ActivationError(f"Claude MCP config is not an object: {path}")
-
-    old = state.get("projects") if isinstance(state.get("projects"), dict) else {}
-    old_names = old.get(project, [])
-    if not isinstance(old_names, list):
-        old_names = []
-    owned = {
-        name for name in old_names
-        if isinstance(name, str)
-    }
-    definitions: dict[str, dict[str, Any]] = {}
-    records = activations["projects"].get(project, {})
-    for entry_id, activation in records.items():
-        if activation.get("enabled", True) is False or "claude" not in activation["consumers"]:
-            continue
-        entry = catalog["entries"].get(entry_id)
-        if not isinstance(entry, dict):
-            continue
-        name = rendered_name(entry["name"])
-        definitions[name] = claude_server_definition(entry_id, project, entry)
-
-    block = data.get("mcpServers")
-    if block is not None and not isinstance(block, dict):
-        raise ActivationError(f"Claude MCP config mcpServers is not an object: {path}")
-    changed_block = bool(owned or definitions)
-    rendered = (
-        _render_mcp_json(
-            _plan_text(existing),
-            definitions,
-            owned - set(definitions),
-        )
-        if changed_block else _plan_text(existing)
-    )
-
-    git_paths = _claude_git_paths(project)
-    tracked = False
-    exclude_path: Optional[str] = None
-    relative: Optional[str] = None
-    if git_paths is not None:
-        relative, exclude_path, _path = git_paths
-        tracked = _codex_is_tracked(project, relative)
-    return (
-        path, exclude_path, relative, tracked, existing, rendered,
-        sorted(definitions),
-    )
-
-
-def _claude_settings_memberships(document: str) -> tuple[set[str], set[str]]:
-    if not document:
-        return set(), set()
-    data = json.loads(document)
-    enabled = data.get("enabledMcpjsonServers", [])
-    disabled = data.get("disabledMcpjsonServers", [])
-    return set(enabled), set(disabled)
-
-
-def claude_render_status(
-    project: str,
-    *,
-    activations: Optional[dict[str, Any]] = None,
-    catalog: Optional[dict[str, Any]] = None,
-    state: Optional[dict[str, Any]] = None,
-) -> ClaudeRenderStatus:
-    """Describe exactly which derived Claude Project bytes need repair."""
-    project = canonical_project(project)
-    mcp_json_path = claude_config_path(project)
-    settings_path = claude_settings_path(project)
-    if not _project_directory_exists(project):
-        return ClaudeRenderStatus(
-            names=(),
-            mcp_json_path=mcp_json_path,
-            mcp_json_changes=False,
-            mcp_json_tracked=False,
-            settings_path=settings_path,
-            settings_changes=False,
-            settings_tracked=False,
-            settings_changed_names=frozenset(),
-            requires_consent=False,
-        )
-
-    activations = (
-        activations if activations is not None else load_activations()
-    )
-    catalog = catalog if catalog is not None else load_catalog()
-    state = state if state is not None else _load_render_state()
-    (
-        mcp_json_path,
-        _exclude_path,
-        _relative,
-        mcp_json_tracked,
-        existing,
-        rendered,
-        names,
-    ) = _claude_render_plan(activations, project, catalog, state)
-    retire = _claude_seeded_names(state, project) - set(names)
-    settings_plan = _claude_settings_plan(
-        project, names, state, retire=retire
-    )
-    settings_git_paths = _claude_git_paths(project, path=settings_path)
-    settings_tracked = (
-        settings_git_paths is not None
-        and _codex_is_tracked(project, settings_git_paths[0])
-    )
-    settings_changed_names: set[str] = set()
-    if settings_plan is not None:
-        settings_path, settings_existing, settings_rendered = settings_plan
-        existing_enabled, existing_disabled = (
-            _claude_settings_memberships(_plan_text(settings_existing))
-        )
-        rendered_enabled, rendered_disabled = (
-            _claude_settings_memberships(settings_rendered)
-        )
-        settings_changed_names = (
-            existing_enabled ^ rendered_enabled
-        ) | (existing_disabled ^ rendered_disabled)
-    mcp_json_changes = rendered != _plan_text(existing)
-    settings_changes = settings_plan is not None
-    requires_consent = (
-        mcp_json_changes and mcp_json_tracked
-    ) or (
-        settings_changes and settings_tracked
-    )
-    return ClaudeRenderStatus(
-        names=tuple(names),
-        mcp_json_path=mcp_json_path,
-        mcp_json_changes=mcp_json_changes,
-        mcp_json_tracked=mcp_json_tracked,
-        settings_path=settings_path,
-        settings_changes=settings_changes,
-        settings_tracked=settings_tracked,
-        settings_changed_names=frozenset(settings_changed_names),
-        requires_consent=requires_consent,
-    )
-
-
-def _retire_old_claude_render(
-    state: dict[str, Any],
-    selected_projects: Optional[set[str]] = None,
-) -> None:
-    """Purge only Project-scoped catalog renders from Claude's rewritten file."""
-    path = render_target_path()
-    try:
-        with open(path, encoding="utf-8") as fh:
-            existing = fh.read()
-        data = json.loads(existing)
-    except FileNotFoundError:
-        return
-    except (OSError, UnicodeError, ValueError):
-        return
-    if not isinstance(data, dict):
-        return
-    projects = data.get("projects")
-    if not isinstance(projects, dict):
-        return
-    old = state.get("projects") if isinstance(state.get("projects"), dict) else {}
-    changed = False
-    for project, record in projects.items():
-        if (
-            selected_projects is not None
-            and project not in selected_projects
-        ):
-            continue
-        if not isinstance(record, dict):
-            continue
-        names = old.get(project, [])
-        if not isinstance(names, list):
-            names = []
-        owned = {
-            name for name in names
-            if isinstance(name, str)
-        }
-        block = record.get("mcpServers")
-        if isinstance(block, dict):
-            remove = {
-                name for name, definition in block.items()
-                if name in owned or (
-                    is_managed_or_legacy(name)
-                    and isinstance(definition, dict)
-                    and (
-                        definition.get("command") == WRAPPER_COMMAND
-                        or (
-                            name.startswith(LEGACY_MANAGED_PREFIX)
-                            and definition.get("command")
-                            == _LEGACY_WRAPPER_COMMAND
-                        )
-                    )
-                )
-            }
-            for name in remove:
-                del block[name]
-            changed = changed or bool(remove)
-            owned |= remove
-        disabled = record.get("disabledMcpServers")
-        if isinstance(disabled, list):
-            retained = [
-                name for name in disabled
-                if not (
-                    isinstance(name, str)
-                    and name in owned
-                )
-            ]
-            if retained != disabled:
-                record["disabledMcpServers"] = retained
-                changed = True
-    if changed:
-        # Claude Code owns this file too, so the purge is a compare-and-swap
-        # against the exact bytes the purge plan was derived from.
-        _swap_text(path, existing, _json_document(data))
-
-
-def _preflight_claude_lifecycle(
-    catalog: dict[str, Any],
-    activations: dict[str, Any],
-    state: dict[str, Any],
-    *,
-    consented: frozenset[str],
-    projects: Optional[Iterable[str]] = None,
-) -> None:
-    """Validate every Project render before any lifecycle store is changed."""
-    refusals: list[str] = []
-    render_projects = (
-        _claude_render_projects(activations, state)
-        if projects is None else sorted(set(projects))
-    )
-    for project in render_projects:
-        status = claude_render_status(
-            project,
-            activations=activations,
-            catalog=catalog,
-            state=state,
-        )
-        if project in consented:
-            continue
-        if status.mcp_json_changes and status.mcp_json_tracked:
-            refusals.append(status.mcp_json_path)
-        if status.settings_changes and status.settings_tracked:
-            refusals.append(status.settings_path)
-    if refusals:
-        raise ActivationError(
-            "tracked Claude Project files refused for: "
-            + ", ".join(refusals)
-            + "; grant consent by activating in that Project with "
-            "--allow-tracked-mcp-json"
-        )
-
-
-def render_claude_activations(
-    activations: Optional[dict[str, Any]] = None,
-    *,
-    consented: frozenset[str] = frozenset(),
-    projects: Optional[Iterable[str]] = None,
-) -> None:
-    activations = activations if activations is not None else load_activations()
-    catalog = load_catalog()
-    state = _load_render_state()
-    render_projects = (
-        _claude_render_projects(activations, state)
-        if projects is None else sorted(set(projects))
-    )
-    _preflight_claude_lifecycle(
-        catalog, activations, state, consented=consented,
-        projects=render_projects,
-    )
-    plans = [
-        (
-            project,
-            _claude_render_plan(activations, project, catalog, state),
-        )
-        for project in render_projects
-    ]
-    settings_plans = {}
-    for project, (
-        _path, _exclude_path, _relative, _tracked, _existing, _rendered,
-        names,
-    ) in plans:
-        if not _project_directory_exists(project):
-            continue
-        settings_plan = _claude_settings_plan(
-            project,
-            names,
-            state,
-            retire=(
-                _claude_seeded_names(state, project)
-                - set(names)
-            ),
-        )
-        settings_git_paths = (
-            _claude_git_paths(project, path=settings_plan[0])
-            if settings_plan is not None else None
-        )
-        settings_tracked = (
-            settings_git_paths is not None
-            and _codex_is_tracked(project, settings_git_paths[0])
-        )
-        settings_plans[project] = (
-            settings_plan,
-            settings_git_paths,
-            settings_tracked,
-        )
-    # The batch writes several unrelated files that cannot share a rename
-    # transaction, so journal every write and compensate on any failure.
-    # Callers that already wrap this in a wider transaction hand their records
-    # up on success; a caller that does not (doctor --fix, migration replans)
-    # is no longer left with a half-written render.
-    with casfile.transaction() as txn:
-        try:
-            _render_claude_batch(
-                activations,
-                state,
-                plans,
-                settings_plans,
-                scoped=projects is not None,
-                render_projects=render_projects,
-            )
-        except Exception as exc:
-            _compensate(txn, "Claude render", exc)
-
-
-def _render_claude_batch(
-    activations: dict[str, Any],
-    state: dict[str, Any],
-    plans: list[tuple[str, tuple[Any, ...]]],
-    settings_plans: dict[str, Any],
-    *,
-    scoped: bool,
-    render_projects: list[str],
-) -> None:
-    _retire_old_claude_render(
-        state, set(render_projects) if scoped else None
-    )
-    old_projects = (
-        state.get("projects")
-        if isinstance(state.get("projects"), dict) else {}
-    )
-    old_seeded = (
-        state.get("seeded")
-        if isinstance(state.get("seeded"), dict) else {}
-    )
-    new_state: dict[str, list[str]] = dict(old_projects) if scoped else {}
-    new_seeded: dict[str, list[str]] = dict(old_seeded) if scoped else {}
-    for project, (
-        path, exclude_path, relative, tracked, existing, rendered, names,
-    ) in plans:
-        if not _project_directory_exists(project):
-            if activations["projects"].get(project):
-                if project in old_projects:
-                    new_state[project] = old_projects[project]
-                if project in old_seeded:
-                    new_seeded[project] = old_seeded[project]
-            else:
-                new_state.pop(project, None)
-                new_seeded.pop(project, None)
-            continue
-        if rendered != _plan_text(existing):
-            if rendered:
-                _swap_text(path, existing, rendered)
-            else:
-                # Reached only when a non-empty pre-image renders away, so the
-                # pre-image is exact: an emptied or deleted file is a concurrent
-                # edit and ``remove`` refuses it.
-                casfile.remove(path, casfile.preimage(existing))
-        if (
-            exclude_path is not None
-            and relative is not None
-            and not tracked
-            and names
-        ):
-            _ensure_local_exclude(exclude_path, relative)
-        if names:
-            new_state[project] = names
-            new_seeded[project] = names
-        else:
-            new_state.pop(project, None)
-            new_seeded.pop(project, None)
-        settings_plan, settings_git_paths, settings_tracked = (
-            settings_plans[project]
-        )
-        if settings_plan is not None:
-            settings_path, settings_existing, settings_rendered = settings_plan
-            if settings_rendered != _plan_text(settings_existing):
-                _swap_text(
-                    settings_path, settings_existing, settings_rendered
-                )
-                if settings_git_paths is not None and not settings_tracked:
-                    settings_relative, settings_exclude, _path = (
-                        settings_git_paths
-                    )
-                    _ensure_local_exclude(
-                        settings_exclude, settings_relative
-                    )
-    _atomic_json(
-        render_state_path(),
-        {"projects": new_state, "seeded": new_seeded},
-        0o600,
-    )
-
-
-def activate(
-    token: str, project: str, consumers: list[str], probe: Optional[object] = None,
-    *, allow_tracked_codex_config: bool = False,
-    allow_tracked_mcp_json: bool = False,
-    accept_degraded_secret_isolation: bool = False,
-) -> ActivationResult:
-    with mutation_lock():
-        return _activate_locked(
-            token,
-            project,
-            consumers,
-            probe,
-            allow_tracked_codex_config=allow_tracked_codex_config,
-            allow_tracked_mcp_json=allow_tracked_mcp_json,
-            accept_degraded_secret_isolation=accept_degraded_secret_isolation,
-        )
-
-
-def _activate_locked(
-    token: str, project: str, consumers: list[str], probe: Optional[object] = None,
-    *, allow_tracked_codex_config: bool = False,
-    allow_tracked_mcp_json: bool = False,
-    accept_degraded_secret_isolation: bool = False,
-) -> ActivationResult:
+def _validate_activation_request(entry: dict[str, Any], consumers: list[str]) -> None:
     if not consumers or any(c not in CONSUMERS for c in consumers):
-        raise ActivationError("activation requires an explicit supported consumer (--for claude, codex, or both)")
-    key = canonical_project(project)
-    try:
-        catalog = load_catalog()
-        entry_id, entry = resolve_entry(catalog, token)
-    except CatalogError as exc:
-        raise ActivationError(str(exc)) from exc
+        raise ActivationError(
+            "activation requires an explicit supported consumer "
+            "(--for claude, codex, or both)"
+        )
     argv = entry.get("command", {}).get("argv", [])
     if (
         "codex" in consumers
@@ -1720,26 +539,70 @@ def _activate_locked(
             "codex mcp-server delegation can activate only for Claude; "
             "self-activation for Codex is not implicit"
         )
+
+
+def activate(
+    token: str, project: str, consumers: list[str], probe: Optional[object] = None,
+    *, accept_degraded_secret_isolation: bool = False,
+) -> ActivationResult:
+    with mutation_lock():
+        return _activate_locked(
+            token,
+            project,
+            consumers,
+            probe,
+            accept_degraded_secret_isolation=accept_degraded_secret_isolation,
+        )
+
+
+def _activate_locked(
+    token: str, project: str, consumers: list[str], probe: Optional[object] = None,
+    *, accept_degraded_secret_isolation: bool = False,
+) -> ActivationResult:
+    key = canonical_project(project)
+    try:
+        catalog = load_catalog()
+        entry_id, entry = resolve_entry(catalog, token)
+    except CatalogError as exc:
+        raise ActivationError(str(exc)) from exc
+    _validate_activation_request(entry, consumers)
+    pending_reason = ""
     # Keep the issue-02 boolean probe seam until legacy profile migration in
     # issue 08. New/default callers receive the detailed deterministic report.
-    if isinstance(probe, DockerProbe) and type(probe).ready is not DockerProbe.ready:
+    if entry.get("type") == "http":
+        is_ready = True
+        missing: list[str] = []
+    elif isinstance(probe, DockerProbe) and type(probe).ready is not DockerProbe.ready:
         container = probe.find_running(key)
         if not container:
-            raise ActivationError(f"target Boxa for {key} is not running; activation never starts it implicitly")
-        is_ready = probe.ready(container, entry)
+            is_ready = False
+            pending_reason = (
+                f"target Boxa for {key} is not running; readiness never starts it implicitly"
+            )
+        else:
+            is_ready = probe.ready(container, entry)
         missing = []
     else:
         readiness_probe = probe if isinstance(probe, ProjectProbe) else ProjectProbe()
         try:
             report = readiness(entry_id, key, readiness_probe)
         except ReadinessError as exc:
-            raise ActivationError(str(exc)) from exc
-        is_ready = report.ready
-        missing = [
-            f"{check.label} ({check.detail})" if check.detail else check.label
-            for check in report.missing
-        ]
-    if not is_ready:
+            stopped_reason = (
+                f"target Boxa for {key} is not running; "
+                "readiness never starts it implicitly"
+            )
+            if str(exc) != stopped_reason:
+                raise ActivationError(str(exc)) from exc
+            is_ready = False
+            missing = []
+            pending_reason = stopped_reason
+        else:
+            is_ready = report.ready
+            missing = [
+                f"{check.label} ({check.detail})" if check.detail else check.label
+                for check in report.missing
+            ]
+    if not is_ready and not pending_reason:
         suffix = f"; missing: {', '.join(missing)}" if missing else ""
         raise ActivationError(
             f"catalog entry {entry['name']!r} is not ready for Project {key}{suffix}"
@@ -1756,59 +619,249 @@ def _activate_locked(
     if degraded and not accepted:
         data.setdefault("acknowledgements", {}).setdefault(key, {})[entry_id] = True
     records = data["projects"].setdefault(key, {})
-    record = {"catalogId": entry_id, "consumers": sorted(set(consumers)), "enabled": True}
+    record = {
+        "catalogId": entry_id,
+        "consumers": sorted(set(consumers)),
+        "enabled": not bool(pending_reason),
+    }
+    if pending_reason:
+        record["pendingReason"] = pending_reason
     previous = records.get(entry_id)
     changed = previous != record
     records[entry_id] = record
-    _commit_activation_render(
-        data, key, allow_tracked_codex_config=allow_tracked_codex_config,
-        allow_tracked_mcp_json=allow_tracked_mcp_json,
-        render_codex=("codex" in record["consumers"] or (
-            isinstance(previous, dict) and "codex" in previous.get("consumers", [])
-        )),
+    _commit_activation_state(data)
+    return ActivationResult(
+        dict(entry),
+        key,
+        record["consumers"],
+        changed,
+        pending=bool(pending_reason),
+        pending_reason=pending_reason,
     )
-    return ActivationResult(dict(entry), key, record["consumers"], changed)
 
 
-def deactivate(
+def activate_everywhere(
     token: str,
-    project: str,
+    consumers: list[str],
+    claude_provider: object,
+    volume_probe: Optional[VolumeProbe] = None,
+    probe: Optional[object] = None,
     *,
-    allow_tracked_codex_config: bool = False,
-    allow_tracked_mcp_json: bool = False,
-) -> ActivationResult:
+    accept_degraded_secret_isolation: bool = False,
+    accept_agent_trust_everywhere: bool = False,
+) -> EverywhereActivationResult:
+    """Durably mark and propagate one entry to every known Project.
+
+    The mark is committed before the best-effort sweep. A later Container start
+    therefore converges a Project even if it was not enumerable or ready during
+    this command, while each known Project still gets an immediate outcome.
+    """
+    targets = enumerate_project_targets(claude_provider, volume_probe)
     with mutation_lock():
-        return _deactivate_locked(
-            token,
-            project,
-            allow_tracked_codex_config=allow_tracked_codex_config,
-            allow_tracked_mcp_json=allow_tracked_mcp_json,
+        catalog = load_catalog()
+        entry_id, entry = resolve_entry(catalog, token)
+        _validate_activation_request(entry, consumers)
+        if (
+            entry.get("executionMode") == "agent-trusted"
+            and not accept_agent_trust_everywhere
+        ):
+            raise ActivationError(
+                "agent-trusted everywhere activation extends agent-identity "
+                "trust to every present and future Project; explicitly "
+                "acknowledge this scope with --yes"
+            )
+        degraded = degradation_status(entry)
+        if degraded and not accept_degraded_secret_isolation:
+            raise ActivationError(
+                "degraded-secret-isolation: node owns the Docker daemon and can "
+                "inspect this server's container environment; acknowledge "
+                "interactively or use --accept-degraded-secret-isolation for "
+                "non-interactive activation"
+            )
+        data = load_activations()
+        mark = {
+            "catalogId": entry_id,
+            "consumers": sorted(set(consumers)),
+        }
+        if degraded:
+            mark["degradedSecretIsolationAcknowledged"] = True
+        previous = data["everywhere"].get(entry_id)
+        mark_changed = previous != mark
+        data["everywhere"][entry_id] = mark
+        if mark_changed:
+            _commit_activation_state(data)
+
+        outcomes: list[EverywhereProjectOutcome] = []
+        changed = mark_changed
+        for target in targets.targets:
+            project_key = canonical_project(target.project_key)
+            current = load_activations()["projects"].get(project_key, {}).get(
+                entry_id
+            )
+            if isinstance(current, dict) and current.get("optedOut") is True:
+                outcomes.append(
+                    EverywhereProjectOutcome(project_key, "opted-out")
+                )
+                continue
+            try:
+                result = _activate_locked(
+                    entry_id,
+                    project_key,
+                    consumers,
+                    probe,
+                    accept_degraded_secret_isolation=accept_degraded_secret_isolation,
+                )
+            except ActivationError as exc:
+                outcomes.append(
+                    EverywhereProjectOutcome(
+                        project_key, "skipped", str(exc)
+                    )
+                )
+                continue
+            outcome = "pending" if result.pending else "activated"
+            if not result.changed:
+                outcome = "skipped"
+            changed = changed or result.changed
+            outcomes.append(
+                EverywhereProjectOutcome(
+                    project_key, outcome, result.pending_reason
+                )
+            )
+        for collision in targets.collisions:
+            reason = (
+                f"Project name {collision.name!r} is ambiguous; "
+                "resolve the colliding host paths explicitly"
+            )
+            outcomes.extend(
+                EverywhereProjectOutcome(project_key, "skipped", reason)
+                for project_key in collision.project_keys
+            )
+        return EverywhereActivationResult(
+            dict(entry), mark["consumers"], True, changed, outcomes
         )
+
+
+def clear_everywhere(token: str) -> EverywhereActivationResult:
+    """Clear only the durable mark; existing activations and opt-outs survive."""
+    with mutation_lock():
+        catalog = load_catalog()
+        entry_id, entry = resolve_entry(catalog, token)
+        data = load_activations()
+        mark = data["everywhere"].pop(entry_id, None)
+        if mark is not None:
+            _commit_activation_state(data)
+        consumers = list(mark.get("consumers", [])) if isinstance(mark, dict) else []
+        return EverywhereActivationResult(
+            dict(entry), consumers, False, mark is not None, []
+        )
+
+
+def _not_ready_reason(entry: dict[str, Any], report: ReadinessReport) -> str:
+    missing = [
+        f"{check.label} ({check.detail})" if check.detail else check.label
+        for check in report.missing
+    ]
+    suffix = f"; missing: {', '.join(missing)}" if missing else ""
+    return (
+        f"catalog entry {entry['name']!r} is not ready for Project "
+        f"{report.project_key}{suffix}"
+    )
+
+
+def reevaluate_pending(
+    project: str,
+    probe: Optional[ProjectProbe] = None,
+) -> PendingReevaluationResult:
+    """Seed everywhere marks and re-evaluate pending state after setup."""
+    with mutation_lock():
+        key = canonical_project(project)
+        catalog = load_catalog()
+        data = load_activations()
+        records = data["projects"].get(key, {})
+        local_probe = probe if probe is not None else ProjectProbe()
+        attempts: list[PendingActivationAttempt] = []
+        changed = False
+        for entry_id, mark in sorted(data.get("everywhere", {}).items()):
+            if entry_id in records:
+                continue
+            entry = catalog["entries"].get(entry_id)
+            if not isinstance(entry, dict):
+                continue
+            if key not in data["projects"]:
+                records = data["projects"].setdefault(key, {})
+            record = {
+                "catalogId": entry_id,
+                "consumers": list(mark["consumers"]),
+                "enabled": entry.get("type") == "http",
+            }
+            records[entry_id] = record
+            if mark.get("degradedSecretIsolationAcknowledged") is True:
+                data.setdefault("acknowledgements", {}).setdefault(key, {})[
+                    entry_id
+                ] = True
+            changed = True
+            if entry.get("type") == "http":
+                attempts.append(PendingActivationAttempt(dict(entry), True))
+        for entry_id, record in sorted(records.items()):
+            if record.get("optedOut") is True:
+                continue
+            if record.get("enabled", True) is not False:
+                continue
+            entry = catalog["entries"].get(entry_id)
+            if not isinstance(entry, dict):
+                continue
+            try:
+                report = readiness_for_entry(
+                    entry,
+                    key,
+                    local_probe,
+                    secret_name=str(entry.get("secretStoreKey") or entry["name"]),
+                )
+                reason = "" if report.ready else _not_ready_reason(entry, report)
+            except ReadinessError as exc:
+                report = None
+                reason = str(exc)
+            if report is not None and report.ready:
+                updated = dict(record)
+                updated["enabled"] = True
+                updated.pop("pendingReason", None)
+                records[entry_id] = updated
+                attempts.append(PendingActivationAttempt(dict(entry), True))
+                changed = changed or updated != record
+                continue
+            updated = dict(record)
+            updated["enabled"] = False
+            updated["pendingReason"] = reason
+            records[entry_id] = updated
+            attempts.append(PendingActivationAttempt(dict(entry), False, reason))
+            changed = changed or updated != record
+        if changed:
+            _commit_activation_state(data)
+        return PendingReevaluationResult(key, attempts, changed)
+
+
+def deactivate(token: str, project: str) -> ActivationResult:
+    with mutation_lock():
+        return _deactivate_locked(token, project)
 
 
 def _deactivate_locked(
     token: str,
     project: str,
-    *,
-    allow_tracked_codex_config: bool,
-    allow_tracked_mcp_json: bool,
 ) -> ActivationResult:
     key = canonical_project(project)
     catalog = load_catalog()
     entry_id, entry = resolve_entry(catalog, token)
     data = load_activations()
-    records = data["projects"].get(key, {})
-    record = records.pop(entry_id, None)
-    if not records:
-        data["projects"].pop(key, None)
-    _commit_activation_render(
-        data, key,
-        allow_tracked_codex_config=allow_tracked_codex_config,
-        allow_tracked_mcp_json=allow_tracked_mcp_json,
-        render_codex=isinstance(record, dict) and "codex" in record.get("consumers", []),
-    )
+    records = data["projects"].setdefault(key, {})
+    record = records.get(entry_id)
+    opt_out = {"catalogId": entry_id, "optedOut": True}
+    changed = record != opt_out
+    records[entry_id] = opt_out
+    if changed:
+        _commit_activation_state(data)
     consumers = list(record.get("consumers", [])) if isinstance(record, dict) else []
-    return ActivationResult(dict(entry), key, consumers, record is not None)
+    return ActivationResult(dict(entry), key, consumers, changed)
 
 
 _RUNTIME_FIELDS = {
@@ -1819,6 +872,7 @@ _RUNTIME_FIELDS = {
     "runtimeKind",
     "secretEnvKeys",
     "type",
+    "url",
 }
 
 
@@ -1828,7 +882,7 @@ def _entry_activations(
     affected: list[dict[str, Any]] = []
     for project, records in sorted(activations["projects"].items()):
         record = records.get(entry_id)
-        if isinstance(record, dict):
+        if isinstance(record, dict) and record.get("optedOut") is not True:
             affected.append(
                 {
                     "projectKey": project,
@@ -1885,74 +939,13 @@ def _catalog_secret_updates(
     return updates
 
 
-def _preflight_codex_lifecycle(
+def _commit_catalog_state(
     catalog: dict[str, Any],
     activations: dict[str, Any],
-    projects: list[str],
-    *,
-    allow_tracked: bool,
-) -> None:
-    """Validate every affected Codex render and tracked-write consent up front."""
-    refusals: list[str] = []
-    for project in projects:
-        (
-            _relative,
-            _exclude_path,
-            path,
-            tracked,
-            existing,
-            rendered,
-            _region,
-        ) = _codex_render_plan(activations, project, catalog)
-        if tracked and rendered != _plan_text(existing) and not allow_tracked:
-            refusals.append(path)
-    if refusals:
-        raise ActivationError(
-            "tracked Codex config requires --allow-tracked-codex-config for: "
-            + ", ".join(refusals)
-        )
-
-
-def _commit_catalog_render(
-    catalog: dict[str, Any],
-    activations: dict[str, Any],
-    codex_projects: list[str],
     secret_updates: dict[str, dict[str, Any]],
     *,
     persist_activations: bool,
-    render_consumers: bool,
-    allow_tracked_codex_config: bool = False,
-    allow_tracked_mcp_json: bool = False,
 ) -> None:
-    state = _load_render_state()
-    claude_projects = (
-        _claude_render_projects(activations, state) if render_consumers else []
-    )
-    durable_consented = {
-        project
-        for project, allowed
-        in activations.get("trackedMcpJson", {}).items()
-        if allowed is True
-    }
-    # A catalog mutation has no single explicitly mutated Project. Its flag may
-    # authorize this batch, but never records new durable Project consent.
-    consented = frozenset(
-        durable_consented
-        | (set(claude_projects) if allow_tracked_mcp_json else set())
-    )
-    if render_consumers:
-        _preflight_claude_lifecycle(
-            catalog,
-            activations,
-            state,
-            consented=consented,
-        )
-    _preflight_codex_lifecycle(
-        catalog,
-        activations,
-        codex_projects,
-        allow_tracked=allow_tracked_codex_config,
-    )
     with casfile.transaction() as txn:
         try:
             save_catalog(catalog)
@@ -1960,20 +953,6 @@ def _commit_catalog_render(
                 save_secrets(path, store)
             if persist_activations:
                 save_activation_store(activations)
-            if render_consumers:
-                render_claude_activations(
-                    activations, consented=consented
-                )
-                for project in codex_projects:
-                    _render_codex_activation(
-                        activations,
-                        project,
-                        allow_tracked=allow_tracked_codex_config,
-                        catalog=catalog,
-                    )
-            # Broker authority is the final commit point. Until every fallible
-            # host store and consumer render above succeeds, concurrent
-            # launches keep reading the exact old runtime snapshot.
             refresh_runtime(activations)
         except Exception as exc:
             _compensate(txn, "MCP catalog mutation", exc)
@@ -1987,6 +966,8 @@ def _preflight_replacement(
     secret_name: Optional[str] = None,
 ) -> None:
     failures: list[str] = []
+    if entry.get("type") == "http":
+        return
     for item in affected:
         project = item["projectKey"]
         if isinstance(probe, DockerProbe) and type(probe).ready is not DockerProbe.ready:
@@ -2022,8 +1003,6 @@ def update_catalog_entry(
     changes: dict[str, Any],
     *,
     probe: Optional[object] = None,
-    allow_tracked_codex_config: bool = False,
-    allow_tracked_mcp_json: bool = False,
 ) -> CatalogUpdateResult:
     """Publish one identity-preserving catalog update across all activations."""
     with mutation_lock():
@@ -2049,31 +1028,14 @@ def update_catalog_entry(
             if current["name"] != updated["name"]
             else {}
         )
-        render_consumers = bool(affected) and (
-            runtime_affecting or current.get("name") != updated.get("name")
-        )
-        codex_projects = (
-            [
-                item["projectKey"] for item in affected
-                if "codex" in item["consumers"]
-            ]
-            if render_consumers
-            else []
-        )
-        _commit_catalog_render(
-            catalog, activations, codex_projects, secret_updates,
+        _commit_catalog_state(
+            catalog, activations, secret_updates,
             persist_activations=False,
-            render_consumers=render_consumers,
-            allow_tracked_codex_config=allow_tracked_codex_config,
-            allow_tracked_mcp_json=allow_tracked_mcp_json,
         )
         return CatalogUpdateResult(dict(updated), runtime_affecting, affected)
 
 
-def remove_catalog_entry(
-    token: str, *, allow_tracked_codex_config: bool = False,
-    allow_tracked_mcp_json: bool = False,
-) -> CatalogRemovalResult:
+def remove_catalog_entry(token: str) -> CatalogRemovalResult:
     """Atomically destroy an entry identity and every activation referencing it."""
     with mutation_lock():
         catalog = load_catalog()
@@ -2083,6 +1045,10 @@ def remove_catalog_entry(
         had_acknowledgement = any(
             entry_id in records
             for records in activations.get("acknowledgements", {}).values()
+        )
+        had_everywhere = entry_id in activations.get("everywhere", {})
+        had_project_state = any(
+            entry_id in records for records in activations["projects"].values()
         )
         for project in list(activations["projects"]):
             records = activations["projects"][project]
@@ -2094,20 +1060,19 @@ def remove_catalog_entry(
             records.pop(entry_id, None)
             if not records:
                 activations["acknowledgements"].pop(project, None)
+        activations.get("everywhere", {}).pop(entry_id, None)
         del catalog["entries"][entry_id]
         secret_updates = _catalog_secret_updates(
             entry_id, entry["name"], replacement_name=None
         )
-        codex_projects = [
-            item["projectKey"] for item in affected
-            if "codex" in item["consumers"]
-        ]
-        _commit_catalog_render(
-            catalog, activations, codex_projects, secret_updates,
-            persist_activations=bool(affected) or had_acknowledgement,
-            render_consumers=bool(affected),
-            allow_tracked_codex_config=allow_tracked_codex_config,
-            allow_tracked_mcp_json=allow_tracked_mcp_json,
+        _commit_catalog_state(
+            catalog, activations, secret_updates,
+            persist_activations=(
+                bool(affected)
+                or had_acknowledgement
+                or had_everywhere
+                or had_project_state
+            ),
         )
         return CatalogRemovalResult(dict(entry), affected)
 
@@ -2115,7 +1080,8 @@ def remove_catalog_entry(
 def effective_catalog(project: str) -> list[dict[str, Any]]:
     key = canonical_project(project)
     catalog = load_catalog()
-    records = load_activations()["projects"].get(key, {})
+    activations = load_activations()
+    records = activations["projects"].get(key, {})
     result = []
     for entry in sorted(catalog["entries"].values(), key=lambda e: (e["name"].casefold(), e["id"])):
         record = records.get(entry["id"])
@@ -2128,11 +1094,27 @@ def effective_catalog(project: str) -> list[dict[str, Any]]:
         row.pop("envKeys", None)
         row.pop("secretEnvKeys", None)
         row["available"] = True
-        row["activated"] = bool(record and record.get("enabled", True))
+        opted_out = bool(record and record.get("optedOut") is True)
+        mark = activations.get("everywhere", {}).get(entry["id"])
+        row["activated"] = bool(
+            record and not opted_out and record.get("enabled", True)
+        )
         row["consumers"] = list(record.get("consumers", [])) if isinstance(record, dict) else []
+        row["everywhere"] = isinstance(mark, dict)
+        row["everywhereConsumers"] = (
+            list(mark.get("consumers", [])) if isinstance(mark, dict) else []
+        )
+        row["optedOut"] = opted_out
+        row["agentIdentityTrustScope"] = (
+            "every-project"
+            if isinstance(mark, dict) and entry.get("executionMode") == "agent-trusted"
+            else "project"
+            if record and not opted_out and entry.get("executionMode") == "agent-trusted"
+            else "none"
+        )
         row["isolationStatus"] = degradation_status(entry) or "isolated"
         row["degradedSecretIsolationAcknowledged"] = (
-            load_activations().get("acknowledgements", {}).get(key, {}).get(entry["id"]) is True
+            activations.get("acknowledgements", {}).get(key, {}).get(entry["id"]) is True
         )
         result.append(row)
     return result

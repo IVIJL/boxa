@@ -92,9 +92,9 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 0
 fi
 
-# First reconcile any legacy profiles. This is non-interactive and each later
-# onboarding step remains explicit; migration itself never installs or grants
-# trust. Failure is soft here and remains visible via `boxa mcp migrate`.
+# First reconcile legacy profiles and remove recorded shared-file renders. This
+# runs on every update, is idempotent, and leaves tracked cleanup for an
+# explicit `boxa mcp migrate --allow-tracked-*` invocation.
 _run_py migrate-text >/dev/null 2>&1 || true
 status_json="$(_run_py onboarding-status 2>/dev/null || true)"
 if [ -z "$status_json" ]; then

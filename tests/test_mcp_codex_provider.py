@@ -106,14 +106,15 @@ class CodexProviderTest(unittest.TestCase):
 
     # -- does not invent support for unverified shapes ----------------------
 
-    def test_remote_like_table_without_command_skipped(self) -> None:
-        # A table with no local `command` (e.g. a url-based / unverified entry)
-        # must NOT be guessed into a candidate.
+    def test_http_table_without_command_is_importable(self) -> None:
         provider = self._provider(
             '[mcp_servers.remote_thing]\nurl = "https://example.test/mcp"\n'
         )
-        self.assertEqual(provider.discover(), [])
-        self.assertIn("No supported Codex MCP config found", provider.note or "")
+        candidates = provider.discover()
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].type, "http")
+        self.assertEqual(candidates[0].url, "https://example.test/mcp")
+        self.assertEqual(candidates[0].classification.placement, "container")
 
     def test_non_stdio_type_with_command_skipped(self) -> None:
         # A table that has a command but an explicit non-stdio type (http/sse)
@@ -127,15 +128,14 @@ class CodexProviderTest(unittest.TestCase):
         self.assertEqual(provider.discover(), [])
         self.assertIn("No supported Codex MCP config found", provider.note or "")
 
-    def test_mixed_skips_unverified_keeps_stdio(self) -> None:
+    def test_mixed_keeps_http_and_stdio(self) -> None:
         provider = self._provider(
             '[mcp_servers.good]\ncommand = "npx"\nargs = ["-y", "good-mcp"]\n\n'
             '[mcp_servers.remote_thing]\nurl = "https://example.test/mcp"\n'
         )
         cands = provider.discover()
         names = {c.name for c in cands}
-        self.assertEqual(names, {"good"})
-        self.assertIn("skipped 1", provider.note or "")
+        self.assertEqual(names, {"good", "remote_thing"})
 
     # -- verified stdio shape parsing ---------------------------------------
 

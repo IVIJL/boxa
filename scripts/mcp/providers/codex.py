@@ -15,10 +15,8 @@ This provider is intentionally conservative (issue 03 acceptance criteria):
     ``[mcp_servers]`` table, the provider returns no candidates and a clear
     "no supported Codex MCP config found" note. It does NOT error and does NOT
     fabricate candidates.
-  * It only parses the ONE verified table shape above (``command``/``args``/
-    ``env`` under ``[mcp_servers.<name>]``). It does not invent support for any
-    other / remote / unverified Codex MCP config shape — such entries are
-    skipped with a note rather than guessed at.
+  * It parses the verified stdio shape above and the verified HTTP ``url``
+    shape. Other unverified Codex MCP config shapes are skipped with a note.
 
 On the machine this slice was built on, ``~/.codex/config.toml`` exists but has
 no ``[mcp_servers]`` tables, so the provider correctly reports "none found".
@@ -105,9 +103,8 @@ def _is_supported_stdio_table(table: dict[str, Any]) -> bool:
     Two ways a table fails the check and is skipped (not guessed at):
       * no ``command`` string (e.g. a remote/URL-based or otherwise unverified
         entry) — there is no local launch we can confidently import in v1;
-      * an explicit non-stdio ``type`` (``http``/``sse``/``remote``/...), which
-        marks a transport this conservative detector does not support, even when
-        a ``command`` happens to be present.
+      * an explicit non-stdio ``type`` (including malformed HTTP without a URL),
+        which marks a transport this stdio detector does not support.
     """
     command = table.get("command")
     if not (isinstance(command, str) and command):
@@ -119,6 +116,16 @@ def _is_supported_stdio_table(table: dict[str, Any]) -> bool:
     ):
         return False
     return True
+
+
+def _http_url(table: dict[str, Any]) -> Optional[str]:
+    url = table.get("url")
+    declared = table.get("type")
+    if not isinstance(url, str) or not url:
+        return None
+    if isinstance(declared, str) and declared.strip().lower() not in ("", "http"):
+        return None
+    return url
 
 
 class CodexProvider:
@@ -210,6 +217,27 @@ class CodexProvider:
             if not isinstance(table, dict):
                 skipped += 1
                 continue
+            url = _http_url(table)
+            if url is not None:
+                candidates.append(
+                    Candidate(
+                        provider=PROVIDER,
+                        source_path=self.config_path,
+                        source_scope="global",
+                        source_project=None,
+                        name=str(name),
+                        type="http",
+                        url=url,
+                        classification=Classification(
+                            placement="container",
+                            confidence="high",
+                            reasons=[
+                                "HTTP MCP server connects from the Container agent session"
+                            ],
+                        ),
+                    )
+                )
+                continue
             if not _is_supported_stdio_table(table):
                 # Unverified / non-stdio shape: do not guess. Skip with a count.
                 skipped += 1
@@ -235,7 +263,7 @@ class CodexProvider:
         if not candidates:
             self.note = (
                 "No supported Codex MCP config found "
-                f"(no verified stdio [{_MCP_TABLE}.*] entries in "
+                f"(no verified stdio or HTTP [{_MCP_TABLE}.*] entries in "
                 f"{self.config_path})."
             )
         elif skipped:

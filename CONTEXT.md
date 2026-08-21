@@ -243,9 +243,9 @@ _Avoid_: global MCP profile, global MCP servers
 
 The catalog and host-owned activations survive host restart, Boxa stop, and
 Container recreation. Installed npm and Docker runtimes use the Project's
-persistent runtime state; consumer renders and the secret-free runtime snapshot
-are derived repairable artifacts. Moving or cloning a Project changes its
-**Project key** and therefore does not carry activations to the new path.
+persistent runtime state; the secret-free runtime snapshot is a derived
+repairable artifact. Moving or cloning a Project changes its **Project key**
+and therefore does not carry activations to the new path.
 
 **MCP catalog entry**:
 A durable server definition in the **MCP catalog**, with an identity independent
@@ -260,38 +260,69 @@ _Avoid_: global server, catalog name
 **MCP readiness**:
 Whether an **MCP catalog entry** has the runtime and prerequisites needed to
 start successfully for a target **Project**. It is a deterministic local check,
-not a live assertion about an external service. Only a ready entry can be
-activated. Readiness and activation require the target Boxa to be running;
-activation never starts it implicitly.
+not a live assertion about an external service, and it never executes the
+server itself. An activation is effective only after readiness passes: for a
+local entry that requires the target Boxa to be running, and a **Pending
+activation** re-evaluates at Container start; a **Remote MCP catalog entry**
+has no runtime readiness. Activation never starts a Boxa implicitly.
 _Avoid_: installed status, enabled status
 
 **MCP activation**:
 The user's explicit choice to expose one **MCP catalog entry** to agents in one
-**Project**. It requires **MCP readiness** and never carries over automatically
-to another Project. It is the durable source of truth and makes the server
-immediately active for its selected agent consumers.
-Consumer selection may differ between agents in the same Project. Boxa renders
-Claude Code through its host-owned Project configuration. Because Codex exposes
-Project-scoped MCP only through the trusted repository's `.codex/config.toml`,
-Boxa renders its managed section there as a derived local artifact and excludes
-an otherwise untracked file through `.git/info/exclude`; the host-owned
-activation remains the source of truth. It refuses to change a tracked Codex
-config without explicit user authorization and always preserves non-Boxa
-content.
+**Project**. It is the durable source of truth and doubles as the user's
+consent; no second approval step exists downstream. A plain activation never
+carries over to another Project; only an **Everywhere entry** does. It becomes
+effective once **MCP readiness** passes; recorded against a stopped Boxa it
+stays a **Pending activation** until then. Consumer selection may differ
+between agents in the same Project. Activations reach sessions only through the
+**Agent launch wrapper** inside the **Container**; Boxa never writes them into
+project or user agent configuration files.
 Removing an activation prevents new connections but does not terminate an
 already connected server process.
 _Avoid_: global enable, inherited MCP
 
 **MCP profile**:
 The set of **MCP activations** currently selected for one **Project**. A fresh
-Project has an empty profile until the user makes a selection.
+Project has an empty profile until the user makes a selection. A Container
+session sees exactly the profile: no inherited, project-file, or user-scope
+servers ever reach it, and no profile server ever reaches a host session.
 _Avoid_: MCP config, MCP preset, effective global profile
+
+**Remote MCP catalog entry**:
+An **MCP catalog entry** that points agents at an MCP server over HTTP(S)
+instead of a Container-spawned process. It has no **MCP execution mode** and no
+runtime readiness; its gate is the Allowlist, which must admit the server's
+domain for sessions to reach it.
+_Avoid_: hosted connector, remote connector entry
+
+**Everywhere entry**:
+An **MCP catalog entry** the user marked to activate in every present and
+future **Project**: the only form of activation that carries between Projects.
+A per-Project deactivation is sticky and always wins over the mark.
+_Avoid_: user-scope server, global activation
+
+**Pending activation**:
+An **MCP activation** recorded while its **MCP readiness** cannot yet pass,
+typically because the target Boxa is stopped. Sessions never see it; readiness
+re-evaluates at the next Container start, and failure keeps it pending and
+reported.
+_Avoid_: queued activation, deferred activation
+
+**Agent launch wrapper**:
+The Container-only wrapper occupying an agent CLI's canonical binary path. On
+every invocation it derives the Project's **MCP profile** from the read-only
+runtime snapshot and injects it as the session's complete MCP configuration,
+resolving the agent binary version at the same moment. An unreadable snapshot
+degrades the session to no MCP with a warning, never a blocked start.
+_Avoid_: shim, PATH alias, agent alias
 
 **Inherited MCP server**:
 An **MCP server** discovered from an existing agent configuration that was
-not created by boxa. It can be proposed for the **MCP catalog**, but is not
-trusted as boxa-managed merely because its configuration is visible inside
-the **Container**.
+not created by boxa. Container sessions never see it; the only path into the
+**Container** is proposal into the **MCP catalog** and explicit activation.
+Discovery classifies it heuristically and never by executing it, and a
+candidate identical to an existing catalog entry is reported as already
+cataloged instead of proposed again.
 _Avoid_: existing MCP server, user MCP server
 
 **Boxa MCP server**:
@@ -355,7 +386,8 @@ host-owned MCP runtime snapshot mounted read-only at a node-readable path. See
 ADR 0014 and ADR 0021.
 
 **Boxa MCP launcher**:
-The `boxa-mcp-run` command rendered into agent config. It runs as the agent user
+The `boxa-mcp-run` command the **Agent launch wrapper** injects into a
+session's MCP configuration. It runs as the agent user
 and asks the **MCP broker** to authorize one server against the effective **MCP
 profile**. It relays stdio to a broker-spawned **Service-isolated MCP server** or
 launches an authorized **Agent-trusted MCP server** as the agent user. Before an

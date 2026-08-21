@@ -210,7 +210,11 @@ else
     # shellcheck disable=SC2317
     write_dns_upstream_file() { printf '%s\n' write-dns >> "$calls"; }
     # shellcheck disable=SC2317
+    refresh_mac_claude_bin_volume() { :; }
+    # shellcheck disable=SC2317
     _boxa::converge_container_resources() { printf 'converge:%s\n' "$*" >> "$calls"; }
+    # shellcheck disable=SC2317
+    _boxa::container_project_path() { printf '%s\n' /work/from-container-env; }
     # shellcheck disable=SC2317
     wait_for_boxa_ready() { :; }
     # shellcheck disable=SC2317
@@ -219,12 +223,20 @@ else
     apply_port_routes() { :; }
     # shellcheck disable=SC2317
     start_boxa_connections() { :; }
+    # shellcheck disable=SC2317
+    reevaluate_pending_mcp() { printf 'pending:%s\n' "$*" >> "$calls"; }
 
     restart_exited_container boxa-app /work/app 2g 3g >/dev/null
     restart_calls="$(< "$calls")"
     assert_eq "stopped Container converges before docker start" \
-        $'write-dns\nconverge:boxa-app /work/app 2g 3g stopped\ndocker:start boxa-app\ndocker:exec -u node boxa-app bash -c /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh' \
+        $'write-dns\nconverge:boxa-app /work/app 2g 3g stopped\ndocker:start boxa-app\ndocker:exec -u node boxa-app bash -c /usr/local/bin/start-rootless-docker.sh && /usr/local/bin/setup-chezmoi.sh && /usr/local/bin/setup-claude.sh\npending:/work/app' \
         "$restart_calls"
+
+    : > "$calls"
+    restart_exited_container boxa-app "" 2g 3g >/dev/null
+    pending_call="$(awk -F: '$1 == "pending" { print $2 }' "$calls")"
+    assert_eq "restart by name derives Project key for pending MCP recheck" \
+        "/work/from-container-env" "$pending_call"
 fi
 
 if [ "$fail_count" -gt 0 ]; then

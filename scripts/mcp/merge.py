@@ -72,9 +72,9 @@ def _identity_tuple(cand: Candidate) -> tuple:
 
     Includes only metadata that is safe to hash/emit (local-plan-mcp.md
     decision 18): scope, project key, server name, NORMALIZED transport type,
-    the argv array (already secret-redacted upstream), and the SORTED
-    environment-variable NAMES. Deliberately excludes ``provider`` and
-    ``source_path`` so the same logical server discovered by different agents
+    the argv array (already secret-redacted upstream), the SORTED
+    environment-variable NAMES, and the URL when present. Deliberately excludes
+    ``provider`` and ``source_path`` so the same logical server discovered by different agents
     collapses to one identity.
 
     Type is normalized (empty/missing -> "stdio", lower-cased) so a Claude entry
@@ -83,7 +83,7 @@ def _identity_tuple(cand: Candidate) -> tuple:
     names are sorted so providers listing the same names in a different order
     still match (order is not semantically meaningful for env).
     """
-    return (
+    identity = (
         cand.source_scope,
         cand.source_project or "",
         cand.name,
@@ -91,6 +91,7 @@ def _identity_tuple(cand: Candidate) -> tuple:
         tuple(cand.command.argv),
         tuple(sorted(cand.command.env_keys)),
     )
+    return identity + ((cand.url or ""),) if cand.url else identity
 
 
 def _collision_key(cand: Candidate) -> tuple:
@@ -119,8 +120,10 @@ def compute_import_id(cand: Candidate) -> str:
         parts[2],  # name
         parts[3],  # type
     ]
-    flat.extend(parts[4])  # argv tokens
-    flat.append("\x1e".join(parts[5]))  # env key names (already sorted)
+    flat.extend(cand.command.argv)
+    flat.append("\x1e".join(sorted(cand.command.env_keys)))
+    if cand.url:
+        flat.append(cand.url)
     blob = "\x1f".join(flat).encode("utf-8")
     digest = hashlib.sha256(blob).hexdigest()
     return "imp-" + digest[:12]
@@ -141,6 +144,10 @@ class MergedCandidate:
     sources: list[MergeSource] = field(default_factory=list)
     conflict: bool = False
     conflict_with: list[str] = field(default_factory=list)
+    catalog_status: str = "unchecked"
+    catalog_id: str = ""
+    catalog_name: str = ""
+    catalog_diff: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def providers(self) -> list[str]:
@@ -161,6 +168,15 @@ class MergedCandidate:
         base["conflict"] = self.conflict
         if self.conflict:
             base["conflictWith"] = list(self.conflict_with)
+        if self.catalog_status != "unchecked":
+            base["catalogStatus"] = self.catalog_status
+            base["alreadyCataloged"] = self.catalog_status == "already-cataloged"
+            base["catalogConflict"] = self.catalog_status == "conflict"
+            if self.catalog_id:
+                base["catalogId"] = self.catalog_id
+                base["catalogName"] = self.catalog_name
+            if self.catalog_diff:
+                base["catalogDiff"] = list(self.catalog_diff)
         return base
 
 
