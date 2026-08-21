@@ -58,6 +58,16 @@ class NoRenderDispatchTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.calls, ["import-activate-json"])
 
+    def test_reimport_all_changed_reaches_python_selection(self):
+        proc = _run(
+            "scope=(--project /work/app); servers=(); imps=(); "
+            "cmd_import_apply true false true true false false false '' '' '' "
+            "scope servers imps"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.calls, ["apply-json"])
+        self.assertIn("--all-changed --reimport", proc.arg_calls[0])
+
     def test_legacy_add_has_no_render_followup(self):
         proc = _run("cmd_add --json --global ctx7 -- npx -y @upstash/context7-mcp@latest")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -76,6 +86,115 @@ class NoRenderDispatchTest(unittest.TestCase):
             ["secret-set-text remote Authorization"],
         )
         self.assertNotIn(secret, "\n".join(proc.arg_calls))
+
+    def test_no_arg_secret_set_picks_missing_entry_and_uses_hidden_prompt(self):
+        secret = "Bearer picker-secret-must-not-leak"
+        script = f'''
+            set -uo pipefail
+            source "{CLI}"
+            export BOXA_MCP_TEST_INTERACTIVE=1
+            export BOXA_PICKER_FZF=0
+            export BOXA_PICKER_TEST_CHOICE=1
+            _run_py() {{
+                case "$1" in
+                    secret-missing-entry-picker) printf 'entry-id\tremote\n' ;;
+                    secret-missing-key-picker) printf 'Authorization\n' ;;
+                    *) return 1 ;;
+                esac
+            }}
+            _run_py_secret_write() {{
+                printf '%s\n' "$*" >"$CALLS"
+                IFS= read -r supplied
+                [ "$supplied" = "$EXPECTED_SECRET" ]
+            }}
+            _finish_secret_write() {{ :; }}
+            cmd_secret set
+        '''
+        descriptor, calls = tempfile.mkstemp()
+        os.close(descriptor)
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", script, os.path.join(ROOT, "scripts", "_harness.sh")],
+                cwd=ROOT,
+                env=dict(os.environ, CALLS=calls, EXPECTED_SECRET=secret),
+                input=secret + "\n",
+                capture_output=True,
+                text=True,
+            )
+            with open(calls, encoding="utf-8") as fh:
+                invoked = fh.read().strip()
+        finally:
+            os.unlink(calls)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(invoked, "secret-set-text entry-id Authorization")
+        self.assertNotIn(secret, proc.stdout + proc.stderr + invoked)
+        self.assertIn("full header value", proc.stderr)
+
+    def test_no_arg_update_uses_authorization_default_then_stores_via_secret_set(self):
+        secret = "Bearer guided-secret-must-not-leak"
+        script = f'''
+            set -uo pipefail
+            source "{CLI}"
+            export BOXA_MCP_TEST_INTERACTIVE=1
+            export BOXA_PICKER_FZF=0
+            export BOXA_PICKER_TEST_CHOICE=1
+            _run_py() {{
+                case "$1" in
+                    catalog-update-picker) printf 'entry-id\tremote\thttp\n' ;;
+                    *) return 1 ;;
+                esac
+            }}
+            _run_py_secret_write() {{
+                printf '%s\n' "$*" >"$SECRET_CALL"
+                IFS= read -r supplied
+                [ "$supplied" = "$EXPECTED_SECRET" ]
+            }}
+            _finish_secret_write() {{ :; }}
+            cmd_update
+        '''
+        secret_fd, secret_call = tempfile.mkstemp()
+        os.close(secret_fd)
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", script, os.path.join(ROOT, "scripts", "_harness.sh")],
+                cwd=ROOT,
+                env=dict(
+                    os.environ,
+                    SECRET_CALL=secret_call,
+                    EXPECTED_SECRET=secret,
+                ),
+                input="\n" + secret + "\n",
+                capture_output=True,
+                text=True,
+            )
+            with open(secret_call, encoding="utf-8") as fh:
+                secret_invoked = fh.read().strip()
+        finally:
+            os.unlink(secret_call)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            secret_invoked,
+            "guided-secret-header-text entry-id Authorization",
+        )
+        self.assertNotIn(
+            secret, proc.stdout + proc.stderr + secret_invoked
+        )
+
+    def test_no_arg_picker_layer_does_not_trigger_without_tty_or_with_json(self):
+        proc = _run("cmd_secret set")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(
+            "Usage: boxa mcp secret set <entry> <header> [--json]",
+            proc.stderr,
+        )
+        self.assertEqual(proc.calls, [])
+
+        proc = _run("cmd_update")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.calls, ["catalog-update-text"])
+        proc = _run("cmd_update --json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.calls, ["catalog-update-json"])
 
     def test_everywhere_activation_reaches_python_without_project_resolution(self):
         proc = _run("cmd_activation activate ctx7 --everywhere --for claude")

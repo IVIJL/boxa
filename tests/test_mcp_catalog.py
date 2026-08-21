@@ -12,6 +12,7 @@ import tempfile
 import unittest
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "scripts"))
@@ -29,6 +30,13 @@ from mcp.catalog import (  # noqa: E402
     update_entry,
 )
 from mcp.profile import global_profile_path, save_profile  # noqa: E402
+from mcp.secrets import (  # noqa: E402
+    global_secrets_path,
+    project_secrets_path,
+    read_header_secrets,
+    read_server_secrets,
+    store_header_secret,
+)
 
 
 class CatalogTest(unittest.TestCase):
@@ -255,6 +263,111 @@ class CatalogTest(unittest.TestCase):
             ])
         self.assertEqual(rc, 0)
         self.assertNotIn("boxa mcp secret set", stdout.getvalue())
+
+    def test_guided_secret_header_merges_and_stores_atomically(self) -> None:
+        secret = "Bearer guided-value-never-output"
+        entry = add_remote_entry(
+            "remote",
+            "https://example.test/mcp",
+            secret_header_keys=["X-Existing"],
+        )
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(secret + "\n")), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli.main([
+                "guided-secret-header-text", entry["id"], "Authorization"
+            ])
+
+        self.assertEqual(rc, 0, stderr.getvalue())
+        updated = load_catalog()["entries"][entry["id"]]
+        self.assertEqual(
+            updated["secretHeaderKeys"], ["X-Existing", "Authorization"]
+        )
+        self.assertEqual(
+            read_header_secrets(global_secrets_path(), entry["id"]),
+            {"authorization": secret},
+        )
+        with open(catalog_path(), encoding="utf-8") as fh:
+            catalog_raw = fh.read()
+        self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue() + catalog_raw)
+
+    def test_guided_secret_header_store_failure_leaves_catalog_unchanged(self) -> None:
+        entry = add_remote_entry(
+            "remote",
+            "https://example.test/mcp",
+            secret_header_keys=["X-Existing"],
+        )
+        before = load_catalog()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO("Bearer failure-value\n")), \
+                mock.patch(
+                    "mcp.cli.store_header_secret",
+                    side_effect=OSError("injected store failure"),
+                ), redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli.main([
+                "guided-secret-header-text", entry["id"], "Authorization"
+            ])
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(load_catalog(), before)
+        self.assertNotIn("failure-value", stdout.getvalue() + stderr.getvalue())
+
+    def test_secret_missing_pickers_only_emit_unstored_declared_headers(self) -> None:
+        first = add_remote_entry(
+            "first",
+            "https://first.example/mcp",
+            secret_header_keys=["Authorization", "X-Api-Key"],
+        )
+        add_remote_entry(
+            "complete",
+            "https://complete.example/mcp",
+            secret_header_keys=["Authorization"],
+        )
+        complete = next(
+            entry for entry in load_catalog()["entries"].values()
+            if entry["name"] == "complete"
+        )
+        store_header_secret(
+            global_secrets_path(), complete["id"], "Authorization", "Bearer stored"
+        )
+        store_header_secret(
+            global_secrets_path(), first["id"], "Authorization", "Bearer stored"
+        )
+        env_entry = add_entry(
+            "env-missing",
+            ["docker", "run", "--rm", "-e", "API_TOKEN", "example/image"],
+        )
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli.main(["secret-missing-entry-picker"])
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertEqual(
+            stdout.getvalue(),
+            f"{env_entry['id']}\tenv-missing\tenvironment\n"
+            f"{first['id']}\tfirst\theader\n",
+        )
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli.main(["secret-missing-key-picker", first["id"]])
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "X-Api-Key\theader\n")
+
+        secret = "environment-value-must-not-leak"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(secret + "\n")), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli.main(["secret-set-text", env_entry["id"], "API_TOKEN"])
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+        self.assertEqual(
+            read_server_secrets(
+                project_secrets_path(os.path.realpath(os.getcwd())),
+                env_entry["name"],
+            ),
+            {"API_TOKEN": secret},
+        )
 
     def test_catalog_update_text_shell_quotes_next_step_arguments(self) -> None:
         name = "remote connector; echo unsafe"

@@ -88,7 +88,7 @@ Subcommands:
   remove      Destroy one catalog identity and cascade its activations.
   reload      Re-stage changed MCP secrets into running Container(s) without a
               stop/start (host-initiated momentary root exec; no restart).
-  secret      Set a declared remote HTTP secret header via a hidden prompt.
+  secret      Fill a missing declared secret via a picker and hidden prompt.
 
 Mental model and common flow:
   1. 'add' records a durable user-wide catalog definition; it does not install
@@ -158,12 +158,15 @@ Status and doctor:
 
 Definition import (write) path:
   boxa mcp import --apply [scope]             Import selected definitions.
-      Interactive TTY  -> multi-select picker of Container-safe candidates.
+      Interactive TTY  -> one sectioned multi-select picker: New + Changed
+                          (reimport); in-sync entries are summarized only.
       Non-interactive  -> requires an explicit selection:
         --server <name>     Apply by server name (repeatable; fails on
                             ambiguity — use --import-id instead).
         --import-id <id>    Apply by stable import id (repeatable).
         --all-applicable    Apply every applicable (container) candidate.
+        --reimport          Let --server/--import-id select catalog matches.
+        --all-changed       Reimport every changed catalog match.
         --conflict update|skip
                             Resolve same-named catalog definition conflicts.
         --force             Import an explicitly selected host-only candidate.
@@ -172,7 +175,9 @@ Definition import (write) path:
       Import, check readiness, and activate in one command. --yes with no
       selection accepts every applicable proposal for non-interactive use.
   Import adds secret-free, service-isolated catalog definitions only. It never
-  installs a runtime, copies credential values, or infers agent trust. The
+  installs a runtime, copies credential values silently, or infers agent trust.
+  Each discovered secret header/env value requires its own default-no consent;
+  non-TTY and --json runs declare names only and print the secret-set next step. The
   default --apply path creates no activation; --activate is the explicit
   one-shot exception. Host-only candidates require --force; unknown and
   excluded candidates remain non-importable.
@@ -202,6 +207,9 @@ Execution mode:
       exists; agent-trusted is incompatible with declared or retained secrets.
 
 Catalog update:
+  boxa mcp update
+      In a TTY, pick a catalog entry. HTTP entries offer one guided action:
+      add a secret authentication header and store its value immediately.
   boxa mcp update <entry> [--name <new-name>] [--description <text>]
       [--url <http(s)-url>]
       [--header <name=value>]... [--secret-header-key <name>]...
@@ -237,7 +245,10 @@ Reload (re-stage secrets into a running Container) path:
       Run this after an 'import --apply' / 'add' that copied a secret value into
       a scope whose Container is already running (the command tells you when).
 
-Secret header path:
+Secret value path:
+  boxa mcp secret set
+      In a TTY, pick an entry and missing declared header/environment key for
+      the current Project, then enter its value through a hidden prompt.
   boxa mcp secret set <entry> <header> [--json]
       Prompt interactively for a declared secretHeaderKeys value. The value is
       read from the terminal, never from argv, and stored in the host-only MCP
@@ -378,6 +389,8 @@ cmd_import() {
     local apply=false
     local activate=false
     local all_applicable=false
+    local all_changed=false
+    local reimport=false
     local yes=false
     local force=false
     local consumer=""
@@ -392,6 +405,8 @@ cmd_import() {
             --apply) apply=true ;;
             --activate) apply=true; activate=true ;;
             --all-applicable) all_applicable=true ;;
+            --all-changed) all_changed=true; reimport=true ;;
+            --reimport) reimport=true ;;
             --yes) yes=true ;;
             --force) force=true ;;
             --for)
@@ -462,7 +477,8 @@ cmd_import() {
     # Selection flags are only meaningful for an apply. Reject them on a plain
     # dry-run rather than silently ignoring the user's choice.
     if [ "$apply" != true ]; then
-        if [ "${#import_ids[@]}" -gt 0 ] || [ "$all_applicable" = true ] || [ "$yes" = true ] \
+        if [ "${#import_ids[@]}" -gt 0 ] || [ "$all_applicable" = true ] \
+            || [ "$all_changed" = true ] || [ "$reimport" = true ] || [ "$yes" = true ] \
             || [ "$force" = true ] || [ -n "$consumer" ] || [ -n "$conflict" ]; then
             echo "Selection, acceptance, force, and activation flags require --apply or --activate." >&2
             return 2
@@ -500,10 +516,11 @@ cmd_import() {
         return 2
     fi
     if [ "$yes" = true ] && [ "${#servers[@]}" -eq 0 ] \
-        && [ "${#import_ids[@]}" -eq 0 ] && [ "$all_applicable" != true ]; then
+        && [ "${#import_ids[@]}" -eq 0 ] && [ "$all_applicable" != true ] \
+        && [ "$all_changed" != true ]; then
         all_applicable=true
     fi
-    cmd_import_apply "$json" "$all_applicable" "$activate" "$yes" \
+    cmd_import_apply "$json" "$all_applicable" "$all_changed" "$reimport" "$activate" "$yes" \
         "$force" "$consumer" "$conflict" "${projects[0]:-}" \
         scope_args servers import_ids
 }
@@ -516,14 +533,14 @@ cmd_import() {
 #   * non-interactive with no selection -> fail with examples (no writes).
 # Array arguments are passed BY NAME (nameref) to avoid re-quoting issues.
 cmd_import_apply() {
-    local json="$1" all_applicable="$2"
+    local json="$1" all_applicable="$2" all_changed=false reimport=false
     local activate=false yes=false force=false consumer="" conflict="" target_project=""
     local scope_name servers_name import_ids_name
     if [ "$#" -eq 5 ]; then
         scope_name="$3"
         servers_name="$4"
         import_ids_name="$5"
-    else
+    elif [ "$#" -eq 11 ]; then
         activate="$3"
         yes="$4"
         force="$5"
@@ -533,6 +550,24 @@ cmd_import_apply() {
         scope_name="$9"
         servers_name="${10}"
         import_ids_name="${11}"
+    elif [ "$#" -eq 7 ]; then
+        all_changed="$3"
+        reimport="$4"
+        scope_name="$5"
+        servers_name="$6"
+        import_ids_name="$7"
+    else
+        all_changed="$3"
+        reimport="$4"
+        activate="$5"
+        yes="$6"
+        force="$7"
+        consumer="$8"
+        conflict="$9"
+        target_project="${10}"
+        scope_name="${11}"
+        servers_name="${12}"
+        import_ids_name="${13}"
     fi
     local -n _scope_args="$scope_name"
     local -n _servers="$servers_name"
@@ -547,6 +582,8 @@ cmd_import_apply() {
         sel_args+=("--import-id" "$s")
     done
     [ "$all_applicable" = true ] && sel_args+=("--all-applicable")
+    [ "$all_changed" = true ] && sel_args+=("--all-changed")
+    [ "$reimport" = true ] && sel_args+=("--reimport")
     [ "$force" = true ] && sel_args+=("--force")
     [ -n "$conflict" ] && sel_args+=("--conflict" "$conflict")
 
@@ -582,6 +619,7 @@ cmd_import_apply() {
             echo "  boxa mcp import --apply --server context7" >&2
             echo "  boxa mcp import --apply --import-id imp-abcdef123456" >&2
             echo "  boxa mcp import --apply --all-applicable" >&2
+            echo "  boxa mcp import --apply --all-changed" >&2
             echo "See 'boxa mcp import' (dry-run) for names and import IDs." >&2
             return 2
         fi
@@ -592,12 +630,23 @@ cmd_import_apply() {
         [ "$json" = true ] && command="import-activate-json"
         local -a flow_args=(--target-project "$target_project" --for "$consumer")
         [ "$yes" = true ] && flow_args+=(--yes)
-        _run_py "$command" "${flow_args[@]}" "${_scope_args[@]}" "${sel_args[@]}"
+        local rc=0
+        _run_py_secret_write "$command" "${flow_args[@]}" \
+            "${_scope_args[@]}" "${sel_args[@]}" || rc=$?
+        _finish_secret_write
+        return "$rc"
     elif [ "$json" = true ]; then
-        _run_py apply-json "${_scope_args[@]}" "${sel_args[@]}"
-        return $?
+        local rc=0
+        _run_py_secret_write apply-json "${_scope_args[@]}" \
+            "${sel_args[@]}" || rc=$?
+        _finish_secret_write
+        return "$rc"
     else
-        _run_py apply-text "${_scope_args[@]}" "${sel_args[@]}"
+        local rc=0
+        _run_py_secret_write apply-text "${_scope_args[@]}" \
+            "${sel_args[@]}" || rc=$?
+        _finish_secret_write
+        return "$rc"
     fi
 }
 
@@ -797,10 +846,15 @@ _wizard_select() {
     # the project picker, whose key — a host path — can contain spaces).
     local -a all_ids=() all_names=() all_scopes=() all_pkeys=()
     local -a all_catalog_statuses=() all_placements=() all_reasons=()
-    local -a menu=()
+    local -a menu_new=() menu_changed=() menu=()
+    local in_sync_count=0
     local id name scope pkey catalog_status placement reason
     while IFS=$'\t' read -r id name scope pkey catalog_status placement reason; do
         [ -n "$id" ] || continue
+        if [ "$catalog_status" = "in-sync" ]; then
+            in_sync_count=$((in_sync_count + 1))
+            continue
+        fi
         all_ids+=("$id")
         all_names+=("$name")
         all_scopes+=("$scope")
@@ -808,16 +862,31 @@ _wizard_select() {
         all_catalog_statuses+=("$catalog_status")
         all_placements+=("${placement:-container}")
         all_reasons+=("$reason")
-        menu+=("$(printf '%-24s %-8s %s %s' "$name" "$scope" \
-            "${placement:-container}" "$catalog_status")"$'\t'"$id")
+        local menu_row
+        menu_row="$(printf '%-24s %-8s %s' "$name" "$scope" \
+            "${placement:-container}")"$'\t'"$id"
+        if [ "$catalog_status" = "changed" ]; then
+            menu_changed+=("Changed (reimport)  $menu_row")
+        else
+            menu_new+=("New                 $menu_row")
+        fi
     done <<< "$applicable"
 
-    echo "Found ${#all_ids[@]} MCP server(s) in your agent config — add them?" >/dev/tty
+    menu=("${menu_new[@]+"${menu_new[@]}"}" "${menu_changed[@]+"${menu_changed[@]}"}")
+
+    echo "New: ${#menu_new[@]}; Changed (reimport): ${#menu_changed[@]}" >/dev/tty
+    if [ "$in_sync_count" -gt 0 ]; then
+        echo "$in_sync_count entries in sync with host configs" >/dev/tty
+    fi
+    if [ "${#all_ids[@]}" -eq 0 ]; then
+        echo "No new or changed MCP servers; nothing applied." >&2
+        return 2
+    fi
 
     local picked
     picked="$(printf '%s\n' "${menu[@]}" | picker::many \
         --prompt "Select MCP servers to import" \
-        --header "Container-safe candidates; choose one or more (q to cancel)")" \
+        --header "New and Changed (reimport); choose one or more (q to cancel)")" \
         || { echo "Selection cancelled; nothing applied." >&2; return 2; }
 
     local -a chosen_ids=()
@@ -1015,11 +1084,22 @@ _apply_wizard() {
 
     local -a out_args=()
     local i id name inherited pkey chosen_scope chosen_key conflict_reply force_reply
+    local reimport_reply
     for i in "${!sel_ids[@]}"; do
         id="${sel_ids[$i]}"
         name="${sel_names[$i]}"
         inherited="${sel_scopes[$i]}"
         pkey="${sel_pkeys[$i]}"
+
+        if [ "${sel_catalog_statuses[$i]}" = "changed" ]; then
+            printf "'%s' differs from catalog fields: %s. Reimport with host values? [y/N] " \
+                "$name" "${sel_reasons[$i]}" >/dev/tty
+            _tty_read reimport_reply ''
+            case "$reimport_reply" in
+                y|Y|yes|YES) out_args+=("--reimport") ;;
+                *) continue ;;
+            esac
+        fi
 
         if [ "${sel_placements[$i]}" = "host-only" ]; then
             printf "'%s' is host-only: %s. Force import anyway? [y/N] " \
@@ -2087,6 +2167,38 @@ cmd_catalog() {
 }
 
 cmd_update() {
+    if [ "$#" -eq 0 ] && _mcp_interactive; then
+        local rows picked token name type action header value rc=0
+        rows="$(_run_py catalog-update-picker)" || return $?
+        if [ -z "$rows" ]; then
+            echo "MCP catalog is empty; nothing updated." >&2
+            return 1
+        fi
+        picked="$(printf '%s\n' "$rows" | picker::one \
+            --prompt "Select MCP catalog entry: ")" || return 1
+        IFS=$'\t' read -r token name type <<< "$picked"
+        if [ "$type" != "http" ]; then
+            echo "No guided update is available for '$name'; use update flags instead." >&2
+            return 1
+        fi
+        action="$(printf '%s\n' $'add secret (auth) header\tadd-secret-header' \
+            | picker::one --prompt "Select update action: ")" || return 1
+        [ "${action##*$'\t'}" = "add-secret-header" ] || return 1
+        printf 'Header name [Authorization]: ' >&2
+        IFS= read -r header || header=""
+        case "$header" in
+            q|Q) return 1 ;;
+            "") header="Authorization" ;;
+        esac
+        _mcp_prompt_secret_value "$name" "$header" header true || return $?
+        value="$_MCP_SECRET_VALUE"
+        _MCP_SECRET_VALUE=""
+        _run_py_secret_write guided-secret-header-text "$token" "$header" <<< "$value" \
+            || rc=$?
+        value=""
+        _finish_secret_write
+        return "$rc"
+    fi
     local json=false after_marker=false
     local -a args=()
     local arg
@@ -2204,12 +2316,58 @@ _mcp_interactive() {
     [ "${BOXA_MCP_TEST_INTERACTIVE:-}" = "1" ] || { [ -t 0 ] && [ -t 1 ]; }
 }
 
+_MCP_SECRET_VALUE=""
+
+_mcp_prompt_secret_value() {
+    local token="$1" key="$2" kind="${3:-header}"
+    local cancel_q="${4:-false}" value=""
+    _MCP_SECRET_VALUE=""
+    if [ "$kind" = "header" ]; then
+        printf "Expected format: the full header value (typically 'Bearer <token>'), without quotes.\n" >&2
+    fi
+    printf "Secret value for %s '%s' on '%s': " "$kind" "$key" "$token" >&2
+    IFS= read -r -s value || value=""
+    echo >&2
+    if [ "$cancel_q" = true ] && { [ "$value" = "q" ] || [ "$value" = "Q" ]; }; then
+        echo "Cancelled; nothing changed." >&2
+        return 1
+    fi
+    if [ -z "$value" ]; then
+        echo "Secret header value must not be empty; nothing changed." >&2
+        return 2
+    fi
+    _MCP_SECRET_VALUE="$value"
+}
+
 cmd_secret() {
     local action="${1:-}" json=false token="" header="" value="" py_cmd
+    local picked_interactively=false
     [ "$#" -gt 0 ] && shift
     if [ "$action" != "set" ]; then
         echo "Usage: boxa mcp secret set <entry> <header> [--json]" >&2
         return 2
+    fi
+    if [ "$#" -eq 0 ] && _mcp_interactive; then
+        picked_interactively=true
+        local entries picked keys key_count key_row kind
+        entries="$(_run_py secret-missing-entry-picker)" || return $?
+        if [ -z "$entries" ]; then
+            echo "No MCP catalog entries have missing secret values." >&2
+            return 1
+        fi
+        picked="$(printf '%s\n' "$entries" | picker::one \
+            --prompt "Select MCP catalog entry with a missing secret: ")" \
+            || return 1
+        token="${picked%%$'\t'*}"
+        keys="$(_run_py secret-missing-key-picker "$token")" || return $?
+        key_count="$(printf '%s\n' "$keys" | awk 'NF { count++ } END { print count + 0 }')"
+        if [ "$key_count" -eq 1 ]; then
+            key_row="$keys"
+        else
+            key_row="$(printf '%s\n' "$keys" | picker::one \
+                --prompt "Select missing secret key: ")" || return 1
+        fi
+        IFS=$'\t' read -r header kind <<< "$key_row"
     fi
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -2237,13 +2395,10 @@ cmd_secret() {
         echo "'mcp secret set' requires an interactive terminal." >&2
         return 2
     fi
-    printf "Secret value for header '%s' on '%s': " "$header" "$token" >&2
-    IFS= read -r -s value || value=""
-    echo >&2
-    if [ -z "$value" ]; then
-        echo "Secret header value must not be empty; nothing changed." >&2
-        return 2
-    fi
+    _mcp_prompt_secret_value "$token" "$header" "${kind:-header}" \
+        "$picked_interactively" || return $?
+    value="$_MCP_SECRET_VALUE"
+    _MCP_SECRET_VALUE=""
     py_cmd="secret-set-text"
     [ "$json" = true ] && py_cmd="secret-set-json"
     _run_py_secret_write "$py_cmd" "$token" "$header" <<< "$value" || {

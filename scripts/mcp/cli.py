@@ -31,7 +31,7 @@ import subprocess  # noqa: S404 - the Boxa Project registry is Docker-backed
 import sys
 from typing import Optional
 
-from . import import_result, inherited_list_result, onboarding, seed, trusted
+from . import casfile, import_result, inherited_list_result, onboarding, seed, trusted
 from .activation import (
     ActivationError,
     _entry_activations,
@@ -87,6 +87,7 @@ from .catalog import (
 from .catalog_import import (
     CatalogImportConflictError,
     catalog_verdicts,
+    destination_scope_overrides,
     import_definitions,
 )
 from .classify import classify_candidate
@@ -138,7 +139,14 @@ from .readiness import (
 )
 from .runner import RunnerError
 from .runner import run as runner_run
-from .secrets import global_secrets_path, read_header_secrets, store_header_secret
+from .secrets import (
+    global_secrets_path,
+    project_secrets_path,
+    read_header_secrets,
+    read_server_secrets,
+    store_header_secret,
+    store_server_secret,
+)
 
 
 def _emit(payload: dict) -> int:
@@ -221,7 +229,12 @@ def _parse_scope(argv: list[str]) -> Optional[_Scope]:
     return scope
 
 
-def _discover(scope: _Scope) -> list[MergedCandidate]:
+def _discover(
+    scope: _Scope,
+    *,
+    scope_overrides: dict[str, ScopeOverride] | None = None,
+    target_project: str = "",
+) -> list[MergedCandidate]:
     """Collect candidates from ALL import providers and merge them.
 
     Each provider normalizes its own config into `Candidate`s; the shared
@@ -252,7 +265,16 @@ def _discover(scope: _Scope) -> list[MergedCandidate]:
     # both output paths (text + JSON) all see the classified result.
     for cand in raw:
         classify_candidate(cand)
-    merged = catalog_verdicts(merge_candidates(raw))
+    merged = merge_candidates(raw)
+    merged = catalog_verdicts(
+        merged,
+        scope_overrides=destination_scope_overrides(
+            merged,
+            scope.project_keys,
+            scope_overrides=scope_overrides,
+            target_project=target_project,
+        ),
+    )
     if scope.server_names:
         wanted = set(scope.server_names)
         merged = [item for item in merged if item.candidate.name in wanted]
@@ -289,6 +311,9 @@ def _render_text(merged: list[MergedCandidate]) -> int:
     unknown = [m for m in merged if _placement(m) == "unknown"]
     excluded = [m for m in merged if _placement(m) == "excluded"]
     conflicts = [m for m in merged if m.conflict]
+    new = [m for m in merged if m.catalog_status == "proposal"]
+    changed = [m for m in merged if m.catalog_status == "changed"]
+    in_sync = [m for m in merged if m.catalog_status == "in-sync"]
 
     summary = (
         f"Discovered {len(merged)} Inherited MCP server(s) "
@@ -305,7 +330,14 @@ def _render_text(merged: list[MergedCandidate]) -> int:
     summary += "):\n"
     sys.stdout.write(summary)
 
+    if new:
+        sys.stdout.write("\nNew\n")
+    if not new and changed:
+        sys.stdout.write("\nNew\n  (none)\n")
+
     for m in merged:
+        if m.catalog_status in {"changed", "in-sync"}:
+            continue
         cand = m.candidate
         scope_label = cand.source_scope
         if cand.source_project:
@@ -365,6 +397,24 @@ def _render_text(merged: list[MergedCandidate]) -> int:
         sys.stdout.write(f"    placement: {cls.placement}{confidence}\n")
         for reason in cls.reasons:
             sys.stdout.write(f"    reason   : {reason}\n")
+    if changed:
+        sys.stdout.write("\nChanged (reimport)\n")
+        for m in changed:
+            sys.stdout.write(f"\n  {m.candidate.name}\n")
+            sys.stdout.write(f"    import id: {m.import_id}\n")
+            sys.stdout.write(
+                f"    catalog  : {m.catalog_name} ({m.catalog_id})\n"
+            )
+            for difference in m.catalog_diff:
+                sys.stdout.write(
+                    f"    diff     : {difference['field']}: "
+                    f"catalog={difference['catalog']!r} "
+                    f"candidate={difference['candidate']!r}\n"
+                )
+    if in_sync:
+        sys.stdout.write(
+            f"\n{len(in_sync)} entries in sync with host configs.\n"
+        )
     sys.stdout.write("\nDry-run only: no MCP profile or agent config was modified.\n")
     sys.stdout.write("Next: boxa mcp import --apply            (interactive)\n")
     if merged:
@@ -490,6 +540,8 @@ class _Selection:
         self.servers: list[str] = []
         self.import_ids: list[str] = []
         self.all_applicable: bool = False
+        self.all_changed: bool = False
+        self.reimport: bool = False
         self.force_host_only: bool = False
         self.catalog_conflicts: dict[str, str] = {}
         self.catalog_conflict_default: str = ""
@@ -510,6 +562,11 @@ def _parse_selection(argv: list[str]) -> Optional[_Selection]:
             sel.scope.include_global = False
         elif arg == "--all-applicable":
             sel.all_applicable = True
+        elif arg == "--all-changed":
+            sel.all_changed = True
+            sel.reimport = True
+        elif arg == "--reimport":
+            sel.reimport = True
         elif arg == "--force":
             sel.force_host_only = True
         elif arg == "--catalog-conflict":
@@ -619,6 +676,12 @@ def _resolve_selection(
         if m is None:
             sys.stderr.write(f"mcp.cli: no candidate with import id {iid!r}\n")
             return None
+        if m.catalog_status in {"changed", "in-sync"} and not sel.reimport:
+            sys.stderr.write(
+                f"mcp.cli: import id {iid!r} is already cataloged; pass "
+                "--reimport to select it\n"
+            )
+            return None
         chosen[m.import_id] = m
 
     for name in sel.servers:
@@ -634,22 +697,61 @@ def _resolve_selection(
                 f"({ids})\n"
             )
             return None
-        chosen[matches[0].import_id] = matches[0]
+        match = matches[0]
+        if match.catalog_status in {"changed", "in-sync"} and not sel.reimport:
+            sys.stderr.write(
+                f"mcp.cli: server {name!r} is already cataloged; pass --reimport "
+                "to select it\n"
+            )
+            return None
+        chosen[match.import_id] = match
 
     if sel.all_applicable:
         for m in merged:
-            if is_applicable(m) and m.catalog_status != "already-cataloged":
+            if is_applicable(m) and m.catalog_status == "proposal":
+                chosen[m.import_id] = m
+
+    if sel.all_changed:
+        for m in merged:
+            if is_applicable(m) and m.catalog_status == "changed":
                 chosen[m.import_id] = m
 
     if not chosen:
+        if sel.all_changed:
+            return []
         sys.stderr.write(
             "mcp.cli: no candidates selected; pass --server <name>, "
-            "--import-id <id>, or --all-applicable\n"
+            "--import-id <id>, --all-applicable, or --all-changed\n"
         )
         return None
 
     # Preserve discovery order for a stable, repeatable summary.
     return [m for m in merged if m.import_id in chosen]
+
+
+def _secret_consent(
+    kind: str, name: str, source_path: str, rotation: bool
+) -> bool:
+    """Ask one default-no takeover question without ever displaying a value."""
+    noun = "secret header" if kind == "header" else "secret environment variable"
+    if rotation:
+        prompt = (
+            f"Stored value for {noun} {name!r} differs — update from "
+            f"{source_path}? [y/N] "
+        )
+    else:
+        prompt = (
+            f"Take over the value of {noun} {name!r} from {source_path} into "
+            "the host-only secret store? [y/N] "
+        )
+    try:
+        with open("/dev/tty", "r+", encoding="utf-8") as tty:
+            tty.write(prompt)
+            tty.flush()
+            reply = tty.readline().strip()
+    except OSError:
+        return False
+    return reply.lower() in {"y", "yes"}
 
 
 def _apply_payload(merged: list[MergedCandidate], sel: _Selection) -> dict:
@@ -668,10 +770,18 @@ def _apply_payload(merged: list[MergedCandidate], sel: _Selection) -> dict:
             selected,
             catalog_conflicts=resolutions,
             force_host_only=sel.force_host_only,
+            secret_consent=None,
+            scope_overrides=destination_scope_overrides(
+                selected, sel.scope.project_keys, scope_overrides=sel.overrides
+            ),
         )
-    except (ApplyConflictError, CatalogImportConflictError) as exc:
+    except (
+        ApplyConflictError, CatalogImportConflictError, CatalogError,
+        ActivationError, OSError, ValueError,
+    ) as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return {"error": "conflict"}
+    _emit_secret_scopes(result.secret_scopes)
     return result.to_dict()
 
 
@@ -699,11 +809,19 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
             selected,
             catalog_conflicts=resolutions,
             force_host_only=sel.force_host_only,
+            secret_consent=_secret_consent if sys.stdin.isatty() else None,
+            scope_overrides=destination_scope_overrides(
+                selected, sel.scope.project_keys, scope_overrides=sel.overrides
+            ),
         )
-    except (ApplyConflictError, CatalogImportConflictError) as exc:
+    except (
+        ApplyConflictError, CatalogImportConflictError, CatalogError,
+        ActivationError, OSError, ValueError,
+    ) as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return 2
 
+    _emit_secret_scopes(result.secret_scopes)
     if not result.imported and not result.skipped:
         sys.stdout.write("No definitions imported.\n")
         return 0
@@ -712,16 +830,33 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
         sys.stdout.write(f"Imported definition {a.name}\n")
         sys.stdout.write(f"  import id: {a.import_id}\n")
         sys.stdout.write(f"  catalog  : {a.catalog_name} ({a.catalog_id})\n")
-        sys.stdout.write(f"  changed  : {'yes' if a.changed else 'no (already present)'}\n")
+        sys.stdout.write(f"  changed  : {'yes' if a.changed else 'no (in sync)'}\n")
 
     for s in result.skipped:
         sys.stdout.write(
             f"Skipped {s['name']} ({s['importId']}): {s['reason']}\n"
         )
 
+    for item in result.skipped_secrets:
+        sys.stdout.write(
+            f"Skipped credential values for {item['name']}: "
+            f"{', '.join(item['keys'])}\n"
+        )
+    if result.skipped_secrets:
+        sys.stdout.write("Next: boxa mcp secret set\n")
+    if result.taken_secrets:
+        sys.stdout.write(
+            "Credential values were moved into the host-only secret store. "
+            "Consider removing their plaintext copies from the host config.\n"
+        )
+
     sys.stdout.write("\nCatalog definitions updated only. Nothing was installed, activated, or rendered.\n")
     imported = {item.import_id: item for item in result.imported}
     selected_by_id = {item.import_id: item for item in selected}
+    skipped_secret_keys = {
+        str(item["name"]): set(item["keys"])
+        for item in result.skipped_secrets
+    }
     if len(imported) == 1:
         imported_item = next(iter(imported.values()))
         candidate = selected_by_id[imported_item.import_id].candidate
@@ -736,14 +871,20 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
                 "--project <path> --for claude|codex\n"
             )
         else:
-            for header in candidate.secret_header_keys:
+            missing_headers = [
+                header for header in candidate.secret_header_keys
+                if header in skipped_secret_keys.get(
+                    imported_item.catalog_name, set()
+                )
+            ]
+            for header in missing_headers:
                 sys.stdout.write(
                     "Next: boxa mcp secret set "
                     f"{shlex.quote(imported_item.catalog_name)} "
                     f"{shlex.quote(header)}\n"
                 )
             sys.stdout.write(
-                f"{'Then' if candidate.secret_header_keys else 'Next'}: "
+                f"{'Then' if missing_headers else 'Next'}: "
                 "boxa mcp activate "
                 f"{shlex.quote(imported_item.catalog_name)} "
                 "--project <path> --for claude|codex\n"
@@ -788,7 +929,14 @@ def _cmd_import_activate(argv: list[str], as_json: bool) -> int:
     sel = _parse_selection(selection_argv)
     if sel is None:
         return 2
-    selected = _resolve_selection(_discover(sel.scope), sel)
+    selected = _resolve_selection(
+        _discover(
+            sel.scope,
+            scope_overrides=sel.overrides,
+            target_project=project,
+        ),
+        sel,
+    )
     if selected is None:
         return 2
     try:
@@ -803,11 +951,21 @@ def _cmd_import_activate(argv: list[str], as_json: bool) -> int:
             selected,
             catalog_conflicts=resolutions,
             force_host_only=sel.force_host_only,
+            secret_consent=(
+                _secret_consent if not as_json and sys.stdin.isatty() else None
+            ),
+            scope_overrides=destination_scope_overrides(
+                selected,
+                sel.scope.project_keys,
+                scope_overrides=sel.overrides,
+                target_project=project,
+            ),
         )
     except (CatalogImportConflictError, CatalogError, ActivationError) as exc:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return 1
 
+    _emit_secret_scopes(imported.secret_scopes)
     flow: list[dict[str, object]] = []
     for item in imported.imported:
         readiness_payload: dict[str, object]
@@ -896,21 +1054,24 @@ def _render_applicable_wizard(merged: list[MergedCandidate]) -> int:
     """
     for m in merged:
         placement = m.candidate.classification.placement
-        if (
-            placement not in {"container", "host-only"}
-            or m.catalog_status == "already-cataloged"
-        ):
+        if placement not in {"container", "host-only"} or m.catalog_status == "already-cataloged":
             continue
-        row = (
+        if m.catalog_status == "proposal" and placement == "container":
+            sys.stdout.write(
+                f"{m.import_id}\t{m.candidate.name}\t"
+                f"{m.candidate.source_scope}\t{m.candidate.source_project or ''}\n"
+            )
+            continue
+        reason = "; ".join(m.candidate.classification.reasons)
+        if m.catalog_status == "changed":
+            reason = json.dumps(
+                m.catalog_diff, sort_keys=True, separators=(",", ":")
+            )
+        sys.stdout.write(
             f"{m.import_id}\t{m.candidate.name}\t"
-            f"{m.candidate.source_scope}\t{m.candidate.source_project or ''}"
+            f"{m.candidate.source_scope}\t{m.candidate.source_project or ''}\t"
+            f"{m.catalog_status}\t{placement}\t{reason}\n"
         )
-        if m.catalog_status == "conflict" or placement == "host-only":
-            row += f"\t{m.catalog_status}"
-        if placement == "host-only":
-            reason = "; ".join(m.candidate.classification.reasons)
-            row += f"\thost-only\t{reason}"
-        sys.stdout.write(row + "\n")
     return 0
 
 
@@ -1763,6 +1924,88 @@ def _cmd_catalog_picker(argv: list[str]) -> int:
     return 0
 
 
+def _cmd_catalog_update_picker(argv: list[str]) -> int:
+    if argv:
+        sys.stderr.write("mcp.cli: catalog-update-picker takes no arguments\n")
+        return 2
+    try:
+        entries = catalog_entries_sorted()
+    except CatalogError as exc:
+        sys.stderr.write(f"mcp.cli: {exc}\n")
+        return 1
+    for entry in entries:
+        sys.stdout.write(
+            f"{entry['id']}\t{entry['name']}\t{entry.get('type', 'stdio')}\n"
+        )
+    return 0
+
+
+def _missing_secrets(
+    project_key: str, token: Optional[str] = None
+) -> list[tuple[dict, str, str]]:
+    entries = catalog_entries_sorted()
+    if token is not None:
+        _entry_id, selected = catalog_resolve(catalog_load(), token)
+        entries = [selected]
+    missing: list[tuple[dict, str, str]] = []
+    for entry in entries:
+        if entry.get("type") == "http":
+            stored = read_header_secrets(
+                global_secrets_path(), str(entry["id"])
+            ) or {}
+            present = {
+                str(name).casefold() for name, value in stored.items() if value
+            }
+            for header in entry.get("secretHeaderKeys", []):
+                if str(header).casefold() not in present:
+                    missing.append((entry, "header", str(header)))
+            continue
+        stored_env = read_server_secrets(
+            project_secrets_path(project_key),
+            str(entry.get("secretStoreKey") or entry["name"]),
+        ) or {}
+        for key in entry.get("secretEnvKeys", []):
+            if not stored_env.get(str(key)):
+                missing.append((entry, "environment", str(key)))
+    return missing
+
+
+def _cmd_secret_missing_entry_picker(argv: list[str]) -> int:
+    if argv:
+        sys.stderr.write(
+            "mcp.cli: secret-missing-entry-picker takes no arguments\n"
+        )
+        return 2
+    try:
+        rows = _missing_secrets(os.path.realpath(os.getcwd()))
+    except (CatalogError, OSError, ValueError) as exc:
+        sys.stderr.write(f"mcp.cli: cannot list missing secrets: {exc}\n")
+        return 1
+    seen: set[str] = set()
+    for entry, kind, _key in rows:
+        entry_id = str(entry["id"])
+        if entry_id not in seen:
+            sys.stdout.write(f"{entry_id}\t{entry['name']}\t{kind}\n")
+            seen.add(entry_id)
+    return 0
+
+
+def _cmd_secret_missing_key_picker(argv: list[str]) -> int:
+    if len(argv) != 1:
+        sys.stderr.write(
+            "mcp.cli: secret-missing-key-picker requires one catalog entry\n"
+        )
+        return 2
+    try:
+        rows = _missing_secrets(os.path.realpath(os.getcwd()), argv[0])
+    except (CatalogError, OSError, ValueError) as exc:
+        sys.stderr.write(f"mcp.cli: cannot list missing secrets: {exc}\n")
+        return 1
+    for _entry, kind, key in rows:
+        sys.stdout.write(f"{key}\t{kind}\n")
+    return 0
+
+
 def _cmd_catalog_resolve(argv: list[str]) -> int:
     if len(argv) != 1:
         return 2
@@ -2411,7 +2654,7 @@ def _cmd_readiness(argv: list[str], as_json: bool) -> int:
 
 
 def _cmd_secret_set(argv: list[str], as_json: bool) -> int:
-    """Store one declared secret header value read exclusively from stdin."""
+    """Store one declared secret value read exclusively from stdin."""
     if len(argv) != 2:
         sys.stderr.write(
             "mcp.cli: secret set requires one catalog entry and header name\n"
@@ -2427,33 +2670,115 @@ def _cmd_secret_set(argv: list[str], as_json: bool) -> int:
     try:
         with catalog_mutation_lock():
             _entry_id, entry = catalog_resolve(catalog_load(), token)
-            if entry.get("type") != "http":
+            if as_json and entry.get("type") != "http":
                 raise CatalogError("secret headers apply only to http catalog entries")
-            declared = {
+            declared_headers = {
                 str(name).casefold(): str(name)
                 for name in entry.get("secretHeaderKeys", [])
             }
-            header_name = declared.get(requested_header.casefold())
-            if header_name is None:
-                raise CatalogError(
-                    f"header {requested_header!r} is not declared in secretHeaderKeys"
+            header_name = declared_headers.get(requested_header.casefold())
+            declared_env = {
+                str(name): str(name) for name in entry.get("secretEnvKeys", [])
+            }
+            env_name = declared_env.get(requested_header)
+            if header_name is not None and entry.get("type") == "http":
+                store_header_secret(
+                    global_secrets_path(), str(entry["id"]), header_name, value
                 )
-            store_header_secret(
-                global_secrets_path(), str(entry["id"]), header_name, value
-            )
+                kind = "header"
+                stored_name = header_name
+                secret_scopes = [("global", "")]
+            elif env_name is not None and entry.get("type") != "http":
+                project_key = os.path.realpath(os.getcwd())
+                store_server_secret(
+                    project_secrets_path(project_key),
+                    str(entry.get("secretStoreKey") or entry["name"]),
+                    env_name,
+                    value,
+                )
+                kind = "environment"
+                stored_name = env_name
+                secret_scopes = [("project", project_key)]
+            else:
+                if entry.get("type") == "http":
+                    raise CatalogError(
+                        f"header {requested_header!r} is not declared in "
+                        "secretHeaderKeys"
+                    )
+                raise CatalogError(
+                    f"secret key {requested_header!r} is not declared on this entry"
+                )
     except (CatalogError, OSError, ValueError) as exc:
         sys.stderr.write(f"mcp.cli: cannot store secret header value: {exc}\n")
         return 1
-    _emit_secret_scopes([("global", "")])
+    _emit_secret_scopes(secret_scopes)
     if as_json:
+        if kind == "header":
+            return _emit({
+                "entry": {"id": entry["id"], "name": entry["name"]},
+                "header": stored_name,
+                "stored": True,
+            })
         return _emit({
             "entry": {"id": entry["id"], "name": entry["name"]},
-            "header": header_name,
+            "environment": stored_name,
             "stored": True,
         })
+    noun = "header" if kind == "header" else "environment variable"
     sys.stdout.write(
-        f"Stored secret value for header {header_name!r} on MCP catalog "
+        f"Stored secret value for {noun} {stored_name!r} on MCP catalog "
         f"entry {entry['name']!r}.\n"
+    )
+    return 0
+
+
+def _cmd_guided_secret_header(argv: list[str]) -> int:
+    """Declare and store one HTTP secret header as one compensated mutation."""
+    if len(argv) != 2:
+        sys.stderr.write(
+            "mcp.cli: guided secret header requires one catalog entry and "
+            "header name\n"
+        )
+        return 2
+    token, requested_header = argv
+    value = sys.stdin.readline()
+    if value.endswith("\n"):
+        value = value[:-1]
+    if not value or any(char in value for char in ("\r", "\n", "\x00")):
+        sys.stderr.write("mcp.cli: secret header value must be one non-empty line\n")
+        return 2
+    try:
+        with catalog_mutation_lock(), casfile.transaction() as txn:
+            try:
+                entry_id, current = catalog_resolve(catalog_load(), token)
+                if current.get("type") != "http":
+                    raise CatalogError(
+                        "secret headers apply only to http catalog entries"
+                    )
+                declared = list(current.get("secretHeaderKeys", []))
+                if requested_header.casefold() not in {
+                    str(name).casefold() for name in declared
+                }:
+                    declared.append(requested_header)
+                store_header_secret(
+                    global_secrets_path(), entry_id, requested_header, value
+                )
+                if declared != current.get("secretHeaderKeys", []):
+                    updated = update_catalog_entry(
+                        entry_id, {"secretHeaderKeys": declared}
+                    ).entry
+                else:
+                    updated = current
+            except Exception:
+                txn.rollback()
+                raise
+    except (CatalogError, ActivationError, OSError, ValueError) as exc:
+        sys.stderr.write(f"mcp.cli: cannot add secret header: {exc}\n")
+        return 1
+    _emit_secret_scopes([("global", "")])
+    sys.stdout.write(
+        f"Stored secret header {requested_header!r} for "
+        f"MCP catalog entry {updated['name']!r}.\n"
     )
     return 0
 
@@ -2952,7 +3277,7 @@ def main(argv: list[str]) -> int:
         sel = _parse_selection(rest)
         if sel is None:
             return 2
-        merged = _discover(sel.scope)
+        merged = _discover(sel.scope, scope_overrides=sel.overrides)
         payload = _apply_payload(merged, sel)
         if payload.get("error") in ("selection", "conflict"):
             return 2
@@ -2961,7 +3286,7 @@ def main(argv: list[str]) -> int:
         sel = _parse_selection(rest)
         if sel is None:
             return 2
-        merged = _discover(sel.scope)
+        merged = _discover(sel.scope, scope_overrides=sel.overrides)
         return _render_apply_text(merged, sel)
     if command == "import-activate-json":
         return _cmd_import_activate(rest, as_json=True)
@@ -2987,6 +3312,12 @@ def main(argv: list[str]) -> int:
         return _cmd_catalog(rest, as_json=False)
     if command == "catalog-picker":
         return _cmd_catalog_picker(rest)
+    if command == "catalog-update-picker":
+        return _cmd_catalog_update_picker(rest)
+    if command == "secret-missing-entry-picker":
+        return _cmd_secret_missing_entry_picker(rest)
+    if command == "secret-missing-key-picker":
+        return _cmd_secret_missing_key_picker(rest)
     if command == "catalog-resolve":
         return _cmd_catalog_resolve(rest)
     if command == "catalog-mode-preview-json":
@@ -3029,6 +3360,8 @@ def main(argv: list[str]) -> int:
         return _cmd_secret_set(rest, as_json=True)
     if command == "secret-set-text":
         return _cmd_secret_set(rest, as_json=False)
+    if command == "guided-secret-header-text":
+        return _cmd_guided_secret_header(rest)
     if command == "catalog-install-json":
         return _cmd_catalog_install(rest, as_json=True)
     if command == "catalog-install-text":

@@ -869,7 +869,7 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
     """Unified catalog, readiness, activation, mode, and isolation snapshot."""
     from .activation import _entry_activations, canonical_project, load_activations
     from .catalog import isolation_status, load_catalog
-    from .catalog_import import catalog_verdicts
+    from .catalog_import import catalog_verdicts, destination_scope_overrides
     from .classify import classify_candidate
     from .merge import merge_candidates
     from .providers.claude import ClaudeProvider
@@ -972,7 +972,14 @@ def catalog_project_status(project: str, probe: Optional[object] = None) -> dict
         ))
     for candidate in inherited_raw:
         classify_candidate(candidate)
-    inherited = catalog_verdicts(merge_candidates(inherited_raw), catalog)
+    inherited = merge_candidates(inherited_raw)
+    inherited = catalog_verdicts(
+        inherited,
+        catalog,
+        scope_overrides=destination_scope_overrides(
+            inherited, [key], target_project=key
+        ),
+    )
     proposals = [
         candidate
         for candidate in inherited

@@ -10,7 +10,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source-path=SCRIPTDIR source=../lib/picker.sh
+# shellcheck source-path=SCRIPTDIR source=../lib/picker.sh disable=SC1091
 source "$SCRIPT_DIR/../lib/picker.sh"
 
 fail_count=0
@@ -146,6 +146,40 @@ gamma" "$(run_e2e 1,3 picker::many --prompt "P:")"
 assert_eq "e2e many+first: mixed a,2" "* All
 beta" "$(run_e2e a,2 picker::many --prompt "P:" --first-option "* All")"
 
+sectioned_out="$(
+    printf '%s\n' \
+        $'New                 alpha\timp-new' \
+        $'Changed (reimport)  beta\timp-changed' \
+        | BOXA_PICKER_TEST_CHOICE="1,2" picker::many --prompt "Import" \
+            --header "New and Changed (reimport); 2 entries in sync" 2>/dev/null
+)"
+assert_eq "e2e many: one sectioned New + Changed pass" \
+    $'New                 alpha\timp-new\nChanged (reimport)  beta\timp-changed' \
+    "$sectioned_out"
+
+update_picker_out="$(
+    printf '%s\n' \
+        $'entry-stdio\tlocal tools\tstdio' \
+        $'entry-http\tremote tools\thttp' \
+        | BOXA_PICKER_TEST_CHOICE=2 picker::one \
+            --prompt "Select MCP catalog entry: " 2>/dev/null
+)"
+assert_eq "mcp update picker: preserves selected id/name/type row" \
+    $'entry-http\tremote tools\thttp' "$update_picker_out"
+
+secret_entry_out="$(
+    printf '%s\n' $'entry-one\tone missing' $'entry-two\ttwo missing' \
+        | BOXA_PICKER_TEST_CHOICE=2 picker::one \
+            --prompt "Select MCP catalog entry with a missing secret: " 2>/dev/null
+)"
+assert_eq "mcp secret picker: selects only supplied missing-entry rows" \
+    $'entry-two\ttwo missing' "$secret_entry_out"
+assert_eq "mcp secret picker: selects one of multiple missing keys" \
+    "X-Api-Key" \
+    "$(printf '%s\n' Authorization X-Api-Key \
+        | BOXA_PICKER_TEST_CHOICE=2 picker::one \
+            --prompt "Select missing secret key: " 2>/dev/null)"
+
 assert_fail "e2e one: empty cancels" \
     bash -c 'export BOXA_PICKER_FZF=0 BOXA_PICKER_TEST_CHOICE=""; \
              source "'"$SCRIPT_DIR"'/../lib/picker.sh"; \
@@ -195,6 +229,8 @@ case "$many_fallback_stderr" in
         ;;
 esac
 
+# Called indirectly by _picker::fzf after command lookup.
+# shellcheck disable=SC2317
 fzf() {
     printf '%s\n' "$*" >&2
     local selected

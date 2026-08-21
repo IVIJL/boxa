@@ -95,7 +95,7 @@ class ImportDiscoveryUxTest(unittest.TestCase):
         self.assertEqual(status["importNudge"], "")
         self.assertEqual(
             status["inheritedCandidates"][0]["catalogStatus"],
-            "already-cataloged",
+            "in-sync",
         )
 
         self._write_claude({})
@@ -212,6 +212,87 @@ class ImportDiscoveryUxTest(unittest.TestCase):
             "secret headers: Authorization (values not shown)", output
         )
         self.assertNotIn(secret_value, output)
+
+    def test_json_declines_takeover_and_reimport_selectors_gate_catalog_matches(self):
+        secret_value = "Bearer json-secret-must-never-appear"
+        self._write_claude({
+            "remote": {
+                "type": "http",
+                "url": "https://mcp.example.test/one",
+                "headers": {"Authorization": secret_value},
+            }
+        })
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = cli.main(["apply-json", "--server", "remote"])
+        self.assertEqual(rc, 0)
+        raw = stdout.getvalue()
+        self.assertNotIn(secret_value, raw)
+        self.assertNotIn(secret_value, stderr.getvalue())
+        payload = json.loads(raw)
+        self.assertEqual(
+            payload["skippedSecrets"][0]["keys"], ["Authorization"]
+        )
+        self.assertEqual(payload["next"], ["boxa mcp secret set"])
+
+        self._write_claude({
+            "remote": {
+                "type": "http",
+                "url": "https://mcp.example.test/two",
+                "headers": {"Authorization": secret_value},
+            }
+        })
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = cli.main(["apply-json", "--server", "remote"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--reimport", stderr.getvalue())
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli.main([
+                "apply-json", "--reimport", "--server", "remote"
+            ])
+        self.assertEqual(rc, 0)
+        self.assertNotIn(secret_value, stdout.getvalue())
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli.main([
+                "apply-json", "--reimport", "--server", "remote"
+            ])
+        self.assertEqual(rc, 0)
+        self.assertFalse(json.loads(stdout.getvalue())["imported"][0]["changed"])
+
+        self._write_claude({
+            "remote": {
+                "type": "http",
+                "url": "https://mcp.example.test/three",
+                "headers": {"Authorization": secret_value},
+            }
+        })
+        import_id = cli._discover(cli._Scope())[0].import_id
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli.main([
+                "apply-json", "--reimport", "--import-id", import_id
+            ])
+        self.assertEqual(rc, 0)
+        self.assertNotIn(secret_value, stdout.getvalue())
+
+        self._write_claude({
+            "remote": {
+                "type": "http",
+                "url": "https://mcp.example.test/four",
+                "headers": {"Authorization": secret_value},
+            }
+        })
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = cli.main(["apply-json", "--all-changed"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn(secret_value, stdout.getvalue())
 
 
 if __name__ == "__main__":

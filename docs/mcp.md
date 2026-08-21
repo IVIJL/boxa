@@ -129,7 +129,11 @@ a Docker container's environment. Status and doctor show
 
 `boxa mcp import` discovers inherited Claude/Codex definitions without writing.
 `--apply` imports selected definitions into the catalog only; it never installs,
-activates, copies credential values, or grants trust.
+activates, copies credential values silently, or grants trust. Each discovered
+secret header or environment value requires its own default-no consent; non-TTY
+and JSON runs declare the key only and leave `boxa mcp secret set` as the next
+step. Already-cataloged definitions appear under Changed (reimport) when their
+host-carried fields differ, while in-sync definitions collapse into a summary.
 
 `boxa mcp migrate` performs the one-time legacy catalog migration and retires
 shared-file artifacts from the superseded design. Global definitions enter the

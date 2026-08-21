@@ -70,8 +70,8 @@ except ModuleNotFoundError:  # pragma: no cover - environment dependent
         _toml = None
 
 
-def _claude_env(cand: Candidate) -> dict[str, str]:
-    """Recover the ``env`` map for a Claude server from its source file."""
+def _claude_spec(cand: Candidate) -> dict[str, Any]:
+    """Recover one Claude server spec from its source file."""
     path = cand.source_path
     if not os.path.isfile(path):
         return {}
@@ -89,7 +89,12 @@ def _claude_env(cand: Candidate) -> dict[str, str]:
     else:
         block = data.get("mcpServers")
     spec = block.get(cand.name) if isinstance(block, dict) else None
-    env = spec.get("env") if isinstance(spec, dict) else None
+    return spec if isinstance(spec, dict) else {}
+
+
+def _claude_env(cand: Candidate) -> dict[str, str]:
+    """Recover the ``env`` map for a Claude server from its source file."""
+    env = _claude_spec(cand).get("env")
     if not isinstance(env, dict):
         return {}
     return {str(k): str(v) for k, v in env.items()}
@@ -136,6 +141,24 @@ def read_secret_values(cand: Candidate) -> dict[str, str]:
     else:
         env = _claude_env(cand)
     return {k: v for k, v in env.items() if k in secret_keys}
+
+
+def read_secret_header_values(cand: Candidate) -> dict[str, str]:
+    """Return declared secret HTTP header values, in memory only."""
+    if cand.provider != "claude-code" or not cand.secret_header_keys:
+        return {}
+    headers = _claude_spec(cand).get("headers")
+    if not isinstance(headers, dict):
+        return {}
+    declared = {name.casefold(): name for name in cand.secret_header_keys}
+    result: dict[str, str] = {}
+    for raw_name, raw_value in headers.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            continue
+        canonical = declared.get(raw_name.casefold())
+        if canonical is not None:
+            result[canonical] = raw_value
+    return result
 
 
 def read_nonsecret_values(cand: Candidate) -> dict[str, str]:

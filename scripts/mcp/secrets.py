@@ -179,6 +179,20 @@ def store_server_secrets(
     save_secrets(path, store)
 
 
+def store_server_secret(
+    path: str, server_name: str, key: str, value: str
+) -> None:
+    """Set one server environment secret without replacing its peers."""
+    store = load_secrets(path)
+    block = store["servers"].setdefault(server_name, {})
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"malformed secret store (server block is not an object): {path}"
+        )
+    block[key] = value
+    save_secrets(path, store)
+
+
 def read_server_secrets(path: str, server_name: str) -> Optional[dict[str, str]]:
     """Return the stored secret block for one server, or None if absent.
 
@@ -218,6 +232,25 @@ def store_header_secret(
         if str(existing_name).casefold() == folded_name:
             del block[existing_name]
     block[folded_name] = value
+    save_secrets(path, store)
+
+
+def store_header_secrets(
+    path: str, entry_id: str, values: dict[str, str]
+) -> None:
+    """Replace one catalog entry's complete secret-header block."""
+    if not values:
+        if not os.path.isfile(path):
+            return
+        store = load_secrets(path)
+        if entry_id in store["headers"]:
+            del store["headers"][entry_id]
+            save_secrets(path, store)
+        return
+    store = load_secrets(path)
+    store["headers"][entry_id] = {
+        str(name).casefold(): str(value) for name, value in values.items()
+    }
     save_secrets(path, store)
 
 

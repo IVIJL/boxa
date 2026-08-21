@@ -346,6 +346,12 @@ def _validate_entry(entry_id: str, entry: Any) -> None:
         raise CatalogError(
             f"malformed catalog (entry {entry_id!r} has invalid secretStoreKey)"
         )
+    if "importIdentity" in entry and (
+        not isinstance(entry["importIdentity"], str) or not entry["importIdentity"]
+    ):
+        raise CatalogError(
+            f"malformed catalog (entry {entry_id!r} has invalid importIdentity)"
+        )
     if entry["type"] == "http":
         _validate_http_url(entry.get("url"), f"entry {entry_id!r} url")
         _validate_http_headers(entry_id, entry)
@@ -362,7 +368,7 @@ def _validate_entry(entry_id: str, entry: Any) -> None:
             )
         allowed = {
             "id", "name", "type", "url", "headers", "secretHeaderKeys",
-            "readiness", "description",
+            "readiness", "description", "importIdentity",
         }
         unknown = set(entry) - allowed
         if unknown:
@@ -741,6 +747,8 @@ def updated_catalog_entry(
         updated["name"] = current["name"]
         if "description" in current and "description" not in updated:
             updated["description"] = current["description"]
+        if "importIdentity" in current and "importIdentity" not in updated:
+            updated["importIdentity"] = current["importIdentity"]
         if updated.get("type") == "stdio" and current.get("type") == "stdio":
             updated["executionMode"] = current["executionMode"]
             if "secretStoreKey" in current:
