@@ -964,25 +964,30 @@ _wizard_project_picker() {
         *) echo "Invalid Project picker mode: $mode" >&2; return 2 ;;
     esac
     local targets
-    # Let stderr through: project-targets-text reports basename collisions
-    # there (two host paths sanitizing to one name, omitted from stdout for
-    # explicit disambiguation). Swallowing it would leave a user unable to see
-    # WHY a valid initialized Project is missing from the picker.
-    targets="$(_run_py project-targets-text)"
-    # project-targets-text prints a human note (not tab-separated) when empty;
-    # rows with a tab are real "<name>\t<key>" targets.
-    local -a tkeys=() tnames=()
+    # Diagnostics travel in captured stdout so they can be placed in the picker
+    # header; pre-fzf stderr would be hidden when fzf repaints the terminal.
+    targets="$(_run_py project-targets-text --diagnostics)"
+    # Rows with a tab are real "<name>\t<key>" targets. Other lines are
+    # diagnostics intended for the picker header / empty-result explanation.
+    local -a tkeys=() tnames=() diagnostics=()
     local tname tkey
     while IFS=$'\t' read -r tname tkey; do
-        [ -n "$tkey" ] || continue
+        if [ -z "$tkey" ]; then
+            [ -n "$tname" ] && diagnostics+=("$tname")
+            continue
+        fi
         tnames+=("$tname")
         tkeys+=("$tkey")
     done <<< "$targets"
 
     if [ "${#tkeys[@]}" -eq 0 ]; then
+        local diagnostic
+        for diagnostic in ${diagnostics[@]+"${diagnostics[@]}"}; do
+            printf '%s\n' "$diagnostic" >&2
+        done
         echo "No initialized boxa Projects to target for '$name'." >&2
-        echo "A target must be known to Claude AND have a boxa-<name>-history volume." >&2
-        echo "Initialize the Project (run 'boxa <name>' once) and re-run import." >&2
+        echo "A target must be registered by boxa AND have an exact-path Claude record." >&2
+        echo "Open the registered Project with Claude and re-run import." >&2
         return 2
     fi
 
@@ -1017,6 +1022,12 @@ _wizard_project_picker() {
         else
             header="Choose one or more Projects; source project is the default (a)"
         fi
+    fi
+    local diagnostic
+    for diagnostic in ${diagnostics[@]+"${diagnostics[@]}"}; do
+        header+=$'\n'"$diagnostic"
+    done
+    if [ -n "$default_row" ]; then
         picked="$(printf '%s\n' "${menu[@]+"${menu[@]}"}" | "$picker_command" \
             --prompt "$prompt" \
             --header "$header" \
@@ -1954,7 +1965,7 @@ _project_target_exists() {
         [ -n "$tkey" ] || continue
         canon="$(readlink -f "$tkey" 2>/dev/null || printf '%s' "$tkey")"
         [ "$canon" = "$want" ] && return 0
-    done < <(_run_py project-targets-text)
+    done < <(_run_py project-targets-text --volume-based)
     return 1
 }
 
@@ -1969,7 +1980,7 @@ _add_scope_picker() {
     local targets
     # Let stderr through so basename collisions are visible (same rationale as
     # the import wizard's project picker).
-    targets="$(_run_py project-targets-text)"
+    targets="$(_run_py project-targets-text --volume-based)"
 
     # The current directory's Project key, used to pre-highlight its row.
     local cwd_key

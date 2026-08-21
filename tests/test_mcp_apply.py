@@ -934,16 +934,23 @@ class CliWizardWiringTest(ApplyEnv):
         self.assertIn("write failed", stderr.getvalue())
 
     def test_wizard_degradation_consent_reads_one_tty_reply(self) -> None:
-        stdin = mock.Mock()
-        stdin.isatty.return_value = True
         tty = mock.mock_open(read_data="y\n")
-        with mock.patch.object(mcp_cli.sys, "stdin", stdin), mock.patch(
-            "builtins.open", tty
-        ):
+        with mock.patch.object(
+            mcp_cli, "_controlling_terminal_usable", return_value=True
+        ), mock.patch("builtins.open", tty):
             accepted = mcp_cli._wizard_degradation_consent("degraded")
 
         self.assertTrue(accepted)
         tty.assert_called_once_with("/dev/tty", "r+", encoding="utf-8")
+
+    def test_wizard_degradation_consent_requires_usable_tty(self) -> None:
+        with mock.patch.object(
+            mcp_cli, "_controlling_terminal_usable", return_value=False
+        ), mock.patch("builtins.open") as tty:
+            accepted = mcp_cli._wizard_degradation_consent("degraded")
+
+        self.assertIsNone(accepted)
+        tty.assert_not_called()
 
     def test_json_apply_wizard_never_offers_activation(self) -> None:
         env = dict(

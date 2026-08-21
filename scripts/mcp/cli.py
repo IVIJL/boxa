@@ -125,6 +125,7 @@ from .projects import (
     VolumeProbe,
     basename_of,
     enumerate_project_targets,
+    enumerate_volume_project_targets,
     sanitize_basename,
 )
 from .providers import ClaudeProvider, CodexProvider
@@ -847,9 +848,19 @@ def _apply_wizard_activations(
     return outcomes, failed
 
 
+def _controlling_terminal_usable() -> bool:
+    """Return whether the process can open its controlling terminal."""
+    try:
+        with open("/dev/tty", "r+", encoding="utf-8"):
+            pass
+    except OSError:
+        return False
+    return True
+
+
 def _wizard_degradation_consent(entry_name: str) -> Optional[bool]:
     """Prompt once for a wizard entry; None means no interactive terminal."""
-    if not sys.stdin.isatty():
+    if not _controlling_terminal_usable():
         return None
     try:
         with open("/dev/tty", "r+", encoding="utf-8") as tty:
@@ -1008,7 +1019,9 @@ def _render_apply_text(merged: list[MergedCandidate], sel: _Selection) -> int:
             selected,
             catalog_conflicts=resolutions,
             force_host_only=sel.force_host_only,
-            secret_consent=_secret_consent if sys.stdin.isatty() else None,
+            secret_consent=(
+                _secret_consent if _controlling_terminal_usable() else None
+            ),
             scope_overrides=destination_scope_overrides(
                 selected, sel.scope.project_keys, scope_overrides=sel.overrides
             ),
@@ -1159,7 +1172,9 @@ def _cmd_import_activate(argv: list[str], as_json: bool) -> int:
             catalog_conflicts=resolutions,
             force_host_only=sel.force_host_only,
             secret_consent=(
-                _secret_consent if not as_json and sys.stdin.isatty() else None
+                _secret_consent
+                if not as_json and _controlling_terminal_usable()
+                else None
             ),
             scope_overrides=destination_scope_overrides(
                 selected,
@@ -3303,50 +3318,85 @@ def _cmd_reload(argv: list[str], as_json: bool) -> int:
 def _cmd_project_targets(argv: list[str], as_json: bool) -> int:
     """`project-targets-{json,text}`: enumerate importable boxa Project targets.
 
-    The machine-readable enumerator the import wizard / `mcp add` pickers (issues
-    12-13) drive: the intersection of Claude's project records with existing
-    ``boxa-<name>-history`` marker volumes, plus any basename collisions
-    surfaced for disambiguation. Accepts an optional ``--docker-bin <path>`` so the shell
-    front-end can point the volume probe at a specific docker/podman binary.
-    Output is secret-free directory metadata.
+    The machine-readable enumerator the import wizard / `mcp add` pickers drive:
+    the exact-path intersection of Claude's project records with the boxa
+    Project registry. Output is secret-free directory metadata.
     """
-    docker_bin = "docker"
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if arg == "--docker-bin":
-            i += 1
-            if i >= len(argv):
-                sys.stderr.write("mcp.cli: --docker-bin requires a value\n")
-                return 2
-            docker_bin = argv[i]
-        elif arg.startswith("--docker-bin="):
-            docker_bin = arg[len("--docker-bin="):]
+    diagnostics = False
+    volume_based = False
+    for arg in argv:
+        if arg == "--diagnostics" and not as_json:
+            diagnostics = True
+        elif arg == "--volume-based" and not as_json:
+            volume_based = True
         else:
             sys.stderr.write(f"mcp.cli: unknown argument {arg!r}\n")
             return 2
-        i += 1
 
-    probe = VolumeProbe(docker_bin=docker_bin)
-    result = enumerate_project_targets(ClaudeProvider(), probe)
+    if volume_based:
+        result = enumerate_volume_project_targets(ClaudeProvider(), VolumeProbe())
+    else:
+        config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+            os.path.expanduser("~"), ".config"
+        )
+        registry_path = os.path.join(config_home, "boxa", "projects.json")
+        try:
+            with open(registry_path, encoding="utf-8") as fh:
+                registry = json.load(fh)
+        except (OSError, ValueError):
+            registry = {}
+        projects = registry.get("projects") if isinstance(registry, dict) else None
+        registry_projects = projects if isinstance(projects, dict) else {}
+        result = enumerate_project_targets(ClaudeProvider(), registry_projects)
     if as_json:
         return _emit(result.to_dict())
 
-    if not result.targets and not result.collisions:
-        sys.stdout.write(
-            "No importable boxa Projects found. A Project must be known to "
-            "Claude AND have an initialized boxa-<name>-history volume.\n"
-        )
-        return 0
+    if not result.targets:
+        if volume_based:
+            sys.stdout.write(
+                "No importable boxa Projects found. A Project must be known to "
+                "Claude AND have an initialized boxa-<name>-history volume.\n"
+            )
+        else:
+            sys.stdout.write(
+                "No importable boxa Projects found. A Project must be in the boxa "
+                "Project registry AND have an exact-path Claude project record.\n"
+            )
     for t in result.targets:
         # Tab-separated so the shell picker can split name from absolute path.
-        sys.stdout.write(f"{t.name}\t{t.project_key}\n")
-    for c in result.collisions:
-        sys.stderr.write(
-            f"mcp.cli: project name {c.name!r} is ambiguous "
-            f"({len(c.project_keys)} host paths sanitize to it): "
-            f"{', '.join(c.project_keys)}\n"
+        display_name = "".join(
+            " " if ord(char) < 32 or ord(char) == 127 else char
+            for char in t.name
         )
+        sys.stdout.write(f"{display_name}\t{t.project_key}\n")
+    if volume_based:
+        for collision in result.collisions:
+            sys.stderr.write(
+                f"mcp.cli: project name {collision.name!r} is ambiguous "
+                f"({len(collision.project_keys)} host paths sanitize to it): "
+                f"{', '.join(collision.project_keys)}\n"
+            )
+    elif diagnostics:
+        for collision in result.collisions:
+            sys.stdout.write(
+                f"Ambiguous Project name {collision.name!r}; paths shown for "
+                f"disambiguation: {', '.join(collision.project_keys)}\n"
+            )
+        for project_key in result.missing_claude_records:
+            sys.stdout.write(
+                f"Skipped registered Project without an exact-path Claude "
+                f"record: {project_key!r}\n"
+            )
+        for project_key in result.stale_projects:
+            sys.stdout.write(
+                "Skipped stale registered Project because its path is not an "
+                f"existing directory: {project_key!r}\n"
+            )
+        for project_key in result.unsafe_project_keys:
+            sys.stdout.write(
+                "Skipped registered Project because its path contains an ASCII "
+                f"protocol delimiter: {project_key!r}\n"
+            )
     return 0
 
 
@@ -3433,7 +3483,7 @@ def _cmd_activation_project_targets(argv: list[str], as_json: bool) -> int:
         def project_keys(self) -> list[str]:
             return known
 
-    result = enumerate_project_targets(_KnownProjects(), VolumeProbe())
+    result = enumerate_volume_project_targets(_KnownProjects(), VolumeProbe())
     if as_json:
         return _emit(result.to_dict())
     for target in result.targets:

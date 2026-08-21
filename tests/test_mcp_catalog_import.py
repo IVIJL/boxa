@@ -302,7 +302,9 @@ class CatalogImportTest(unittest.TestCase):
             selection.overrides[merged[0].import_id] = override
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout), \
-                mock.patch.object(cli.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(
+                    cli, "_controlling_terminal_usable", return_value=True
+                ), \
                 mock.patch.object(cli, "_secret_consent", return_value=True):
             self.assertEqual(cli._render_apply_text(merged, selection), 0)
         for value in read_secret_values(candidate).values():
@@ -433,13 +435,21 @@ class CatalogImportTest(unittest.TestCase):
         })
         stdout = io.StringIO()
         stderr = io.StringIO()
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
         old_cwd = os.getcwd()
         try:
             os.chdir(project)
-            with contextlib.redirect_stdout(stdout), \
+            with os.fdopen(read_fd, encoding="utf-8") as piped_stdin, \
+                    contextlib.redirect_stdout(stdout), \
                     contextlib.redirect_stderr(stderr), \
-                    mock.patch.object(cli.sys.stdin, "isatty", return_value=True), \
-                    mock.patch.object(cli, "_secret_consent", return_value=True):
+                    mock.patch.object(cli.sys, "stdin", piped_stdin), \
+                    mock.patch.object(
+                        cli, "_controlling_terminal_usable", return_value=True
+                    ), mock.patch.object(
+                        cli, "_secret_consent", return_value=True
+                    ) as consent:
+                self.assertFalse(piped_stdin.isatty())
                 self.assertEqual(
                     cli.main(["apply-text", "--all", "--server", "tool"]), 0
                 )
@@ -447,6 +457,8 @@ class CatalogImportTest(unittest.TestCase):
             os.chdir(old_cwd)
         self.assertNotIn(secret, stdout.getvalue())
         self.assertNotIn(secret, stderr.getvalue())
+        self.assertNotIn("Skipped credential values", stdout.getvalue())
+        consent.assert_called_once()
         entries = load_catalog()["entries"]
         self.assertNotIn(secret, json.dumps(entries))
         imported_id = next(iter(entries))
@@ -499,6 +511,88 @@ class CatalogImportTest(unittest.TestCase):
         self.assertNotIn(secret, status_stdout.getvalue())
         self.assertNotIn(secret, rerun_stderr.getvalue())
 
+    def test_unusable_tty_keeps_secret_takeover_noninteractive(self):
+        secret = "unusable-tty-secret-value"
+        path = self._write_source("tool", {
+            "command": "uvx",
+            "env": {"API_KEY": secret},
+        })
+        candidate = _candidate("tool", ["uvx"])
+        candidate.provider = "claude-code"
+        candidate.source_path = path
+        candidate.command = Command(
+            argv=["uvx"],
+            env_keys=["API_KEY"],
+            secret_env_keys=["API_KEY"],
+        )
+        merged = merge_candidates([candidate])
+        selection = cli._Selection()
+        selection.import_ids = [merged[0].import_id]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), mock.patch.object(
+            cli, "_controlling_terminal_usable", return_value=False
+        ), mock.patch.object(cli, "_secret_consent") as consent:
+            self.assertEqual(cli._render_apply_text(merged, selection), 0)
+
+        self.assertIn("Skipped credential values for tool: API_KEY", stdout.getvalue())
+        self.assertIn("Next: boxa mcp secret set", stdout.getvalue())
+        self.assertNotIn(secret, stdout.getvalue())
+        consent.assert_not_called()
+        self.assertIsNone(read_server_secrets(global_secrets_path(), "tool"))
+        self.assertNotIn(secret, json.dumps(load_catalog()["entries"]))
+
+    def test_json_apply_unconditionally_disables_secret_consent(self):
+        secret = "json-disabled-consent-value"
+        self._write_source("tool", {
+            "command": "uvx",
+            "env": {"API_KEY": secret},
+        })
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), mock.patch.object(
+            cli, "_controlling_terminal_usable", return_value=True
+        ) as tty_probe, mock.patch.object(cli, "_secret_consent") as consent:
+            self.assertEqual(
+                cli.main(["apply-json", "--all", "--server", "tool"]), 0
+            )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["skippedSecrets"][0]["keys"], ["API_KEY"])
+        self.assertNotIn(secret, stdout.getvalue())
+        tty_probe.assert_not_called()
+        consent.assert_not_called()
+        self.assertIsNone(read_server_secrets(global_secrets_path(), "tool"))
+        self.assertNotIn(secret, json.dumps(load_catalog()["entries"]))
+
+    def test_json_import_activate_never_probes_for_secret_consent(self):
+        candidate = merge_candidates([_candidate("tool", ["uvx"])])
+        imported = mock.Mock()
+        imported.imported = []
+        imported.secret_scopes = []
+        imported.to_dict.return_value = {"imported": []}
+        stdout = io.StringIO()
+        with mock.patch.object(
+            cli, "_discover", return_value=candidate
+        ), mock.patch.object(
+            cli, "import_definitions", return_value=imported
+        ) as importer, mock.patch.object(
+            cli, "_controlling_terminal_usable", return_value=True
+        ) as tty_probe, contextlib.redirect_stdout(stdout):
+            self.assertEqual(
+                cli._cmd_import_activate(
+                    [
+                        "--target-project", "/project",
+                        "--for", "claude",
+                        "--server", "tool",
+                    ],
+                    as_json=True,
+                ),
+                0,
+            )
+
+        self.assertIsNone(importer.call_args.kwargs["secret_consent"])
+        tty_probe.assert_not_called()
+        self.assertEqual(json.loads(stdout.getvalue())["flow"], [])
+
     def test_all_applicable_global_stdio_takeover_uses_target_project_store(self):
         secret = "all-applicable-project-only-value"
         project = os.path.join(self.tmp.name, "all-applicable-project")
@@ -515,7 +609,9 @@ class CatalogImportTest(unittest.TestCase):
             os.chdir(project)
             with contextlib.redirect_stdout(stdout), \
                     contextlib.redirect_stderr(stderr), \
-                    mock.patch.object(cli.sys.stdin, "isatty", return_value=True), \
+                    mock.patch.object(
+                        cli, "_controlling_terminal_usable", return_value=True
+                    ), \
                     mock.patch.object(cli, "_secret_consent", return_value=True):
                 self.assertEqual(
                     cli.main(["apply-text", "--all", "--all-applicable"]), 0

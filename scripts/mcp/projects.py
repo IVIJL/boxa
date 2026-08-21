@@ -12,19 +12,16 @@ host path via Claude's project records"):
     because rendering writes into Claude Code's ``~/.claude.json`` ``projects``
     map, which is keyed by absolute path. A bare sanitized Project NAME is
     insufficient — two host paths can sanitize to the same name (ADR 0005).
-  * There is no boxa-side registry of Project -> host path. The authoritative
-    source is **Claude's own ``projects`` map**: it stores every absolute path
-    Claude has worked with, and because each Project is bind-mounted at its
-    literal host path (ADR 0004) that path is valid both on the host and inside
-    the Container.
-  * Knowing a path is not enough: the target must be a real boxa Project that
-    can actually run the server. So the enumerator offers the **intersection** of
-    Claude project records with existing boxa per-project volumes, matched by
-    the ADR 0005 sanitized basename. A directory Claude knows but boxa has not
-    initialized (no volume) is NOT offered.
+  * The boxa Project registry maps exact host paths to their display names.
+    Import targets are the path-based intersection of that registry with
+    Claude's ``projects`` map. Container-side ``/workspace`` records and other
+    Claude records outside the registry are therefore irrelevant.
+  * Two registry paths may share a display name. Both remain valid targets and
+    their paths disambiguate them in the picker; the ambiguity is also surfaced
+    as a diagnostic instead of silently dropping either Project.
 
-Marker volume
--------------
+Legacy activation marker volume
+-------------------------------
 The ADR 0013 amendment names ``boxa-<name>-claude`` as the marker, but that
 volume is **legacy**: current boxa bind-mounts the host ``~/.claude`` directly
 (ADR 0002) and ``docker-run.sh`` treats ``boxa-(.+-)?claude`` volumes as stale
@@ -32,15 +29,11 @@ pre-migration state, removing them. An initialized Project today instead always
 has the per-project ``boxa-<name>-history`` and ``boxa-<name>-docker``
 volumes (``lib/naming.sh`` ``BOXA_PROJECT_VOLUME_SUFFIXES``; created
 unconditionally in ``docker-run.sh``). Gating on the obsolete ``-claude`` volume
-would return zero targets for every normal install. Per the issue's "match what's
-actually there", we therefore probe the canonical per-project marker
+would return zero targets for every normal install. The activation workflows
+that still enumerate from Docker therefore probe the canonical per-project marker
 (``boxa-<name>-history``) — the same suffix boxa uses to reverse-derive the
 Project list — which faithfully realizes the amendment's intent ("a real boxa
 Project that can actually run the server").
-
-Two host paths sanitizing to the same volume name are a **collision**: they are
-surfaced for explicit disambiguation, never silently merged (mirrors the
-``_resolve_project_key`` contract referenced by the amendment).
 
 Secret-safe: this module only handles directory paths (non-secret) and a docker
 volume-existence probe. It never reads agent credentials or MCP env values.
@@ -48,10 +41,11 @@ volume-existence probe. It never reads agent credentials or MCP env values.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess  # noqa: S404 - volume probe genuinely shells out to docker
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Mapping, Optional
 
 # Per-project volume name boxa uses as proof a directory is a real,
 # initialized Project: ``boxa-<sanitized-basename>-history``. This is one of
@@ -151,12 +145,12 @@ class VolumeProbe:
 class ProjectTarget:
     """One importable boxa Project target (ADR 0013 amendment).
 
-    Carries BOTH the display name (the sanitized Project name, which is also the
-    volume/container label) and the absolute host path (``project_key``) that
-    keys the Claude ``projects`` map and the rendered Project-scoped profile.
+    Carries both the registry display name and the absolute host path
+    (``project_key``) that keys the Claude ``projects`` map and the rendered
+    Project-scoped profile.
     """
 
-    name: str  # sanitized Project name == boxa label
+    name: str  # boxa registry display name
     project_key: str  # absolute host path (the render key)
 
     def to_dict(self) -> dict[str, str]:
@@ -165,12 +159,10 @@ class ProjectTarget:
 
 @dataclass(frozen=True)
 class ProjectCollision:
-    """Two or more Claude project keys sanitize to the same Project name.
+    """Two or more target paths share one registry display name.
 
-    Surfaced for explicit disambiguation rather than guessed at: a bare
-    sanitized name maps to one ``boxa-<name>-history`` volume, so two distinct
-    host paths sharing that name cannot be told apart by volume existence alone.
-    The caller reports the colliding keys so the user resolves it deliberately.
+    Both paths remain targets because the picker displays their exact host
+    paths. The caller also reports the ambiguity in the picker header.
     """
 
     name: str
@@ -185,60 +177,90 @@ class ProjectTargets:
     """Result of enumerating importable boxa Project targets.
 
     ``targets`` are the offered Projects (sorted by name); ``collisions`` are
-    name clashes surfaced for disambiguation. Both are secret-free directory
-    metadata.
+    name clashes surfaced for disambiguation. Missing Claude records, stale
+    paths, and protocol-unsafe keys are retained as diagnostics. All fields are
+    secret-free directory metadata.
     """
 
     targets: list[ProjectTarget] = field(default_factory=list)
     collisions: list[ProjectCollision] = field(default_factory=list)
+    missing_claude_records: list[str] = field(default_factory=list)
+    stale_projects: list[str] = field(default_factory=list)
+    unsafe_project_keys: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
             "targets": [t.to_dict() for t in self.targets],
             "collisions": [c.to_dict() for c in self.collisions],
+            "missingClaudeRecords": list(self.missing_claude_records),
+            "staleProjects": list(self.stale_projects),
+            "unsafeProjectKeys": list(self.unsafe_project_keys),
         }
 
 
 def enumerate_project_targets(
     claude_provider,
+    registry_projects: Mapping[str, object],
+) -> ProjectTargets:
+    """Enumerate import targets by exact registry/Claude path intersection."""
+    claude_keys = {str(key) for key in claude_provider.project_keys()}
+    by_name: dict[str, list[str]] = {}
+    targets: list[ProjectTarget] = []
+    missing: list[str] = []
+    stale: list[str] = []
+    unsafe: list[str] = []
+    for project_key, raw_metadata in registry_projects.items():
+        if not isinstance(project_key, str) or not project_key.startswith("/"):
+            continue
+        if not isinstance(raw_metadata, Mapping):
+            continue
+        raw_name = raw_metadata.get("name")
+        if not isinstance(raw_name, str) or not raw_name:
+            continue
+        if any(ord(char) < 32 or ord(char) == 127 for char in project_key):
+            unsafe.append(project_key)
+            continue
+        if not os.path.isdir(project_key):
+            stale.append(project_key)
+            continue
+        if project_key not in claude_keys:
+            missing.append(project_key)
+            continue
+        targets.append(ProjectTarget(name=raw_name, project_key=project_key))
+        by_name.setdefault(raw_name, []).append(project_key)
+
+    collisions = [
+        ProjectCollision(name=name, project_keys=sorted(keys))
+        for name, keys in by_name.items()
+        if len(keys) > 1
+    ]
+
+    targets.sort(key=lambda t: (t.name, t.project_key))
+    collisions.sort(key=lambda c: c.name)
+    return ProjectTargets(
+        targets=targets,
+        collisions=collisions,
+        missing_claude_records=sorted(missing),
+        stale_projects=sorted(stale),
+        unsafe_project_keys=sorted(unsafe),
+    )
+
+
+def enumerate_volume_project_targets(
+    claude_provider,
     probe: Optional[VolumeProbe] = None,
 ) -> ProjectTargets:
-    """Enumerate the boxa Projects an MCP server can be applied to.
-
-    The offered set is the **intersection** of Claude's known project records
-    (``claude_provider.project_keys()`` — every absolute path Claude tracks) with
-    existing ``boxa-<sanitized-basename>-history`` marker volumes. A record
-    whose volume does not exist is excluded (Claude knows the directory but boxa
-    has not initialized it as a Project). Volume existence is checked through
-    ``probe`` so tests never call real ``docker``.
-
-    Basename collisions — two distinct project keys sanitizing to the same name —
-    are reported in ``collisions`` and excluded from ``targets``: a single volume
-    name cannot disambiguate them, so the user must choose explicitly rather than
-    have boxa guess which host path the volume belongs to.
-
-    Returns a :class:`ProjectTargets` with both lists sorted for deterministic
-    output.
-    """
+    """Legacy volume-based target set used by activation workflows."""
     probe = probe or VolumeProbe()
-
-    # Group every Claude project key by its sanitized Project name. A name with
-    # more than one distinct key is a collision; a name with exactly one key is a
-    # resolvable candidate (subject to the volume check below).
     by_name: dict[str, list[str]] = {}
     seen_keys: set[str] = set()
     for raw_key in claude_provider.project_keys():
         key = str(raw_key)
-        # De-duplicate identical keys so a doubly-listed record does not look
-        # like a self-collision.
         if key in seen_keys:
             continue
         seen_keys.add(key)
         name = sanitize_basename(basename_of(key))
         if not name:
-            # A key whose basename sanitizes to empty (e.g. "/" or all-punctuation)
-            # has no usable Project name / volume — skip it rather than probe a
-            # malformed "boxa--history" volume.
             continue
         by_name.setdefault(name, []).append(key)
 
@@ -246,16 +268,11 @@ def enumerate_project_targets(
     collisions: list[ProjectCollision] = []
     for name, keys in by_name.items():
         if len(keys) > 1:
-            # Multiple host paths share this sanitized name -> the single
-            # boxa-<name>-history volume cannot disambiguate them. Surface for
-            # explicit choice; never silently pick one.
             collisions.append(ProjectCollision(name=name, project_keys=sorted(keys)))
             continue
-        # Exactly one key for this name: offer it only if the boxa Project
-        # volume actually exists (proves the directory is an initialized Project).
         if probe.exists(project_volume_name(name)):
             targets.append(ProjectTarget(name=name, project_key=keys[0]))
 
-    targets.sort(key=lambda t: (t.name, t.project_key))
-    collisions.sort(key=lambda c: c.name)
+    targets.sort(key=lambda target: (target.name, target.project_key))
+    collisions.sort(key=lambda collision: collision.name)
     return ProjectTargets(targets=targets, collisions=collisions)

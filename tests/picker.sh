@@ -161,6 +161,60 @@ wizard_projects_out="$(
 assert_eq "import Project picker: fallback selects destination + activation Project" \
     $'/source\n/other' "$wizard_projects_out"
 
+wizard_projects_fallback="$(
+    BOXA_PICKER_FZF=0 BOXA_PICKER_TEST_CHOICE=1,2 \
+        bash -c '
+            source "$1"
+            _run_py() {
+                printf "%s\n" $'"'"'api\t/work/a/api'"'"' \
+                    $'"'"'api\t/work/b/api'"'"' \
+                    "Ambiguous Project name '"'"'api'"'"'; paths shown for disambiguation"
+            }
+            _wizard_project_picker server ""
+        ' "$SCRIPT_DIR/../scripts/_harness.sh" \
+            "$SCRIPT_DIR/../scripts/mcp-cli.sh" 2>&1
+)"
+case "$wizard_projects_fallback" in
+    *"Ambiguous Project name 'api'"*"/work/a/api"*"/work/b/api"*)
+        printf 'PASS  import Project picker: fallback shows both paths and diagnostic\n'
+        ;;
+    *)
+        printf 'FAIL  import Project picker: fallback shows both paths and diagnostic\n      output: %q\n' \
+            "$wizard_projects_fallback"
+        fail_count=$((fail_count + 1))
+        ;;
+esac
+
+wizard_projects_fzf="$(
+    BOXA_PICKER_FZF=1 bash -c '
+        source "$1"
+        _run_py() {
+            printf "%s\n" $'"'"'api\t/work/a/api'"'"' \
+                $'"'"'api\t/work/b/api'"'"' \
+                "Ambiguous Project name '"'"'api'"'"'; paths shown for disambiguation"
+        }
+        fzf() {
+            printf "FZF_ARGS:%s\n" "$*" >&2
+            local rows
+            rows="$(cat)"
+            printf "FZF_ROWS:%s\n" "$rows" >&2
+            printf "%s\n" "${rows%%$'"'"'\n'"'"'*}"
+        }
+        _wizard_project_picker server "" one
+    ' "$SCRIPT_DIR/../scripts/_harness.sh" \
+        "$SCRIPT_DIR/../scripts/mcp-cli.sh" 2>&1
+)"
+case "$wizard_projects_fzf" in
+    *"FZF_ARGS:"*"Ambiguous Project name 'api'"*"FZF_ROWS:"*"/work/a/api"*"/work/b/api"*)
+        printf 'PASS  import Project picker: fzf shows both paths and diagnostic header\n'
+        ;;
+    *)
+        printf 'FAIL  import Project picker: fzf shows both paths and diagnostic header\n      output: %q\n' \
+            "$wizard_projects_fzf"
+        fail_count=$((fail_count + 1))
+        ;;
+esac
+
 # shellcheck disable=SC2016 # $1 is intentionally expanded by the child shell.
 assert_fail "import Project picker: q cancels" \
     env BOXA_PICKER_FZF=0 BOXA_PICKER_TEST_CHOICE=q \

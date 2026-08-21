@@ -20,7 +20,7 @@ from .catalog import (
     updated_catalog_entry,
 )
 from .profile import config_root
-from .projects import VolumeProbe, enumerate_project_targets
+from .projects import VolumeProbe, enumerate_volume_project_targets
 from .readiness import (
     ProjectProbe,
     ReadinessError,
@@ -688,7 +688,7 @@ def activate_everywhere(
     therefore converges a Project even if it was not enumerable or ready during
     this command, while each known Project still gets an immediate outcome.
     """
-    targets = enumerate_project_targets(claude_provider, volume_probe)
+    targets = enumerate_volume_project_targets(claude_provider, volume_probe)
     with mutation_lock():
         catalog = load_catalog()
         entry_id, entry = resolve_entry(catalog, token)

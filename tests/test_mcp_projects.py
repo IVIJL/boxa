@@ -7,11 +7,9 @@ Run with:
 
 Two units under test:
 
-  * ``mcp.projects`` — the enumerator that intersects Claude project records with
-    existing ``boxa-<name>-history`` marker volumes (matched by ADR 0005
-    sanitized basename), carries the absolute host path, and surfaces collisions.
-    The docker volume probe is INJECTED via a stub ``VolumeProbe`` subclass so no
-    real ``docker`` is ever invoked.
+  * ``mcp.projects`` — the enumerator that intersects the boxa Project registry
+    with Claude project records by exact host path, carries the absolute host
+    path, and surfaces same-display-name ambiguity without dropping targets.
   * ``mcp.apply`` scope override — applying a candidate to an explicit scope that
     overrides its inherited one, with scoped secrets following the chosen scope,
     plus the post-override slot-conflict guard. HOME / XDG_CONFIG_HOME point at a
@@ -22,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -45,6 +44,7 @@ from mcp.profile import (  # noqa: E402
 from mcp.projects import (  # noqa: E402
     VolumeProbe,
     enumerate_project_targets,
+    enumerate_volume_project_targets,
     project_volume_name,
     sanitize_basename,
 )
@@ -69,7 +69,7 @@ class _StubClaude:
 
 
 class _StubProbe(VolumeProbe):
-    """Volume probe backed by a fixed set of names; never calls real docker."""
+    """Volume probe backed by a fixed set of names; never calls Docker."""
 
     def __init__(self, existing):
         super().__init__()
@@ -102,85 +102,254 @@ class SanitizeBasenameTest(unittest.TestCase):
 
 
 class EnumerateProjectTargetsTest(unittest.TestCase):
-    def test_excludes_records_without_a_volume(self):
-        # Two Claude records; only one has a boxa-<name>-history volume.
-        claude = _StubClaude(
-            ["/home/u/Projekty/HasVol", "/home/u/Projekty/NoVol"]
-        )
-        probe = _StubProbe(["boxa-HasVol-history"])
-        result = enumerate_project_targets(claude, probe)
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _project(self, relative):
+        path = os.path.join(self._tmp.name, relative)
+        os.makedirs(path)
+        return path
+
+    def test_live_host_shape_offers_only_exact_registered_host_path(self):
+        host_project = self._project("home/vlcak/Projekty/easyjukebox_api")
+        claude = _StubClaude([
+            host_project,
+            "/workspace/easyjukebox-api",
+            os.path.join(self._tmp.name, "home", "vlcak"),
+        ])
+        registry = {
+            host_project: {"name": "easyjukebox-api"},
+        }
+
+        result = enumerate_project_targets(claude, registry)
+
         self.assertEqual(
-            [t.name for t in result.targets], ["HasVol"]
+            [(target.name, target.project_key) for target in result.targets],
+            [("easyjukebox-api", host_project)],
         )
         self.assertEqual(result.collisions, [])
+        self.assertEqual(result.missing_claude_records, [])
 
-    def test_target_carries_name_and_absolute_path(self):
-        claude = _StubClaude(["/home/u/Projekty/App"])
-        probe = _StubProbe(["boxa-App-history"])
-        result = enumerate_project_targets(claude, probe)
-        self.assertEqual(len(result.targets), 1)
-        target = result.targets[0]
-        self.assertEqual(target.name, "App")
-        self.assertEqual(target.project_key, "/home/u/Projekty/App")
+    def test_same_display_name_keeps_both_paths_and_reports_ambiguity(self):
+        paths = [self._project("work/a/api"), self._project("work/b/api")]
+        registry = {path: {"name": "api"} for path in paths}
 
-    def test_basename_collision_reported_not_merged(self):
-        # Two distinct host paths sanitize to the same name "api".
-        claude = _StubClaude(["/work/a/api", "/work/b/api"])
-        # Even if a volume exists, a collision cannot be disambiguated.
-        probe = _StubProbe(["boxa-api-history"])
-        result = enumerate_project_targets(claude, probe)
-        self.assertEqual(result.targets, [])
+        result = enumerate_project_targets(_StubClaude(paths), registry)
+
+        self.assertEqual(
+            [target.project_key for target in result.targets], paths
+        )
         self.assertEqual(len(result.collisions), 1)
-        collision = result.collisions[0]
-        self.assertEqual(collision.name, "api")
-        self.assertEqual(
-            collision.project_keys, ["/work/a/api", "/work/b/api"]
-        )
+        self.assertEqual(result.collisions[0].name, "api")
+        self.assertEqual(result.collisions[0].project_keys, paths)
 
-    def test_probe_is_only_seam_to_docker(self):
-        # The stub probe records every queried volume name; the test passes
-        # without any real docker being available, proving injection works.
-        claude = _StubClaude(["/home/u/Projekty/App"])
-        probe = _StubProbe([])
-        result = enumerate_project_targets(claude, probe)
+    def test_registered_path_without_exact_claude_record_is_diagnostic(self):
+        project = self._project("work/app")
+        registry = {project: {"name": "app"}}
+        result = enumerate_project_targets(_StubClaude([project + "/"]), registry)
+
         self.assertEqual(result.targets, [])
-        self.assertEqual(probe.queried, ["boxa-App-history"])
+        self.assertEqual(result.missing_claude_records, [project])
 
-    def test_duplicate_keys_not_a_self_collision(self):
-        claude = _StubClaude(
-            ["/home/u/Projekty/App", "/home/u/Projekty/App"]
+    def test_stale_registered_path_is_diagnostic(self):
+        project = os.path.join(self._tmp.name, "deleted")
+        registry = {project: {"name": "deleted"}}
+
+        result = enumerate_project_targets(_StubClaude([project]), registry)
+
+        self.assertEqual(result.targets, [])
+        self.assertEqual(result.stale_projects, [project])
+
+    def test_control_character_project_key_is_diagnostic(self):
+        project = self._project("unsafe\tproject")
+        registry = {project: {"name": "unsafe"}}
+
+        result = enumerate_project_targets(_StubClaude([project]), registry)
+
+        self.assertEqual(result.targets, [])
+        self.assertEqual(result.unsafe_project_keys, [project])
+
+    def test_ignores_invalid_registry_records(self):
+        registry = {
+            "relative/app": {"name": "app"},
+            "/work/no-metadata": "invalid",
+            "/work/no-name": {},
+        }
+        result = enumerate_project_targets(
+            _StubClaude(list(registry)), registry
         )
-        probe = _StubProbe(["boxa-App-history"])
-        result = enumerate_project_targets(claude, probe)
-        self.assertEqual([t.name for t in result.targets], ["App"])
-        self.assertEqual(result.collisions, [])
-
-    def test_trailing_slash_normalized(self):
-        claude = _StubClaude(["/home/u/Projekty/App/"])
-        probe = _StubProbe(["boxa-App-history"])
-        result = enumerate_project_targets(claude, probe)
-        self.assertEqual(result.targets[0].project_key, "/home/u/Projekty/App/")
-        self.assertEqual(result.targets[0].name, "App")
+        self.assertEqual(result.targets, [])
+        self.assertEqual(result.missing_claude_records, [])
 
     def test_sorted_output(self):
-        claude = _StubClaude(
-            ["/home/u/Zeta", "/home/u/Alpha", "/home/u/Mid"]
-        )
-        probe = _StubProbe(
-            ["boxa-Zeta-history", "boxa-Alpha-history", "boxa-Mid-history"]
-        )
-        result = enumerate_project_targets(claude, probe)
+        paths = [
+            self._project("home/u/Zeta"),
+            self._project("home/u/Alpha"),
+            self._project("home/u/Mid"),
+        ]
+        registry = {
+            path: {"name": path.rsplit("/", 1)[-1]} for path in paths
+        }
+        result = enumerate_project_targets(_StubClaude(paths), registry)
         self.assertEqual(
             [t.name for t in result.targets], ["Alpha", "Mid", "Zeta"]
         )
 
-    def test_default_probe_is_constructed_when_omitted(self):
-        # When no probe is passed, a real VolumeProbe is built; with no docker
-        # the OSError path returns "no volume" and the target set is empty.
-        claude = _StubClaude(["/home/u/Projekty/App"])
-        result = enumerate_project_targets(
-            claude, VolumeProbe(docker_bin="/nonexistent/docker-bin-xyz")
+    def test_project_targets_json_uses_the_same_path_based_enumeration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_dir = os.path.join(tmp, "claude")
+            registry_dir = os.path.join(tmp, "config", "boxa")
+            os.makedirs(claude_dir)
+            os.makedirs(registry_dir)
+            paths = [
+                os.path.join(tmp, "work", "a", "api"),
+                os.path.join(tmp, "work", "b", "api"),
+            ]
+            for path in paths:
+                os.makedirs(path)
+            missing = os.path.join(tmp, "work", "missing")
+            os.makedirs(missing)
+            stale = os.path.join(tmp, "work", "deleted")
+            unsafe = os.path.join(tmp, "work", "unsafe\tproject")
+            os.makedirs(unsafe)
+            with open(
+                os.path.join(claude_dir, ".claude.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({"projects": {path: {} for path in paths}}, fh)
+            with open(
+                os.path.join(registry_dir, "projects.json"),
+                "w",
+                encoding="utf-8",
+            ) as fh:
+                json.dump({
+                    "version": 1,
+                    "projects": {
+                        **{path: {"name": "api"} for path in paths},
+                        missing: {"name": "missing"},
+                        stale: {"name": "deleted"},
+                        unsafe: {"name": "unsafe"},
+                    },
+                }, fh)
+            env = dict(
+                os.environ,
+                CLAUDE_CONFIG_DIR=claude_dir,
+                XDG_CONFIG_HOME=os.path.join(tmp, "config"),
+                PYTHONPATH=os.path.join(_REPO_ROOT, "scripts"),
+            )
+
+            proc = subprocess.run(
+                [sys.executable, "-m", "mcp.cli", "project-targets-json"],
+                cwd=_REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            text_proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp.cli",
+                    "project-targets-text",
+                    "--diagnostics",
+                ],
+                cwd=_REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(
+            [target["projectKey"] for target in payload["targets"]], paths
         )
+        self.assertEqual(payload["collisions"][0]["projectKeys"], paths)
+        self.assertEqual(payload["missingClaudeRecords"], [missing])
+        self.assertEqual(payload["staleProjects"], [stale])
+        self.assertEqual(payload["unsafeProjectKeys"], [unsafe])
+        self.assertEqual(text_proc.returncode, 0, text_proc.stderr)
+        diagnostic_lines = [
+            line for line in text_proc.stdout.splitlines() if "\t" not in line
+        ]
+        self.assertTrue(any("not an existing directory" in line for line in diagnostic_lines))
+        self.assertTrue(any("ASCII protocol delimiter" in line for line in diagnostic_lines))
+        self.assertIn(repr(unsafe), text_proc.stdout)
+
+
+class EnumerateVolumeProjectTargetsTest(unittest.TestCase):
+    def test_excludes_records_without_a_volume(self):
+        claude = _StubClaude([
+            "/home/u/Projekty/HasVol",
+            "/home/u/Projekty/NoVol",
+        ])
+        probe = _StubProbe(["boxa-HasVol-history"])
+
+        result = enumerate_volume_project_targets(claude, probe)
+
+        self.assertEqual([target.name for target in result.targets], ["HasVol"])
+        self.assertEqual(result.collisions, [])
+
+    def test_target_carries_name_and_absolute_path(self):
+        claude = _StubClaude(["/home/u/Projekty/App"])
+        result = enumerate_volume_project_targets(
+            claude, _StubProbe(["boxa-App-history"])
+        )
+
+        self.assertEqual(
+            [(target.name, target.project_key) for target in result.targets],
+            [("App", "/home/u/Projekty/App")],
+        )
+
+    def test_basename_collision_reported_not_merged(self):
+        paths = ["/work/a/api", "/work/b/api"]
+        result = enumerate_volume_project_targets(
+            _StubClaude(paths), _StubProbe(["boxa-api-history"])
+        )
+
+        self.assertEqual(result.targets, [])
+        self.assertEqual(result.collisions[0].project_keys, paths)
+
+    def test_duplicate_keys_are_not_a_self_collision(self):
+        path = "/home/u/Projekty/App"
+        result = enumerate_volume_project_targets(
+            _StubClaude([path, path]), _StubProbe(["boxa-App-history"])
+        )
+
+        self.assertEqual([target.project_key for target in result.targets], [path])
+        self.assertEqual(result.collisions, [])
+
+    def test_trailing_slash_is_preserved_while_basename_is_normalized(self):
+        path = "/home/u/Projekty/App/"
+        result = enumerate_volume_project_targets(
+            _StubClaude([path]), _StubProbe(["boxa-App-history"])
+        )
+
+        self.assertEqual(result.targets[0].project_key, path)
+        self.assertEqual(result.targets[0].name, "App")
+
+    def test_probe_receives_the_sanitized_volume_name(self):
+        probe = _StubProbe([])
+
+        result = enumerate_volume_project_targets(
+            _StubClaude(["/home/u/My_App"]), probe
+        )
+
+        self.assertEqual(result.targets, [])
+        self.assertEqual(probe.queried, ["boxa-My-App-history"])
+
+    def test_probe_failure_yields_no_target(self):
+        result = enumerate_volume_project_targets(
+            _StubClaude(["/home/u/App"]),
+            VolumeProbe(docker_bin="/nonexistent/docker-bin-xyz"),
+        )
+
         self.assertEqual(result.targets, [])
 
 
