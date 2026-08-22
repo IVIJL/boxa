@@ -1247,15 +1247,16 @@ def _render_applicable_list(merged: list[MergedCandidate]) -> int:
     """Emit one applicable candidate per line for the shell's TTY picker.
 
     Format: ``<import_id>\\t<name>\\t<scope>``. Applicable means ``container``
-    placement (the only thing v1 can apply). SECRET-FREE — identity metadata
-    only. Non-applicable candidates are intentionally omitted so the picker can
-    never offer a host-only/unknown choice.
+    placement (the only thing v1 can apply) with ``proposal`` catalog status:
+    the no-arg activate offer ("add one?") must only propose servers NOT yet
+    in the catalog — cataloged ones (in-sync/changed) would be rejected by the
+    apply path without ``--reimport``, and belong to the catalog picker instead.
+    SECRET-FREE — identity metadata only. Non-applicable candidates are
+    intentionally omitted so the picker can never offer a host-only/unknown
+    choice.
     """
     for m in merged:
-        if (
-            not is_applicable(m)
-            or m.catalog_status in {"already-cataloged", "conflict"}
-        ):
+        if not is_applicable(m) or m.catalog_status != "proposal":
             continue
         scope = m.candidate.source_scope
         if m.candidate.source_project:

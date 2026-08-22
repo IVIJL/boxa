@@ -1054,6 +1054,32 @@ class CliWizardWiringTest(ApplyEnv):
         )
         self.assertIn("source Project key contains", stderr.getvalue())
 
+    def test_applicable_list_offers_only_uncataloged_proposals(self) -> None:
+        # The no-arg activate offer ("add one?") drives list-applicable; a
+        # cataloged candidate (in-sync/changed) must not be offered, because
+        # the apply path rejects it without --reimport (the activate flow
+        # never passes --reimport). Only fresh proposals belong in the offer.
+        merged = merge_candidates([
+            _container_cand("fresh-helper"),
+            _container_cand("cataloged-helper"),
+            _container_cand("drifted-helper"),
+        ])
+        statuses = {
+            "fresh-helper": "proposal",
+            "cataloged-helper": "in-sync",
+            "drifted-helper": "changed",
+        }
+        for item in merged:
+            item.catalog_status = statuses[item.candidate.name]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = mcp_cli._render_applicable_list(merged)
+
+        self.assertEqual(rc, 0)
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].split("\t")[1], "fresh-helper")
+
     def test_override_rejects_relative_project_key(self) -> None:
         # The wizard must only ever pass a resolved ABSOLUTE host path; a bare
         # name is rejected at parse time before any write.
