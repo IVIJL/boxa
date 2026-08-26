@@ -1,6 +1,8 @@
 # ADR 0032 — Per-installation agent identity (agent key, forge access, onboarding)
 
-- **Status:** accepted
+- **Status:** accepted (setup/credential flow superseded by ADR 0033
+  forge identity catalog; decision 2 three-state gate and the posture
+  checklists superseded by ADR 0034)
 - **Date:** 2026-08-22
 - **Extends:** ADR 0026 (SSH gate), ADR 0017 (provisioning registry),
   ADR 0031 (consent-first credential takeover), ADR 0006 (pickers)
@@ -85,7 +87,7 @@ systemd service does not keep a WSL2 VM alive.
    token from host gh/glab configs only via the ADR 0031 consent flow.
    In-container `gh auth login`/`glab auth login` **is supported** for
    users who work that way: per-project named volumes back
-   `~/.config/gh` and `~/.config/glab`, so an in-box login survives
+   `~/.config/gh` and `~/.config/glab-cli`, so an in-box login survives
    recreation and stays project-scoped; injected env wins over config
    files (gh semantics), documented.
 
@@ -151,3 +153,19 @@ systemd service does not keep a WSL2 VM alive.
   that must track GitHub/GitLab UI changes.
 - Users who skip everything lose nothing they have today; the feature is
   strictly opt-in via provisioning category B.
+
+## Forge identity postures
+
+Guided setup now offers three postures per forge. The machine/service account
+remains the recommended default.
+
+- **My own account — quick.** The agent pushes as you, with everything you can
+  access; forge-side repository restrictions cannot narrow that identity.
+- **Machine/service account — safest.** Invite or grant it only where needed;
+  the trade-off is another account to manage.
+- **GitHub fine-grained PAT only — narrow, HTTPS-only.** Choose repositories
+  and token permissions, but SSH remotes cannot authenticate as the agent.
+- **GitLab personal PAT only — account-wide, HTTPS-only.** A personal PAT has
+  full account reach for its granted scopes. Use a project or group access
+  token for genuinely project-scoped access. SSH remotes cannot authenticate
+  as the agent.

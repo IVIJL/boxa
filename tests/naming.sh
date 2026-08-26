@@ -64,6 +64,8 @@ assert_eq "sanitize idempotent"      "my-app"     "$(boxa::sanitize "$(boxa::san
 
 assert_eq "volume_name history"      "boxa-foo-history"   "$(boxa::volume_name foo history)"
 assert_eq "volume_name docker"       "boxa-foo-docker"    "$(boxa::volume_name foo docker)"
+assert_eq "volume_name gh"           "boxa-foo-gh"        "$(boxa::volume_name foo gh)"
+assert_eq "volume_name glab"         "boxa-foo-glab"      "$(boxa::volume_name foo glab)"
 
 # --- boxa::route_domain (default = test when dns.conf absent) --------------
 
@@ -148,7 +150,8 @@ assert_eq "display default no port"  "foo.test"              "$(boxa::route_host
 
 # --- boxa::project_volume_regex --------------------------------------------
 
-assert_eq "project_volume_regex"     "^boxa-.+-(history|docker)$"     "$(boxa::project_volume_regex)"
+assert_eq "project_volume_regex"     "^boxa-.+-(history|docker|gh|glab)$" \
+    "$(boxa::project_volume_regex)"
 
 # --- boxa::names_from_path -------------------------------------------------
 
@@ -159,6 +162,8 @@ assert_eq "from_path CONTAINER_NAME"     "boxa-boxa"                "$BOXA_CONTA
 assert_eq "from_path HOSTNAME"           "boxa"                       "$BOXA_HOSTNAME"
 assert_eq "from_path VOL_HISTORY"        "boxa-boxa-history"        "$BOXA_VOL_HISTORY"
 assert_eq "from_path VOL_DOCKER"         "boxa-boxa-docker"         "$BOXA_VOL_DOCKER"
+assert_eq "from_path VOL_GH"             "boxa-boxa-gh"             "$BOXA_VOL_GH"
+assert_eq "from_path VOL_GLAB"           "boxa-boxa-glab"           "$BOXA_VOL_GLAB"
 assert_eq "from_path WORKSPACE_ALIAS"    "/workspace/boxa"            "$BOXA_WORKSPACE_ALIAS"
 
 # Path with space + diacritics (the latent-bug scenario from the plan)

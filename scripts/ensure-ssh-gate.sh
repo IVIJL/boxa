@@ -26,7 +26,7 @@ EOF
 }
 
 ssh_gate::probe() {
-    # Only explicit global on is active; global off records a decline decision.
+    # Only explicit global forwarding is active; off records a decline.
     # An empty project path cannot match a valid section, so the shared parser
     # reports only the global value here without duplicating ssh.conf parsing.
     _boxa::resolve_ssh_gate ""
@@ -42,7 +42,6 @@ ssh_gate::probe() {
 ssh_gate::enable() {
     _boxa::write_ssh_conf global "" on
     printf 'SSH agent forwarding enabled globally.\n'
-    _boxa::ssh_add_keys_if_agent_unready
 }
 
 ssh_gate::dismiss() {
@@ -71,7 +70,7 @@ ssh_gate::offer() {
     fi
 
     printf '\nBoxa no longer forwards your SSH agent into containers automatically.\n'
-    printf 'A forwarded socket grants a container signing authority over every key in the agent.\n'
+    printf 'Each enabled Project receives its own SSH agent and signing authority over its assigned keys.\n'
     printf 'Enable forwarding? [y/N] '
     read -r answer || answer=""
     case "$answer" in

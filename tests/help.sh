@@ -42,11 +42,17 @@ assert_contains() {
     fi
 }
 
-for command in agent-browser mcp allow-for mem doctor keep-awake build ports connect; do
+for command in agent-browser mcp allow-for mem forge doctor keep-awake build ports connect; do
     direct_help="$(run_boxa "$command" --help)"
     help_command="$(run_boxa help "$command")"
     assert_eq "$command help forms match" "$help_command" "$direct_help"
 done
+
+forge_help="$(run_boxa help forge)"
+assert_contains "forge help documents hidden credential input" \
+    "reads a token from a hidden prompt" "$forge_help"
+assert_contains "forge help documents offline retention" \
+    "Probe failures keep the credential" "$forge_help"
 
 keep_awake_help="$(run_boxa help keep-awake)"
 assert_contains "keep-awake help documents lifecycle commands" \

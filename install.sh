@@ -782,6 +782,35 @@ setup_mcp_onboarding() {
     fi
 }
 
+# --- Agent identity onboarding (ADR 0032) -----------------------------------
+
+setup_agent_identity() {
+    info "Checking Agent identity setup..."
+
+    local hook="$BOXA_DIR/scripts/ensure-agent-identity.sh"
+    if [ ! -x "$hook" ]; then
+        warn "scripts/ensure-agent-identity.sh missing or non-executable; skipping."
+        SKIPPED+=("Agent identity offer (hook missing)")
+        return
+    fi
+
+    local hook_args=(offer)
+    if $AUTO_YES || [ ! -t 0 ] || [ ! -t 1 ]; then
+        hook_args+=(--non-interactive)
+    fi
+
+    if "$hook" "${hook_args[@]}"; then
+        case "$("$hook" probe)" in
+            ok)       CONFIGURED+=("Agent identity") ;;
+            declined) SKIPPED+=("Agent identity (declined)") ;;
+            *)        SKIPPED+=("Agent identity (not decided; run 'boxa doctor --fix agent-identity' later)") ;;
+        esac
+    else
+        warn "Agent identity check failed — run 'boxa doctor --fix agent-identity' manually later."
+        SKIPPED+=("Agent identity offer (check failed; see warnings above)")
+    fi
+}
+
 # --- SSH gate migration offer (ADR 0026) ------------------------------------
 
 setup_ssh_gate() {
@@ -1688,6 +1717,9 @@ main() {
 
     echo ""
     setup_mcp_onboarding
+
+    echo ""
+    setup_agent_identity
 
     echo ""
     setup_ssh_gate

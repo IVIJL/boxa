@@ -5,7 +5,7 @@
 # Sourced by docker-run.sh (host). Owns the format of:
 #   - container name        boxa-<project>
 #   - hostname              <project>
-#   - per-project volumes   boxa-<project>-{history,docker}
+#   - per-project volumes   boxa-<project>-{history,docker,gh,glab}
 #   - workspace alias       /workspace/<project>
 #   - traefik route hosts   [<port>.]<project>.<active-domain>     (display)
 #                           [<port>.]<project>.test                (local)
@@ -25,7 +25,7 @@
 # Consumed by sourcing scripts; shellcheck can't see that.
 # shellcheck disable=SC2034
 
-BOXA_PROJECT_VOLUME_SUFFIXES=(history docker)
+BOXA_PROJECT_VOLUME_SUFFIXES=(history docker gh glab)
 
 # Local TLD. RFC 2606 reserved for testing; chosen for browser/CLI parity
 # (no baked-in browser fast-path like *.localhost has). Constant — not
@@ -206,5 +206,7 @@ _boxa::derive_from_project_name() {
     BOXA_HOSTNAME="${BOXA_PROJECT_NAME}"
     BOXA_VOL_HISTORY="$(boxa::volume_name "$BOXA_PROJECT_NAME" history)"
     BOXA_VOL_DOCKER="$(boxa::volume_name "$BOXA_PROJECT_NAME" docker)"
+    BOXA_VOL_GH="$(boxa::volume_name "$BOXA_PROJECT_NAME" gh)"
+    BOXA_VOL_GLAB="$(boxa::volume_name "$BOXA_PROJECT_NAME" glab)"
     BOXA_WORKSPACE_ALIAS="/workspace/${BOXA_PROJECT_NAME}"
 }

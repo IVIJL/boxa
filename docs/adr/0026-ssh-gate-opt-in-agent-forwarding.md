@@ -1,6 +1,8 @@
 # ADR 0026 — SSH gate: agent forwarding becomes opt-in; boxa never loads keys
 
-- **Status:** accepted
+- **Status:** accepted (memory-only key loading and the single shared
+  agent superseded by ADR 0034 key registry + project agents; the
+  consent invariants stand)
 - **Date:** 2026-08-19
 - **Builds on:** ADR 0017 (provisioning registry — the one-time prompt), ADR 0006 (picker conventions), ADR 0020 (per-project conf grammar)
 

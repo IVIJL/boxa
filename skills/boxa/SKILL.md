@@ -1,12 +1,12 @@
 ---
 name: boxa
-description: Boxa dev environment guide — invoke when the user mentions the boxa CLI, boxa Containers, MCP catalog or MCP activation, trusted MCP execution, the SSH gate, dev URLs (*.test, *.sslip.io), Allow-for windows, the Allowlist, Agent-browser session lifecycle, ports, mkcert HTTPS, Container identity, or anything about why network/host behaviour differs from a plain shell.
+description: Boxa dev environment guide — invoke when the user mentions the boxa CLI, boxa Containers, MCP catalog or MCP activation, trusted MCP execution, the SSH gate, Forge gate, dev URLs (*.test, *.sslip.io), Allow-for windows, the Allowlist, Agent-browser session lifecycle, ports, mkcert HTTPS, Container identity, or anything about why network/host behaviour differs from a plain shell.
 user-invocable: false
 ---
 
 # Boxa
 
-Boxa runs each Project in a Linux Container behind a default-deny outbound firewall. The `boxa` CLI lives on the host and manages Containers, the **Allowlist**, **Allow-for windows**, **Host connections**, the **SSH gate**, **Agent-browser sessions**, ports, and the mkcert HTTPS layer. See `CONTEXT.md` for the canonical glossary and `docs/adr/` for design rationale.
+Boxa runs each Project in a Linux Container behind a default-deny outbound firewall. The `boxa` CLI lives on the host and manages Containers, the **Allowlist**, **Allow-for windows**, **Host connections**, the **SSH gate**, **Forge gate**, **Agent-browser sessions**, ports, and the mkcert HTTPS layer. See `CONTEXT.md` for the canonical glossary and `docs/adr/` for design rationale.
 
 ## Identity check (run first)
 
@@ -23,11 +23,12 @@ The file is the canonical **Container identity** (CONTEXT.md § Project / contai
 
 You are inside a Container. Respect these boundaries:
 
-1. **The `boxa` CLI is host-only.** It does not exist in the Container PATH. To start/stop Containers, manage the **Allowlist**, open **Allow-for windows**, create or remove **Host connections**, change the **SSH gate**, or orchestrate **Agent-browser sessions**, ask the user to run the corresponding `boxa …` command on the host.
+1. **The `boxa` CLI is host-only.** It does not exist in the Container PATH. To start/stop Containers, manage the **Allowlist**, open **Allow-for windows**, create or remove **Host connections**, change the **SSH gate** or **Forge gate**, or orchestrate **Agent-browser sessions**, ask the user to run the corresponding `boxa …` command on the host.
 2. **Network is default-deny against the Allowlist.** Roughly fifteen domains resolve; everything else is `REJECT`ed by the firewall. **DNS pinning** forces all name resolution through the in-Container dnsmasq, so hardcoded-IP fetches fail too. See ADR 0001, ADR 0007.
 3. **Container-to-host services use a Host connection.** The Allowlist is a domain gate and does not grant traffic to a host service. Ask the user to run `boxa connect host <port> --name <label> [--all]` on the host. Omit `--all` for the current box; include it only when every present and future box should be trusted. See ADR 0023.
-4. **SSH agent forwarding is opt-in.** The **SSH gate** is off by default, can be enabled globally or per Project only from the host, and takes effect when the Container is created. A forwarded socket grants signing authority over every key in the host agent; Boxa never reads private keys or loads them without a user-confirmed **Key picker** action. See ADR 0026.
-5. **Dev URLs bypass the firewall.** `http(s)://<port>.<project>.test` and `http(s)://<port>.<project>.127.0.0.1.sslip.io` resolve locally and never hit the **Allowlist** gate. See ADR 0007.
+4. **SSH agent forwarding is opt-in.** The **SSH gate** is `off` or `on` only from the host and takes effect when the Container is created. When on, the Container receives its dedicated **Project agent**; a forwarded socket grants signing authority over every key in that agent. See ADR 0026 and ADR 0034.
+5. **Forge credentials are opt-in.** The **Forge gate** is off by default, can be enabled globally or per Project only from the host, and injects credentials only when the Container is created. It does not grant network access to the forge host; the **Allowlist** remains separate. See ADR 0032.
+6. **Dev URLs bypass the firewall.** `http(s)://<port>.<project>.test` and `http(s)://<port>.<project>.127.0.0.1.sslip.io` resolve locally and never hit the **Allowlist** gate. See ADR 0007.
 
 ### Recognising a default-deny denial
 
@@ -114,20 +115,38 @@ selects that box explicitly; `--all` instead grants every present and future
 box and cannot be combined with `--from`. Inner Docker connects through
 `10.0.2.2:<local-port>`.
 
-### SSH gate (ADR 0026)
+### SSH gate (ADR 0026, ADR 0034)
 
 ```sh
 boxa ssh                        # show effective state for the current Project
-boxa ssh on|off [project|path]  # set a durable per-Project choice
-boxa ssh on|off --global        # set the durable global choice
-boxa ssh add                    # open the consent-first Key picker
+boxa ssh off|on [project|path]
+boxa ssh off|on --global
+boxa ssh add                    # add keys to the current Project agent
 ```
 
 Project configuration overrides the global choice; absent both, forwarding is
-off. Changes affect newly created Containers, so follow the restart hint for a
-running Project. The separate **Boxa SSH config** mount is not gated. Reaching
-an SSH server still requires the **Allowlist** or a **Host connection**. See
-`docs/ssh.md` for the security model and host keychain setup.
+off. `on` forwards that Project's dedicated agent. Changes affect newly created Containers, so
+follow the restart hint for a running Project. The separate **Boxa SSH config**
+mount is not gated. Reaching an SSH server still requires the **Allowlist** or a
+**Host connection**. See `docs/ssh.md` for the security model.
+
+### Forge gate (ADR 0032)
+
+```sh
+boxa forge                       # show gate, source, credentials, token ages
+boxa forge on|off [project|path] # set a durable per-Project choice
+boxa forge on|off --global       # set the durable global fallback
+boxa forge set github|gitlab     # securely store or rotate a token
+boxa forge setup [github|gitlab] # run the guided identity flow
+```
+
+Project configuration overrides the global fallback; absent both, forge access
+is off. Gate changes and rotations affect newly created Containers, so follow
+the `boxa stop && boxa` restart hint. When on, Boxa injects `GH_TOKEN` and/or
+`GITLAB_TOKEN`; self-hosted GitLab also gets `GITLAB_HOST`. These environment
+credentials override persistent in-Container `gh`/`glab` login files. After
+`set`, Boxa offers to add an uncovered forge host to the **Allowlist**, default
+No; declining prints a manual `boxa allow <host>` hint. See `docs/forge.md`.
 
 ### Ports and HTTPS
 
@@ -207,7 +226,9 @@ Three boxa-specific facts:
 - ADR 0021 — Project-selected MCP catalog and agent-trusted execution
 - ADR 0023 — Host connections via a durable scoped firewall slot
 - ADR 0026 — opt-in SSH gate and Key picker
+- ADR 0032 — per-installation Agent identity and Forge gate
 - `docs/ssh.md` — complete **SSH gate**, **Key picker**, and **Boxa SSH config** guide
+- `docs/forge.md` — complete **Agent identity**, **Forge store**, and **Forge gate** guide
 - `docs/networking.md` — complete **Cross-boxa connection** and **Host connection** guide
 - `docs/mcp.md` — complete MCP catalog, readiness, activation and trust guide
 - `boxa --help` (on host) for the full CLI surface
@@ -219,7 +240,8 @@ Short decision tree for the most-frequent symptoms.
 - **`boxa: command not found`** inside a Container → the CLI is host-only. Ask the user to run it on the host.
 - **`Could not resolve host` / `Connection refused` / hanging fetch** to an external internet host inside a Container → almost always an **Allowlist** miss. Ask the user to run `boxa allow <domain>` (durable) or `boxa allow-for <min>` (time-bounded).
 - **Container traffic cannot reach a service on the host** → the remedy is a **Host connection**, not the Allowlist. Ask the user to run `boxa connect host <port> --name <label> [--all]` on the host, then use the persisted local address shown by `boxa connections` (`10.0.2.2:<local-port>` from inner Docker).
-- **`git push` / `git pull` over SSH has no agent or identities** → check `boxa ssh` on the host. The **SSH gate** is off by default; enable it with `boxa ssh on` and recreate the Container as instructed. If the gate is on but the host agent is empty, use `boxa ssh add`. Network access to the SSH host remains a separate Allowlist or Host connection decision.
+- **`git push` / `git pull` over SSH has no agent or identities** → check `boxa ssh` on the host. The **SSH gate** is off by default; use `boxa ssh on`, add or assign the intended keys to that Project agent, then recreate the Container as instructed. Network access remains a separate Allowlist or Host connection decision.
+- **`gh` / `glab` is unauthenticated or uses a stale identity** → check `boxa forge` on the host. Enable the **Forge gate** with `boxa forge on`, store or rotate the credential with `boxa forge set github|gitlab`, and recreate the Container. Injected environment credentials win over persistent in-Container CLI login files; forge network access still requires the Allowlist.
 - **`ERR_CONNECTION_REFUSED` against a dev URL** (`<port>.<project>.test` / `.sslip.io`) → the Container is not running, the dev server is not bound to that port, or it is bound to `127.0.0.1` instead of `0.0.0.0`. Check `boxa status` and `boxa ports <project>` on the host.
 - **`ERR_TUNNEL_CONNECTION_FAILED` in Host agent Chrome** for an external host → the **Agent-browser proxy** denied it in **default mode**. Either add the host to the **Agent-browser allowlist** (`~/.config/boxa/agent-browser-allowed-domains.conf`) or open an **Agent-browser network window** with `boxa agent-browser allow-for <min> <project>`. Since the deny-visibility slice shipped, the in-container `agent-browser` wrapper also re-navigates Chrome to an inline `data:` URL that renders the same denial reason directly in the window, so you can read the blocked host and the recovery commands without digging through the proxy log.
 - **Certificate warnings on a `*.test` or `*.sslip.io` URL** → mkcert root CA is not trusted in the current Chrome profile. Check ADR 0008 for graceful-degradation behaviour; the user may need to re-run `boxa dns-install`.

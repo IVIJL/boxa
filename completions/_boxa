@@ -29,6 +29,7 @@ _boxa() {
                 'ls:List running containers'
                 'mem:Show per-project memory diagnostics'
                 'ssh:Manage the SSH agent forwarding gate'
+                'forge:Manage forge credentials and their access gate'
                 'stop:Stop container (--clean removes volumes)'
                 'remove:Remove project data (volumes)'
                 'port:Expose port via Traefik'
@@ -96,14 +97,54 @@ _boxa() {
                         local -a ssh_actions
                         ssh_actions=(
                             'add:Add keys to the host SSH agent'
-                            'on:Enable SSH agent forwarding'
                             'off:Disable SSH agent forwarding'
+                            'on:Forward the per-project ssh-agent'
                         )
                         _describe 'ssh actions' ssh_actions
+                    elif [[ $words[3] == off || $words[3] == on ]]; then
+                        local -a flags
+                        flags=(
+                            '--global:Set the global ssh.conf scope'
+                            '--pick:Select known Projects interactively'
+                        )
+                        _describe 'ssh flags' flags
+                        _boxa_containers
+                    fi
+                    ;;
+                forge)
+                    if (( CURRENT == 3 )); then
+                        local -a forge_actions
+                        forge_actions=(
+                            'status:Open the forge persona and Project dashboard'
+                            'add:Register a verified forge identity'
+                            'list:List forge identities'
+                            'keys:Manage persona SSH keys'
+                            'use:Assign a forge identity to Projects'
+                            'default:Set a default forge identity'
+                            'remove:Remove a forge identity'
+                            'set:Store or rotate a forge credential'
+                            'unset:Remove a forge credential'
+                            'setup:Open the shared forge dashboard'
+                            'checklist:Run a new-identity forge checklist'
+                            'adopt:Import a host CLI token with consent'
+                            'on:Enable forge credential access'
+                            'off:Disable forge credential access'
+                        )
+                        _describe 'forge actions' forge_actions
+                    elif [[ $words[3] == add || $words[3] == set \
+                        || $words[3] == unset \
+                        || $words[3] == setup || $words[3] == checklist \
+                        || $words[3] == adopt ]]; then
+                        local -a forges
+                        forges=(
+                            'github:GitHub'
+                            'gitlab:GitLab'
+                        )
+                        _describe 'forges' forges
                     elif [[ $words[3] == on || $words[3] == off ]]; then
                         local -a flags
-                        flags=('--global:Set the global ssh.conf scope')
-                        _describe 'ssh flags' flags
+                        flags=('--global:Set the global forge.conf scope')
+                        _describe 'forge flags' flags
                         _boxa_containers
                     fi
                     ;;

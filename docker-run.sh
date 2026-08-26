@@ -41,10 +41,25 @@ Containers:
   boxa mem unset [project|path]  Remove durable per-project Memory limits
   boxa mem unset --global       Remove the durable global Memory limits
   boxa ssh                       Show SSH gate state for the current Project
-  boxa ssh add                   Interactively add keys to the host SSH agent
-  boxa ssh on|off [project|path]
+  boxa ssh add                   Add keys to the current Project persona
+  boxa ssh off|on [project|path]
                                    Set the durable per-project SSH gate
-  boxa ssh on|off --global       Set the durable global SSH gate
+  boxa ssh off|on --pick          Set the SSH gate for selected Projects
+  boxa ssh off|on --global
+                                   Set the durable global SSH gate
+  boxa forge                     Open the persona and Project dashboard
+  boxa forge add [github|gitlab] Register a verified persona
+  boxa forge list                List configured personas
+  boxa forge keys <name>         Manage a persona's SSH keys
+  boxa forge use [<name>]        Assign a persona to selected Projects
+  boxa forge default <name>      Set the global default persona
+  boxa forge remove <name> [--force]
+                                   Remove a persona
+  boxa forge on|off [project|path]
+                                   Set the durable per-project forge gate
+  boxa forge on|off --global     Set the durable global forge gate
+  boxa forge set|unset github|gitlab
+                                   Store, rotate, or remove a forge token
   boxa stop [name] [--clean]     Stop one container (--clean removes volumes)
   boxa stop --all [--reason TOKEN]
                                    Stop every boxa Container without cleanup
@@ -224,14 +239,56 @@ EOF
 Usage:
   boxa ssh
   boxa ssh add
-  boxa ssh on|off [project|path]
-  boxa ssh on|off --global
+  boxa ssh off|on [project|path]
+  boxa ssh off|on --pick
+  boxa ssh off|on --global
 
 Show the effective SSH agent forwarding gate for the current Project, its
-source, and the path to ~/.config/boxa/ssh.conf. `add` interactively adds keys
-to the host agent. `on` and `off` durably write the selected project or global
-scope. Project changes default to the current directory and take effect when
-the Container is next created.
+source, per-project ssh-agent liveness and key fingerprints, and the path to
+~/.config/boxa/ssh.conf. `add` manages keys on the Project's assigned persona
+and is available only while the gate is `on`. `off` forwards no signing
+socket. Legacy `agent` and `user` config values migrate on first read. Project
+changes default to the current directory and take effect when the Container is
+next created. `--pick` selects one or more known Projects interactively.
+EOF
+            ;;
+        forge)
+            cat <<'EOF'
+Usage:
+  boxa forge
+  boxa forge status
+  boxa forge add [github|gitlab]
+  boxa forge list
+  boxa forge keys <name>
+  boxa forge use [<name>]
+  boxa forge default <name>
+  boxa forge remove <name> [--force]
+  boxa forge on|off [project|path]
+  boxa forge on|off --global
+  boxa forge set github|gitlab
+  boxa forge unset github|gitlab
+  boxa forge setup [github|gitlab]
+  boxa forge checklist github|gitlab
+  boxa forge adopt github|gitlab
+
+Open the shared dashboard of live persona probes, token ages, key fingerprints,
+Project assignments, and SSH gate states. Bare forge, status, and setup use the
+same dashboard and contextual actions. `list` shows the persona catalog once.
+`add` runs the selected kind checklist and registers the verified account.
+`keys` generates, adopts, detaches, or verifies one persona's SSH keys.
+`use` assigns one persona to one or more Projects and turns forge access on
+there; without a name it first opens the persona picker. `default` sets the
+global fallback persona. `remove` refuses personas used by a Project or as the
+default unless `--force` also cleans those references.
+`set` reads a token from a hidden prompt,
+stores it in a host-owned 0600 file, then verifies the authenticated identity.
+Probe failures keep the credential for offline use. `on` and `off` durably
+write the selected project or global scope. Stored environment credentials win
+over in-Container gh/glab config files. Changes are frozen at Container
+creation; run `boxa stop && boxa` to apply them, rather than expecting a live
+update. `setup` opens the same dashboard, optionally preferring a forge when the
+empty state starts add-persona; `checklist` runs one new-account checklist
+directly; `adopt` offers consent-first import from the host CLI config.
 EOF
             ;;
         doctor)
@@ -444,6 +501,10 @@ source "$BOXA_DIR/lib/resources.sh"
 # Per-project opt-in SSH agent forwarding gate (ADR 0026).
 # shellcheck source=lib/ssh.sh
 source "$BOXA_DIR/lib/ssh.sh"
+
+# Host-side forge credentials and per-project opt-in gate (ADR 0032).
+# shellcheck source=lib/forge.sh
+source "$BOXA_DIR/lib/forge.sh"
 
 # Per-project Memory autopsy: cgroup live data, inspect post-mortem state,
 # project-aggregate RSS, OOM archives, and concrete recovery commands.
@@ -2759,7 +2820,11 @@ stop_dns_if_idle() {
 }
 
 attach_to_container() {
-    local name="$1"
+    local name="$1" project_path="${2:-}"
+    if [ -z "$project_path" ]; then
+        project_path="$(_boxa::container_project_path "$name" 2>/dev/null || true)"
+    fi
+    _boxa::forge_token_expiry_heads_up "$project_path"
     echo "Attaching to running container: $name"
     set_tab_title "${name#boxa-}"
     # Prefer the host project path advertised by Phase 2 containers; fall back
@@ -3173,6 +3238,50 @@ _boxa::container_project_path() {
         }'
 }
 
+# Union the durable Project registry with running boxa Containers. Registry
+# names win for duplicate absolute paths; the picker moves the current Project
+# to its first/default row.
+_boxa::forge_project_targets() {
+    local registry name path container existing duplicate
+    local -a names=() paths=()
+
+    registry="${XDG_CONFIG_HOME:-$HOME/.config}/boxa/projects.json"
+    if [ -f "$registry" ]; then
+        while IFS=$'\t' read -r name path; do
+            [[ "$path" == /* ]] || continue
+            names+=("$name")
+            paths+=("$path")
+        done < <(jq -r '
+            select(.version == 1 and (.projects | type == "object"))
+            | .projects | to_entries[]
+            | select((.key | type) == "string"
+                and (.value.name | type) == "string")
+            | [.value.name, .key] | @tsv
+        ' "$registry" 2>/dev/null || true)
+    fi
+
+    while IFS= read -r container; do
+        [ -n "$container" ] || continue
+        path="$(_boxa::container_project_path "$container" 2>/dev/null || true)"
+        [[ "$path" == /* ]] || continue
+        duplicate=false
+        for existing in ${paths[@]+"${paths[@]}"}; do
+            if [ "$existing" = "$path" ]; then
+                duplicate=true
+                break
+            fi
+        done
+        [ "$duplicate" = false ] || continue
+        names+=("${container#boxa-}")
+        paths+=("$path")
+    done < <(docker ps --filter 'name=^boxa-' --format '{{.Names}}' \
+        2>/dev/null | filter_user_containers || true)
+
+    for existing in "${!paths[@]}"; do
+        printf '%s\t%s\n' "${names[$existing]}" "${paths[$existing]}"
+    done
+}
+
 # Read current effective cgroup usage (memory.current minus reclaimable cache
 # per _boxa::effective_usage_bytes), so a warm page cache does not trip the
 # shrink-safety warning — the kernel evicts it before an OOM. The probe's
@@ -3289,6 +3398,26 @@ _boxa::sweep_invocation_resource_limits() {
 
     exclude="$(_boxa::cli_override_container "$@" 2>/dev/null || true)"
     _boxa::sweep_running_resource_limits "$exclude" || true
+}
+
+_boxa::validate_auto_mode_args() {
+    [ "$#" -gt 1 ] || return 0
+
+    local target="$1" subcommand="$2"
+    shift 2
+
+    printf "Unexpected arguments after '%s': %s" "$target" "$subcommand" >&2
+    [ "$#" -eq 0 ] || printf ' %s' "$@" >&2
+    printf '\n' >&2
+
+    case "$subcommand" in
+        ls|mem|ssh|forge|stop|remove|port|ports|connect|connections|allow|deny|blocked|allow-for|agent-browser|mcp|cursor|code|ssh-config|clip|claude-token|build|update|doctor|keep-awake|dns-install|dns-status|dns-uninstall|uninstall|prune|sync-skills|help)
+            printf 'Did you mean: boxa %s' "$subcommand" >&2
+            [ "$#" -eq 0 ] || printf ' %s' "$@" >&2
+            printf ' %s\n' "$target" >&2
+            ;;
+    esac
+    return 1
 }
 
 list_running_containers() {
@@ -3636,6 +3765,7 @@ case "${1:-}" in
     ssh)     MODE="ssh";     shift
              SSH_ACTION="${1:-}"
              SSH_GLOBAL=false
+             SSH_PICK=false
              SSH_TARGET=
              if [ -n "$SSH_ACTION" ]; then
                  case "$SSH_ACTION" in
@@ -3648,7 +3778,7 @@ case "${1:-}" in
                          }
                          ;;
                      *)
-                         echo "Usage: boxa ssh [add|on|off [project|path] [--global]]" >&2
+                         echo "Usage: boxa ssh [add|off|on [project|path] [--global|--pick]]" >&2
                          exit 1
                          ;;
                  esac
@@ -3659,6 +3789,9 @@ case "${1:-}" in
                          case "$1" in
                              --global)
                                  SSH_GLOBAL=true
+                                 ;;
+                             --pick)
+                                 SSH_PICK=true
                                  ;;
                              -* )
                                  echo "Unknown flag for ssh $SSH_ACTION: $1" >&2
@@ -3678,9 +3811,134 @@ case "${1:-}" in
                          echo "boxa ssh $SSH_ACTION --global does not accept a project or path." >&2
                          exit 1
                      fi
+                     if [ "$SSH_PICK" = true ] && [ -n "$SSH_TARGET" ]; then
+                         echo "boxa ssh $SSH_ACTION --pick does not accept a project or path." >&2
+                         exit 1
+                     fi
+                     if [ "$SSH_PICK" = true ] && [ "$SSH_GLOBAL" = true ]; then
+                         echo "boxa ssh $SSH_ACTION --pick cannot be combined with --global." >&2
+                         exit 1
+                     fi
                  fi
              elif [ "$#" -gt 0 ]; then
-                 echo "Usage: boxa ssh [add|on|off [project|path] [--global]]" >&2
+                 echo "Usage: boxa ssh [add|off|on [project|path] [--global|--pick]]" >&2
+                 exit 1
+             fi
+             ;;
+    forge)   MODE="forge";   shift
+             FORGE_ACTION="${1:-}"
+             FORGE_GLOBAL=false
+             FORGE_TARGET=
+             FORGE_NAME=
+             FORGE_IDENTITY=
+             FORGE_FORCE=false
+             if [ -n "$FORGE_ACTION" ]; then
+                 case "$FORGE_ACTION" in
+                     on|off)
+                         shift
+                         while [ "$#" -gt 0 ]; do
+                             case "$1" in
+                                 --global)
+                                     FORGE_GLOBAL=true
+                                     ;;
+                                 -* )
+                                     echo "Unknown flag for forge $FORGE_ACTION: $1" >&2
+                                     exit 1
+                                     ;;
+                                 *)
+                                     if [ -n "$FORGE_TARGET" ]; then
+                                         echo "Unexpected positional for forge $FORGE_ACTION: $1" >&2
+                                         exit 1
+                                     fi
+                                     FORGE_TARGET="$1"
+                                     ;;
+                             esac
+                             shift
+                         done
+                         if [ "$FORGE_GLOBAL" = true ] && [ -n "$FORGE_TARGET" ]; then
+                             echo "boxa forge $FORGE_ACTION --global does not accept a project or path." >&2
+                             exit 1
+                         fi
+                         ;;
+                     set|unset|checklist|adopt)
+                         shift
+                         FORGE_NAME="${1:-}"
+                         if [ "$#" -ne 1 ] \
+                             || { [ "$FORGE_NAME" != github ] \
+                                 && [ "$FORGE_NAME" != gitlab ]; }; then
+                             echo "Usage: boxa forge $FORGE_ACTION github|gitlab" >&2
+                             exit 1
+                         fi
+                         shift
+                         ;;
+                     add|setup)
+                         shift
+                         FORGE_NAME="${1:-}"
+                         if [ "$#" -gt 1 ] \
+                             || { [ -n "$FORGE_NAME" ] \
+                                 && [ "$FORGE_NAME" != github ] \
+                                 && [ "$FORGE_NAME" != gitlab ]; }; then
+                             echo "Usage: boxa forge $FORGE_ACTION [github|gitlab]" >&2
+                             exit 1
+                         fi
+                         [ "$#" -eq 0 ] || shift
+                         ;;
+                     use)
+                         shift
+                         if [ "$#" -gt 1 ]; then
+                             echo "Usage: boxa forge use [<name>]" >&2
+                             exit 1
+                         fi
+                         FORGE_IDENTITY="${1:-}"
+                         [ "$#" -eq 0 ] || shift
+                         ;;
+                     default|keys)
+                         shift
+                         if [ "$#" -ne 1 ]; then
+                             echo "Usage: boxa forge $FORGE_ACTION <name>" >&2
+                             exit 1
+                         fi
+                         FORGE_IDENTITY="$1"
+                         shift
+                         ;;
+                     remove)
+                         shift
+                         if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+                             echo "Usage: boxa forge remove <name> [--force]" >&2
+                             exit 1
+                         fi
+                         FORGE_IDENTITY="$1"
+                         shift
+                         if [ "$#" -eq 1 ]; then
+                             if [ "$1" != --force ]; then
+                                 echo "Usage: boxa forge remove <name> [--force]" >&2
+                                 exit 1
+                             fi
+                             FORGE_FORCE=true
+                             shift
+                         fi
+                         ;;
+                     list)
+                         shift
+                         if [ "$#" -ne 0 ]; then
+                             echo "Usage: boxa forge list" >&2
+                             exit 1
+                         fi
+                         ;;
+                     status)
+                         shift
+                         if [ "$#" -ne 0 ]; then
+                             echo "Usage: boxa forge status" >&2
+                             exit 1
+                         fi
+                         ;;
+                     *)
+                         echo "Usage: boxa forge [status|add [github|gitlab]|list|keys <name>|use [<name>]|default <name>|remove <name> [--force]|on|off [project|path] [--global]|set|unset|checklist|adopt github|gitlab|setup [github|gitlab]]" >&2
+                         exit 1
+                         ;;
+                 esac
+             elif [ "$#" -gt 0 ]; then
+                 echo "Usage: boxa forge [status|add [github|gitlab]|list|keys <name>|use [<name>]|default <name>|remove <name> [--force]|on|off [project|path] [--global]|set|unset|checklist|adopt github|gitlab|setup [github|gitlab]]" >&2
                  exit 1
              fi
              ;;
@@ -4062,7 +4320,92 @@ if [ "$MODE" = "mem-unset" ]; then
     exit 0
 fi
 
-# --- boxa ssh [add|on|off [project|path] [--global]] -----------------------
+# --- boxa ssh [add|off|on [project|path] [--global|--pick]] -----------------
+
+_boxa::ssh_clear_unassigned_project_registry_locked() {
+    local project_path="$1"
+
+    _boxa::ssh_registry_replace_project "$project_path" "" || return 1
+    _boxa::ssh_reconcile_running_project_agent "$project_path"
+}
+
+_boxa::ssh_clear_unassigned_project_locked() {
+    local project_path="$1"
+
+    _boxa::resolve_forge_identity "$project_path" || return 1
+    # Status 2 tells the caller that a catalog-locked recheck found an
+    # assignment, so neither cleanup nor the stale no-persona note applies.
+    [ -z "$_BOXA_FORGE_RESOLVED_IDENTITY_ID" ] || return 2
+    _boxa::ssh_with_registry_lock \
+        _boxa::ssh_clear_unassigned_project_registry_locked "$project_path"
+}
+
+_boxa::ssh_on_project_follow_up() {
+    local project_path="$1" status=0 identity_id assignment_completed=
+    local cleanup_status=0
+
+    _boxa::resolve_forge_identity "$project_path" || return 1
+    identity_id="$_BOXA_FORGE_RESOLVED_IDENTITY_ID"
+    if [ -z "$identity_id" ]; then
+        if _boxa::forge_offer_missing_persona_assignment "$project_path"; then
+            # Assignment derives the normal persona-based gate. This explicit
+            # command still owns the requested on state, including keyless
+            # personas.
+            _boxa::write_ssh_conf project "$project_path" on || return 1
+            assignment_completed=1
+            _boxa::resolve_forge_identity "$project_path" || return 1
+            identity_id="$_BOXA_FORGE_RESOLVED_IDENTITY_ID"
+        fi
+        if [ -z "$identity_id" ]; then
+            _boxa::forge_with_catalog_lock \
+                _boxa::ssh_clear_unassigned_project_locked "$project_path" \
+                || cleanup_status=$?
+            [ "$cleanup_status" -ne 2 ] || return 0
+            [ "$cleanup_status" -eq 0 ] || return "$cleanup_status"
+            _boxa::forge_missing_persona_note "$project_path" on
+            return 0
+        fi
+    fi
+
+    if [ -z "$assignment_completed" ]; then
+        _boxa::ssh_add_project_keys_if_agent_unready "$project_path" \
+            || status=$?
+        [ "$status" -ne 0 ] || return 0
+        [ "$status" -eq 2 ] || return "$status"
+    fi
+
+    _boxa::forge_load_persona "$identity_id" || return 1
+    if [ -z "$_BOXA_FORGE_PERSONA_KEYS" ]; then
+        _boxa::forge_keyless_persona_note "$identity_id" on
+        return 0
+    fi
+    [ -z "$assignment_completed" ] || return 0
+    printf "Could not reapply the SSH keys attached to persona '%s'. Run 'boxa forge' and verify its attached keys.\n" \
+        "$identity_id" >&2
+    return 1
+}
+
+_boxa::ssh_apply_project_gate_cli() {
+    local action="$1" project_path="$2" container
+
+    if [ "$action" = on ]; then
+        _boxa::resolve_forge_gate "$project_path"
+        if [ "$_BOXA_FORGE_GATE" = off ]; then
+            printf "Forge access is off for %s. Run 'boxa forge on %s' before enabling SSH forwarding.\n" \
+                "$project_path" "$project_path" >&2
+            return 2
+        fi
+    fi
+    boxa::names_from_path "$project_path"
+    container="$BOXA_CONTAINER_NAME"
+    _boxa::write_ssh_conf project "$project_path" "$action" || return 1
+    printf 'SSH agent forwarding set to %s for %s.\n' "$action" "$project_path"
+    if docker ps --filter "name=^${container}$" --format '{{.ID}}' \
+            2>/dev/null | grep -q .; then
+        printf 'WARNING: SSH forwarding change takes effect after boxa stop && boxa.\n'
+    fi
+    [ "$action" != on ] || _boxa::ssh_on_project_follow_up "$project_path"
+}
 
 if [ "$MODE" = "ssh" ]; then
     if [ -z "$SSH_ACTION" ]; then
@@ -4072,31 +4415,28 @@ if [ "$MODE" = "ssh" ]; then
     fi
 
     if [ "$SSH_ACTION" = add ]; then
-        _boxa::ssh_add_keys
-        exit $?
+        _boxa::mem_resolve_target "" "$PWD" || exit 1
+        _boxa::resolve_ssh_gate "$_BOXA_MEM_PROJECT_PATH"
+        case "$_BOXA_SSH_GATE" in
+            on)
+                _boxa::resolve_forge_identity "$_BOXA_MEM_PROJECT_PATH" \
+                    || exit 1
+                if [ -z "$_BOXA_FORGE_RESOLVED_IDENTITY_ID" ]; then
+                    echo "No persona is assigned to this Project. Run 'boxa forge use' first." >&2
+                    exit 1
+                fi
+                _boxa::forge_keys "$_BOXA_FORGE_RESOLVED_IDENTITY_ID"
+                exit $?
+                ;;
+            off)
+                echo "SSH forwarding is off. Enable this Project with 'boxa ssh on' before adding keys."
+                exit 1
+                ;;
+        esac
     fi
 
-    ssh_scope=project
-    ssh_path=
-    ssh_container=
     if [ "$SSH_GLOBAL" = true ]; then
-        ssh_scope=global
-    else
-        _boxa::mem_resolve_target "$SSH_TARGET" "$PWD" || exit 1
-        ssh_path="$_BOXA_MEM_PROJECT_PATH"
-        ssh_container="$_BOXA_MEM_CONTAINER"
-        if [ -z "$ssh_path" ]; then
-            ssh_path="$(_boxa::container_project_path "$ssh_container" 2>/dev/null || true)"
-        fi
-        if [[ "$ssh_path" != /* ]]; then
-            echo "Cannot determine the absolute host path for Project $_BOXA_MEM_PROJECT." >&2
-            echo "Pass an existing project path or start the Project once before changing its SSH gate by name." >&2
-            exit 1
-        fi
-    fi
-
-    _boxa::write_ssh_conf "$ssh_scope" "$ssh_path" "$SSH_ACTION" || exit 1
-    if [ "$ssh_scope" = global ]; then
+        _boxa::write_ssh_conf global "" "$SSH_ACTION" || exit 1
         echo "SSH agent forwarding set to $SSH_ACTION in the global ssh.conf scope."
         ssh_running_containers="$(docker ps --filter 'name=^boxa-' \
             --format '{{.Names}}' 2>/dev/null | filter_user_containers || true)"
@@ -4111,18 +4451,154 @@ if [ "$MODE" = "ssh" ]; then
                 break
             fi
         done <<< "$ssh_running_containers"
+        if [ -n "${ssh_restart_needed:-}" ]; then
+            echo "WARNING: SSH forwarding change takes effect after boxa stop && boxa."
+        fi
+        exit 0
+    fi
+
+    if [ "$SSH_PICK" = true ]; then
+        ssh_paths="$(_boxa::forge_known_project_picker "$SSH_ACTION")" || exit 1
     else
-        echo "SSH agent forwarding set to $SSH_ACTION for $ssh_path."
-        if docker ps --filter "name=^${ssh_container}$" --format '{{.ID}}' \
-            2>/dev/null | grep -q .; then
-            ssh_restart_needed=1
+        _boxa::mem_resolve_target "$SSH_TARGET" "$PWD" || exit 1
+        ssh_path="$_BOXA_MEM_PROJECT_PATH"
+        if [ -z "$ssh_path" ]; then
+            ssh_path="$(_boxa::container_project_path \
+                "$_BOXA_MEM_CONTAINER" 2>/dev/null || true)"
+        fi
+        if [[ "$ssh_path" != /* ]]; then
+            echo "Cannot determine the absolute host path for Project $_BOXA_MEM_PROJECT." >&2
+            echo "Pass an existing project path or start the Project once before changing its SSH gate by name." >&2
+            exit 1
+        fi
+        ssh_paths="$ssh_path"
+    fi
+
+    ssh_apply_failed=
+    while IFS= read -r ssh_path; do
+        [ -n "$ssh_path" ] || continue
+        ssh_apply_status=0
+        _boxa::ssh_apply_project_gate_cli "$SSH_ACTION" "$ssh_path" \
+            || ssh_apply_status=$?
+        [ "$ssh_apply_status" -eq 0 ] && continue
+        if [ "$SSH_PICK" = true ] && [ "$ssh_apply_status" -eq 2 ]; then
+            ssh_apply_failed=1
+            continue
+        fi
+        exit 1
+    done <<< "$ssh_paths"
+    [ -z "$ssh_apply_failed" ] || exit 1
+    exit 0
+fi
+
+# --- boxa forge credentials, checklists, and gate ---------------------------
+
+if [ "$MODE" = "forge" ]; then
+    if [ -z "$FORGE_ACTION" ] || [ "$FORGE_ACTION" = status ] \
+            || [ "$FORGE_ACTION" = setup ]; then
+        _boxa::mem_resolve_target "" "$PWD" || exit 1
+        forge_current_path="$_BOXA_MEM_PROJECT_PATH"
+        _boxa::forge_dashboard "$forge_current_path" "$FORGE_NAME"
+        exit $?
+    fi
+
+    _boxa::forge_migrate_legacy_credentials || exit 1
+
+    case "$FORGE_ACTION" in
+        list)
+            _boxa::forge_list
+            exit $?
+            ;;
+        keys)
+            _boxa::forge_keys "$FORGE_IDENTITY"
+            exit $?
+            ;;
+        use)
+            _boxa::mem_resolve_target "" "$PWD" || exit 1
+            forge_current_path="$_BOXA_MEM_PROJECT_PATH"
+            if [[ "$forge_current_path" != /* ]]; then
+                echo "Cannot determine the absolute host path for the current Project." >&2
+                exit 1
+            fi
+            _boxa::forge_use "$FORGE_IDENTITY" "$forge_current_path"
+            exit $?
+            ;;
+        default)
+            _boxa::forge_default "$FORGE_IDENTITY"
+            exit $?
+            ;;
+        remove)
+            _boxa::forge_remove "$FORGE_IDENTITY" "$FORGE_FORCE"
+            exit $?
+            ;;
+        add)
+            _boxa::forge_add "$FORGE_NAME"
+            exit $?
+            ;;
+        set)
+            _boxa::forge_set "$FORGE_NAME"
+            exit $?
+            ;;
+        unset)
+            _boxa::forge_unset "$FORGE_NAME"
+            exit $?
+            ;;
+        checklist)
+            _boxa::forge_checklist "$FORGE_NAME"
+            exit $?
+            ;;
+        adopt)
+            _boxa::forge_adopt_existing "$FORGE_NAME"
+            exit $?
+            ;;
+    esac
+
+    forge_scope=project
+    forge_path=
+    forge_container=
+    if [ "$FORGE_GLOBAL" = true ]; then
+        forge_scope=global
+    else
+        _boxa::mem_resolve_target "$FORGE_TARGET" "$PWD" || exit 1
+        forge_path="$_BOXA_MEM_PROJECT_PATH"
+        forge_container="$_BOXA_MEM_CONTAINER"
+        if [ -z "$forge_path" ]; then
+            forge_path="$(_boxa::container_project_path \
+                "$forge_container" 2>/dev/null || true)"
+        fi
+        if [[ "$forge_path" != /* ]]; then
+            echo "Cannot determine the absolute host path for Project $_BOXA_MEM_PROJECT." >&2
+            echo "Pass an existing project path or start the Project once before changing its forge gate by name." >&2
+            exit 1
         fi
     fi
-    if [ -n "${ssh_restart_needed:-}" ]; then
-        echo "WARNING: SSH forwarding change takes effect after boxa stop && boxa."
+
+    _boxa::forge_set_gate "$forge_scope" "$forge_path" "$FORGE_ACTION" \
+        || exit 1
+    if [ "$forge_scope" = global ]; then
+        echo "Forge access set to $FORGE_ACTION in the global forge.conf scope."
+        forge_running_containers="$(docker ps --filter 'name=^boxa-' \
+            --format '{{.Names}}' 2>/dev/null | filter_user_containers || true)"
+        while IFS= read -r forge_running_container; do
+            [ -n "$forge_running_container" ] || continue
+            forge_running_path="$(_boxa::container_project_path \
+                "$forge_running_container" 2>/dev/null || true)"
+            [ -n "$forge_running_path" ] || continue
+            _boxa::resolve_forge_gate "$forge_running_path"
+            if [ "$_BOXA_FORGE_SOURCE" = global ]; then
+                forge_restart_needed=1
+                break
+            fi
+        done <<< "$forge_running_containers"
+    else
+        echo "Forge access set to $FORGE_ACTION for $forge_path."
+        if docker ps --filter "name=^${forge_container}$" --format '{{.ID}}' \
+            2>/dev/null | grep -q .; then
+            forge_restart_needed=1
+        fi
     fi
-    if [ "$SSH_ACTION" = on ]; then
-        _boxa::ssh_add_keys_if_agent_unready || exit 1
+    if [ -n "${forge_restart_needed:-}" ]; then
+        echo "WARNING: Forge access change takes effect after boxa stop && boxa."
     fi
     exit 0
 fi
@@ -4277,6 +4753,13 @@ if [ "$MODE" = "update" ]; then
     # regardless of whether the repo changed.
     if [ -x "$BOXA_DIR/scripts/ensure-mcp-onboarding.sh" ]; then
         "$BOXA_DIR/scripts/ensure-mcp-onboarding.sh" --quiet-if-noop || true
+    fi
+
+    # Agent identity (ADR 0032) — one-time elective offer. Run it before the
+    # SSH gate migration so choosing the dedicated Agent gate suppresses the
+    # older personal-agent forwarding offer.
+    if [ -x "$BOXA_DIR/scripts/ensure-agent-identity.sh" ]; then
+        "$BOXA_DIR/scripts/ensure-agent-identity.sh" offer || true
     fi
 
     # SSH gate migration (ADR 0026) — one-time elective offer. A global gate
@@ -4449,6 +4932,11 @@ if [ "$MODE" = "doctor" ]; then
             for _step in "${BOXA_PROVISIONING_OK[@]}"; do
                 _doctor_print_step "$_step"
             done
+        fi
+        if printf '%s\n' "${BOXA_PROVISIONING_OK[@]}" \
+            "${BOXA_PROVISIONING_REPAIRED[@]}" | grep -qx agent-identity; then
+            "$BOXA_DIR/scripts/ensure-agent-identity.sh" summary 2>/dev/null \
+                || true
         fi
         if [ "${#BOXA_PROVISIONING_SKIPPED[@]}" -gt 0 ]; then
             echo "Skipped (no runnable script):"
@@ -5420,7 +5908,7 @@ if [ "$MODE" = "remove" ]; then
     list_projects_with_volumes() {
         docker volume ls -q --filter "name=boxa-" 2>/dev/null \
             | grep -E -- "$(boxa::project_volume_regex)" \
-            | sed 's/^boxa-//;s/-\(docker\|history\)$//' \
+            | sed 's/^boxa-//;s/-\(docker\|gh\|glab\|history\)$//' \
             | sort -u || true
     }
 
@@ -6056,6 +6544,8 @@ while [[ "${1:-}" == --* ]]; do
 done
 unset flag
 
+_boxa::validate_auto_mode_args "$@" || exit 1
+
 if [ -d "${1:-.}" ]; then
     # Argument is a directory (or none → CWD) → create/attach mode
     PROJECT_PATH="$(realpath "${1:-.}")"
@@ -6079,7 +6569,7 @@ if [ -d "${1:-.}" ]; then
             "$CLI_MEMORY" "$CLI_MEMORY_SWAP" || exit 1
         start_boxa_connections "$CONTAINER_NAME"
         _boxa::print_existing_container_ssh_status "$CONTAINER_NAME"
-        attach_to_container "$CONTAINER_NAME"
+        attach_to_container "$CONTAINER_NAME" "$PROJECT_PATH"
         # exec → script ends here
     fi
 
@@ -6090,7 +6580,7 @@ if [ -d "${1:-.}" ]; then
         if restart_exited_container "$CONTAINER_NAME" "$PROJECT_PATH" \
                 "$CLI_MEMORY" "$CLI_MEMORY_SWAP"; then
             _boxa::print_existing_container_ssh_status "$CONTAINER_NAME"
-            attach_to_container "$CONTAINER_NAME"
+            attach_to_container "$CONTAINER_NAME" "$PROJECT_PATH"
             # exec → script ends here
         fi
         # restart failed → container removed, fall through to creation
@@ -6188,6 +6678,10 @@ DOCKER_ARGS=(
     # Per-project volumes
     -v "${BOXA_VOL_HISTORY}:/home/node/.local/share/atuin"
     -v "${BOXA_VOL_DOCKER}:/home/node/.local/share/docker"
+    # Forge-gate environment variables take precedence over these config files
+    # (gh semantics).
+    -v "${BOXA_VOL_GH}:/home/node/.config/gh"
+    -v "${BOXA_VOL_GLAB}:/home/node/.config/glab-cli"
     # Shared volumes
     -v boxa-nvim-data:/home/node/.local/share/nvim
     -v boxa-npm-global:/usr/local/share/npm-global
@@ -6321,11 +6815,37 @@ fi
 
 # SSH agent forwarding: the gate controls only the signing socket. The Boxa
 # SSH config mount above remains independent.
+_boxa::forge_apply_default_persona_to_project "$PROJECT_PATH" || exit 1
 _boxa::resolve_ssh_gate "$PROJECT_PATH"
+ssh_persona="$(_boxa::ssh_project_persona "$PROJECT_PATH")"
+ssh_legacy_mode="$_BOXA_SSH_LEGACY_MODE"
 if [ "$_BOXA_SSH_GATE" = on ]; then
     ssh_agent_status=2
+    ssh_reapply_failed=false
+    ssh_reapply_stop_failed=false
     ssh_key_list=""
-    if _boxa::ssh_resolve_agent; then
+    if [ -n "$ssh_legacy_mode" ]; then
+        _boxa::ssh_apply_legacy_keys "$PROJECT_PATH" "$ssh_legacy_mode" || true
+    else
+        if _boxa::ssh_ensure_project_agent "$PROJECT_PATH" \
+                && [ -n "$_BOXA_SSH_PROJECT_AGENT_STARTED" ]; then
+            ssh_reapply_status=0
+            _boxa::ssh_reapply_registry_keys "$PROJECT_PATH" \
+                || ssh_reapply_status=$?
+            if [ "$ssh_reapply_status" -ne 0 ] \
+                    && [ "$ssh_reapply_status" -ne 2 ]; then
+                ssh_reapply_failed=true
+                if _boxa::ssh_stop_project_agent "$PROJECT_PATH"; then
+                    unset SSH_AUTH_SOCK SSH_AGENT_PID
+                    SSH_WARNING="WARNING: Could not restore the Project SSH key bundle; the per-project ssh-agent was stopped so the next boxa start will retry"
+                else
+                    ssh_reapply_stop_failed=true
+                    SSH_WARNING="WARNING: Could not restore the Project SSH key bundle; the per-project ssh-agent could not be stopped and is left in a partial, unreliable state. Stop it manually, then re-run 'boxa start'"
+                fi
+            fi
+        fi
+    fi
+    if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
         if ssh_key_list="$(ssh-add -l 2>/dev/null)"; then
             ssh_agent_status=0
         else
@@ -6335,36 +6855,77 @@ if [ "$_BOXA_SSH_GATE" = on ]; then
 
     if [ "$ssh_agent_status" -le 1 ]; then
         DOCKER_ARGS+=(
-            -v "$SSH_AUTH_SOCK:/tmp/ssh-agent.sock"
-            -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock
+            -v "$(_boxa::ssh_project_agent_socket_dir "$PROJECT_PATH"):/tmp/boxa-agent"
+            -e SSH_AUTH_SOCK=/tmp/boxa-agent/agent.sock
         )
     else
-        SSH_WARNING="WARNING: SSH agent not available - SSH forwarding won't work inside boxa
-  Ensure an SSH agent is running, then restart boxa"
+        if [ -z "$SSH_WARNING" ]; then
+            SSH_WARNING="WARNING: Per-project ssh-agent unavailable - SSH forwarding won't work inside boxa
+  Ensure the per-project ssh-agent is running, then restart boxa"
+        fi
     fi
 
-    if [ "$ssh_agent_status" -eq 0 ]; then
-        ssh_key_names="$(printf '%s\n' "$ssh_key_list" | awk '
-            {
-                $1 = ""
-                $2 = ""
-                sub(/^[[:space:]]+/, "")
-                sub(/[[:space:]]+\([^()]*\)$/, "")
-                names = names (names == "" ? "" : ", ") $0
-            }
-            END { print names }
-        ')"
-        SSH_STATUS="SSH: forwarded (keys: $ssh_key_names)"
+    if [ "$ssh_reapply_stop_failed" = true ]; then
+        SSH_STATUS="SSH: gate on; per-project ssh-agent key restore failed; ssh-agent could not be stopped"
+    elif [ "$ssh_agent_status" -eq 0 ]; then
+        ssh_key_fingerprints="$(printf '%s\n' "$ssh_key_list" \
+            | awk 'NF { values = values (values == "" ? "" : ", ") $2 } END { print values }')"
+        SSH_STATUS="SSH: gate on; per-project ssh-agent running (persona '$ssh_persona' keys: $ssh_key_fingerprints)"
+    elif [ "$ssh_agent_status" -eq 1 ]; then
+        SSH_STATUS="SSH: gate on; per-project ssh-agent running (persona '$ssh_persona', no keys) — run 'boxa ssh add'"
+    elif [ "$ssh_reapply_failed" = true ]; then
+        SSH_STATUS="SSH: gate on; per-project ssh-agent key restore failed"
     else
-        SSH_STATUS="SSH: forwarding on, but agent has no keys — run 'boxa ssh add'"
+        SSH_STATUS="SSH: gate on; per-project ssh-agent unavailable"
     fi
 else
-    SSH_STATUS="SSH: not forwarded (enable: boxa ssh on)"
+    SSH_STATUS="SSH: gate off (enable: boxa ssh on)"
 fi
 
 # Pass through API key
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     DOCKER_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+fi
+
+# Forge credential delivery: the gate and per-Project persona assignment are
+# resolved and the host persona store is read at every Container creation.
+# Export values only into this boxa process and pass variable names to Docker,
+# keeping token values out of Docker's argv.
+_boxa::resolve_forge_gate "$PROJECT_PATH"
+if [ "$_BOXA_FORGE_GATE" = on ]; then
+    _boxa::forge_token_expiry_heads_up "$PROJECT_PATH"
+    _boxa::resolve_forge_identity "$PROJECT_PATH"
+    if [ -n "$_BOXA_FORGE_RESOLVED_IDENTITY_ID" ] \
+            && _boxa::forge_load_committer_identity \
+                "$_BOXA_FORGE_RESOLVED_IDENTITY_ID"; then
+        GIT_COMMITTER_NAME="$_BOXA_FORGE_COMMITTER_NAME"
+        GIT_COMMITTER_EMAIL="$_BOXA_FORGE_COMMITTER_EMAIL"
+        export GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+        DOCKER_ARGS+=(-e GIT_COMMITTER_NAME -e GIT_COMMITTER_EMAIL)
+    fi
+    for forge in github gitlab; do
+        _boxa::resolve_forge_identity "$PROJECT_PATH" "$forge"
+        [ -n "$_BOXA_FORGE_RESOLVED_IDENTITY_ID" ] || continue
+        _boxa::forge_load_identity "$_BOXA_FORGE_RESOLVED_IDENTITY_ID" "$forge" \
+            || continue
+        case "$forge" in
+            github)
+                GH_TOKEN="$_BOXA_FORGE_TOKEN"
+                export GH_TOKEN
+                DOCKER_ARGS+=(-e GH_TOKEN)
+                ;;
+            gitlab)
+                GITLAB_TOKEN="$_BOXA_FORGE_TOKEN"
+                export GITLAB_TOKEN
+                DOCKER_ARGS+=(-e GITLAB_TOKEN)
+                if [ -n "$_BOXA_FORGE_HOST" ]; then
+                    GITLAB_HOST="$_BOXA_FORGE_HOST"
+                    export GITLAB_HOST
+                    DOCKER_ARGS+=(-e GITLAB_HOST)
+                fi
+                ;;
+        esac
+    done
 fi
 
 # Read Claude setup-token from config file (env var wins if already set)

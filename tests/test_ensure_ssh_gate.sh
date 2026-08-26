@@ -61,14 +61,14 @@ check "suppressed Yes does not create config" "absent" \
 
 reset_state
 mkdir -p "${BOXA_SSH_CONF%/*}"
-printf 'agent = off\n' > "$BOXA_SSH_CONF"
+printf 'gate = off\n' > "$BOXA_SSH_CONF"
 off_before="$(cksum "$BOXA_SSH_CONF")"
 off_output="$(printf 'y\n' | "$HOOK" offer --interactive)"
 check "global off suppresses prompt" "" "$off_output"
 check "global off remains unchanged" "$off_before" "$(cksum "$BOXA_SSH_CONF")"
 check "global off probes declined" "declined" "$("$HOOK" probe)"
 
-printf 'agent = on\n' > "$BOXA_SSH_CONF"
+printf 'gate = on\n' > "$BOXA_SSH_CONF"
 on_output="$(printf 'n\n' | "$HOOK" offer --interactive)"
 check "global on suppresses prompt" "" "$on_output"
 check "global on does not create marker" "absent" \
@@ -77,7 +77,7 @@ check "global on probes ok" "ok" "$("$HOOK" probe)"
 
 reset_state
 mkdir -p "${BOXA_SSH_CONF%/*}"
-printf '[/work/app]\nagent = on\n' > "$BOXA_SSH_CONF"
+printf '[/work/app]\ngate = on\n' > "$BOXA_SSH_CONF"
 project_output="$(printf 'n\n' | "$HOOK" offer --interactive)"
 check "project-only choice does not suppress prompt" "yes" \
     "$([[ "$project_output" == *'Enable forwarding? [y/N]'* ]] && printf yes || printf no)"
@@ -86,13 +86,13 @@ check "project-only decline writes marker" "present" \
 
 reset_state
 yes_output="$(printf 'y\n' | "$HOOK" offer --interactive)"
-check "Yes writes global on" "agent = on" "$(cat "$BOXA_SSH_CONF")"
+check "Yes writes canonical binary global state" "gate = on" "$(cat "$BOXA_SSH_CONF")"
 check "Yes does not need marker" "absent" \
     "$([ -e "$BOXA_SSH_GATE_MARKER" ] && printf present || printf absent)"
 check "Yes reports enabled" "yes" \
     "$([[ "$yes_output" == *'SSH agent forwarding enabled globally.'* ]] && printf yes || printf no)"
 
-# A fixture-local ssh library records that enable chains the existing helper.
+# A fixture-local ssh library verifies that enable writes only the requested gate.
 STUB_ROOT="$TMP_ROOT/stub"
 mkdir -p "$STUB_ROOT/scripts" "$STUB_ROOT/lib"
 cp "$HOOK" "$STUB_ROOT/scripts/ensure-ssh-gate.sh"
@@ -101,13 +101,10 @@ cp "$HOOK" "$STUB_ROOT/scripts/ensure-ssh-gate.sh"
 cat > "$STUB_ROOT/lib/ssh.sh" <<'EOF'
 _boxa::resolve_ssh_gate() { _BOXA_SSH_SOURCE=default; }
 _boxa::write_ssh_conf() { printf '%s|%s|%s\n' "$1" "$2" "$3" > "$BOXA_TEST_WRITE_LOG"; }
-_boxa::ssh_add_keys_if_agent_unready() { printf 'called\n' > "$BOXA_TEST_PICKER_LOG"; }
 EOF
 export BOXA_TEST_WRITE_LOG="$TMP_ROOT/write.log"
-export BOXA_TEST_PICKER_LOG="$TMP_ROOT/picker.log"
 "$STUB_ROOT/scripts/ensure-ssh-gate.sh" enable >/dev/null
-check "enable uses global config writer" "global||on" "$(cat "$BOXA_TEST_WRITE_LOG")"
-check "enable chains key picker helper" "called" "$(cat "$BOXA_TEST_PICKER_LOG")"
+check "enable uses global binary config writer" "global||on" "$(cat "$BOXA_TEST_WRITE_LOG")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -17,10 +17,8 @@
 # detect "expand all"-style routing.
 #
 # When --header is set, the text is shown above the choices: fzf renders it
-# via its --header option (survives full-screen mode); the numbered fallback
-# prints it to stderr just above the option list. Use it for context the
-# user needs to see while picking — fzf otherwise hides everything that was
-# on the terminal before launch.
+# via its --header option; the numbered fallback prints it to stderr just above
+# the option list. Use it for context the user needs to see while picking.
 #
 # Override fzf detection (for tests): export BOXA_PICKER_FZF=0
 # See docs/adr/0006-interactive-picker-conventions.md.
@@ -82,14 +80,21 @@ _picker::fzf_available() {
 
 _picker::fzf() {
     local mode="$1" prompt="$2" header="$3"; shift 3
-    local args=(--prompt="$prompt")
+    local height='40%'
+    if fzf --height='~40%' --version >/dev/null 2>&1; then
+        height='~40%'
+    fi
+    local args=(--prompt="$prompt" --height="$height" --min-height=10 --layout=reverse)
     if [ "$mode" = many ]; then
         [ -n "$header" ] && header+=$'\n'
         header+="Tab selects multiple"
     fi
     [ -n "$header" ] && args+=(--header="$header")
     [ "$mode" = many ] && args+=(--multi)
-    printf '%s\n' "$@" | fzf "${args[@]}" || return 1
+    local selection
+    selection="$(printf '%s\n' "$@" | fzf "${args[@]}")" || return 1
+    _picker::echo_selection "$prompt" "$selection"
+    printf '%s\n' "$selection"
 }
 
 _picker::fallback() {
@@ -130,7 +135,18 @@ _picker::fallback() {
 
     local choice
     choice=$(_picker::read_choice) || return 1
-    _picker::select "$mode" "$first_count" "$choice" "${items[@]}"
+    local selection
+    selection="$(_picker::select "$mode" "$first_count" "$choice" "${items[@]}")" \
+        || return 1
+    _picker::echo_selection "$prompt" "$selection"
+    printf '%s\n' "$selection"
+}
+
+_picker::echo_selection() {
+    local prompt="$1" selection="$2"
+    prompt="${prompt%"${prompt##*[![:space:]]}"}"
+    selection="${selection//$'\n'/, }"
+    printf '%s %s\n' "$prompt" "$selection" >&2
 }
 
 # Read a single line from the controlling terminal.

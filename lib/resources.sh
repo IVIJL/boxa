@@ -27,6 +27,285 @@ _BOXA_RESOURCE_UPDATE_WARNING=
 _BOXA_RESOURCES_CONF_CHANGED=
 _BOXA_OOM_PRE_UPDATE_SWEEP_DONE=
 
+_boxa::pid_lock_new_tombstone() {
+    local claim="$1" self_pid="$2"
+    (umask 077 && mktemp "${claim}.tombstone.${self_pid}.XXXXXX")
+}
+
+_boxa::pid_lock_has_tombstone() {
+    local claim="$1" candidate
+    for candidate in "$claim".tombstone.*; do
+        [ -e "$candidate" ] && return 0
+    done
+    return 1
+}
+
+_boxa::pid_lock_release_claim() {
+    local claim="$1" self_pid="$2" tombstone
+    tombstone="$(_boxa::pid_lock_new_tombstone "$claim" "$self_pid")" \
+        || return 1
+    if mv "$claim" "$tombstone" 2>/dev/null; then
+        rm -f "$tombstone"
+        return 0
+    fi
+    rm -f "$tombstone"
+    return 1
+}
+
+_boxa::pid_lock_finish_tombstone_takeover() {
+    local lock="$1" claim="$2" tombstone="$3" self_pid="$4"
+    local claim_owner='' owner=''
+
+    if [ ! -s "$tombstone" ]; then
+        rm -f "$tombstone"
+        return 1
+    fi
+    IFS= read -r claim_owner < "$tombstone" || claim_owner=
+    if [[ "$claim_owner" =~ ^[0-9]+$ ]] \
+            && kill -0 "$claim_owner" 2>/dev/null; then
+        if [ ! -e "$claim" ] && ln "$tombstone" "$claim" 2>/dev/null \
+                && [ "$tombstone" -ef "$claim" ]; then
+            rm -f "$tombstone"
+        else
+            rm -f "$claim/${tombstone##*/}" 2>/dev/null || true
+            rm -f "$tombstone"
+        fi
+        return 1
+    fi
+    if [ -r "$lock/owner" ]; then
+        IFS= read -r owner < "$lock/owner" || owner=
+    fi
+    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+        rm -f "$tombstone"
+        return 1
+    fi
+    if ! (umask 077 && printf '%s\n' "$self_pid" > "$lock/owner"); then
+        rm -f "$tombstone"
+        return 1
+    fi
+    rm -f "$tombstone"
+    return 0
+}
+
+# Run one callback under a portable mkdir lock. The owner PID lets later
+# callers reclaim a lock left by an interrupted process. Atomic file claims and
+# unique rename tombstones serialize owner publication and stale takeover,
+# including the short grace for a missing owner file. Signal exits and normal
+# returns both remove locks owned by this invocation.
+_boxa::acquire_pid_lock() {
+    local lock="$1" self_pid="${BASHPID:-$$}" owner='' now mtime
+    local candidate candidate_pid claim claim_mtime claim_owner claim_temp
+    local retry tombstone tombstone_blocked
+    local created stale grace="${BOXA_PID_LOCK_MISSING_OWNER_GRACE:-2}"
+
+    [[ "$grace" =~ ^[0-9]+$ ]] || grace=2
+
+    for _ in {1..100}; do
+        created=
+        stale=
+        if mkdir "$lock" 2>/dev/null; then
+            created=1
+            chmod 700 "$lock" || {
+                rmdir "$lock" 2>/dev/null || true
+                return 1
+            }
+            if [ -n "${BOXA_TEST_PID_LOCK_AFTER_MKDIR_MARKER:-}" ]; then
+                : > "$BOXA_TEST_PID_LOCK_AFTER_MKDIR_MARKER" || return 1
+                while [ ! -e "${BOXA_TEST_PID_LOCK_AFTER_MKDIR_RELEASE:?}" ]; do
+                    sleep 0.01
+                done
+            fi
+        fi
+
+        if [ -r "$lock/owner" ]; then
+            IFS= read -r owner < "$lock/owner" || owner=
+            if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+                sleep 0.1
+                continue
+            fi
+            stale=1
+        elif [ -n "$created" ]; then
+            stale=1
+        else
+            now="$(date +%s)" || return 1
+            mtime="$(stat -c %Y "$lock" 2>/dev/null \
+                || stat -f %m "$lock" 2>/dev/null || printf '%s' "$now")"
+            [ "$((now - mtime))" -ge "$grace" ] && stale=1
+        fi
+
+        if [ -n "$stale" ] \
+                && [ -n "${BOXA_TEST_PID_LOCK_BEFORE_CLAIM_MARKER:-}" ]; then
+            : > "$BOXA_TEST_PID_LOCK_BEFORE_CLAIM_MARKER" || return 1
+            while [ ! -e "${BOXA_TEST_PID_LOCK_BEFORE_CLAIM_RELEASE:?}" ]; do
+                sleep 0.01
+            done
+        fi
+        claim="$lock/claim"
+        tombstone=
+        tombstone_blocked=
+        for candidate in "$claim".tombstone.*; do
+            [ -e "$candidate" ] || continue
+            candidate_pid="${candidate#"${claim}.tombstone."}"
+            candidate_pid="${candidate_pid%%.*}"
+            if [[ "$candidate_pid" =~ ^[0-9]+$ ]] \
+                    && kill -0 "$candidate_pid" 2>/dev/null; then
+                tombstone_blocked=1
+                break
+            fi
+            [ -n "$tombstone" ] || tombstone="$candidate"
+        done
+        if [ -n "$tombstone_blocked" ]; then
+            sleep 0.1
+            continue
+        fi
+        if [ -n "$tombstone" ]; then
+            candidate="$tombstone"
+            tombstone="$(_boxa::pid_lock_new_tombstone "$claim" "$self_pid")" \
+                || return 1
+            if mv "$candidate" "$tombstone" 2>/dev/null; then
+                if _boxa::pid_lock_finish_tombstone_takeover \
+                        "$lock" "$claim" "$tombstone" "$self_pid"; then
+                    return 0
+                fi
+            else
+                rm -f "$tombstone"
+            fi
+            sleep 0.1
+            continue
+        fi
+        if [ -n "$stale" ] && [ -e "$claim" ]; then
+            claim_owner=
+            if [ -f "$claim" ] && [ -r "$claim" ]; then
+                IFS= read -r claim_owner < "$claim" || claim_owner=
+            fi
+            if [[ "$claim_owner" =~ ^[0-9]+$ ]] \
+                    && kill -0 "$claim_owner" 2>/dev/null; then
+                sleep 0.1
+                continue
+            fi
+            if [[ ! "$claim_owner" =~ ^[0-9]+$ ]]; then
+                now="$(date +%s)" || return 1
+                claim_mtime="$(stat -c %Y "$claim" 2>/dev/null \
+                    || stat -f %m "$claim" 2>/dev/null \
+                    || printf '%s' "$now")"
+                if [ "$((now - claim_mtime))" -lt "$grace" ]; then
+                    sleep 0.1
+                    continue
+                fi
+            fi
+            if [ -n "${BOXA_TEST_PID_LOCK_BEFORE_STALE_CLAIM_RENAME_MARKER:-}" ]; then
+                : > "$BOXA_TEST_PID_LOCK_BEFORE_STALE_CLAIM_RENAME_MARKER" \
+                    || return 1
+                while [ ! -e \
+                        "${BOXA_TEST_PID_LOCK_BEFORE_STALE_CLAIM_RENAME_RELEASE:?}" ]; do
+                    sleep 0.01
+                done
+            fi
+            tombstone="$(_boxa::pid_lock_new_tombstone "$claim" "$self_pid")" \
+                || return 1
+            if mv "$claim" "$tombstone" 2>/dev/null; then
+                if [ -n "${BOXA_TEST_PID_LOCK_AFTER_STALE_CLAIM_RENAME_MARKER:-}" ]; then
+                    printf '%s\n' "$self_pid" \
+                        > "$BOXA_TEST_PID_LOCK_AFTER_STALE_CLAIM_RENAME_MARKER" \
+                        || return 1
+                    while [ ! -e \
+                            "${BOXA_TEST_PID_LOCK_AFTER_STALE_CLAIM_RENAME_RELEASE:?}" ]; do
+                        sleep 0.01
+                    done
+                fi
+                if _boxa::pid_lock_finish_tombstone_takeover \
+                        "$lock" "$claim" "$tombstone" "$self_pid"; then
+                    return 0
+                fi
+            else
+                rm -f "$tombstone"
+            fi
+            sleep 0.1
+            continue
+        fi
+        if [ -n "$stale" ]; then
+            claim_temp="${claim}.prepare.${self_pid}.${_}"
+            if ! (umask 077 && set -C \
+                    && printf '%s\n' "$self_pid" > "$claim_temp") 2>/dev/null; then
+                sleep 0.1
+                continue
+            fi
+            if ! ln "$claim_temp" "$claim" 2>/dev/null \
+                    || [ ! "$claim_temp" -ef "$claim" ]; then
+                rm -f "$claim/${claim_temp##*/}" 2>/dev/null || true
+                rm -f "$claim_temp"
+                sleep 0.1
+                continue
+            fi
+            trap '_boxa::pid_lock_release_claim "$claim" "$self_pid" >/dev/null 2>&1 || true; rm -f "$claim_temp"; exit 129' HUP
+            trap '_boxa::pid_lock_release_claim "$claim" "$self_pid" >/dev/null 2>&1 || true; rm -f "$claim_temp"; exit 130' INT
+            trap '_boxa::pid_lock_release_claim "$claim" "$self_pid" >/dev/null 2>&1 || true; rm -f "$claim_temp"; exit 143' TERM
+            if [ -n "${BOXA_TEST_PID_LOCK_AFTER_CLAIM_MARKER:-}" ]; then
+                printf '%s\n' "$self_pid" \
+                    > "$BOXA_TEST_PID_LOCK_AFTER_CLAIM_MARKER" || return 1
+                while [ ! -e "${BOXA_TEST_PID_LOCK_AFTER_CLAIM_RELEASE:?}" ]; do
+                    sleep 0.01
+                done
+            fi
+            if _boxa::pid_lock_has_tombstone "$claim" \
+                    || [ ! "$claim_temp" -ef "$claim" ]; then
+                _boxa::pid_lock_release_claim "$claim" "$self_pid" \
+                    >/dev/null 2>&1 || true
+                rm -f "$claim_temp"
+                trap - HUP INT TERM
+                sleep 0.1
+                continue
+            fi
+            owner=
+            if [ -r "$lock/owner" ]; then
+                IFS= read -r owner < "$lock/owner" || owner=
+            fi
+            if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+                _boxa::pid_lock_release_claim "$claim" "$self_pid" \
+                    >/dev/null 2>&1 || true
+                rm -f "$claim_temp"
+                trap - HUP INT TERM
+                sleep 0.1
+                continue
+            fi
+            if ! (umask 077 && printf '%s\n' "$self_pid" > "$lock/owner"); then
+                retry=
+                [ -d "$lock" ] && [ "$claim_temp" -ef "$claim" ] || retry=1
+                _boxa::pid_lock_release_claim "$claim" "$self_pid" \
+                    >/dev/null 2>&1 || true
+                rm -f "$claim_temp"
+                trap - HUP INT TERM
+                if [ -n "$retry" ]; then
+                    sleep 0.1
+                    continue
+                fi
+                return 1
+            fi
+            _boxa::pid_lock_release_claim "$claim" "$self_pid" \
+                >/dev/null 2>&1 || true
+            rm -f "$claim_temp"
+            trap - HUP INT TERM
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+_boxa::with_pid_lock() {
+    local lock="$1" callback="$2"
+    shift 2
+
+    (
+        _boxa::acquire_pid_lock "$lock" || return 75
+        trap 'rm -rf -- "$lock"' EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        "$callback" "$@"
+    )
+}
+
 # Run at the first convergence update only. Ordering invariant: archive events
 # under the pre-update limit before converging.
 _boxa::sweep_oom_before_resource_update() {

@@ -27,8 +27,9 @@ if [ "$(id -u)" = "0" ]; then
         update-ca-certificates >/dev/null
     fi
 
-    # Volumes for IDE servers may be created as root on first mount.
-    chown node:node /home/node/.cursor-server /home/node/.vscode-server 2>/dev/null || true
+    # Named volumes may be created as root on first mount.
+    chown node:node /home/node/.cursor-server /home/node/.vscode-server \
+        /home/node/.config/gh /home/node/.config/glab-cli 2>/dev/null || true
 
     # Bridge $HOST_HOME (host user's home dir) to /home/node (container user's
     # home, where the bind mounts live). Two requirements collide:

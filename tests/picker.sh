@@ -298,7 +298,7 @@ case "$many_fallback_stderr" in
             "$many_fallback_stderr"
         fail_count=$((fail_count + 1))
         ;;
-    *"(comma-separated: numbers and a/q)"*)
+    *"(comma-separated: numbers and a/q)"*'P: * All, beta')
         printf 'PASS  e2e many fallback: hint omits Tab and explains selection\n'
         ;;
     *)
@@ -311,19 +311,48 @@ esac
 # Called indirectly by _picker::fzf after command lookup.
 # shellcheck disable=SC2317
 fzf() {
-    printf '%s\n' "$*" >&2
-    local selected
-    IFS= read -r selected
-    printf '%s\n' "$selected"
+    if [[ "$*" = *--version* ]]; then
+        return 0
+    fi
+    printf 'FZF_ARGS:%s\n' "$*" >&2
+    printf 'alpha\nbeta\n'
 }
-fzf_stderr="$(_picker::fzf many "P:" "Choose items" alpha beta 2>&1 1>/dev/null)"
+fzf_stderr_file="$(mktemp "${TMPDIR:-/tmp}/boxa-picker-fzf.XXXXXX")"
+fzf_stdout="$(_picker::fzf many "P:" "Choose items" alpha beta \
+    2>"$fzf_stderr_file")"
+fzf_stderr="$(<"$fzf_stderr_file")"
+rm -f "$fzf_stderr_file"
 unset -f fzf
-if [[ "$fzf_stderr" = *"--multi"* \
-    && "$fzf_stderr" = *"Choose items"*"Tab selects multiple"* ]]; then
-    printf 'PASS  fzf many: enables multi-select and explains Tab selection\n'
+if [[ "$fzf_stdout" = $'alpha\nbeta' \
+    && "$fzf_stderr" = *"FZF_ARGS:"*"--height=~40%"*"--min-height=10"*"--layout=reverse"* \
+    && "$fzf_stderr" = *"--multi"* \
+    && "$fzf_stderr" = *"Choose items"*"Tab selects multiple"* \
+    && "$fzf_stderr" = *'P: alpha, beta' ]]; then
+    printf 'PASS  fzf many: renders inline and echoes the multi-selection\n'
 else
-    printf 'FAIL  fzf many: enables multi-select and explains Tab selection\n      stderr: %q\n' \
-        "$fzf_stderr"
+    printf 'FAIL  fzf many: renders inline and echoes the multi-selection\n      stdout: %q\n      stderr: %q\n' \
+        "$fzf_stdout" "$fzf_stderr"
+    fail_count=$((fail_count + 1))
+fi
+
+# shellcheck disable=SC2317
+fzf() {
+    if [[ "$*" = *--version* ]]; then
+        return 2
+    fi
+    printf 'FZF_ARGS:%s\n' "$*" >&2
+    printf 'alpha\n'
+}
+legacy_fzf_stderr="$(_picker::fzf one "P:" "" alpha beta 2>&1 1>/dev/null)"
+unset -f fzf
+if [[ "$legacy_fzf_stderr" = *"FZF_ARGS:"*"--height=40%"* \
+    && "$legacy_fzf_stderr" != *"--height=~40%"* \
+    && "$legacy_fzf_stderr" = *"--layout=reverse"* \
+    && "$legacy_fzf_stderr" = *'P: alpha' ]]; then
+    printf 'PASS  fzf legacy: falls back to plain inline height\n'
+else
+    printf 'FAIL  fzf legacy: falls back to plain inline height\n      stderr: %q\n' \
+        "$legacy_fzf_stderr"
     fail_count=$((fail_count + 1))
 fi
 

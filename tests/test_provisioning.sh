@@ -79,6 +79,22 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$tmp/scripts/ensure-ssh-gate.sh"
+cat > "$tmp/scripts/ensure-agent-identity.sh" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    probe)
+        if [ -f "$BOXA_DIR/_agent_identity_state" ]; then
+            cat "$BOXA_DIR/_agent_identity_state"
+        else
+            printf 'missing\n'
+        fi
+        ;;
+    enable)
+        printf 'ok\n' > "$BOXA_DIR/_agent_identity_state"
+        ;;
+esac
+EOF
+chmod +x "$tmp/scripts/ensure-agent-identity.sh"
 
 # shellcheck source=../lib/provisioning.sh disable=SC1091
 source "$REPO_DIR/lib/provisioning.sh"
@@ -89,8 +105,8 @@ check "field id"       "allow-for-host-state" "$(boxa::provisioning_field "$entr
 check "field script"   "scripts/ensure-allow-for-host-state.sh" "$(boxa::provisioning_field "$entry" script)"
 check "field category" "A" "$(boxa::provisioning_field "$entry" category)"
 
-# --- Registry: 9 category-A + 5 category-B + 5 category-C steps ---------------
-check "registry size" "19" "${#BOXA_PROVISIONING_STEPS[@]}"
+# --- Registry: 9 category-A + 6 category-B + 5 category-C steps ---------------
+check "registry size" "20" "${#BOXA_PROVISIONING_STEPS[@]}"
 
 # --- First run repairs the one stub that has work, rest already OK ------------
 boxa::run_provisioning repair-a >/dev/null
@@ -170,6 +186,17 @@ check "probe ssh-gate declined" "declined" "$(boxa::provisioning_probe ssh-gate)
 boxa::run_provisioning fix ssh-gate >/dev/null
 check "fix ssh-gate reuses enable" "ssh-gate" "${BOXA_PROVISIONING_REPAIRED[*]}"
 check "fix ssh-gate reaches ok" "ok" "$(boxa::provisioning_probe ssh-gate)"
+rm -f "$tmp/_agent_identity_state"
+check "probe agent-identity missing" "missing" \
+    "$(boxa::provisioning_probe agent-identity)"
+printf 'declined\n' > "$tmp/_agent_identity_state"
+check "probe agent-identity declined" "declined" \
+    "$(boxa::provisioning_probe agent-identity)"
+boxa::run_provisioning fix agent-identity >/dev/null
+check "fix agent-identity reuses enable" "agent-identity" \
+    "${BOXA_PROVISIONING_REPAIRED[*]}"
+check "fix agent-identity reaches ok" "ok" \
+    "$(boxa::provisioning_probe agent-identity)"
 check "probe keep-awake missing" "missing" "$(boxa::provisioning_probe keep-awake)"
 printf 'declined\n' > "$tmp/_keep_awake_state"
 check "probe keep-awake declined" "declined" "$(boxa::provisioning_probe keep-awake)"
@@ -229,6 +256,7 @@ PYEOF
 TEST_HTTPS_STATE=active
 printf 'x\n' > "$HOME/.config/boxa/claude-token"
 printf 'ok\n' > "$tmp/_keep_awake_state"
+printf 'ok\n' > "$tmp/_agent_identity_state"
 printf 'declined\n' > "$tmp/_ssh_gate_state"
 touch "$tmp/_mcp_done"
 boxa::run_provisioning fix >/dev/null
@@ -241,15 +269,15 @@ boxa::run_provisioning fix >/dev/null
 check "bare fix repairs missing ssh-gate" "ssh-gate" "${BOXA_PROVISIONING_REPAIRED[*]}"
 check "bare fix missing ssh-gate reaches ok" "ok" "$(boxa::provisioning_probe ssh-gate)"
 rm -f "$HOME/.config/boxa/claude-token" "$tmp/_keep_awake_state" \
-    "$tmp/_ssh_gate_state" "$tmp/_mcp_done"
+    "$tmp/_agent_identity_state" "$tmp/_ssh_gate_state" "$tmp/_mcp_done"
 
-# report-electives: no mutation, classifies all five as missing in this fixture
+# report-electives: no mutation, classifies all six as missing in this fixture
 # (keep-awake unset; https unset; no token; MCP shouldOffer -> missing).
 # shellcheck disable=SC2034  # read by the sourced https.sh stub via subshell
 TEST_HTTPS_STATE=""
 rm -f "$tmp/_ssh_gate_state"
 boxa::run_provisioning report-electives >/dev/null
-check "report missing count" "5" "${#BOXA_PROVISIONING_MISSING[@]}"
+check "report missing count" "6" "${#BOXA_PROVISIONING_MISSING[@]}"
 
 # fix re-probes after the action (P2): an action that runs but does NOT resolve
 # the elective is reported as still-missing, never faked as repaired.

@@ -1,17 +1,24 @@
 # SSH
 
-Boxa controls SSH agent forwarding with the **SSH gate**. The gate is off by
-default: a newly created Container receives no host agent socket and has no
-`SSH_AUTH_SOCK`. Enable it only for Projects that need SSH signing.
+Boxa controls SSH signing-socket forwarding with the **SSH gate**. Each Project
+has one of two states:
+
+- `off` forwards no agent and is the default.
+- `on` forwards that Project's dedicated **Project agent**.
+
+A newly created Container in `off` state receives no host agent socket and has
+no `SSH_AUTH_SOCK`. When on, the Project agent contains keys added through the
+Key picker or restored by legacy migration; separate Projects never share an
+agent or socket.
 
 Run these commands on the host:
 
 ```bash
 boxa ssh                         # Show the effective state for the current Project
-boxa ssh on                      # Enable for the current Project
 boxa ssh off                     # Disable for the current Project
-boxa ssh on ~/projects/my-app    # Enable for a specific Project
-boxa ssh on --global             # Enable globally
+boxa ssh on                      # Enable the current Project
+boxa ssh on ~/projects/my-app    # Enable a specific Project
+boxa ssh on --global             # Enable the global fallback
 boxa ssh off --global            # Disable globally
 ```
 
@@ -19,17 +26,18 @@ Project choices override the global choice. Boxa stores both in
 `~/.config/boxa/ssh.conf`, using absolute host paths for Project sections:
 
 ```ini
-agent = off
+gate = on
 
 [/home/me/projects/my-app]
-agent = on
+gate = off
 ```
 
 Changes take effect only when the Container is created. If the affected
 Container is already running, Boxa prints the required restart command:
-`boxa stop && boxa`. Every Container start also reports whether SSH is not
-forwarded, forwarded with the agent's key names, or enabled but unavailable or
-empty.
+`boxa stop && boxa`. Every Container start and attach reports the frozen
+reality: the binary gate, Project agent liveness, and key fingerprints.
+Changing `ssh.conf` does not change that report
+until the Container is recreated.
 
 The **SSH gate** controls only the signing socket. It does not control the
 separate [Boxa SSH config](#boxa-ssh-config) mount, and it does not grant network
@@ -39,8 +47,9 @@ for a service on the host.
 
 ## Key picker
 
-`boxa ssh add` opens the consent-first **Key picker**. `boxa ssh on` opens the
-same flow when the host agent is not running or contains no keys.
+`boxa ssh add` opens the consent-first **Key picker** for the current Project
+agent. It is available only while the effective gate state is `on`. `boxa ssh
+on` opens the same flow when enabling a Project whose agent has no keys.
 
 Before looking in `~/.ssh`, Boxa asks permission. If you decline, the picker
 still offers manual path entry. If you consent, candidate discovery uses file
@@ -51,21 +60,31 @@ multiple candidates or enter a path manually.
 The selected key is loaded by `ssh-add`, which asks for its passphrase when
 needed. Boxa first lets `ssh-add` test the key non-interactively. If that
 succeeds, the key has no passphrase and Boxa prints a warning with the command
-to protect it. Boxa never loads a key without this explicit Key picker action
-and never invokes `ssh-add` during Container creation.
+to protect it. Boxa never first loads a user key without this explicit Key
+picker action. A legacy migration may re-open the picker during startup.
+
+## Agent key
+
+The **Agent key** remains Boxa's per-installation ed25519 identity. Its private
+key stays under `~/.config/boxa/agent-identity/` on the host. The key material
+and its existing identity directory are preserved by the binary-gate migration.
+
+The socket, not the private key, is forwarded. During legacy `agent` migration,
+Boxa loads the preserved Agent key into the Project agent. If the key has not
+been provisioned yet, the Project agent remains empty.
 
 ## Security model
 
-A forwarded agent socket is full signing authority over **every key currently
-loaded in that agent**. Code in the Container cannot read the private key bytes,
+A forwarded Project agent socket is full signing authority over **every key
+currently loaded in that agent**. Code in the Container cannot read private key bytes,
 but it can ask the agent to sign and can therefore authenticate anywhere those
 keys and the available network permit. The SSH gate does not filter individual
 keys.
 
-Keep the gate off where SSH is unnecessary, load only the keys you intend to
-expose, and protect private keys with passphrases. Boxa never reads private key
-material and never calls `ssh-add` on its own; only a user-confirmed Key picker
-action causes a load.
+Keep the gate `off` where SSH is unnecessary. Add only keys belonging to the
+intended principal and protect personal private keys with passphrases.
+Boxa never reads private key material; only a user-confirmed Key picker action
+first loads user keys.
 
 ## Migration and first install
 
@@ -75,8 +94,16 @@ The default answer is **No**. Declining leaves the gate off and records the
 choice so Boxa does not ask again. A non-interactive install or update leaves
 the gate off without recording a choice, so a later interactive run can ask.
 
-You can change the decision at any time with `boxa ssh on|off --global` or add
-a Project override with `boxa ssh on|off [project|path]`.
+You can change the decision at any time with
+`boxa ssh off|on --global` or add a Project override with
+`boxa ssh off|on [project|path]`.
+
+Legacy `agent = agent` and `agent = user` values map in memory to `on` on every
+read, with a once-per-process visible note; reading does not rewrite the file.
+The Agent-key mode seeds the Project agent from the preserved Agent key. User
+mode asks the user to reselect the keys previously added through the Key picker.
+The canonical `gate = off|on` grammar is written only by an explicit gate
+change, and its new key name deliberately makes older parsers fail closed.
 
 ## Boxa SSH config
 

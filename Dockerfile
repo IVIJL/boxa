@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean && \
     apt-get update && apt-get install -y --no-install-recommends \
     # Claude Code packages
-    less git procps sudo zsh man-db unzip gnupg2 gh \
+    less git procps sudo zsh man-db unzip gnupg2 gh glab \
     iptables ipset iproute2 dnsutils aggregate jq nano vim dnsmasq iputils-ping socat \
     # util-linux: setpriv (broker credential drop) + unshare/mount (ADR 0014
     # issue 21 per-broker mount namespace + X-mount.idmap workspace remount).
@@ -142,9 +142,10 @@ RUN mkdir -p /workspace /home/node/.claude \
     chown -R node:node /workspace /home/node/.claude \
     /home/node/.cursor-server /home/node/.vscode-server
 
-# Pre-populate GitHub SSH host keys (so git works without host known_hosts)
+# Pre-populate GitHub and GitLab SSH host keys (so git works without host known_hosts)
 RUN mkdir -p /home/node/.ssh && chmod 700 /home/node/.ssh && \
     ssh-keyscan -t ed25519,rsa github.com >> /home/node/.ssh/known_hosts 2>/dev/null && \
+    ssh-keyscan -t ed25519,rsa gitlab.com >> /home/node/.ssh/known_hosts 2>/dev/null && \
     chmod 600 /home/node/.ssh/known_hosts && \
     chown -R node:node /home/node/.ssh
 

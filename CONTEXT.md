@@ -192,12 +192,44 @@ _Avoid_: host-service, host relay, host hole, host forward
 ### SSH
 
 **SSH gate**:
-The opt-in gate controlling whether the host's SSH agent socket is
-forwarded into a **Container**. Off by default; enabled globally or per
-**Project** (`boxa ssh on`, durable in `~/.config/boxa/ssh.conf`).
-Governs only the agent socket — the signing capability — not the
-**Boxa SSH config** mount. Takes effect at Container creation.
-_Avoid_: ssh forwarding flag, agent mount, ssh sharing
+The opt-in gate deciding whether a **Container** receives an SSH signing
+socket. Its states are **off** and **on**; when on, the socket belongs to the
+project's **Project agent** and offers exactly the assigned **Persona**'s
+keys. The effective choice resolves per **Project** with
+an optional global fallback. It does not govern the **Boxa SSH config**.
+_Avoid_: ssh forwarding flag, agent mount, ssh sharing, ssh mode
+
+**Agent key**:
+A per-installation SSH identity dedicated to automation, generated into or
+adopted by the **Agent identity**; exposed only through a **Project agent**.
+_Avoid_: bot key, boxa key, machine-user key
+
+**Agent identity**:
+The scoped automation identity represented by the **Agent key**, forge machine
+accounts, and their deliberately limited credentials and memberships.
+_Avoid_: bot account, service identity, user identity
+
+**off**:
+The **SSH gate** state that exposes no SSH signing socket to the **Container**.
+_Avoid_: disabled, none, closed
+
+**on**:
+The **SSH gate** state that exposes the **Project agent**'s socket to the
+**Container**; which keys it offers is the **Project**'s key assignment, not a
+gate property.
+_Avoid_: agent mode, user mode, enabled
+
+**Project agent**:
+The dedicated host-side ssh-agent one **Project** gets when its **SSH gate**
+is **on**: its own socket, holding exactly the assigned **Persona**'s keys —
+always keys of a single principal, never a mix.
+_Avoid_: shared agent, boxa agent, global agent
+
+**Key registry**:
+The durable host-side record of key paths (never private key material) that
+have been added through the **Key picker**. A **Project agent** is silently
+re-populated from it at that **Project**'s container start.
+_Avoid_: key cache, key store, saved keys
 
 **Boxa SSH config**:
 The user-curated host aliases file `~/.config/boxa/ssh_config`
@@ -207,13 +239,47 @@ material or signing capability.
 _Avoid_: ssh config mount, host ssh config (that is the `--ssh-config` flag)
 
 **Key picker**:
-The consent-first interactive flow in `boxa ssh on` / `boxa ssh add`
+The consent-first interactive flow (`boxa ssh add` and the inline add
+flow when enabling an empty gate)
 that offers host keys for `ssh-add`: asks before listing `~/.ssh`,
 discovers candidates by filename only (never reading private key
 material), lets the user multi-select or type a path, and warns when a
 selected key turns out to be passphrase-less. The only way boxa ever
 causes a key to enter the agent.
 _Avoid_: key scanner, key importer, auto-add
+
+### Forge
+
+**Persona**:
+A named credential bundle owned by one principal: its SSH keys plus at most
+one token per forge, with committer identity derived from it. What a
+**Project** is assigned — always whole, never per forge.
+_Avoid_: forge identity (pre-persona per-forge entity), account entry,
+credential set
+
+**Identity kind**:
+A descriptive label (`mine`, `agent`, or `other`) on a **Persona** answering
+"whose account is this?"; it selects no setup flow or capability.
+
+**Identity assignment**:
+A **Project**'s explicit choice of at most one **Persona**; assigning replaces
+the previous one completely.
+
+**Default persona**:
+The single user-wide **Persona** used when a **Project** has no explicit
+**Identity assignment**; a per-project `none` overrides it.
+_Avoid_: default identity (pre-persona per-forge default)
+
+**Forge store**:
+The host-owned credential store for the **Agent identity**'s GitHub and GitLab
+tokens and identity metadata.
+_Avoid_: token cache, credential mount, forge login
+
+**Forge gate**:
+The opt-in gate controlling whether stored forge credentials and committer
+identity enter a **Container**. It resolves per **Project** with an optional
+global fallback and is off by default.
+_Avoid_: token forwarding, forge access flag, credential injection
 
 ### MCP
 
@@ -624,15 +690,17 @@ _Avoid_: boxa check, boxa repair, boxa heal
   **Allowlist** admits domains via DNS resolution into the
   **Allowed-domains ipset**; a **Host connection** admits exactly one
   IP:port pair. Neither implies the other.
-- The **SSH gate** stands in the same row as the **Allowlist**, a **Host
-  connection**, and the **Agent-browser allowlist**: default-deny, host-owned,
-  never grantable from inside the **Container**. It admits a signing
-  capability, not traffic — reaching an SSH host still requires the
-  **Allowlist** (or a **Host connection**).
+- The **SSH gate** and **Forge gate** stand in the same row as the
+  **Allowlist**, a **Host connection**, and the **Agent-browser allowlist**:
+  default-deny, host-owned, never grantable from inside the **Container**.
+  They admit signing or forge-credential capabilities, not traffic — reaching
+  a forge still requires the **Allowlist** (or a **Host connection** for a
+  host-side service).
 - The **SSH gate** resolves per **Project**: a project section in
   `ssh.conf` overrides the global choice; absent both, the gate is off.
-  Boxa never loads keys into the agent on its own — only the **Key
-  picker** (user-confirmed `ssh-add`) does.
+  A key first enters a **Project agent** only through the **Key
+  picker** (user-confirmed `ssh-add`); the **Key registry** may silently
+  re-add only keys that already passed that consent.
 - A **Project** has one effective **MCP profile** at a time, formed only from
   its explicit **MCP activations**. The user-wide **MCP catalog** contributes
   available definitions, never implicit selections.

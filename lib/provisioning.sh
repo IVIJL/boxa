@@ -60,6 +60,7 @@ BOXA_PROVISIONING_STEPS=(
     "boxa-skill|scripts/ensure-boxa-skill.sh|A"
     "completions|scripts/ensure-completions.sh|A"
     "keep-awake|scripts/ensure-keep-awake.sh|B"
+    "agent-identity|scripts/ensure-agent-identity.sh|B"
     "ssh-gate|scripts/ensure-ssh-gate.sh|B"
     "mcp-onboarding|scripts/ensure-mcp-onboarding.sh|B"
     "claude-token|-|B"
@@ -158,6 +159,14 @@ boxa::provisioning_probe() {
                 "$keep_awake_script" probe
             fi
             ;;
+        agent-identity)
+            local agent_identity_script="$BOXA_DIR/scripts/ensure-agent-identity.sh"
+            if [ ! -x "$agent_identity_script" ]; then
+                printf 'missing'
+            else
+                "$agent_identity_script" probe
+            fi
+            ;;
         ssh-gate)
             local ssh_gate_script="$BOXA_DIR/scripts/ensure-ssh-gate.sh"
             if [ ! -x "$ssh_gate_script" ]; then
@@ -214,6 +223,9 @@ boxa::repair_elective() {
             ;;
         keep-awake)
             "$BOXA_DIR/scripts/ensure-keep-awake.sh" enable
+            ;;
+        agent-identity)
+            "$BOXA_DIR/scripts/ensure-agent-identity.sh" enable
             ;;
         ssh-gate)
             "$BOXA_DIR/scripts/ensure-ssh-gate.sh" enable
