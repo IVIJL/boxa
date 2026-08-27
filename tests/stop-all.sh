@@ -13,6 +13,8 @@ mkdir -p "$TEST_BOXA_DIR/scripts" "$_TMPROOT/bin" "$_TMPROOT/home"
 cp "$SCRIPT_DIR/../docker-run.sh" "$TEST_BOXA_DIR/docker-run.sh"
 cp -R "$SCRIPT_DIR/../lib" "$TEST_BOXA_DIR/lib"
 cp -R "$SCRIPT_DIR/../config" "$TEST_BOXA_DIR/config"
+cp -R "$SCRIPT_DIR/../scripts/mcp" "$TEST_BOXA_DIR/scripts/mcp"
+cp "$SCRIPT_DIR/../scripts/shutdown-inner-containers.sh" "$TEST_BOXA_DIR/scripts/"
 
 cat > "$_TMPROOT/bin/docker" <<'STUB'
 #!/bin/bash
@@ -58,6 +60,22 @@ case "${1:-}" in
             && [ "${5:-}" = test ] && [ "${6:-}" = -f ]; then
             exit 1
         fi
+        if [[ " $* " == *" test -x /usr/local/bin/boxa-shutdown-inner "* ]]; then
+            [ "${BOXA_STOP_TEST_HELPER_MISSING:-}" != true ]
+            exit
+        fi
+        if [[ "$*" == *"boxa-shutdown-inner"* ]]; then
+            if [ "${BOXA_STOP_TEST_HELPER_MISSING:-}" = true ]; then
+                printf 'bash: /usr/local/bin/boxa-shutdown-inner: No such file or directory\n' >&2
+                exit 127
+            fi
+            case "${BOXA_STOP_TEST_INNER_FAIL_PROJECT:-}" in
+                all) exit 1 ;;
+                alpha|beta)
+                    [[ " $* " == *" boxa-${BOXA_STOP_TEST_INNER_FAIL_PROJECT} "* ]] && exit 1
+                    ;;
+            esac
+        fi
         ;;
     inspect)
         if [ "${BOXA_STOP_TEST_UP:-}" = true ] && [[ "$*" == *".State.Status"* ]]; then
@@ -77,6 +95,12 @@ case "${1:-}" in
             if [ "${BOXA_STOP_TEST_FAIL_PARTIAL:-}" = true ]; then
                 exit 1
             fi
+        fi
+        ;;
+    rm)
+        if [ -n "${BOXA_STOP_TEST_FAIL_RM_PROJECT:-}" ] \
+            && [ "${2:-}" = "boxa-${BOXA_STOP_TEST_FAIL_RM_PROJECT}" ]; then
+            exit 1
         fi
         ;;
 esac
@@ -140,13 +164,19 @@ reset_case() {
     unset BOXA_STOP_TEST_EMPTY BOXA_STOP_TEST_FAIL_BATCH BOXA_STOP_TEST_FAIL_LIST \
         BOXA_STOP_TEST_FAIL_PARTIAL BOXA_STOP_TEST_PREP_BARRIER \
         BOXA_STOP_TEST_REMAINING BOXA_STOP_TEST_UP BOXA_STOP_TEST_DAEMON_REACHABLE \
-        BOXA_STOP_TEST_RUNNING_ATTACH
+        BOXA_STOP_TEST_RUNNING_ATTACH BOXA_STOP_TEST_INNER_FAIL_PROJECT \
+        BOXA_STOP_TEST_FAIL_RM_PROJECT BOXA_STOP_TEST_HELPER_MISSING
 }
 
 line_count() {
     local pattern="$1" file="$2"
     [ -f "$file" ] || { printf '0'; return; }
     grep -c -- "$pattern" "$file" || true
+}
+
+installed_helper_count() {
+    line_count '^exec -u node boxa-[^ ]* /usr/local/bin/boxa-shutdown-inner$' \
+        "$BOXA_STOP_TEST_DOCKER_LOG"
 }
 
 assert_eq() {
@@ -212,6 +242,8 @@ parallel_rc=$?
 assert_eq "parallel Container prep completes" "0" "$parallel_rc"
 assert_eq "both Container preparations start before either finishes" "2" \
     "$(sed -n '/^end:/q; /^begin:/p' "$BOXA_STOP_TEST_PREP_LOG" | wc -l)"
+assert_eq "explicit stop-all invokes the inner shutdown helper" "2" \
+    "$(installed_helper_count)"
 
 reset_case
 export BOXA_STOP_TEST_PREP_BARRIER=true
@@ -223,7 +255,9 @@ assert_eq "interactive Stop all completes" "0" "$interactive_parallel_rc"
 assert_eq "interactive Stop all preparations run concurrently" "2" \
     "$(sed -n '/^end:/q; /^begin:/p' "$BOXA_STOP_TEST_PREP_LOG" | wc -l)"
 assert_eq "interactive Stop all stops each Container in its own invocation" "2" \
-    "$(line_count '^stop -t 15 boxa-\(alpha\|beta\)$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+    "$(line_count '^stop boxa-\(alpha\|beta\)$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+assert_eq "interactive Stop all invokes the inner shutdown helper" "2" \
+    "$(installed_helper_count)"
 unset BOXA_PICKER_FZF BOXA_PICKER_TEST_CHOICE
 
 reset_case
@@ -239,7 +273,9 @@ plain_output="$(run_boxa stop --all 2>&1)"
 plain_rc=$?
 assert_eq "--all exits successfully" "0" "$plain_rc"
 assert_eq "each outer Container stops in its own docker invocation" "2" \
-    "$(line_count '^stop -t 15 boxa-\(alpha\|beta\)$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+    "$(line_count '^stop boxa-\(alpha\|beta\)$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+assert_eq "outer stops do not override the configured timeout" "0" \
+    "$(line_count '^stop -t 15 boxa-' "$BOXA_STOP_TEST_DOCKER_LOG")"
 assert_eq "each Container runs its pre-stop closeout" "2" \
     "$(line_count '^boxa-' "$BOXA_STOP_TEST_CLOSEOUT_LOG")"
 assert_contains "--all reports the first stopped Container" \
@@ -266,6 +302,22 @@ export BOXA_STOP_TEST_REMAINING=true
 run_boxa stop alpha >/dev/null 2>&1
 remaining_rc=$?
 assert_eq "single stop with a remaining Container succeeds" "0" "$remaining_rc"
+assert_eq "named stop invokes the inner shutdown helper" "1" \
+    "$(installed_helper_count)"
+assert_eq "named outer stop uses its configured timeout" "1" \
+    "$(line_count '^stop boxa-alpha$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+
+reset_case
+export BOXA_STOP_TEST_HELPER_MISSING=true
+mixed_version_output="$(run_boxa stop alpha 2>&1)"
+mixed_version_rc=$?
+assert_eq "named stop supports a pre-feature running Container" "0" \
+    "$mixed_version_rc"
+assert_eq "missing installed helper falls back to the current checkout helper" "1" \
+    "$(line_count '^exec -i -u node boxa-alpha bash -s$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+if [ "$mixed_version_rc" -ne 0 ]; then
+    printf '%s\n' "$mixed_version_output"
+fi
 
 reset_case
 export BOXA_STOP_TEST_DAEMON_REACHABLE=false
@@ -347,7 +399,7 @@ export BOXA_PICKER_FZF=0
 export BOXA_PICKER_TEST_CHOICE=a
 partial_output="$(run_boxa stop --clean 2>&1)"
 partial_rc=$?
-assert_eq "interactive Stop all survives a failed docker stop" "0" "$partial_rc"
+assert_eq "interactive Stop all returns non-zero after a failed docker stop" "1" "$partial_rc"
 assert_contains "failed interactive stop still cleans the first Container" \
     "Stopped + data removed:boxa-alpha" "$partial_output"
 assert_contains "failed interactive stop still cleans the second Container" \
@@ -365,6 +417,61 @@ assert_eq "failed interactive stop still stops idle Traefik" "1" \
 assert_eq "failed interactive stop still stops idle DNS" "1" \
     "$(line_count '^stop boxa_dns$' "$BOXA_STOP_TEST_DOCKER_LOG")"
 unset BOXA_PICKER_FZF BOXA_PICKER_TEST_CHOICE
+
+reset_case
+export BOXA_STOP_TEST_INNER_FAIL_PROJECT=alpha
+named_cleanup_output="$(run_boxa stop alpha 2>&1)"
+named_cleanup_rc=$?
+assert_eq "named stop returns non-zero after inner cleanup failure" "1" "$named_cleanup_rc"
+assert_contains "named stop reports incomplete inner cleanup" \
+    "boxa-alpha had shutdown or inner cleanup errors" "$named_cleanup_output"
+assert_eq "named stop still removes its outer Container" "1" \
+    "$(line_count '^rm boxa-alpha$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+
+reset_case
+export BOXA_STOP_TEST_INNER_FAIL_PROJECT=alpha
+fleet_cleanup_output="$(run_boxa stop --all 2>&1)"
+fleet_cleanup_rc=$?
+assert_eq "explicit stop-all aggregates one inner cleanup failure" "1" "$fleet_cleanup_rc"
+assert_contains "explicit stop-all reports the failed cleanup batch" \
+    "Containers had shutdown or inner cleanup errors" "$fleet_cleanup_output"
+assert_eq "partial inner failure still stops every outer Container" "2" \
+    "$(line_count '^stop boxa-\(alpha\|beta\)$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+assert_eq "partial inner failure still removes every outer Container" "2" \
+    "$(line_count '^rm boxa-\(alpha\|beta\)$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+
+reset_case
+export BOXA_STOP_TEST_INNER_FAIL_PROJECT=beta
+export BOXA_PICKER_FZF=0
+export BOXA_PICKER_TEST_CHOICE=a
+interactive_cleanup_output="$(run_boxa stop 2>&1)"
+interactive_cleanup_rc=$?
+assert_eq "interactive stop-all aggregates inner cleanup failure" "1" \
+    "$interactive_cleanup_rc"
+assert_contains "interactive stop-all reports incomplete cleanup" \
+    "Containers had shutdown or inner cleanup errors" "$interactive_cleanup_output"
+assert_eq "interactive cleanup failure still removes the fleet" "2" \
+    "$(line_count '^rm boxa-\(alpha\|beta\)$' "$BOXA_STOP_TEST_DOCKER_LOG")"
+unset BOXA_PICKER_FZF BOXA_PICKER_TEST_CHOICE
+
+reset_case
+export BOXA_STOP_TEST_INNER_FAIL_PROJECT=alpha
+run_boxa stop --all --reason presleep >/dev/null 2>&1
+failed_reason_rc=$?
+assert_eq "reasoned stop returns non-zero after inner cleanup failure" "1" "$failed_reason_rc"
+failed_notification="$(sed -n '1p' "$BOXA_STOP_TEST_NOTIFICATION_LOG")"
+assert_contains "failed reason notification describes incomplete cleanup" \
+    "Boxes alpha, beta processed; shutdown or inner cleanup was incomplete" "$failed_notification"
+
+reset_case
+export BOXA_STOP_TEST_FAIL_RM_PROJECT=alpha
+outer_remove_output="$(run_boxa stop --all 2>&1)"
+outer_remove_rc=$?
+assert_eq "outer removal failure returns non-zero after the fleet" "1" "$outer_remove_rc"
+assert_contains "outer removal failure identifies the Container" \
+    "outer Container boxa-alpha could not be removed" "$outer_remove_output"
+assert_eq "outer removal failure does not skip later removals" "1" \
+    "$(line_count '^rm boxa-beta$' "$BOXA_STOP_TEST_DOCKER_LOG")"
 
 reset_case
 export BOXA_STOP_TEST_EMPTY=true

@@ -2712,8 +2712,46 @@ connection_record_local_port_conflicts() {
         "$config_file"
 }
 
+# Run the Compose-aware helper inside one Container. Containers created before
+# ADR 0035 do not have the installed helper yet; rebuilding the image does not
+# replace their existing root filesystem. Stream the helper from the current
+# host checkout in that mixed-version case so the explicit shutdown contract
+# also applies during upgrades.
+run_inner_shutdown() {
+    local name="$1"
+    local installed_helper="/usr/local/bin/boxa-shutdown-inner"
+    local checkout_helper="$BOXA_DIR/scripts/shutdown-inner-containers.sh"
+
+    if ! docker exec -u node "$name" bash -c '
+        if [ ! -S "$XDG_RUNTIME_DIR/docker.sock" ]; then
+            echo "ERROR: inner Docker socket is unavailable; cleanup cannot be verified." >&2
+            exit 1
+        fi
+        if ! docker info >/dev/null 2>&1; then
+            echo "ERROR: inner Docker daemon is unreachable; cleanup cannot be verified." >&2
+            exit 1
+        fi
+    '; then
+        return 1
+    fi
+
+    if docker exec -u node "$name" test -x "$installed_helper" 2>/dev/null; then
+        docker exec -u node "$name" "$installed_helper"
+        return
+    fi
+
+    if [ ! -r "$checkout_helper" ]; then
+        printf 'ERROR: shutdown helper is missing from both %s and the current Boxa checkout.\n' \
+            "$name" >&2
+        return 1
+    fi
+
+    printf 'Using current shutdown helper for older Container: %s\n' "$name"
+    docker exec -i -u node "$name" bash -s < "$checkout_helper"
+}
+
 # Prepare a boxa container for shutdown — close allow-for and Agent-browser
-# state first, then stop inner DinD containers while the outer container is
+# state first, then stop Inner containers while the outer Container is
 # still reachable. The caller owns the outer `docker stop` invocation.
 prepare_container_for_stop() {
     local name="$1"
@@ -2745,37 +2783,31 @@ prepare_container_for_stop() {
         "$BOXA_DIR/scripts/closeout-agent-browser-on-stop.sh" "$name" || true
     fi
 
-    docker exec -u node "$name" bash -c '
-        if [ -S "$XDG_RUNTIME_DIR/docker.sock" ] && docker info >/dev/null 2>&1; then
-            inner=$(docker ps --format "{{.ID}} {{.Names}}" 2>/dev/null)
-            if [ -n "$inner" ]; then
-                echo "Stopping inner Docker containers (up to 30s)..."
-                ids=()
-                while read -r cid cname; do
-                    echo "  Stopping: $cname ($cid)"
-                    ids+=("$cid")
-                done <<< "$inner"
-                docker stop -t 30 "${ids[@]}" >/dev/null 2>&1 || true
-            fi
-        fi
-    ' 2>/dev/null || true
+    if ! run_inner_shutdown "$name"; then
+        printf 'ERROR: inner Docker cleanup failed for %s; continuing with outer Container shutdown.\n' \
+            "$name" >&2
+        return 1
+    fi
 }
 
 # Gracefully stop one boxa container. The all-Container path calls the same
 # preparation helper per container, then batches the outer stops.
 graceful_stop_container() {
     local name="$1"
-    prepare_container_for_stop "$name"
+    local failed=false
+
+    prepare_container_for_stop "$name" || failed=true
     echo "Stopping container $name..."
-    docker stop -t 15 "$name" > /dev/null 2>&1 || true
+    docker stop "$name" > /dev/null 2>&1 || failed=true
+    [ "$failed" = false ]
 }
 
 # Prepare Containers concurrently, then stop them concurrently. The docker CLI
 # stops a multi-name `docker stop` one Container at a time, so one background
-# stop per Container is what keeps the whole fleet inside a single 15s budget.
-# Failures propagate: `stop --all` may run unattended (`--reason` Closeout), so
-# a Container that refused to stop must surface as a non-zero exit. Interactive
-# callers opt out with `|| true` — see the "* Stop all" branch.
+# stop per Container is what lets each use its configured stop timeout in
+# parallel.
+# Preparation and outer-stop failures are aggregated only after every parallel
+# job has been waited for, so one broken inner daemon cannot strand the fleet.
 stop_containers_batched() {
     local -a containers=("$@") prepare_pids=() stop_pids=()
     local name pid failed=false
@@ -2786,11 +2818,11 @@ stop_containers_batched() {
         prepare_pids+=("$!")
     done
     for pid in "${prepare_pids[@]}"; do
-        wait "$pid"
+        wait "$pid" || failed=true
     done
-    echo "Stopping containers (up to 15s)..."
+    echo "Stopping containers (using configured stop timeout)..."
     for name in "${containers[@]}"; do
-        docker stop -t 15 "$name" > /dev/null &
+        docker stop "$name" > /dev/null &
         stop_pids+=("$!")
     done
     for pid in "${stop_pids[@]}"; do
@@ -5872,6 +5904,27 @@ if [ "$MODE" = "stop" ]; then
         done
     }
 
+    stop_single_container() {
+        local name="$1" project="$2" message_gap="$3" failed=false
+
+        graceful_stop_container "$name" || failed=true
+        _boxa::remove_container_after_oom_sweep "$name" || failed=true
+        if [ "$CLEAN_VOLUMES" = true ]; then
+            remove_project_volumes "$project"
+            _boxa::remove_project_route_yamls "$project"
+            _boxa::remove_project_https_artifacts "$project"
+            echo "Stopped + data removed:${message_gap}${name}"
+        else
+            echo "Stopped:${message_gap}${name}"
+        fi
+        stop_traefik_if_idle
+        stop_dns_if_idle
+        if [ "$failed" = true ]; then
+            echo "ERROR: $name had shutdown or inner cleanup errors." >&2
+            return 1
+        fi
+    }
+
     if [ "$STOP_ALL" = true ]; then
         stop_container_output=$(
             docker ps -a --filter "name=^boxa-" --format '{{.Names}}' \
@@ -5883,16 +5936,22 @@ if [ "$MODE" = "stop" ]; then
         fi
 
         if [ "${#stop_containers[@]}" -gt 0 ]; then
-            stop_containers_batched "${stop_containers[@]}"
+            stop_batch_failed=false
+            stop_containers_batched "${stop_containers[@]}" || stop_batch_failed=true
 
             stopped_projects=()
             for name in "${stop_containers[@]}"; do
-                _boxa::remove_container_after_oom_sweep "$name"
                 stopped_projects+=("${name#boxa-}")
-                echo "Stopped:$name"
+                if _boxa::remove_container_after_oom_sweep "$name"; then
+                    echo "Stopped:$name"
+                else
+                    printf 'ERROR: outer Container %s could not be removed.\n' "$name" >&2
+                    stop_batch_failed=true
+                fi
             done
         else
             stopped_projects=()
+            stop_batch_failed=false
         fi
 
         stop_traefik_if_idle
@@ -5904,10 +5963,18 @@ if [ "$MODE" = "stop" ]; then
             for project in "${stopped_projects[@]:1}"; do
                 stopped_list+=", $project"
             done
+            if [ "$stop_batch_failed" = true ]; then
+                notification_body="Boxes $stopped_list processed; shutdown or inner cleanup was incomplete"
+            else
+                notification_body="Boxes $stopped_list stopped before shutdown"
+            fi
             "$BOXA_DIR/scripts/deliver-allow-for-notification.sh" --notification \
-                "Boxa closeout: $STOP_REASON" \
-                "Boxes $stopped_list stopped before shutdown" \
+                "Boxa closeout: $STOP_REASON" "$notification_body" \
                 "/var/log/boxa" >/dev/null 2>&1 || true
+        fi
+        if [ "$stop_batch_failed" = true ]; then
+            echo "ERROR: one or more Containers had shutdown or inner cleanup errors." >&2
+            exit 1
         fi
         exit 0
     fi
@@ -5916,19 +5983,8 @@ if [ "$MODE" = "stop" ]; then
         boxa::names_from_token "$PROJECT_FILTER"
         name="$BOXA_CONTAINER_NAME"
         if docker ps -a --filter "name=^${name}$" --format '{{.ID}}' | grep -q .; then
-            graceful_stop_container "$name"
-            _boxa::remove_container_after_oom_sweep "$name"
-            if [ "$CLEAN_VOLUMES" = true ]; then
-                remove_project_volumes "$BOXA_PROJECT_NAME"
-                _boxa::remove_project_route_yamls "$BOXA_PROJECT_NAME"
-                _boxa::remove_project_https_artifacts "$BOXA_PROJECT_NAME"
-                echo "Stopped + data removed:$name"
-            else
-                echo "Stopped:$name"
-            fi
-            stop_traefik_if_idle
-            stop_dns_if_idle
-            exit 0
+            stop_single_container "$name" "$BOXA_PROJECT_NAME" ""
+            exit $?
         fi
         echo "Container $name is not running." >&2
     fi
@@ -5943,15 +5999,12 @@ if [ "$MODE" = "stop" ]; then
         if [ -n "$interactive_container_output" ]; then
             mapfile -t interactive_containers <<< "$interactive_container_output"
         fi
-        # Best-effort: a Container that vanished mid-selection or refused to
-        # stop must not abort the cleanup that follows (OOM sweep removal,
-        # --clean data removal, idle Traefik/DNS shutdown). This mirrors the
-        # pre-batching loop, which used graceful_stop_container and ignored
-        # individual stop failures. Explicit `stop --all` keeps propagating.
-        stop_containers_batched "${interactive_containers[@]}" || true
+        interactive_stop_failed=false
+        stop_containers_batched "${interactive_containers[@]}" \
+            || interactive_stop_failed=true
         for c in "${interactive_containers[@]}"; do
             proj="${c#boxa-}"
-            _boxa::remove_container_after_oom_sweep "$c"
+            _boxa::remove_container_after_oom_sweep "$c" || interactive_stop_failed=true
             if [ "$CLEAN_VOLUMES" = true ]; then
                 remove_project_volumes "$proj"
                 _boxa::remove_project_route_yamls "$proj"
@@ -5963,20 +6016,13 @@ if [ "$MODE" = "stop" ]; then
         done
         stop_traefik_if_idle
         stop_dns_if_idle
+        if [ "$interactive_stop_failed" = true ]; then
+            echo "ERROR: one or more Containers had shutdown or inner cleanup errors." >&2
+            exit 1
+        fi
     else
         proj="${selected#boxa-}"
-        graceful_stop_container "$selected"
-        _boxa::remove_container_after_oom_sweep "$selected"
-        if [ "$CLEAN_VOLUMES" = true ]; then
-            remove_project_volumes "$proj"
-            _boxa::remove_project_route_yamls "$proj"
-            _boxa::remove_project_https_artifacts "$proj"
-            echo "Stopped + data removed: $selected"
-        else
-            echo "Stopped: $selected"
-        fi
-        stop_traefik_if_idle
-        stop_dns_if_idle
+        stop_single_container "$selected" "$proj" " "
     fi
     exit 0
 fi

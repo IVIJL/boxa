@@ -414,6 +414,7 @@ COPY --chown=node:node dotfiles/ /usr/local/share/boxa/dotfiles/
 COPY scripts/n scripts/nx /usr/local/bin/
 COPY scripts/start-rootless-docker.sh /usr/local/bin/
 COPY scripts/boxa-entrypoint.sh /usr/local/bin/
+COPY scripts/shutdown-inner-containers.sh /usr/local/bin/boxa-shutdown-inner
 COPY scripts/boxa-firewall-reload.sh /usr/local/bin/boxa-firewall-reload
 COPY scripts/setup-claude.sh /usr/local/bin/
 COPY scripts/setup-nvim-data.sh /usr/local/bin/
@@ -452,7 +453,8 @@ COPY managed-settings/claude-code/51-boxa-memory.json \
 
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
-    /usr/local/bin/boxa-entrypoint.sh /usr/local/bin/boxa-firewall-reload \
+    /usr/local/bin/boxa-entrypoint.sh /usr/local/bin/boxa-shutdown-inner \
+    /usr/local/bin/boxa-firewall-reload \
     /usr/local/bin/setup-claude.sh /usr/local/bin/setup-nvim-data.sh \
     /usr/local/bin/start-allow-for-window \
     /usr/local/bin/teardown-allow-for-window \

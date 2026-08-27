@@ -525,6 +525,19 @@ _Avoid_: Project UUID, stable Project ID
 The Docker container `boxa-<project>` that runs the project's dev
 environment. Each project gets exactly one container at a time.
 
+**Compose project**:
+A Docker Compose application running inside a **Container** on that
+Container's rootless Docker daemon.
+_Avoid_: inner project, Docker project
+
+**Inner container**:
+A Docker container running on a **Container**'s rootless Docker daemon.
+_Avoid_: nested container, DinD container
+
+**Unmanaged inner container**:
+An **Inner container** that does not belong to a **Compose project**.
+_Avoid_: standalone container, non-Compose container
+
 **Container identity**:
 A root-owned JSON file at `/etc/boxa/identity.json` inside the
 **Container**, written by the entrypoint, recording the active
@@ -653,6 +666,8 @@ _Avoid_: boxa check, boxa repair, boxa heal
 ## Relationships
 
 - A **Project** has exactly one **Container** at a time.
+- A **Container** can contain zero or more **Compose projects** and zero or
+  more **Unmanaged inner containers**; both consist of **Inner containers**.
 - An **Allowlist** is shared across all of a user's **Containers**
   (bind-mounted `:ro` from `~/.config/boxa/allowed-domains.conf`).
 - An **Allow-for window** runs in exactly one **Container** at a time;

@@ -199,16 +199,21 @@ if [ "$(id -u)" = "0" ]; then
     exec setpriv --reuid=node --regid=node --init-groups -- "$0" "$@"
 fi
 
-# Node phase: keep PID 1 alive with graceful shutdown for inner DinD.
+# Node phase: keep PID 1 alive with graceful shutdown for Inner containers.
 shutdown_handler() {
     echo "boxa: SIGTERM received, stopping inner containers..."
     if [ -S "$XDG_RUNTIME_DIR/docker.sock" ] && docker info >/dev/null 2>&1; then
         inner=$(docker ps --format "{{.ID}} {{.Names}}" 2>/dev/null)
         if [ -n "$inner" ]; then
+            stop_pids=()
             while read -r cid cname; do
                 echo "  Stopping: $cname ($cid)"
-                docker stop -t 30 "$cid" >/dev/null 2>&1 || true
+                docker stop -t 30 "$cid" >/dev/null 2>&1 &
+                stop_pids+=("$!")
             done <<< "$inner"
+            for stop_pid in "${stop_pids[@]}"; do
+                wait "$stop_pid" || true
+            done
         fi
         echo "boxa: Inner containers stopped."
     fi

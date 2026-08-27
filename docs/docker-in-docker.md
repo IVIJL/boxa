@@ -33,24 +33,32 @@ rationale.
 
 ## Docker data persistence
 
-Docker images and containers are stored in a per-project named volume
-(`boxa-<project>-docker`), so they survive container restarts without
-re-pulling images. Volumes persist across `boxa stop` but can be cleaned with
-`boxa stop --clean` or `boxa remove`.
+Docker data is stored in a per-project named volume (`boxa-<project>-docker`).
+Images, Compose volumes, anonymous volumes, and bind-mounted data persist across
+`boxa stop`. Use `boxa stop --clean` or `boxa remove` when the Project's Docker
+data should be removed explicitly.
 
 ## Graceful shutdown
 
-The container uses `boxa-entrypoint.sh` as PID 1, which traps `SIGTERM` and
-gracefully stops all inner DinD containers before exiting. This prevents
-database corruption on `boxa stop` or host reboot.
+Explicit `boxa stop` discovers running and exited inner containers before it
+stops the outer Container. Each Compose project is brought down with Compose's
+dependency ordering, its configured service grace periods, and orphan removal.
+Unmanaged inner containers are gracefully stopped and removed in parallel.
+This recreates container writable layers and Compose-owned networks on the next
+`docker compose up`; it does not explicitly remove images, bind mounts, named
+volumes, or anonymous volumes.
 
-The shutdown chain: host Docker → `SIGTERM` → entrypoint trap → `docker stop`
-inner containers → inner processes flush/shutdown → entrypoint exits.
-Additionally, `boxa stop` runs a pre-stop hook that explicitly stops inner
-containers before sending `SIGTERM` to the entrypoint (belt-and-suspenders).
+The container also uses `boxa-entrypoint.sh` as PID 1, which traps `SIGTERM` and
+provides a deliberately simpler emergency fallback when the outer Container
+receives a direct signal. It discovers only currently running inner containers,
+starts their graceful stops concurrently, and waits best-effort for all of them.
+It does not inspect Compose metadata or remove containers, networks, or volumes,
+so stopped container records remain for the next start.
 
-The container uses `--stop-timeout 45` to allow sufficient time for inner
-containers with databases to shut down cleanly.
+The outer Container is configured with `--stop-timeout 45`. Normal `boxa stop`
+uses that configured deadline rather than shortening it; direct Docker or
+`SIGTERM` shutdown remains bounded by the same outer deadline even if an inner
+stop fails or stalls.
 
 ## Windows shutdown hook
 
@@ -79,7 +87,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\uninstall-shutdown-hook
 
 ## Reaching another box from an inner container
 
-Inner DinD containers run on their own nested network and cannot resolve other
+Inner containers run on their own nested network and cannot resolve other
 boxes on `devproxy` directly. To let an inner compose service reach a published
 TCP port in *another* box, use `boxa connect` and dial `10.0.2.2:<local-port>`
 from the inner container. See
