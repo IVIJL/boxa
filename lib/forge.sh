@@ -449,11 +449,12 @@ _boxa::forge_remove_project_section_locked() {
     _boxa::remove_conf_section_file "$project_path" "$conf"
 }
 
-# Purge forge.conf, ssh.conf, and the SSH Key registry while holding the
-# established catalog -> registry lock order used by forge assignment writes.
+# Purge path-keyed state while holding the established catalog -> SSH registry
+# lock order; an optional callback may take the Project registry lock inside it.
 _boxa::forge_purge_project_state_all_locks() {
-    local project_path="$1" forge_status ssh_result ssh_status
-    local registry_status status
+    local project_path="$1" project_callback="${2:-}"
+    local forge_status ssh_result ssh_status registry_status
+    local project_status=skipped status
 
     _boxa::ssh_validate_project_purge_locked "$project_path" || return 1
     if _boxa::forge_remove_project_section_locked "$project_path"; then
@@ -470,8 +471,26 @@ _boxa::forge_purge_project_state_all_locks() {
         status=$?
     fi
     IFS=$'\t' read -r ssh_status registry_status <<< "$ssh_result"
-    printf '%s\t%s\t%s\n' "$forge_status" "$ssh_status" "$registry_status"
-    return "$status"
+    if [ "$status" -ne 0 ]; then
+        printf '%s\t%s\t%s\t%s\n' \
+            "$forge_status" "$ssh_status" "$registry_status" "$project_status"
+        return "$status"
+    fi
+    if [ -n "$project_callback" ]; then
+        if "$project_callback" "$project_path"; then
+            project_status=removed
+        else
+            status=$?
+            if [ "$status" -eq 2 ]; then
+                project_status=absent
+                status=0
+            else
+                return "$status"
+            fi
+        fi
+    fi
+    printf '%s\t%s\t%s\t%s\n' \
+        "$forge_status" "$ssh_status" "$registry_status" "$project_status"
 }
 
 _boxa::forge_purge_project_state_locked() {

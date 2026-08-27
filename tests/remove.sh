@@ -47,11 +47,24 @@ cat > "$_TMPROOT/bin/sudo" <<'STUB'
 #!/bin/bash
 exit 0
 STUB
+
+cat > "$_TMPROOT/bin/flock" <<'STUB'
+#!/bin/bash
+if [ -d "$BOXA_REMOVE_TEST_FORGE_LOCK" ] \
+        && [ -d "$BOXA_REMOVE_TEST_SSH_LOCK" ]; then
+    printf 'held\n' >> "$BOXA_REMOVE_TEST_PROJECT_LOCK_ORDER"
+else
+    printf 'released\n' >> "$BOXA_REMOVE_TEST_PROJECT_LOCK_ORDER"
+fi
+STUB
 chmod +x "$TEST_BOXA_DIR/docker-run.sh" "$_TMPROOT/bin/docker" \
-    "$_TMPROOT/bin/sudo"
+    "$_TMPROOT/bin/flock" "$_TMPROOT/bin/sudo"
 
 export BOXA_REMOVE_TEST_VOLUMES="$_TMPROOT/volumes"
 export BOXA_REMOVE_TEST_REMOVED_VOLUMES="$_TMPROOT/removed-volumes"
+export BOXA_REMOVE_TEST_FORGE_LOCK="$TEST_CONFIG/forge.conf.lock"
+export BOXA_REMOVE_TEST_SSH_LOCK="$TEST_CONFIG/ssh-key-registry.lock"
+export BOXA_REMOVE_TEST_PROJECT_LOCK_ORDER="$_TMPROOT/project-lock-order"
 
 fail_count=0
 
@@ -98,6 +111,7 @@ reset_stores() {
     mkdir -p "$TEST_CONFIG"
     : > "$BOXA_REMOVE_TEST_VOLUMES"
     : > "$BOXA_REMOVE_TEST_REMOVED_VOLUMES"
+    : > "$BOXA_REMOVE_TEST_PROJECT_LOCK_ORDER"
     unset BOXA_REMOVE_TEST_RUNNING
 }
 
@@ -173,6 +187,8 @@ assert_file_eq "SSH purge preserves unrelated bytes" \
     "$_TMPROOT/expected-ssh" "$TEST_CONFIG/ssh.conf"
 assert_file_eq "registry purge preserves unrelated bytes" \
     "$_TMPROOT/expected-registry" "$TEST_CONFIG/ssh-key-registry"
+assert_eq "projects.json mutates while forge and SSH locks are held" held \
+    "$(cat "$BOXA_REMOVE_TEST_PROJECT_LOCK_ORDER")"
 
 # JSON registry rows preserve tabs and backslashes through name resolution.
 reset_stores

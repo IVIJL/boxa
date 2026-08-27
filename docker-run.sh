@@ -6094,7 +6094,7 @@ if [ "$MODE" = "remove" ]; then
 
     purge_project_path_config() {
         local project_path="$1" status purge_result forge_status
-        local ssh_status registry_status row
+        local ssh_status registry_status project_status row
         local forge_conf="${BOXA_FORGE_CONF:-$HOME/.config/boxa/forge.conf}"
         local ssh_conf="${BOXA_SSH_CONF:-$HOME/.config/boxa/ssh.conf}"
         local key_registry
@@ -6115,14 +6115,15 @@ if [ "$MODE" = "remove" ]; then
         _boxa::conf_has_section "$project_path" "$key_registry" \
             && _BOXA_REMOVE_CONFIG_FOUND=true
 
-        if purge_result="$(_boxa::forge_purge_project_state "$project_path")"; then
+        if purge_result="$(_boxa::forge_purge_project_state \
+                "$project_path" _boxa::remove_recorded_project_path)"; then
             status=0
         else
             status=$?
-            echo "  ERROR: could not atomically purge forge and SSH state for $project_path." >&2
+            echo "  ERROR: could not atomically purge path-keyed config state for $project_path." >&2
             return "$status"
         fi
-        IFS=$'\t' read -r forge_status ssh_status registry_status \
+        IFS=$'\t' read -r forge_status ssh_status registry_status project_status \
             <<< "$purge_result"
         if [ "$forge_status" = removed ]; then
             echo "  Removed forge.conf section: $project_path"
@@ -6143,17 +6144,11 @@ if [ "$MODE" = "remove" ]; then
             echo "  Note: no SSH key registry section for $project_path."
         fi
 
-        if _boxa::remove_recorded_project_path "$project_path"; then
+        if [ "$project_status" = removed ]; then
             echo "  Removed projects.json entry: $project_path"
             _BOXA_REMOVE_CONFIG_FOUND=true
         else
-            status=$?
-            if [ "$status" -eq 2 ]; then
-                echo "  Note: no projects.json entry for $project_path."
-            else
-                echo "  ERROR: could not remove projects.json entry for $project_path." >&2
-                return "$status"
-            fi
+            echo "  Note: no projects.json entry for $project_path."
         fi
     }
 
