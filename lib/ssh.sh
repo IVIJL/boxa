@@ -322,16 +322,34 @@ _boxa::ssh_registry_remove_project_locked() {
     _boxa::remove_conf_section_file "$project_path" "$registry"
 }
 
+_boxa::ssh_validate_project_purge_locked() {
+    local project_path="$1" registry
+
+    _BOXA_SSH_PURGE_REGISTRY_INVOLVED=
+    registry="$(_boxa::ssh_key_registry_path)"
+    _boxa::conf_has_section "$project_path" "$registry" || return 0
+    _BOXA_SSH_PURGE_REGISTRY_INVOLVED=1
+    _boxa::ssh_registry_validate_path 'SSH key registry Project path' \
+        "$project_path" || return 1
+    _boxa::ssh_registry_load_project "$project_path"
+}
+
+_boxa::ssh_empty_running_project_agent() {
+    local project_path="$1"
+
+    _boxa::ssh_resolve_project_agent "$project_path" || return 0
+    ssh-add -D >/dev/null 2>&1
+}
+
 _boxa::ssh_purge_project_state_locked() {
     local project_path="$1"
     local conf="${BOXA_SSH_CONF:-$HOME/.config/boxa/ssh.conf}"
     local ssh_status registry_status
 
-    # Validate the complete registry before rewriting ssh.conf so malformed
-    # user-controlled data cannot leave a half-purged SSH state.
-    _boxa::ssh_registry_validate_path 'SSH key registry Project path' \
-        "$project_path" || return 1
-    _boxa::ssh_registry_load_project "$project_path" || return 1
+    # Validate only when this Project owns a registry section. projects.json
+    # can represent paths that the strict SSH registry grammar deliberately
+    # rejects, and those paths must remain removable from their own store.
+    _boxa::ssh_validate_project_purge_locked "$project_path" || return 1
     if _boxa::remove_conf_section_file "$project_path" "$conf"; then
         ssh_status=removed
     else
@@ -340,7 +358,9 @@ _boxa::ssh_purge_project_state_locked() {
             *) return 1 ;;
         esac
     fi
-    if _boxa::ssh_registry_remove_project_locked "$project_path"; then
+    if [ -z "$_BOXA_SSH_PURGE_REGISTRY_INVOLVED" ]; then
+        registry_status=absent
+    elif _boxa::ssh_registry_remove_project_locked "$project_path"; then
         registry_status=removed
     else
         case $? in
@@ -349,7 +369,7 @@ _boxa::ssh_purge_project_state_locked() {
         esac
     fi
     printf '%s\t%s\n' "$ssh_status" "$registry_status"
-    _boxa::ssh_reconcile_running_project_agent "$project_path"
+    _boxa::ssh_empty_running_project_agent "$project_path"
 }
 
 _boxa::ssh_purge_project_state() {

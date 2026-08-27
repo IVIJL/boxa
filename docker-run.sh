@@ -3168,8 +3168,17 @@ _boxa::project_registry_rows() {
 _boxa::decode_project_registry_row() {
     local row="$1"
 
-    _BOXA_PROJECT_REGISTRY_NAME="$(jq -r '.[0]' <<< "$row")" || return 1
-    _BOXA_PROJECT_REGISTRY_PATH="$(jq -r '.[1]' <<< "$row")" || return 1
+    IFS= read -r -d '' _BOXA_PROJECT_REGISTRY_NAME \
+        < <(jq -j '.[0], "\u0000"' <<< "$row") || return 1
+    IFS= read -r -d '' _BOXA_PROJECT_REGISTRY_PATH \
+        < <(jq -j '.[1], "\u0000"' <<< "$row") || return 1
+}
+
+_boxa::decode_project_registry_path_token() {
+    local token="$1"
+
+    IFS= read -r -d '' _BOXA_PROJECT_REGISTRY_PATH \
+        < <(jq -j '., "\u0000"' <<< "$token")
 }
 
 # Remove one exact path under the same lock and schema checks used when
@@ -6059,13 +6068,13 @@ if [ "$MODE" = "remove" ]; then
         printf '%s\n' "${!targets[@]}" | sed '/^$/d' | sort
     }
 
-    registry_paths_for_name() {
-        local target_name="$1" name path row
+    registry_path_tokens_for_name() {
+        local target_name="$1" name row
         while IFS= read -r row; do
             _boxa::decode_project_registry_row "$row" || continue
             name="$_BOXA_PROJECT_REGISTRY_NAME"
-            path="$_BOXA_PROJECT_REGISTRY_PATH"
-            [ "$name" = "$target_name" ] && printf '%s\n' "$path"
+            [ "$name" != "$target_name" ] \
+                || jq -c '.[1]' <<< "$row"
         done < <(_boxa::project_registry_rows)
     }
 
@@ -6150,9 +6159,9 @@ if [ "$MODE" = "remove" ]; then
 
     remove_target() {
         local requested="$1" purge_all_mappings="${2:-false}"
-        local target mapping_name legacy_match=false path selected found=false
-        local running_name
-        local -a paths=()
+        local target mapping_name legacy_match=false path path_token selected
+        local found=false running_name index path_choice
+        local -a paths=() path_tokens=() path_choices=()
         local -A resolved_names=()
 
         if [[ "$requested" == /* ]]; then
@@ -6176,18 +6185,35 @@ if [ "$MODE" = "remove" ]; then
             if [ "$legacy_match" = false ]; then
                 target="$mapping_name"
             fi
-            mapfile -t paths < <(
-                registry_paths_for_name "$mapping_name"
+            mapfile -t path_tokens < <(
+                registry_path_tokens_for_name "$mapping_name"
                 [ "$mapping_name" = "$target" ] \
-                    || registry_paths_for_name "$target"
+                    || registry_path_tokens_for_name "$target"
             )
+            for path_token in "${path_tokens[@]}"; do
+                _boxa::decode_project_registry_path_token "$path_token" \
+                    || return 1
+                paths+=("$_BOXA_PROJECT_REGISTRY_PATH")
+            done
             if [ "${#paths[@]}" -gt 1 ] \
                     && [ "$purge_all_mappings" != true ]; then
-                selected="$(printf '%s\n' "${paths[@]}" | picker::one \
+                for path in "${paths[@]}"; do
+                    case "$path" in
+                        *$'\n'*|*$'\r'*) printf -v path_choice '%q' "$path" ;;
+                        *) path_choice="$path" ;;
+                    esac
+                    path_choices+=("$path_choice")
+                done
+                selected="$(printf '%s\n' "${path_choices[@]}" | picker::one \
                     --prompt "Purge Project path:" \
                     --first-option "* Purge all paths")" || return 1
                 if [ "$selected" != "* Purge all paths" ]; then
-                    paths=("$selected")
+                    for index in "${!path_choices[@]}"; do
+                        if [ "${path_choices[$index]}" = "$selected" ]; then
+                            paths=("${paths[$index]}")
+                            break
+                        fi
+                    done
                 fi
             fi
         fi
@@ -6197,6 +6223,12 @@ if [ "$MODE" = "remove" ]; then
         for running_name in "${!resolved_names[@]}"; do
             if is_project_running "$running_name"; then
                 echo "Container boxa-${running_name} is running — stop it first." >&2
+                return 1
+            fi
+        done
+        for path in "${paths[@]}"; do
+            if ! _boxa::forge_validate_project_purge_state "$path"; then
+                echo "  ERROR: invalid path-keyed state prevents removal of $path." >&2
                 return 1
             fi
         done

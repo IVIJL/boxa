@@ -455,11 +455,7 @@ _boxa::forge_purge_project_state_all_locks() {
     local project_path="$1" forge_status ssh_result ssh_status
     local registry_status status
 
-    # Validate before the first rewrite. This keeps malformed registry data
-    # from producing a partial forge/SSH purge or bypassing agent reconciliation.
-    _boxa::ssh_registry_validate_path 'SSH key registry Project path' \
-        "$project_path" || return 1
-    _boxa::ssh_registry_load_project "$project_path" || return 1
+    _boxa::ssh_validate_project_purge_locked "$project_path" || return 1
     if _boxa::forge_remove_project_section_locked "$project_path"; then
         forge_status=removed
     else
@@ -485,6 +481,16 @@ _boxa::forge_purge_project_state_locked() {
 
 _boxa::forge_purge_project_state() {
     _boxa::forge_with_catalog_lock _boxa::forge_purge_project_state_locked "$@"
+}
+
+_boxa::forge_validate_project_purge_state_locked() {
+    _boxa::ssh_with_registry_lock \
+        _boxa::ssh_validate_project_purge_locked "$@"
+}
+
+_boxa::forge_validate_project_purge_state() {
+    _boxa::forge_with_catalog_lock \
+        _boxa::forge_validate_project_purge_state_locked "$@"
 }
 
 _boxa::forge_run_catalog_locked() {

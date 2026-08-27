@@ -189,6 +189,33 @@ assert_eq "special-character registry path is purged" 0 \
 assert_eq "special-character config section is purged" 0 \
     "$(wc -c < "$TEST_CONFIG/forge.conf" | tr -d ' ')"
 
+# projects.json-only paths are not constrained by the SSH registry grammar.
+reset_stores
+hash_path='/work/hash#project'
+jq -n --arg path "$hash_path" --arg name hash-project \
+    '{version: 1, projects: {($path): {name: $name, lastSeen: "now"}}}' \
+    > "$TEST_CONFIG/projects.json"
+run_boxa remove hash-project >/dev/null 2>&1
+hash_rc=$?
+assert_eq "projects.json-only path containing # is removable" 0 "$hash_rc"
+assert_eq "# path is removed from projects.json" 0 \
+    "$(jq '.projects | length' "$TEST_CONFIG/projects.json")"
+
+# Encoded path tokens keep LF-containing paths as one removal target.
+reset_stores
+lf_path=$'/work/line\n/work/unrelated'
+unrelated_path=/work/unrelated
+jq -n --arg target "$lf_path" --arg unrelated "$unrelated_path" \
+    '{version: 1, projects: {
+        ($target): {name: "line-break", lastSeen: "now"},
+        ($unrelated): {name: "keep-unrelated", lastSeen: "now"}
+    }}' > "$TEST_CONFIG/projects.json"
+run_boxa remove line-break >/dev/null 2>&1
+lf_rc=$?
+assert_eq "LF-containing path remains one purge target" 0 "$lf_rc"
+assert_eq "LF purge preserves the separately keyed path" "$unrelated_path" \
+    "$(jq -r '.projects | keys[]' "$TEST_CONFIG/projects.json")"
+
 # An absolute path uses its registered name for legacy artifact cleanup.
 reset_stores
 path_target=/work/path-target
@@ -236,11 +263,16 @@ write_projects '{"/work/malformed-registry":{"name":"malformed-registry","lastSe
 printf '[%s]\ngate = on\n' "$malformed_path" > "$TEST_CONFIG/ssh.conf"
 printf '[%s]\nkey = /keys/valid\ngarbage\n' "$malformed_path" \
     > "$TEST_CONFIG/ssh-key-registry"
+printf '%s\n' boxa-malformed-registry-history > "$BOXA_REMOVE_TEST_VOLUMES"
 malformed_output="$(run_boxa remove malformed-registry 2>&1)"
 malformed_rc=$?
 assert_eq "malformed SSH registry fails outer remove loudly" 1 "$malformed_rc"
-assert_contains "malformed registry reports atomic purge failure" \
-    "ERROR: could not atomically purge forge and SSH state" "$malformed_output"
+assert_contains "malformed registry reports preflight failure" \
+    "ERROR: invalid path-keyed state prevents removal" "$malformed_output"
+assert_eq "malformed registry preflight preserves Project volumes" \
+    boxa-malformed-registry-history "$(cat "$BOXA_REMOVE_TEST_VOLUMES")"
+assert_eq "malformed registry preflight removes no Project volumes" '' \
+    "$(cat "$BOXA_REMOVE_TEST_REMOVED_VOLUMES")"
 assert_contains "failed malformed purge preserves ssh.conf" \
     "[$malformed_path]" "$(cat "$TEST_CONFIG/ssh.conf")"
 assert_eq "failed malformed purge preserves projects.json" 1 \
