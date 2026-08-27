@@ -316,6 +316,68 @@ assert_contains "failed malformed purge preserves ssh.conf" \
 assert_eq "failed malformed purge preserves projects.json" 1 \
     "$(jq '.projects | length' "$TEST_CONFIG/projects.json")"
 
+# Malformed projects.json fails before any path-keyed or artifact mutation.
+reset_stores
+malformed_projects_path=/work/malformed-projects
+printf '{"version":1,"projects":' > "$TEST_CONFIG/projects.json"
+cp "$TEST_CONFIG/projects.json" "$_TMPROOT/expected-malformed-projects"
+printf '[%s]\nforge = on\n' "$malformed_projects_path" \
+    > "$TEST_CONFIG/forge.conf"
+printf '[%s]\ngate = on\n' "$malformed_projects_path" \
+    > "$TEST_CONFIG/ssh.conf"
+printf '[%s]\nkey = /keys/keep\n' "$malformed_projects_path" \
+    > "$TEST_CONFIG/ssh-key-registry"
+cp "$TEST_CONFIG/forge.conf" "$_TMPROOT/expected-malformed-projects-forge"
+cp "$TEST_CONFIG/ssh.conf" "$_TMPROOT/expected-malformed-projects-ssh"
+cp "$TEST_CONFIG/ssh-key-registry" \
+    "$_TMPROOT/expected-malformed-projects-registry"
+printf '%s\n' boxa-malformed-projects-history > "$BOXA_REMOVE_TEST_VOLUMES"
+malformed_projects_output="$(run_boxa remove "$malformed_projects_path" 2>&1)"
+malformed_projects_rc=$?
+assert_eq "malformed projects.json fails outer remove loudly" 1 \
+    "$malformed_projects_rc"
+assert_contains "malformed projects.json reports preflight failure" \
+    "ERROR: malformed or unsupported projects.json; removal aborted." \
+    "$malformed_projects_output"
+assert_eq "malformed projects.json preserves Project volumes" \
+    boxa-malformed-projects-history "$(cat "$BOXA_REMOVE_TEST_VOLUMES")"
+assert_eq "malformed projects.json removes no Project volumes" '' \
+    "$(cat "$BOXA_REMOVE_TEST_REMOVED_VOLUMES")"
+assert_file_eq "malformed projects.json preserves forge.conf" \
+    "$_TMPROOT/expected-malformed-projects-forge" "$TEST_CONFIG/forge.conf"
+assert_file_eq "malformed projects.json preserves ssh.conf" \
+    "$_TMPROOT/expected-malformed-projects-ssh" "$TEST_CONFIG/ssh.conf"
+assert_file_eq "malformed projects.json preserves SSH key registry" \
+    "$_TMPROOT/expected-malformed-projects-registry" \
+    "$TEST_CONFIG/ssh-key-registry"
+assert_file_eq "malformed projects.json remains byte-identical" \
+    "$_TMPROOT/expected-malformed-projects" "$TEST_CONFIG/projects.json"
+
+# Missing and valid-empty Project registries remain non-errors.
+reset_stores
+absent_projects_path=/work/absent-projects
+printf '[%s]\nforge = on\n' "$absent_projects_path" \
+    > "$TEST_CONFIG/forge.conf"
+absent_projects_output="$(run_boxa remove "$absent_projects_path" 2>&1)"
+absent_projects_rc=$?
+assert_eq "absent projects.json still permits removal" 0 "$absent_projects_rc"
+assert_contains "absent projects.json is reported as a note" \
+    "Note: no projects.json entry for $absent_projects_path." \
+    "$absent_projects_output"
+
+reset_stores
+empty_projects_path=/work/empty-projects
+write_projects '{}'
+printf '[%s]\nforge = on\n' "$empty_projects_path" \
+    > "$TEST_CONFIG/forge.conf"
+empty_projects_output="$(run_boxa remove "$empty_projects_path" 2>&1)"
+empty_projects_rc=$?
+assert_eq "valid-empty projects.json still permits removal" 0 \
+    "$empty_projects_rc"
+assert_contains "valid-empty projects.json is reported as a note" \
+    "Note: no projects.json entry for $empty_projects_path." \
+    "$empty_projects_output"
+
 # The interactive union exposes a registry-only Project.
 reset_stores
 write_projects '{"/work/picker-only":{"name":"picker-only","lastSeen":"now"}}'

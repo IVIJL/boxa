@@ -3181,6 +3181,14 @@ _boxa::decode_project_registry_path_token() {
         < <(jq -j '., "\u0000"' <<< "$token")
 }
 
+_boxa::validate_project_registry() {
+    local registry="${XDG_CONFIG_HOME:-$HOME/.config}/boxa/projects.json"
+
+    [ -f "$registry" ] || return 0
+    jq -e '.version == 1 and (.projects | type == "object")' \
+        "$registry" >/dev/null 2>&1
+}
+
 # Remove one exact path under the same lock and schema checks used when
 # recording Projects. Returns 2 when the registry or path is absent.
 _boxa::remove_recorded_project_path() {
@@ -3207,9 +3215,9 @@ _boxa::remove_recorded_project_path() {
             echo "boxa: WARNING: flock is unavailable; Project registry removal is not protected from concurrent starts" >&2
         fi
         [ -f "$registry" ] || return 2
-        jq -e --arg path "$project_path" \
-            '.version == 1 and (.projects | type == "object")
-                and (.projects | has($path))' \
+        jq -e '.version == 1 and (.projects | type == "object")' \
+            "$registry" >/dev/null 2>&1 || return 1
+        jq -e --arg path "$project_path" '.projects | has($path)' \
             "$registry" >/dev/null 2>&1 || return 2
         tmp="$(mktemp "$config_dir/.projects.json.XXXXXX")" || return 1
         if ! jq --arg path "$project_path" 'del(.projects[$path])' \
@@ -6165,6 +6173,11 @@ if [ "$MODE" = "remove" ]; then
         local found=false running_name index path_choice
         local -a paths=() path_tokens=() path_choices=()
         local -A resolved_names=()
+
+        if ! _boxa::validate_project_registry; then
+            echo "  ERROR: malformed or unsupported projects.json; removal aborted." >&2
+            return 1
+        fi
 
         if [[ "$requested" == /* ]]; then
             target="$(registry_name_for_path "$requested" 2>/dev/null || true)"
