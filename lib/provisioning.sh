@@ -65,6 +65,7 @@ BOXA_PROVISIONING_STEPS=(
     "mcp-onboarding|scripts/ensure-mcp-onboarding.sh|B"
     "claude-token|-|B"
     "https|-|B"
+    "host-binaries|-|C"
     "git|-|C"
     "docker|-|C"
     "docker-group|-|C"
@@ -253,6 +254,8 @@ BOXA_SYMLINK_PATH="${BOXA_SYMLINK_PATH:-/usr/local/bin/boxa}"
 boxa::prereq_state() {
     local id="$1"
     case "$id" in
+        host-binaries)
+            command -v jq >/dev/null 2>&1 && printf 'ok' || printf 'missing' ;;
         git)
             command -v git >/dev/null 2>&1 && printf 'ok' || printf 'missing' ;;
         docker)
@@ -316,6 +319,8 @@ boxa::prereq_state() {
 boxa::prereq_remedy() {
     local id="$1"
     case "$id" in
+        host-binaries)
+            printf 'Install missing host binary jq via your package manager (e.g. apt install jq / brew install jq).' ;;
         git)
             printf 'Install git via your package manager (e.g. apt install git / brew install git).' ;;
         docker)

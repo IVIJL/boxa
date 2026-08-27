@@ -89,7 +89,7 @@ Options:
   --help, -h   Show this help message
 
 What this script does:
-  1. Installs git, keychain, and xhost (if missing; xhost = native Linux only)
+  1. Installs git, jq, keychain, and xhost (if missing; xhost = native Linux only)
   2. Configures SSH agent via keychain (no key scanning)
   3. Adds AddKeysToAgent to ~/.ssh/config
   4. Clones boxa to ~/.local/share/boxa
@@ -210,6 +210,17 @@ install_git() {
     msg "Installing git..."
     pkg_install git
     INSTALLED+=("git")
+}
+
+install_jq() {
+    info "Checking jq..."
+    if has jq; then
+        SKIPPED+=("jq (already installed)")
+        return
+    fi
+    msg "Installing jq..."
+    pkg_install jq
+    INSTALLED+=("jq")
 }
 
 install_docker_ce() {
@@ -1647,7 +1658,7 @@ main() {
 
     if ! $AUTO_YES; then
         msg "This script will:"
-        msg "  1. Install git, keychain, and xhost (if missing; xhost = native Linux only)"
+        msg "  1. Install git, jq, keychain, and xhost (if missing; xhost = native Linux only)"
         msg "  2. Configure SSH agent via keychain"
         msg "  3. Clone boxa to $BOXA_DIR"
         msg "  4. Choose your dotfiles strategy (boxa bundled starter / your chezmoi repo / none)"
@@ -1676,6 +1687,7 @@ main() {
     pkg_update
 
     install_git
+    install_jq
     install_keychain
     install_xhost
 

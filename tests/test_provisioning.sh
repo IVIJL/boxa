@@ -105,8 +105,8 @@ check "field id"       "allow-for-host-state" "$(boxa::provisioning_field "$entr
 check "field script"   "scripts/ensure-allow-for-host-state.sh" "$(boxa::provisioning_field "$entry" script)"
 check "field category" "A" "$(boxa::provisioning_field "$entry" category)"
 
-# --- Registry: 9 category-A + 6 category-B + 5 category-C steps ---------------
-check "registry size" "20" "${#BOXA_PROVISIONING_STEPS[@]}"
+# --- Registry: 9 category-A + 6 category-B + 6 category-C steps ---------------
+check "registry size" "21" "${#BOXA_PROVISIONING_STEPS[@]}"
 
 # --- First run repairs the one stub that has work, rest already OK ------------
 boxa::run_provisioning repair-a >/dev/null
@@ -231,6 +231,36 @@ check "doctor repaired ssh-gate includes disable hint" \
     "$([[ "$doctor_output" == *'  - ssh-gate    (disable: boxa ssh off --global)'* ]] \
         && printf yes || printf no)"
 
+# Doctor reports a missing required host binary as an actionable prerequisite
+# and exits non-zero, without attempting to repair it.
+cat > "$doctor_cli_dir/lib/provisioning.sh" <<'EOF'
+#!/usr/bin/env bash
+BOXA_PROVISIONING_STEPS=("host-binaries|-|C")
+boxa::run_provisioning() {
+    BOXA_PROVISIONING_REPAIRED=()
+    BOXA_PROVISIONING_OK=()
+    BOXA_PROVISIONING_SKIPPED=()
+    BOXA_PROVISIONING_PREREQ_MISSING=("host-binaries")
+    BOXA_PROVISIONING_MISSING=()
+    BOXA_PROVISIONING_DECLINED=()
+    BOXA_PROVISIONING_FAILED=()
+}
+boxa::prereq_remedy() {
+    printf 'Install missing host binary jq via your package manager (e.g. apt install jq / brew install jq).'
+}
+EOF
+doctor_output="$(HOME="$tmp/doctor-home" \
+    bash "$doctor_cli_dir/docker-run.sh" doctor 2>&1)"
+doctor_rc=$?
+check "doctor missing jq exits nonzero" "1" "$doctor_rc"
+check "doctor missing jq reports host-binaries" \
+    "yes" \
+    "$([[ "$doctor_output" == *'  - host-binaries'* ]] && printf yes || printf no)"
+check "doctor missing jq prints actionable remedy" \
+    "yes" \
+    "$([[ "$doctor_output" == *'Install missing host binary jq via your package manager (e.g. apt install jq / brew install jq).'* ]] \
+        && printf yes || printf no)"
+
 # Stub the MCP Python core so the mcp-onboarding probe is DETERMINISTIC,
 # independent of any ambient `mcp` package in site-packages: shouldOffer=true
 # (missing) until a marker file appears, then profileExists=true (ok). The
@@ -338,6 +368,19 @@ check "prereq symlink rejects non-link" "missing" "$(boxa::prereq_state boxa-sym
 # remedy is a non-empty instruction
 if [ -n "$(boxa::prereq_remedy docker)" ]; then _r=0; else _r=1; fi
 check "prereq remedy nonempty" "0" "$_r"
+# The grouped host-binaries prerequisite currently requires jq. Control PATH so
+# the check is deterministic regardless of the developer host.
+host_binary_path="$tmp/host-binaries"
+mkdir -p "$host_binary_path"
+printf '#!/usr/bin/env bash\n' > "$host_binary_path/jq"
+chmod +x "$host_binary_path/jq"
+check "prereq host binaries ok" "ok" \
+    "$(PATH="$host_binary_path" boxa::prereq_state host-binaries)"
+check "prereq host binaries missing jq" "missing" \
+    "$(PATH="$tmp/no-host-binaries" boxa::prereq_state host-binaries)"
+check "prereq host binaries remedy names jq" \
+    "Install missing host binary jq via your package manager (e.g. apt install jq / brew install jq)." \
+    "$(boxa::prereq_remedy host-binaries)"
 # Go is a diagnose-only prerequisite while keep-awake still needs its binary.
 touch "$tmp/_go_missing"
 check "prereq Go missing" "missing" "$(boxa::prereq_state go)"
