@@ -442,6 +442,18 @@ _boxa::write_forge_conf() {
         "$scope" "$project_path" "$config_value" "$config_key"
 }
 
+_boxa::forge_remove_project_section_locked() {
+    local project_path="$1"
+    local conf="${BOXA_FORGE_CONF:-$HOME/.config/boxa/forge.conf}"
+
+    _boxa::remove_conf_section_file "$project_path" "$conf"
+}
+
+_boxa::forge_remove_project_section() {
+    _boxa::forge_with_catalog_lock \
+        _boxa::forge_remove_project_section_locked "$@"
+}
+
 _boxa::forge_run_catalog_locked() {
     local callback="$1"
     shift
@@ -4081,18 +4093,21 @@ _boxa::forge_scrub_identity_references_locked() {
 }
 
 _boxa::forge_known_project_paths() {
-    local conf line parsed section name project_path
+    local conf line parsed section name project_path history_section
 
     for conf in "${BOXA_FORGE_CONF:-$HOME/.config/boxa/forge.conf}" \
-            "${BOXA_SSH_CONF:-$HOME/.config/boxa/ssh.conf}"; do
+            "${BOXA_SSH_CONF:-$HOME/.config/boxa/ssh.conf}" \
+            "$(_boxa::ssh_key_registry_path)"; do
         [ -f "$conf" ] || continue
+        history_section="$(_boxa::ssh_key_registry_history_section)"
         while IFS= read -r line || [ -n "$line" ]; do
             parsed="${line%%#*}"
             parsed="${parsed#"${parsed%%[![:space:]]*}"}"
             parsed="${parsed%"${parsed##*[![:space:]]}"}"
             [[ "$parsed" == \[*\] ]] || continue
             section="${parsed:1:${#parsed}-2}"
-            [[ "$section" == /* ]] && printf '%s\n' "$section"
+            [[ "$section" == /* ]] || continue
+            [ "$section" != "$history_section" ] && printf '%s\n' "$section"
         done < "$conf"
     done
     if declare -F _boxa::forge_project_targets >/dev/null; then

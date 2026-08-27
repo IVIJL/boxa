@@ -63,7 +63,7 @@ Containers:
   boxa stop [name] [--clean]     Stop one container (--clean removes volumes)
   boxa stop --all [--reason TOKEN]
                                    Stop every boxa Container without cleanup
-  boxa remove [name]             Remove project data (volumes)
+  boxa remove [name|path]        Remove project data and path-keyed config
 
 Ports & connect:
   boxa port <port>               Expose port via Traefik
@@ -410,7 +410,7 @@ Stop one boxa Container, or stop every boxa Container non-interactively with
 --reason tags that run and raises a Closeout notification when it completes.
 EOF
             ;;
-        remove)         printf 'boxa remove [name]             Remove project data (volumes)\n' ;;
+        remove)         printf 'boxa remove [name|path]        Remove project data and path-keyed config\n' ;;
         port)           printf 'boxa port <port>               Expose port via Traefik\n' ;;
         connections)    printf 'boxa connections               List cross-boxa and Host TCP forwards\n' ;;
         deny)           printf 'boxa deny [domain]             Remove allowed domain (interactive)\n' ;;
@@ -3148,6 +3148,59 @@ _boxa::record_project() {
         elif ! mv -f "$tmp" "$registry"; then
             rm -f "$tmp"
             echo "boxa: WARNING: could not update Project registry at $registry" >&2
+        fi
+    )
+}
+
+_boxa::project_registry_rows() {
+    local registry="${XDG_CONFIG_HOME:-$HOME/.config}/boxa/projects.json"
+
+    [ -f "$registry" ] || return 0
+    jq -r '
+        select(.version == 1 and (.projects | type == "object"))
+        | .projects | to_entries[]
+        | select((.key | type) == "string"
+            and (.value.name | type) == "string")
+        | [.value.name, .key] | @tsv
+    ' "$registry" 2>/dev/null || true
+}
+
+# Remove one exact path under the same lock and schema checks used when
+# recording Projects. Returns 2 when the registry or path is absent.
+_boxa::remove_recorded_project_path() {
+    local project_path="$1" config_dir registry lockfile
+
+    config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/boxa"
+    registry="$config_dir/projects.json"
+    lockfile="$registry.lock"
+    [ -f "$registry" ] || return 2
+    (
+        local tmp
+        if command -v flock >/dev/null 2>&1; then
+            if ! { exec 9>"$lockfile"; } 2>/dev/null; then
+                echo "boxa: WARNING: could not open Project registry lock at $lockfile" >&2
+                return 1
+            elif ! flock -x -w 10 9; then
+                echo "boxa: WARNING: could not lock Project registry at $lockfile within 10 seconds" >&2
+                return 1
+            fi
+        else
+            echo "boxa: WARNING: flock is unavailable; Project registry removal is not protected from concurrent starts" >&2
+        fi
+        jq -e --arg path "$project_path" \
+            '.version == 1 and (.projects | type == "object")
+                and (.projects | has($path))' \
+            "$registry" >/dev/null 2>&1 || return 2
+        tmp="$(mktemp "$config_dir/.projects.json.XXXXXX")" || return 1
+        if ! jq --arg path "$project_path" 'del(.projects[$path])' \
+                "$registry" > "$tmp"; then
+            rm -f "$tmp"
+            return 1
+        fi
+        chmod 0600 "$tmp"
+        if ! mv -f "$tmp" "$registry"; then
+            rm -f "$tmp"
+            return 1
         fi
     )
 }
@@ -5904,24 +5957,68 @@ if [ "$MODE" = "remove" ]; then
         docker ps --filter "name=^boxa-${1}$" --format '{{.ID}}' | grep -q .
     }
 
-    remove_project_data() {
-        local proj="$1"
-        local found=false
+    project_has_route_yamls() {
+        local project="$1" f base suffix prefix
+        [ -d "$TRAEFIK_CONFIG_DIR" ] || return 1
+        for f in "$TRAEFIK_CONFIG_DIR/boxa-${project}-"*.yml \
+                "$TRAEFIK_CONFIG_DIR/boxa-${project}-"*.yml.pre-https-backup; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f")"
+            base="${base%.pre-https-backup}"
+            base="${base%.yml}"
+            suffix="${base##*-}"
+            case "$suffix" in ''|*[!0-9]*) continue ;; esac
+            prefix="${base%-*}"
+            [ "$prefix" = "boxa-${project}" ] && return 0
+        done
+        return 1
+    }
+
+    project_has_https_artifacts() {
+        local project="$1" artifact
+        for artifact in "$BOXA_CERTS_DIR/${project}.pem" \
+                "$BOXA_CERTS_DIR/${project}.key" \
+                "$BOXA_CERTS_DIR/${project}.meta" \
+                "$BOXA_CERT_TLS_DIR/${project}-tls.yml"; do
+            [ ! -e "$artifact" ] || return 0
+        done
+        return 1
+    }
+
+    remove_project_artifacts() {
+        local proj="$1" suffix vol volume_count=0 archive_output
+        _BOXA_REMOVE_ARTIFACT_FOUND=false
         for suffix in "${BOXA_PROJECT_VOLUME_SUFFIXES[@]}"; do
-            local vol
             vol="$(boxa::volume_name "$proj" "$suffix")"
             if docker volume inspect "$vol" > /dev/null 2>&1; then
                 docker volume rm "$vol" > /dev/null
                 echo "  Removed volume: $vol"
-                found=true
+                volume_count=$((volume_count + 1))
+                _BOXA_REMOVE_ARTIFACT_FOUND=true
             fi
         done
+        [ "$volume_count" -gt 0 ] \
+            || echo "  Note: no volumes for project $proj."
+        if project_has_route_yamls "$proj"; then
+            _BOXA_REMOVE_ARTIFACT_FOUND=true
+            echo "  Removed Traefik route files"
+        else
+            echo "  Note: no Traefik route files."
+        fi
         _boxa::remove_project_route_yamls "$proj"
+        if project_has_https_artifacts "$proj"; then
+            _BOXA_REMOVE_ARTIFACT_FOUND=true
+            echo "  Removed HTTPS artifacts"
+        else
+            echo "  Note: no HTTPS artifacts."
+        fi
         _boxa::remove_project_https_artifacts "$proj"
-        _boxa::remove_project_agent_browser_archives "$proj"
-        if [ "$found" = false ]; then
-            echo "  No volumes for project $proj." >&2
-            return 1
+        archive_output="$(_boxa::remove_project_agent_browser_archives "$proj")"
+        if [ -n "$archive_output" ]; then
+            _BOXA_REMOVE_ARTIFACT_FOUND=true
+            printf '%s\n' "$archive_output"
+        else
+            echo "  Note: no agent-browser archives."
         fi
     }
 
@@ -5934,58 +6031,191 @@ if [ "$MODE" = "remove" ]; then
             | sort -u || true
     }
 
-    if [ -n "$PROJECT_FILTER" ]; then
-        # Legacy un-sanitized volumes (created before sanitize-end-to-end)
-        # remain reachable: prefer the literal token when a matching volume
-        # exists, otherwise use the sanitized form for the current convention.
-        target="$PROJECT_FILTER"
-        legacy_match=false
-        for suffix in "${BOXA_PROJECT_VOLUME_SUFFIXES[@]}"; do
-            if docker volume inspect "boxa-${PROJECT_FILTER}-${suffix}" >/dev/null 2>&1; then
-                legacy_match=true
+    list_removal_targets() {
+        local name path
+        local -A registered_paths=() targets=()
+
+        while IFS= read -r name; do
+            [ -n "$name" ] && targets["$name"]=1
+        done < <(list_projects_with_volumes)
+        while IFS=$'\t' read -r name path; do
+            [ -n "$name" ] && targets["$name"]=1
+            [[ "$path" == /* ]] && registered_paths["$path"]=1
+        done < <(_boxa::project_registry_rows)
+        while IFS= read -r path; do
+            [[ "$path" == /* ]] || continue
+            [ -n "${registered_paths[$path]:-}" ] || targets["$path"]=1
+        done < <(_boxa::forge_known_project_paths)
+        printf '%s\n' "${!targets[@]}" | sed '/^$/d' | sort
+    }
+
+    registry_paths_for_name() {
+        local target_name="$1" name path
+        while IFS=$'\t' read -r name path; do
+            [ "$name" = "$target_name" ] && printf '%s\n' "$path"
+        done < <(_boxa::project_registry_rows)
+    }
+
+    registry_name_for_path() {
+        local target_path="$1" name path
+        while IFS=$'\t' read -r name path; do
+            if [ "$path" = "$target_path" ]; then
+                printf '%s\n' "$name"
+                return 0
+            fi
+        done < <(_boxa::project_registry_rows)
+        return 1
+    }
+
+    purge_project_path_config() {
+        local project_path="$1" status ssh_result ssh_status registry_status
+        local forge_conf="${BOXA_FORGE_CONF:-$HOME/.config/boxa/forge.conf}"
+        local ssh_conf="${BOXA_SSH_CONF:-$HOME/.config/boxa/ssh.conf}"
+        local key_registry
+        _BOXA_REMOVE_CONFIG_FOUND=false
+
+        key_registry="$(_boxa::ssh_key_registry_path)"
+        while IFS=$'\t' read -r registry_name path; do
+            [ -n "$registry_name" ] || continue
+            if [ "$path" = "$project_path" ]; then
+                _BOXA_REMOVE_CONFIG_FOUND=true
                 break
             fi
-        done
-        if [ "$legacy_match" = false ]; then
-            boxa::names_from_token "$PROJECT_FILTER"
-            target="$BOXA_PROJECT_NAME"
+        done < <(_boxa::project_registry_rows)
+        _boxa::conf_has_section "$project_path" "$forge_conf" \
+            && _BOXA_REMOVE_CONFIG_FOUND=true
+        _boxa::conf_has_section "$project_path" "$ssh_conf" \
+            && _BOXA_REMOVE_CONFIG_FOUND=true
+        _boxa::conf_has_section "$project_path" "$key_registry" \
+            && _BOXA_REMOVE_CONFIG_FOUND=true
+
+        if _boxa::remove_recorded_project_path "$project_path"; then
+            echo "  Removed projects.json entry: $project_path"
+            _BOXA_REMOVE_CONFIG_FOUND=true
+        else
+            status=$?
+            if [ "$status" -eq 2 ]; then
+                echo "  Note: no projects.json entry for $project_path."
+            else
+                echo "  WARN: could not remove projects.json entry for $project_path." >&2
+            fi
+        fi
+        if _boxa::forge_remove_project_section "$project_path"; then
+            echo "  Removed forge.conf section: $project_path"
+            _BOXA_REMOVE_CONFIG_FOUND=true
+        else
+            status=$?
+            if [ "$status" -eq 2 ]; then
+                echo "  Note: no forge.conf section for $project_path."
+            else
+                echo "  WARN: could not remove forge.conf section for $project_path." >&2
+            fi
+        fi
+        if ssh_result="$(_boxa::ssh_purge_project_state "$project_path")"; then
+            status=0
+        else
+            status=$?
+            echo "  WARN: could not purge SSH state for $project_path." >&2
+        fi
+        IFS=$'\t' read -r ssh_status registry_status <<< "$ssh_result"
+        if [ "$ssh_status" = removed ]; then
+            echo "  Removed ssh.conf section: $project_path"
+            _BOXA_REMOVE_CONFIG_FOUND=true
+        elif [ "$status" -eq 0 ]; then
+            echo "  Note: no ssh.conf section for $project_path."
+        fi
+        if [ "$registry_status" = removed ]; then
+            echo "  Removed SSH key registry section: $project_path"
+            _BOXA_REMOVE_CONFIG_FOUND=true
+        elif [ "$status" -eq 0 ]; then
+            echo "  Note: no SSH key registry section for $project_path."
+        fi
+    }
+
+    remove_target() {
+        local requested="$1" purge_all_mappings="${2:-false}"
+        local target mapping_name legacy_match=false path selected found=false
+        local -a paths=()
+
+        if [[ "$requested" == /* ]]; then
+            target="$(registry_name_for_path "$requested" 2>/dev/null || true)"
+            if [ -z "$target" ]; then
+                boxa::names_from_path "$requested"
+                target="$BOXA_PROJECT_NAME"
+            fi
+            paths=("$requested")
+        else
+            target="$requested"
+            for suffix in "${BOXA_PROJECT_VOLUME_SUFFIXES[@]}"; do
+                if docker volume inspect "boxa-${requested}-${suffix}" \
+                        >/dev/null 2>&1; then
+                    legacy_match=true
+                    break
+                fi
+            done
+            boxa::names_from_token "$requested"
+            mapping_name="$BOXA_PROJECT_NAME"
+            if [ "$legacy_match" = false ]; then
+                target="$mapping_name"
+            fi
+            mapfile -t paths < <(
+                registry_paths_for_name "$mapping_name"
+                [ "$mapping_name" = "$target" ] \
+                    || registry_paths_for_name "$target"
+            )
+            if [ "${#paths[@]}" -gt 1 ] \
+                    && [ "$purge_all_mappings" != true ]; then
+                selected="$(printf '%s\n' "${paths[@]}" | picker::one \
+                    --prompt "Purge Project path:" \
+                    --first-option "* Purge all paths")" || return 1
+                if [ "$selected" != "* Purge all paths" ]; then
+                    paths=("$selected")
+                fi
+            fi
         fi
 
         if is_project_running "$target"; then
             echo "Container boxa-${target} is running — stop it first." >&2
-            exit 1
+            return 1
         fi
         echo "Removing data for project: $target"
-        remove_project_data "$target"
+        remove_project_artifacts "$target"
+        [ "$_BOXA_REMOVE_ARTIFACT_FOUND" = false ] || found=true
+        if [ "${#paths[@]}" -eq 0 ]; then
+            echo "  Note: no projects.json path mapping for $target; config purge skipped."
+        else
+            for path in "${paths[@]}"; do
+                purge_project_path_config "$path"
+                [ "$_BOXA_REMOVE_CONFIG_FOUND" = false ] || found=true
+            done
+        fi
+        if [ "$found" = false ]; then
+            echo "nothing to remove for $requested" >&2
+            return 1
+        fi
+    }
+
+    if [ -n "$PROJECT_FILTER" ]; then
+        remove_target "$PROJECT_FILTER"
         exit $?
     fi
 
-    # Interactive: list projects with volumes
-    projects=$(list_projects_with_volumes)
-    if [ -z "$projects" ]; then
-        echo "No boxa project volumes."
+    # Interactive: union volume-backed Projects with every path-keyed store.
+    removal_targets=$(list_removal_targets)
+    if [ -z "$removal_targets" ]; then
+        echo "No boxa project data."
         exit 0
     fi
 
-    selected=$(printf '%s\n' "$projects" \
+    selected=$(printf '%s\n' "$removal_targets" \
         | picker::one --prompt "Remove project:" --first-option "* Remove all") || exit 1
 
     if [ "$selected" = "* Remove all" ]; then
         while IFS= read -r proj; do
-            if is_project_running "$proj"; then
-                echo "Container boxa-${proj} is running — skipping." >&2
-                continue
-            fi
-            echo "Removing data for project: $proj"
-            remove_project_data "$proj" || true
-        done <<< "$projects"
+            remove_target "$proj" true || true
+        done <<< "$removal_targets"
     else
-        if is_project_running "$selected"; then
-            echo "Container boxa-${selected} is running — stop it first." >&2
-            exit 1
-        fi
-        echo "Removing data for project: $selected"
-        remove_project_data "$selected"
+        remove_target "$selected"
     fi
     exit 0
 fi

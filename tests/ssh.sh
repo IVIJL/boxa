@@ -1388,6 +1388,26 @@ assert_eq "private-only registry key reconciles before and after agent restart" 
     "$expected_real_fingerprint"$'\n'"$expected_real_fingerprint"$'\n'"$expected_real_fingerprint" \
     "$real_restart_fingerprints"
 
+purged_agent_project="$_TMPROOT/purged-agent-project"
+mkdir -p "$purged_agent_project"
+_boxa::ssh_registry_record_key "$purged_agent_project" "$real_registry_key"
+purged_agent_state="$(
+    unset -f ssh-add
+    _boxa::ssh_reapply_registry_keys "$purged_agent_project" >/dev/null \
+        || exit 1
+    _boxa::ssh_purge_project_state "$purged_agent_project" >/dev/null \
+        || exit 1
+    if ssh-add -l >/dev/null 2>&1; then
+        printf 'keys\n'
+    else
+        printf 'empty\n'
+    fi
+)"
+assert_eq "Project-state purge empties a running per-project agent" empty \
+    "$purged_agent_state"
+assert_eq "Project-state purge removes the complete Key registry section" 0 \
+    "$(grep -cF "[$purged_agent_project]" "$BOXA_SSH_KEY_REGISTRY" || true)"
+
 concurrent_assignment_project="$_TMPROOT/concurrent-assignment-project"
 mkdir -p "$concurrent_assignment_project"
 _boxa::ssh_registry_record_key \

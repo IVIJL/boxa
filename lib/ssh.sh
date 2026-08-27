@@ -310,6 +310,47 @@ _boxa::ssh_registry_replace_project() {
     _boxa::ssh_with_registry_lock _boxa::ssh_registry_replace_project_locked "$@"
 }
 
+# Remove a Project's complete registry section. The full registry is validated
+# before the byte-preserving rewrite, matching every other registry mutation.
+_boxa::ssh_registry_remove_project_locked() {
+    local project_path="$1" registry
+
+    _boxa::ssh_registry_validate_path 'SSH key registry Project path' \
+        "$project_path" || return 1
+    _boxa::ssh_registry_load_project "$project_path" || return 1
+    registry="$(_boxa::ssh_key_registry_path)"
+    _boxa::remove_conf_section_file "$project_path" "$registry"
+}
+
+_boxa::ssh_purge_project_state_locked() {
+    local project_path="$1"
+    local conf="${BOXA_SSH_CONF:-$HOME/.config/boxa/ssh.conf}"
+    local ssh_status registry_status
+
+    if _boxa::remove_conf_section_file "$project_path" "$conf"; then
+        ssh_status=removed
+    else
+        case $? in
+            2) ssh_status=absent ;;
+            *) return 1 ;;
+        esac
+    fi
+    if _boxa::ssh_registry_remove_project_locked "$project_path"; then
+        registry_status=removed
+    else
+        case $? in
+            2) registry_status=absent ;;
+            *) return 1 ;;
+        esac
+    fi
+    printf '%s\t%s\n' "$ssh_status" "$registry_status"
+    _boxa::ssh_reconcile_running_project_agent "$project_path"
+}
+
+_boxa::ssh_purge_project_state() {
+    _boxa::ssh_with_registry_lock _boxa::ssh_purge_project_state_locked "$@"
+}
+
 # Resolve the SSH gate for one project. A valid project value overrides a
 # valid global value; missing or invalid values leave the secure default off.
 _boxa::resolve_ssh_gate() {

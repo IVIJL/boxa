@@ -489,6 +489,79 @@ _boxa::remove_conf_keys() {
     unset -f _boxa::emit_conf_line _boxa::flush_conf_target
 }
 
+# Remove every exact Project section, including its comments and unknown keys,
+# while preserving every byte outside those sections. Callers own the file
+# lock and the atomic replacement so this parser can be shared by forge.conf,
+# ssh.conf, and the SSH Key registry.
+# Usage: _boxa::remove_conf_section <section> <conf> <temp>
+_boxa::remove_conf_section() {
+    local target_section="$1" conf="$2" temp="$3"
+    local line parsed value in_target='' output_started=''
+
+    _BOXA_CONF_SECTION_REMOVED=
+    while IFS= read -r line || [ -n "$line" ]; do
+        parsed="${line%%#*}"
+        parsed="${parsed#"${parsed%%[![:space:]]*}"}"
+        parsed="${parsed%"${parsed##*[![:space:]]}"}"
+        if [[ "$parsed" == \[* ]]; then
+            in_target=
+            if [[ "$parsed" == \[*\] ]]; then
+                value="${parsed:1:${#parsed}-2}"
+                if [ "$value" = "$target_section" ]; then
+                    in_target=1
+                    _BOXA_CONF_SECTION_REMOVED=1
+                fi
+            fi
+        fi
+        [ -z "$in_target" ] || continue
+        [ -z "$output_started" ] || printf '\n' >> "$temp"
+        printf '%s' "$line" >> "$temp"
+        output_started=1
+    done < "$conf"
+}
+
+_boxa::conf_has_section() {
+    local target_section="$1" conf="$2" line parsed value
+
+    [ -f "$conf" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        parsed="${line%%#*}"
+        parsed="${parsed#"${parsed%%[![:space:]]*}"}"
+        parsed="${parsed%"${parsed##*[![:space:]]}"}"
+        [[ "$parsed" == \[*\] ]] || continue
+        value="${parsed:1:${#parsed}-2}"
+        [ "$value" != "$target_section" ] || return 0
+    done < "$conf"
+    return 1
+}
+
+# Atomically apply the strict section removal while retaining file mode and
+# final-newline state. Returns 2 when the file or section is absent.
+_boxa::remove_conf_section_file() {
+    local target_section="$1" conf="$2" temp mode file_had_newline=''
+
+    [ -f "$conf" ] || return 2
+    if [ -s "$conf" ] \
+            && [ "$(tail -c 1 "$conf" | wc -l | tr -d ' ')" -gt 0 ]; then
+        file_had_newline=1
+    fi
+    temp="$(mktemp "${conf}.tmp.XXXXXX")" || return 1
+    if ! _boxa::remove_conf_section "$target_section" "$conf" "$temp"; then
+        rm -f "$temp"
+        return 1
+    fi
+    if [ -z "$_BOXA_CONF_SECTION_REMOVED" ]; then
+        rm -f "$temp"
+        return 2
+    fi
+    [ -z "$file_had_newline" ] || [ ! -s "$temp" ] || printf '\n' >> "$temp"
+    mode="$(stat -c '%a' "$conf" 2>/dev/null || stat -f '%Lp' "$conf")"
+    if ! chmod "$mode" "$temp" || ! mv "$temp" "$conf"; then
+        rm -f "$temp"
+        return 1
+    fi
+}
+
 # Reject a global change if any project that inherits a changed key would
 # resolve to an invalid Memory and Memory+swap pair.
 _boxa::validate_global_project_pairs() {
