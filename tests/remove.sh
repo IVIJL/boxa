@@ -353,6 +353,45 @@ assert_file_eq "malformed projects.json preserves SSH key registry" \
 assert_file_eq "malformed projects.json remains byte-identical" \
     "$_TMPROOT/expected-malformed-projects" "$TEST_CONFIG/projects.json"
 
+# Multiple top-level JSON values are not a valid version-1 Project registry.
+reset_stores
+multi_projects_path=/work/multi-projects
+printf '{"version":1,"projects":{"%s":{"name":"multi-projects","lastSeen":"now"}}}\n' \
+    "$multi_projects_path" > "$TEST_CONFIG/projects.json"
+printf '{"version":1,"projects":{}}\n' >> "$TEST_CONFIG/projects.json"
+cp "$TEST_CONFIG/projects.json" "$_TMPROOT/expected-multi-projects"
+printf '[%s]\nforge = on\n' "$multi_projects_path" \
+    > "$TEST_CONFIG/forge.conf"
+printf '[%s]\ngate = on\n' "$multi_projects_path" \
+    > "$TEST_CONFIG/ssh.conf"
+printf '[%s]\nkey = /keys/keep\n' "$multi_projects_path" \
+    > "$TEST_CONFIG/ssh-key-registry"
+cp "$TEST_CONFIG/forge.conf" "$_TMPROOT/expected-multi-projects-forge"
+cp "$TEST_CONFIG/ssh.conf" "$_TMPROOT/expected-multi-projects-ssh"
+cp "$TEST_CONFIG/ssh-key-registry" \
+    "$_TMPROOT/expected-multi-projects-registry"
+printf '%s\n' boxa-multi-projects-history > "$BOXA_REMOVE_TEST_VOLUMES"
+multi_projects_output="$(run_boxa remove "$multi_projects_path" 2>&1)"
+multi_projects_rc=$?
+assert_eq "multi-document projects.json fails outer remove loudly" 1 \
+    "$multi_projects_rc"
+assert_contains "multi-document projects.json reports malformed preflight" \
+    "ERROR: malformed or unsupported projects.json; removal aborted." \
+    "$multi_projects_output"
+assert_eq "multi-document projects.json preserves Project volumes" \
+    boxa-multi-projects-history "$(cat "$BOXA_REMOVE_TEST_VOLUMES")"
+assert_eq "multi-document projects.json removes no Project volumes" '' \
+    "$(cat "$BOXA_REMOVE_TEST_REMOVED_VOLUMES")"
+assert_file_eq "multi-document projects.json preserves forge.conf" \
+    "$_TMPROOT/expected-multi-projects-forge" "$TEST_CONFIG/forge.conf"
+assert_file_eq "multi-document projects.json preserves ssh.conf" \
+    "$_TMPROOT/expected-multi-projects-ssh" "$TEST_CONFIG/ssh.conf"
+assert_file_eq "multi-document projects.json preserves SSH key registry" \
+    "$_TMPROOT/expected-multi-projects-registry" \
+    "$TEST_CONFIG/ssh-key-registry"
+assert_file_eq "multi-document projects.json remains byte-identical" \
+    "$_TMPROOT/expected-multi-projects" "$TEST_CONFIG/projects.json"
+
 # Missing and valid-empty Project registries remain non-errors.
 reset_stores
 absent_projects_path=/work/absent-projects

@@ -3156,9 +3156,10 @@ _boxa::project_registry_rows() {
     local registry="${XDG_CONFIG_HOME:-$HOME/.config}/boxa/projects.json"
 
     [ -f "$registry" ] || return 0
-    jq -r '
-        select(.version == 1 and (.projects | type == "object"))
-        | .projects | to_entries[]
+    jq -sr '
+        select(length == 1 and .[0].version == 1
+            and (.[0].projects | type) == "object")
+        | .[0].projects | to_entries[]
         | select((.key | type) == "string"
             and (.value.name | type) == "string")
         | [.value.name, .key] | @json
@@ -3185,7 +3186,8 @@ _boxa::validate_project_registry() {
     local registry="${XDG_CONFIG_HOME:-$HOME/.config}/boxa/projects.json"
 
     [ -f "$registry" ] || return 0
-    jq -e '.version == 1 and (.projects | type == "object")' \
+    jq -se 'length == 1 and .[0].version == 1
+            and (.[0].projects | type) == "object"' \
         "$registry" >/dev/null 2>&1
 }
 
@@ -3215,7 +3217,8 @@ _boxa::remove_recorded_project_path() {
             echo "boxa: WARNING: flock is unavailable; Project registry removal is not protected from concurrent starts" >&2
         fi
         [ -f "$registry" ] || return 2
-        jq -e '.version == 1 and (.projects | type == "object")' \
+        jq -se 'length == 1 and .[0].version == 1
+                and (.[0].projects | type) == "object"' \
             "$registry" >/dev/null 2>&1 || return 1
         jq -e --arg path "$project_path" '.projects | has($path)' \
             "$registry" >/dev/null 2>&1 || return 2
