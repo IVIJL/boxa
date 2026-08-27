@@ -19,6 +19,8 @@ _TMPROOT="$(mktemp -d)"
 export BOXA_FORGE_CONF="$_TMPROOT/forge.conf"
 export BOXA_FORGE_DIR="$_TMPROOT/forge"
 export BOXA_SSH_CONF="$_TMPROOT/ssh.conf"
+export BOXA_SSH_KEY_REGISTRY="$_TMPROOT/ssh-key-registry"
+# shellcheck disable=SC2034  # consumed by sourced allowlist helpers
 ALLOWLIST_HOST_FILE="$_TMPROOT/allowed-domains.conf"
 trap 'rm -rf "$_TMPROOT"' EXIT
 
@@ -318,6 +320,55 @@ assert_eq "forge writer reclaims a lock owned by a dead process" "off" \
     "$(resolve_gate /work/app)"
 assert_eq "reclaimed forge lock is removed after success" "absent" \
     "$([ -e "$BOXA_FORGE_CONF.lock" ] && printf present || printf absent)"
+
+# --- Default persona SSH gate synthesis -----------------------------------
+
+default_key="$_TMPROOT/default-key"
+ssh-keygen -q -t ed25519 -N '' -C default-key -f "$default_key"
+_boxa::forge_write_persona default-keyed agent "$default_key" \
+    github-token default-user 1 '' '' '' ''
+_boxa::forge_write_persona default-keyless other '' \
+    github-token keyless-user 1 '' '' '' ''
+
+default_keyed_project="$_TMPROOT/default-keyed-project"
+: > "$BOXA_FORGE_CONF"
+printf '[%s]\n' "$default_keyed_project" > "$BOXA_SSH_CONF"
+_boxa::forge_default default-keyed >/dev/null
+assert_contains "default persona writes the global forge gate" 'forge = on' \
+    "$(< "$BOXA_FORGE_CONF")"
+_boxa::resolve_forge_gate "$default_keyed_project"
+assert_eq "default persona enables the global forge gate" on \
+    "$_BOXA_FORGE_GATE"
+_boxa::resolve_ssh_gate "$default_keyed_project"
+assert_eq "keyed default persona turns a default-resolving Project SSH gate on" \
+    on "$_BOXA_SSH_GATE"
+
+default_keyless_project="$_TMPROOT/default-keyless-project"
+: > "$BOXA_FORGE_CONF"
+printf 'gate = on\n[%s]\n' "$default_keyless_project" > "$BOXA_SSH_CONF"
+_boxa::ssh_registry_replace_project "$default_keyless_project" "$default_key"
+_boxa::forge_default default-keyless >/dev/null
+assert_not_contains "keyless default does not materialize a Project off gate" \
+    'gate = off' "$(< "$BOXA_SSH_CONF")"
+_boxa::resolve_ssh_gate "$default_keyless_project"
+assert_eq "keyless default leaves the Project on through the global SSH gate" \
+    on "$_BOXA_SSH_GATE"
+assert_eq "keyless default preserves the global SSH source" global \
+    "$_BOXA_SSH_SOURCE"
+_boxa::ssh_registry_load_project "$default_keyless_project"
+assert_eq "keyless default clears stale Project key paths" 0 \
+    "${#_BOXA_SSH_REGISTRY_KEYS[@]}"
+
+default_explicit_project="$_TMPROOT/default-explicit-project"
+: > "$BOXA_FORGE_CONF"
+printf 'gate = on\n[%s]\ngate = on\n' "$default_explicit_project" \
+    > "$BOXA_SSH_CONF"
+_boxa::forge_default default-keyless >/dev/null
+_boxa::resolve_ssh_gate "$default_explicit_project"
+assert_eq "synthesized off still replaces an explicit Project SSH gate" off \
+    "$_BOXA_SSH_GATE"
+assert_eq "synthesized off keeps the explicit Project SSH source" project \
+    "$_BOXA_SSH_SOURCE"
 
 # --- Persona catalog -------------------------------------------------------
 

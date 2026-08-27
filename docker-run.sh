@@ -4407,6 +4407,27 @@ _boxa::ssh_apply_project_gate_cli() {
     [ "$action" != on ] || _boxa::ssh_on_project_follow_up "$project_path"
 }
 
+_boxa::ssh_report_global_project_overrides() {
+    local action="$1" project_path
+    local -a unaffected_paths=()
+    local -A seen_paths=()
+
+    while IFS= read -r project_path; do
+        [[ "$project_path" == /* ]] || continue
+        [ -z "${seen_paths[$project_path]:-}" ] || continue
+        seen_paths["$project_path"]=1
+        _boxa::resolve_ssh_gate "$project_path"
+        if [ "$_BOXA_SSH_SOURCE" = project ] \
+                && [ "$_BOXA_SSH_GATE" != "$action" ]; then
+            unaffected_paths+=("$project_path")
+        fi
+    done < <(_boxa::forge_known_project_paths)
+    [ "${#unaffected_paths[@]}" -gt 0 ] || return 0
+    echo "Note: these Projects keep their own explicit SSH setting and are unaffected:" >&2
+    printf '  %s\n' "${unaffected_paths[@]}" >&2
+    printf "Change them with 'boxa ssh %s --pick'.\n" "$action" >&2
+}
+
 if [ "$MODE" = "ssh" ]; then
     if [ -z "$SSH_ACTION" ]; then
         _boxa::mem_resolve_target "" "$PWD" || exit 1
@@ -4438,6 +4459,7 @@ if [ "$MODE" = "ssh" ]; then
     if [ "$SSH_GLOBAL" = true ]; then
         _boxa::write_ssh_conf global "" "$SSH_ACTION" || exit 1
         echo "SSH agent forwarding set to $SSH_ACTION in the global ssh.conf scope."
+        _boxa::ssh_report_global_project_overrides "$SSH_ACTION"
         ssh_running_containers="$(docker ps --filter 'name=^boxa-' \
             --format '{{.Names}}' 2>/dev/null | filter_user_containers || true)"
         while IFS= read -r ssh_running_container; do

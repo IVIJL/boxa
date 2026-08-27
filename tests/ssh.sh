@@ -1020,6 +1020,20 @@ for gate_state in off on; do
         "boxa stop && boxa" "$(cat "$cli_transcript")"
 done
 
+seed_conf "gate=off" "[$cli_project]" "gate=off"
+global_override_transcript="$_TMPROOT/global-project-override.transcript"
+script -q -e -E never \
+    -c "$cli_env bash '$BOXA_DIR/docker-run.sh' ssh on --global" \
+    "$global_override_transcript" </dev/null >/dev/null
+assert_contains "global SSH change notes an unaffected explicit Project override" \
+    "Note: these Projects keep their own explicit SSH setting and are unaffected:" \
+    "$(cat "$global_override_transcript")"
+assert_contains "global SSH override note lists the Project path" \
+    "  $cli_project" "$(cat "$global_override_transcript")"
+assert_contains "global SSH override note gives the matching picker command" \
+    "Change them with 'boxa ssh on --pick'." \
+    "$(cat "$global_override_transcript")"
+
 legacy_user_transcript="$_TMPROOT/legacy-user.transcript"
 _boxa::ssh_registry_remove_key "$cli_project" "$cli_key"
 printf 'agent = user\n' > "$BOXA_SSH_CONF"

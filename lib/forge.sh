@@ -3431,21 +3431,26 @@ _boxa::forge_reconcile_project_ssh_gate() {
 
 _boxa::forge_apply_project_ssh_gate_locked() {
     local project_path="$1" report_change="$2" old_gate="$3" keys="$4"
-    local registry registry_backup='' registry_existed=''
+    local registry registry_backup='' registry_existed='' write_gate=true
 
     registry="$(_boxa::ssh_key_registry_path)"
     _boxa::forge_backup_file "$registry" registry_backup registry_existed \
         || return 1
+    if [ "$_BOXA_FORGE_SYNTHESIZED_SSH_GATE" = off ]; then
+        _boxa::resolve_ssh_gate "$project_path"
+        [ "$_BOXA_SSH_SOURCE" = project ] || write_gate=false
+    fi
     if ! _boxa::ssh_registry_replace_project "$project_path" "$keys" \
-            || ! _boxa::write_ssh_conf project "$project_path" \
-                "$_BOXA_FORGE_SYNTHESIZED_SSH_GATE" \
+            || { [ "$write_gate" = true ] \
+                && ! _boxa::write_ssh_conf project "$project_path" \
+                    "$_BOXA_FORGE_SYNTHESIZED_SSH_GATE"; } \
             || ! _boxa::forge_reconcile_project_ssh_gate "$project_path"; then
         _boxa::forge_restore_file "$registry" "$registry_backup" \
             "$registry_existed" || true
         return 1
     fi
     _boxa::forge_discard_backup "$registry_backup"
-    if [ "$report_change" = true ] \
+    if [ "$write_gate" = true ] && [ "$report_change" = true ] \
             && [ "$old_gate" != "$_BOXA_FORGE_SYNTHESIZED_SSH_GATE" ]; then
         printf 'Project %s SSH forwarding changed from %s to %s.\n' \
             "$project_path" "$old_gate" "$_BOXA_FORGE_SYNTHESIZED_SSH_GATE"
@@ -3894,12 +3899,42 @@ _boxa::forge_recompute_default_projects() {
 
 _boxa::forge_default_locked() {
     local identity_id="$1"
+    local forge_conf="${BOXA_FORGE_CONF:-$HOME/.config/boxa/forge.conf}"
+    local ssh_conf="${BOXA_SSH_CONF:-$HOME/.config/boxa/ssh.conf}"
+    local forge_backup='' ssh_backup=''
+    local forge_existed='' ssh_existed=''
+    local affected_projects project_path
 
     _boxa::forge_require_identity "$identity_id" || return 1
-    _boxa::write_forge_conf_locked global '' "$identity_id" identity \
+    affected_projects="$(_boxa::forge_projects_resolving_through_default)" \
         || return 1
+    _boxa::forge_backup_file "$forge_conf" forge_backup forge_existed \
+        || return 1
+    if ! _boxa::forge_backup_file "$ssh_conf" ssh_backup ssh_existed; then
+        _boxa::forge_restore_file "$forge_conf" "$forge_backup" \
+            "$forge_existed" || true
+        _boxa::forge_discard_backup "$ssh_backup"
+        return 1
+    fi
+    if ! _boxa::write_forge_conf_locked global '' "$identity_id" identity \
+            || ! _boxa::write_forge_conf_locked global '' on \
+            || ! _boxa::forge_recompute_default_projects; then
+        _boxa::forge_restore_file "$forge_conf" "$forge_backup" \
+            "$forge_existed" || true
+        _boxa::forge_restore_file "$ssh_conf" "$ssh_backup" \
+            "$ssh_existed" || true
+        while IFS= read -r project_path; do
+            [ -n "$project_path" ] || continue
+            if ! _boxa::forge_apply_project_ssh_gate "$project_path"; then
+                printf 'Could not restore SSH forwarding for Project %s after the failed default persona change.\n' \
+                    "$project_path" >&2
+            fi
+        done <<< "$affected_projects"
+        return 1
+    fi
+    _boxa::forge_discard_backup "$forge_backup"
+    _boxa::forge_discard_backup "$ssh_backup"
     printf "Default persona set to '%s'.\n" "$identity_id"
-    _boxa::forge_recompute_default_projects
 }
 
 _boxa::forge_default() {
