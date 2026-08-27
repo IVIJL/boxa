@@ -3161,8 +3161,15 @@ _boxa::project_registry_rows() {
         | .projects | to_entries[]
         | select((.key | type) == "string"
             and (.value.name | type) == "string")
-        | [.value.name, .key] | @tsv
+        | [.value.name, .key] | @json
     ' "$registry" 2>/dev/null || true
+}
+
+_boxa::decode_project_registry_row() {
+    local row="$1"
+
+    _BOXA_PROJECT_REGISTRY_NAME="$(jq -r '.[0]' <<< "$row")" || return 1
+    _BOXA_PROJECT_REGISTRY_PATH="$(jq -r '.[1]' <<< "$row")" || return 1
 }
 
 # Remove one exact path under the same lock and schema checks used when
@@ -6032,13 +6039,16 @@ if [ "$MODE" = "remove" ]; then
     }
 
     list_removal_targets() {
-        local name path
+        local name path row
         local -A registered_paths=() targets=()
 
         while IFS= read -r name; do
             [ -n "$name" ] && targets["$name"]=1
         done < <(list_projects_with_volumes)
-        while IFS=$'\t' read -r name path; do
+        while IFS= read -r row; do
+            _boxa::decode_project_registry_row "$row" || continue
+            name="$_BOXA_PROJECT_REGISTRY_NAME"
+            path="$_BOXA_PROJECT_REGISTRY_PATH"
             [ -n "$name" ] && targets["$name"]=1
             [[ "$path" == /* ]] && registered_paths["$path"]=1
         done < <(_boxa::project_registry_rows)
@@ -6050,15 +6060,21 @@ if [ "$MODE" = "remove" ]; then
     }
 
     registry_paths_for_name() {
-        local target_name="$1" name path
-        while IFS=$'\t' read -r name path; do
+        local target_name="$1" name path row
+        while IFS= read -r row; do
+            _boxa::decode_project_registry_row "$row" || continue
+            name="$_BOXA_PROJECT_REGISTRY_NAME"
+            path="$_BOXA_PROJECT_REGISTRY_PATH"
             [ "$name" = "$target_name" ] && printf '%s\n' "$path"
         done < <(_boxa::project_registry_rows)
     }
 
     registry_name_for_path() {
-        local target_path="$1" name path
-        while IFS=$'\t' read -r name path; do
+        local target_path="$1" name path row
+        while IFS= read -r row; do
+            _boxa::decode_project_registry_row "$row" || continue
+            name="$_BOXA_PROJECT_REGISTRY_NAME"
+            path="$_BOXA_PROJECT_REGISTRY_PATH"
             if [ "$path" = "$target_path" ]; then
                 printf '%s\n' "$name"
                 return 0
@@ -6068,16 +6084,17 @@ if [ "$MODE" = "remove" ]; then
     }
 
     purge_project_path_config() {
-        local project_path="$1" status ssh_result ssh_status registry_status
+        local project_path="$1" status purge_result forge_status
+        local ssh_status registry_status row
         local forge_conf="${BOXA_FORGE_CONF:-$HOME/.config/boxa/forge.conf}"
         local ssh_conf="${BOXA_SSH_CONF:-$HOME/.config/boxa/ssh.conf}"
         local key_registry
         _BOXA_REMOVE_CONFIG_FOUND=false
 
         key_registry="$(_boxa::ssh_key_registry_path)"
-        while IFS=$'\t' read -r registry_name path; do
-            [ -n "$registry_name" ] || continue
-            if [ "$path" = "$project_path" ]; then
+        while IFS= read -r row; do
+            _boxa::decode_project_registry_row "$row" || continue
+            if [ "$_BOXA_PROJECT_REGISTRY_PATH" = "$project_path" ]; then
                 _BOXA_REMOVE_CONFIG_FOUND=true
                 break
             fi
@@ -6089,6 +6106,34 @@ if [ "$MODE" = "remove" ]; then
         _boxa::conf_has_section "$project_path" "$key_registry" \
             && _BOXA_REMOVE_CONFIG_FOUND=true
 
+        if purge_result="$(_boxa::forge_purge_project_state "$project_path")"; then
+            status=0
+        else
+            status=$?
+            echo "  ERROR: could not atomically purge forge and SSH state for $project_path." >&2
+            return "$status"
+        fi
+        IFS=$'\t' read -r forge_status ssh_status registry_status \
+            <<< "$purge_result"
+        if [ "$forge_status" = removed ]; then
+            echo "  Removed forge.conf section: $project_path"
+            _BOXA_REMOVE_CONFIG_FOUND=true
+        else
+            echo "  Note: no forge.conf section for $project_path."
+        fi
+        if [ "$ssh_status" = removed ]; then
+            echo "  Removed ssh.conf section: $project_path"
+            _BOXA_REMOVE_CONFIG_FOUND=true
+        else
+            echo "  Note: no ssh.conf section for $project_path."
+        fi
+        if [ "$registry_status" = removed ]; then
+            echo "  Removed SSH key registry section: $project_path"
+            _BOXA_REMOVE_CONFIG_FOUND=true
+        else
+            echo "  Note: no SSH key registry section for $project_path."
+        fi
+
         if _boxa::remove_recorded_project_path "$project_path"; then
             echo "  Removed projects.json entry: $project_path"
             _BOXA_REMOVE_CONFIG_FOUND=true
@@ -6097,45 +6142,18 @@ if [ "$MODE" = "remove" ]; then
             if [ "$status" -eq 2 ]; then
                 echo "  Note: no projects.json entry for $project_path."
             else
-                echo "  WARN: could not remove projects.json entry for $project_path." >&2
+                echo "  ERROR: could not remove projects.json entry for $project_path." >&2
+                return "$status"
             fi
-        fi
-        if _boxa::forge_remove_project_section "$project_path"; then
-            echo "  Removed forge.conf section: $project_path"
-            _BOXA_REMOVE_CONFIG_FOUND=true
-        else
-            status=$?
-            if [ "$status" -eq 2 ]; then
-                echo "  Note: no forge.conf section for $project_path."
-            else
-                echo "  WARN: could not remove forge.conf section for $project_path." >&2
-            fi
-        fi
-        if ssh_result="$(_boxa::ssh_purge_project_state "$project_path")"; then
-            status=0
-        else
-            status=$?
-            echo "  WARN: could not purge SSH state for $project_path." >&2
-        fi
-        IFS=$'\t' read -r ssh_status registry_status <<< "$ssh_result"
-        if [ "$ssh_status" = removed ]; then
-            echo "  Removed ssh.conf section: $project_path"
-            _BOXA_REMOVE_CONFIG_FOUND=true
-        elif [ "$status" -eq 0 ]; then
-            echo "  Note: no ssh.conf section for $project_path."
-        fi
-        if [ "$registry_status" = removed ]; then
-            echo "  Removed SSH key registry section: $project_path"
-            _BOXA_REMOVE_CONFIG_FOUND=true
-        elif [ "$status" -eq 0 ]; then
-            echo "  Note: no SSH key registry section for $project_path."
         fi
     }
 
     remove_target() {
         local requested="$1" purge_all_mappings="${2:-false}"
         local target mapping_name legacy_match=false path selected found=false
+        local running_name
         local -a paths=()
+        local -A resolved_names=()
 
         if [[ "$requested" == /* ]]; then
             target="$(registry_name_for_path "$requested" 2>/dev/null || true)"
@@ -6174,10 +6192,14 @@ if [ "$MODE" = "remove" ]; then
             fi
         fi
 
-        if is_project_running "$target"; then
-            echo "Container boxa-${target} is running — stop it first." >&2
-            return 1
-        fi
+        resolved_names["$target"]=1
+        [ -z "${mapping_name:-}" ] || resolved_names["$mapping_name"]=1
+        for running_name in "${!resolved_names[@]}"; do
+            if is_project_running "$running_name"; then
+                echo "Container boxa-${running_name} is running — stop it first." >&2
+                return 1
+            fi
+        done
         echo "Removing data for project: $target"
         remove_project_artifacts "$target"
         [ "$_BOXA_REMOVE_ARTIFACT_FOUND" = false ] || found=true
@@ -6185,7 +6207,7 @@ if [ "$MODE" = "remove" ]; then
             echo "  Note: no projects.json path mapping for $target; config purge skipped."
         else
             for path in "${paths[@]}"; do
-                purge_project_path_config "$path"
+                purge_project_path_config "$path" || return 1
                 [ "$_BOXA_REMOVE_CONFIG_FOUND" = false ] || found=true
             done
         fi

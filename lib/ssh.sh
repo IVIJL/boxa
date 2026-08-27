@@ -327,6 +327,11 @@ _boxa::ssh_purge_project_state_locked() {
     local conf="${BOXA_SSH_CONF:-$HOME/.config/boxa/ssh.conf}"
     local ssh_status registry_status
 
+    # Validate the complete registry before rewriting ssh.conf so malformed
+    # user-controlled data cannot leave a half-purged SSH state.
+    _boxa::ssh_registry_validate_path 'SSH key registry Project path' \
+        "$project_path" || return 1
+    _boxa::ssh_registry_load_project "$project_path" || return 1
     if _boxa::remove_conf_section_file "$project_path" "$conf"; then
         ssh_status=removed
     else

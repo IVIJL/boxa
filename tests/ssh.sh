@@ -1408,6 +1408,36 @@ assert_eq "Project-state purge empties a running per-project agent" empty \
 assert_eq "Project-state purge removes the complete Key registry section" 0 \
     "$(grep -cF "[$purged_agent_project]" "$BOXA_SSH_KEY_REGISTRY" || true)"
 
+malformed_purge_project="$_TMPROOT/malformed-purge-project"
+mkdir -p "$malformed_purge_project"
+cp "$BOXA_SSH_KEY_REGISTRY" "$_TMPROOT/registry-before-malformed-purge"
+cp "$BOXA_SSH_CONF" "$_TMPROOT/ssh-before-malformed-purge"
+_boxa::ssh_registry_record_key "$malformed_purge_project" "$real_registry_key"
+printf '[%s]\ngate = on\n' "$malformed_purge_project" >> "$BOXA_SSH_CONF"
+malformed_purge_state="$(
+    unset -f ssh-add
+    _boxa::ssh_reapply_registry_keys "$malformed_purge_project" >/dev/null \
+        || exit 1
+    printf 'garbage\n' >> "$BOXA_SSH_KEY_REGISTRY"
+    if _boxa::ssh_purge_project_state "$malformed_purge_project" \
+            >/dev/null 2>&1; then
+        printf 'unexpected-success\n'
+    else
+        printf 'failed\n'
+    fi
+    if ssh-add -l >/dev/null 2>&1; then
+        printf 'keys\n'
+    else
+        printf 'empty\n'
+    fi
+    grep -qF "[$malformed_purge_project]" "$BOXA_SSH_CONF" \
+        && printf 'conf-preserved\n'
+)"
+assert_eq "malformed registry fails before SSH state or agent mutation" \
+    $'failed\nkeys\nconf-preserved' "$malformed_purge_state"
+mv "$_TMPROOT/registry-before-malformed-purge" "$BOXA_SSH_KEY_REGISTRY"
+mv "$_TMPROOT/ssh-before-malformed-purge" "$BOXA_SSH_CONF"
+
 concurrent_assignment_project="$_TMPROOT/concurrent-assignment-project"
 mkdir -p "$concurrent_assignment_project"
 _boxa::ssh_registry_record_key \

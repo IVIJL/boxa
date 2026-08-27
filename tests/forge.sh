@@ -321,6 +321,45 @@ assert_eq "forge writer reclaims a lock owned by a dead process" "off" \
 assert_eq "reclaimed forge lock is removed after success" "absent" \
     "$([ -e "$BOXA_FORGE_CONF.lock" ] && printf present || printf absent)"
 
+# Project purge keeps the catalog lock while waiting inside the SSH registry
+# critical section, preserving the catalog -> registry lock order.
+purge_lock_project=/work/purge-lock
+printf '[%s]\nforge = on\n' "$purge_lock_project" > "$BOXA_FORGE_CONF"
+printf '[%s]\ngate = on\n' "$purge_lock_project" > "$BOXA_SSH_CONF"
+printf '[%s]\nkey = /keys/purge-lock\n' "$purge_lock_project" \
+    > "$BOXA_SSH_KEY_REGISTRY"
+purge_lock_marker="$_TMPROOT/purge-lock.marker"
+purge_lock_release="$_TMPROOT/purge-lock.release"
+purge_catalog_acquired="$_TMPROOT/purge-catalog.acquired"
+eval "$(declare -f _boxa::ssh_purge_project_state_locked \
+    | sed '1s/_boxa::ssh_purge_project_state_locked/_boxa::ssh_purge_project_state_locked_real/')"
+_boxa::ssh_purge_project_state_locked() {
+    : > "$purge_lock_marker"
+    while [ ! -e "$purge_lock_release" ]; do sleep 0.01; done
+    _boxa::ssh_purge_project_state_locked_real "$@"
+}
+# shellcheck disable=SC2317  # invoked dynamically by the catalog lock helper
+_boxa::test_mark_catalog_acquired() {
+    : > "$purge_catalog_acquired"
+}
+_boxa::forge_purge_project_state "$purge_lock_project" >/dev/null &
+purge_lock_pid=$!
+for _ in {1..100}; do [ -e "$purge_lock_marker" ] && break; sleep 0.01; done
+_boxa::forge_with_catalog_lock _boxa::test_mark_catalog_acquired &
+purge_catalog_pid=$!
+sleep 0.1
+assert_eq "Project purge retains the catalog lock inside the registry lock" \
+    absent "$([ -e "$purge_catalog_acquired" ] && printf present || printf absent)"
+: > "$purge_lock_release"
+wait "$purge_lock_pid"
+wait "$purge_catalog_pid"
+assert_eq "catalog waiter proceeds after atomic Project purge" \
+    present "$([ -e "$purge_catalog_acquired" ] && printf present || printf absent)"
+eval "$(declare -f _boxa::ssh_purge_project_state_locked_real \
+    | sed '1s/_boxa::ssh_purge_project_state_locked_real/_boxa::ssh_purge_project_state_locked/')"
+unset -f _boxa::ssh_purge_project_state_locked_real \
+    _boxa::test_mark_catalog_acquired
+
 # --- Default persona SSH gate synthesis -----------------------------------
 
 default_key="$_TMPROOT/default-key"

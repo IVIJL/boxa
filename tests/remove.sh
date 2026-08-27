@@ -34,7 +34,12 @@ case "${1:-}" in
                 ;;
         esac
         ;;
-    ps) ;;
+    ps)
+        if [ -n "${BOXA_REMOVE_TEST_RUNNING:-}" ] \
+                && [[ " $* " == *" name=^boxa-${BOXA_REMOVE_TEST_RUNNING}$ "* ]]; then
+            printf '%s\n' running-id
+        fi
+        ;;
 esac
 STUB
 
@@ -93,6 +98,7 @@ reset_stores() {
     mkdir -p "$TEST_CONFIG"
     : > "$BOXA_REMOVE_TEST_VOLUMES"
     : > "$BOXA_REMOVE_TEST_REMOVED_VOLUMES"
+    unset BOXA_REMOVE_TEST_RUNNING
 }
 
 write_projects() {
@@ -168,6 +174,21 @@ assert_file_eq "SSH purge preserves unrelated bytes" \
 assert_file_eq "registry purge preserves unrelated bytes" \
     "$_TMPROOT/expected-registry" "$TEST_CONFIG/ssh-key-registry"
 
+# JSON registry rows preserve tabs and backslashes through name resolution.
+reset_stores
+special_path=$'/work/back\\slash\tsegment'
+jq -n --arg path "$special_path" --arg name special-name \
+    '{version: 1, projects: {($path): {name: $name, lastSeen: "now"}}}' \
+    > "$TEST_CONFIG/projects.json"
+printf '[%s]\nforge = on\n' "$special_path" > "$TEST_CONFIG/forge.conf"
+run_boxa remove special-name >/dev/null 2>&1
+special_rc=$?
+assert_eq "registry path with tab and backslash resolves exactly" 0 "$special_rc"
+assert_eq "special-character registry path is purged" 0 \
+    "$(jq '.projects | length' "$TEST_CONFIG/projects.json")"
+assert_eq "special-character config section is purged" 0 \
+    "$(wc -c < "$TEST_CONFIG/forge.conf" | tr -d ' ')"
+
 # An absolute path uses its registered name for legacy artifact cleanup.
 reset_stores
 path_target=/work/path-target
@@ -191,6 +212,38 @@ assert_eq "legacy literal volume target succeeds" 0 "$legacy_rc"
 assert_contains "legacy literal volume is still removed" \
     "Removed volume: boxa-legacy.name-history" "$legacy_output"
 assert_eq "legacy target also purges its sanitized registry mapping" 0 \
+    "$(jq '.projects | length' "$TEST_CONFIG/projects.json")"
+
+# Every literal/sanitized name is guarded before legacy cleanup starts.
+reset_stores
+write_projects '{"/work/legacy-running":{"name":"legacy-running","lastSeen":"now"}}'
+printf '%s\n' boxa-legacy.running-history > "$BOXA_REMOVE_TEST_VOLUMES"
+export BOXA_REMOVE_TEST_RUNNING=legacy-running
+running_output="$(run_boxa remove legacy.running 2>&1)"
+running_rc=$?
+assert_eq "sanitized running Container blocks legacy removal" 1 "$running_rc"
+assert_contains "running guard names the sanitized Container" \
+    "Container boxa-legacy-running is running" "$running_output"
+assert_eq "blocked legacy removal preserves its volume" \
+    boxa-legacy.running-history "$(cat "$BOXA_REMOVE_TEST_VOLUMES")"
+assert_eq "blocked legacy removal preserves its registry path" 1 \
+    "$(jq '.projects | length' "$TEST_CONFIG/projects.json")"
+
+# Malformed SSH registry data fails loudly before any config rewrite.
+reset_stores
+malformed_path=/work/malformed-registry
+write_projects '{"/work/malformed-registry":{"name":"malformed-registry","lastSeen":"now"}}'
+printf '[%s]\ngate = on\n' "$malformed_path" > "$TEST_CONFIG/ssh.conf"
+printf '[%s]\nkey = /keys/valid\ngarbage\n' "$malformed_path" \
+    > "$TEST_CONFIG/ssh-key-registry"
+malformed_output="$(run_boxa remove malformed-registry 2>&1)"
+malformed_rc=$?
+assert_eq "malformed SSH registry fails outer remove loudly" 1 "$malformed_rc"
+assert_contains "malformed registry reports atomic purge failure" \
+    "ERROR: could not atomically purge forge and SSH state" "$malformed_output"
+assert_contains "failed malformed purge preserves ssh.conf" \
+    "[$malformed_path]" "$(cat "$TEST_CONFIG/ssh.conf")"
+assert_eq "failed malformed purge preserves projects.json" 1 \
     "$(jq '.projects | length' "$TEST_CONFIG/projects.json")"
 
 # The interactive union exposes a registry-only Project.

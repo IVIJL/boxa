@@ -449,9 +449,42 @@ _boxa::forge_remove_project_section_locked() {
     _boxa::remove_conf_section_file "$project_path" "$conf"
 }
 
-_boxa::forge_remove_project_section() {
-    _boxa::forge_with_catalog_lock \
-        _boxa::forge_remove_project_section_locked "$@"
+# Purge forge.conf, ssh.conf, and the SSH Key registry while holding the
+# established catalog -> registry lock order used by forge assignment writes.
+_boxa::forge_purge_project_state_all_locks() {
+    local project_path="$1" forge_status ssh_result ssh_status
+    local registry_status status
+
+    # Validate before the first rewrite. This keeps malformed registry data
+    # from producing a partial forge/SSH purge or bypassing agent reconciliation.
+    _boxa::ssh_registry_validate_path 'SSH key registry Project path' \
+        "$project_path" || return 1
+    _boxa::ssh_registry_load_project "$project_path" || return 1
+    if _boxa::forge_remove_project_section_locked "$project_path"; then
+        forge_status=removed
+    else
+        case $? in
+            2) forge_status=absent ;;
+            *) return 1 ;;
+        esac
+    fi
+    if ssh_result="$(_boxa::ssh_purge_project_state_locked "$project_path")"; then
+        status=0
+    else
+        status=$?
+    fi
+    IFS=$'\t' read -r ssh_status registry_status <<< "$ssh_result"
+    printf '%s\t%s\t%s\n' "$forge_status" "$ssh_status" "$registry_status"
+    return "$status"
+}
+
+_boxa::forge_purge_project_state_locked() {
+    _boxa::ssh_with_registry_lock \
+        _boxa::forge_purge_project_state_all_locks "$@"
+}
+
+_boxa::forge_purge_project_state() {
+    _boxa::forge_with_catalog_lock _boxa::forge_purge_project_state_locked "$@"
 }
 
 _boxa::forge_run_catalog_locked() {
