@@ -3189,7 +3189,10 @@ _boxa::remove_recorded_project_path() {
     config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/boxa"
     registry="$config_dir/projects.json"
     lockfile="$registry.lock"
-    [ -f "$registry" ] || return 2
+    if ! mkdir -p "$config_dir"; then
+        echo "boxa: WARNING: could not access Project registry at $registry" >&2
+        return 1
+    fi
     (
         local tmp
         if command -v flock >/dev/null 2>&1; then
@@ -3203,6 +3206,7 @@ _boxa::remove_recorded_project_path() {
         else
             echo "boxa: WARNING: flock is unavailable; Project registry removal is not protected from concurrent starts" >&2
         fi
+        [ -f "$registry" ] || return 2
         jq -e --arg path "$project_path" \
             '.version == 1 and (.projects | type == "object")
                 and (.projects | has($path))' \
@@ -6115,6 +6119,9 @@ if [ "$MODE" = "remove" ]; then
         _boxa::conf_has_section "$project_path" "$key_registry" \
             && _BOXA_REMOVE_CONFIG_FOUND=true
 
+        # Remove all four-store state present while these locks are held.
+        # A (re)registration starting after this critical section is a new
+        # Project start and out of scope; live Containers fail the earlier guard.
         if purge_result="$(_boxa::forge_purge_project_state \
                 "$project_path" _boxa::remove_recorded_project_path)"; then
             status=0

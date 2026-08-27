@@ -56,6 +56,12 @@ if [ -d "$BOXA_REMOVE_TEST_FORGE_LOCK" ] \
 else
     printf 'released\n' >> "$BOXA_REMOVE_TEST_PROJECT_LOCK_ORDER"
 fi
+if [ -n "${BOXA_REMOVE_TEST_REGISTER_ON_LOCK:-}" ]; then
+    jq -n --arg path "$BOXA_REMOVE_TEST_REGISTER_ON_LOCK" \
+        '{version: 1, projects: {
+            ($path): {name: "registered-under-lock", lastSeen: "now"}
+        }}' > "$BOXA_REMOVE_TEST_PROJECTS"
+fi
 STUB
 chmod +x "$TEST_BOXA_DIR/docker-run.sh" "$_TMPROOT/bin/docker" \
     "$_TMPROOT/bin/flock" "$_TMPROOT/bin/sudo"
@@ -65,6 +71,7 @@ export BOXA_REMOVE_TEST_REMOVED_VOLUMES="$_TMPROOT/removed-volumes"
 export BOXA_REMOVE_TEST_FORGE_LOCK="$TEST_CONFIG/forge.conf.lock"
 export BOXA_REMOVE_TEST_SSH_LOCK="$TEST_CONFIG/ssh-key-registry.lock"
 export BOXA_REMOVE_TEST_PROJECT_LOCK_ORDER="$_TMPROOT/project-lock-order"
+export BOXA_REMOVE_TEST_PROJECTS="$TEST_CONFIG/projects.json"
 
 fail_count=0
 
@@ -113,6 +120,7 @@ reset_stores() {
     : > "$BOXA_REMOVE_TEST_REMOVED_VOLUMES"
     : > "$BOXA_REMOVE_TEST_PROJECT_LOCK_ORDER"
     unset BOXA_REMOVE_TEST_RUNNING
+    unset BOXA_REMOVE_TEST_REGISTER_ON_LOCK
 }
 
 write_projects() {
@@ -189,6 +197,20 @@ assert_file_eq "registry purge preserves unrelated bytes" \
     "$_TMPROOT/expected-registry" "$TEST_CONFIG/ssh-key-registry"
 assert_eq "projects.json mutates while forge and SSH locks are held" held \
     "$(cat "$BOXA_REMOVE_TEST_PROJECT_LOCK_ORDER")"
+
+# The missing-registry decision is made after acquiring all purge locks.
+reset_stores
+lock_publish_path=/work/published-at-lock
+printf '[%s]\nforge = on\n' "$lock_publish_path" > "$TEST_CONFIG/forge.conf"
+export BOXA_REMOVE_TEST_REGISTER_ON_LOCK="$lock_publish_path"
+lock_publish_output="$(run_boxa remove "$lock_publish_path" 2>&1)"
+lock_publish_rc=$?
+unset BOXA_REMOVE_TEST_REGISTER_ON_LOCK
+assert_eq "registry published at lock acquisition is removed" 0 "$lock_publish_rc"
+assert_contains "lock-time registration is reported as removed" \
+    "Removed projects.json entry: $lock_publish_path" "$lock_publish_output"
+assert_eq "lock-time registration leaves no registry entry" 0 \
+    "$(jq '.projects | length' "$TEST_CONFIG/projects.json")"
 
 # JSON registry rows preserve tabs and backslashes through name resolution.
 reset_stores
