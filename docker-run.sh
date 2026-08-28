@@ -825,7 +825,77 @@ bootstrap_traefik() {
 }
 
 seed_allowed_domains() {
-    allowlist::ensure_seeded "$ALLOWLIST_HOST_FILE" "$BOXA_DIR/config/default-allowlist.conf"
+    local defaults="$BOXA_DIR/config/default-allowlist.conf"
+    if [ -f "$defaults" ]; then
+        allowlist::ensure_seeded "$ALLOWLIST_HOST_FILE" "$defaults"
+    fi
+}
+
+# Move legacy single-file shared config into the ADR 0036 directory mount and
+# ensure every manifest member exists. The warning is naturally one-shot: it
+# is emitted only by the invocation that actually moves at least one file.
+prepare_shared_config() {
+    mkdir -p "$SHARED_CONFIG_HOST_DIR"
+
+    local filename legacy_file shared_file
+    local migrated=false
+    for filename in "${SHARED_CONFIG_FILES[@]}"; do
+        legacy_file="$ALLOWLIST_HOST_DIR/$filename"
+        shared_file="$SHARED_CONFIG_HOST_DIR/$filename"
+        if [ -f "$legacy_file" ] && [ ! -e "$shared_file" ]; then
+            mv "$legacy_file" "$shared_file"
+            migrated=true
+        fi
+    done
+    seed_allowed_domains
+    for filename in "${SHARED_CONFIG_FILES[@]}"; do
+        shared_file="$SHARED_CONFIG_HOST_DIR/$filename"
+        [ -e "$shared_file" ] || : > "$shared_file"
+    done
+
+    if $migrated; then
+        local containers container mounts stale_containers
+        containers=$(docker ps --filter "name=^boxa-" --format '{{.Names}}' 2>/dev/null \
+            | filter_user_containers || true)
+        stale_containers=""
+        while IFS= read -r container; do
+            [ -n "$container" ] || continue
+            mounts=$(docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' \
+                "$container" 2>/dev/null || true)
+            for filename in "${SHARED_CONFIG_FILES[@]}"; do
+                if printf '%s\n' "$mounts" \
+                        | grep -qxF "/etc/boxa-shared/$filename"; then
+                    stale_containers+="${stale_containers:+$'\n'}$container"
+                    break
+                fi
+            done
+        done <<< "$containers"
+        if [ -n "$stale_containers" ]; then
+            echo "WARNING: Shared config moved to ~/.config/boxa/shared/."
+            echo "  These running Containers still hold legacy file mounts:"
+            while IFS= read -r container; do
+                [ -n "$container" ] && echo "    - $container"
+            done <<< "$stale_containers"
+            echo "  Run 'boxa stop && boxa' for each to pick up future allowlist changes."
+        fi
+    fi
+}
+
+shared_config_unexpected_files() {
+    [ -d "$SHARED_CONFIG_HOST_DIR" ] || return 0
+
+    local path filename manifest_file listed
+    while IFS= read -r path; do
+        filename="${path##*/}"
+        listed=false
+        for manifest_file in "${SHARED_CONFIG_FILES[@]}"; do
+            if [ "$filename" = "$manifest_file" ]; then
+                listed=true
+                break
+            fi
+        done
+        $listed || printf '%s\n' "$filename"
+    done < <(find "$SHARED_CONFIG_HOST_DIR" -mindepth 1 -maxdepth 1 -print | sort)
 }
 
 # Keep ~/.config/boxa/dns/boxa.conf bit-for-bit identical to the
@@ -2961,8 +3031,9 @@ detect_docker_dns_upstream() {
 # bind-mounted into the container. Called on BOTH the create and the
 # `docker start` restart paths so a daemon-DNS change is picked up without
 # recreating the container — a docker -e env var would freeze at create time.
-# Written in place (truncate, not unlink+recreate) so the bind-mount inode is
-# preserved (memory: Docker Desktop snapshots bind mounts by inode).
+# Written in place as transition-window hygiene for Containers that still hold
+# the legacy single-file mount. New directory-mounted Containers do not depend
+# on the member file's inode.
 write_dns_upstream_file() {
     mkdir -p "$(dirname "$DNS_UPSTREAM_HOST_FILE")"
     detect_docker_dns_upstream > "$DNS_UPSTREAM_HOST_FILE"
@@ -3286,15 +3357,13 @@ restart_exited_container() {
         mcp_project_path="$(_boxa::container_project_path "$name")"
     fi
     echo "Restarting exited container: $name"
-    # Containers created before the DNS upstream bind mount existed (ADR 0015)
-    # would have DNS_UPSTREAM_CONTAINER_FILE absent after a plain `docker start`,
-    # leaving DNS broken. Detect the missing mount and fall back to recreation
-    # (rm + return 1), the same contract the caller already handles for stale
-    # mounts. New containers always have the mount, so this is a one-time
-    # post-upgrade recreation.
+    # Containers created before the shared-config directory mount existed
+    # would retain legacy or missing file mounts after a plain `docker start`.
+    # Detect the missing directory mount and fall back to recreation (rm +
+    # return 1), the same contract the caller already handles for stale mounts.
     if ! docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$name" 2>/dev/null \
-            | grep -qxF "$DNS_UPSTREAM_CONTAINER_FILE"; then
-        echo "Recreating container to add the DNS upstream mount (ADR 0015)..."
+            | grep -qxF "$SHARED_CONFIG_CONTAINER_DIR"; then
+        echo "Recreating container to add the shared-config directory mount (ADR 0036)..."
         _boxa::remove_container_after_oom_sweep "$name"
         return 1
     fi
@@ -4324,6 +4393,11 @@ case "${1:-}" in
     *)         MODE="auto" ;;
 esac
 
+# Every normal invocation converges the host layout before any command reads
+# or writes shared config. Help exits during parsing and intentionally has no
+# host-side effects.
+prepare_shared_config
+
 # --- boxa ls ---------------------------------------------------------------
 
 if [ "$MODE" = "ls" ]; then
@@ -5169,6 +5243,16 @@ if [ "$MODE" = "doctor" ]; then
     fi
 
     report_broken_host_connections
+
+    unexpected_shared_config="$(shared_config_unexpected_files)"
+    if [ -n "$unexpected_shared_config" ]; then
+        echo ""
+        echo "WARNING: Unexpected files in ~/.config/boxa/shared/:"
+        while IFS= read -r unexpected_file; do
+            [ -n "$unexpected_file" ] && echo "  - $unexpected_file"
+        done <<< "$unexpected_shared_config"
+        echo "Only SHARED_CONFIG_FILES manifest entries are permitted there."
+    fi
 
     if [ "${#BOXA_PROVISIONING_FAILED[@]}" -gt 0 ]; then
         echo ""
@@ -6769,7 +6853,7 @@ fi
 if [ "$MODE" = "allow" ]; then
     # No domain specified → list allowed domains
     if [ -z "${DOMAIN:-}" ]; then
-        echo "Allowed domains (~/.config/boxa/allowed-domains.conf):"
+        echo "Allowed domains (~/.config/boxa/shared/allowed-domains.conf):"
         allowed_list=$(allowlist::read "$ALLOWLIST_HOST_FILE" | sort)
         if [ -n "$allowed_list" ]; then
             echo "$allowed_list" | while read -r d; do echo "  $d"; done
@@ -7063,11 +7147,6 @@ DOCKER_ARGS=(
 )
 
 _boxa::append_mkcert_ca_args
-
-# Docker DNS upstream(s) for init-firewall.sh — bind-mounted read-only (not a
-# frozen -e env var) so `docker start` restarts re-read the current value.
-# write_dns_upstream_file (above) created the host file. See ADR 0015.
-DOCKER_ARGS+=(-v "$DNS_UPSTREAM_HOST_FILE:$DNS_UPSTREAM_CONTAINER_FILE:ro")
 
 # Git config from host (staging path — copied to /etc/gitconfig by entrypoint
 # so VS Code/Cursor can write credential helpers without "Device busy" error)
@@ -7641,10 +7720,10 @@ fi
 # Host home directory for WezTerm OSC 7 safe fallback CWD
 DOCKER_ARGS+=(-e "HOST_HOME=$HOME")
 
-# Shared firewall allowlist (host → all containers, read-only)
-mkdir -p "$ALLOWLIST_HOST_DIR"
-touch "$ALLOWLIST_HOST_FILE"
-DOCKER_ARGS+=(-v "$ALLOWLIST_HOST_FILE:$ALLOWLIST_CONTAINER_FILE:ro")
+# Shared firewall configuration (host → all Containers, read-only). The host
+# directory was created and populated strictly from SHARED_CONFIG_FILES by
+# prepare_shared_config; mount only that dedicated security boundary.
+DOCKER_ARGS+=(-v "$SHARED_CONFIG_HOST_DIR:$SHARED_CONFIG_CONTAINER_DIR:ro")
 
 # Harvest log directory for `boxa allow-for` (ADR 0009). Provisioned
 # root:root 0755 by install.sh / `boxa update` self-heal. Mounted RW so

@@ -9,7 +9,8 @@ agent simply cannot exfiltrate to an arbitrary host.
 GitHub is allowed by IP range. Default allowed domains include the Anthropic
 API, npm, PyPI, crates.io, the VS Code marketplace, Cursor, and Docker Hub. The
 allowlist file is seeded on first run at
-`~/.config/boxa/allowed-domains.conf` and can be edited by hand or via the CLI.
+`~/.config/boxa/shared/allowed-domains.conf` and can be edited by hand or via
+the CLI.
 
 See [ADR 0001](adr/0001-dnsmasq-dynamic-allowlist.md) for the dynamic-allowlist
 design and [ADR 0015](adr/0015-firewall-dns-upstream-on-native-docker.md) for

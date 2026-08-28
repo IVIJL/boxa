@@ -12,7 +12,7 @@ has its own `Allowlist` file and its own enforcement layer.
 The firewall side has full CLI coverage: `boxa blocked` shows what
 the in-container dnsmasq queried but failed to match against the
 **Allowed-domains ipset**, with an interactive picker that adds the
-selection to `~/.config/boxa/allowed-domains.conf`. `boxa allow
+selection to `~/.config/boxa/shared/allowed-domains.conf`. `boxa allow
 <domain>` and `boxa deny <domain>` round-trip the file.
 
 The agent-browser side has none of that. The proxy daemon (slice 04 of

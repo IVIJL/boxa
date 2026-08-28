@@ -10,7 +10,7 @@ shared resolver, and the optional HTTPS layer.
 ### Firewall
 
 **Allowlist**:
-The user-curated set of domains in `~/.config/boxa/allowed-domains.conf`
+The user-curated set of domains in `~/.config/boxa/shared/allowed-domains.conf`
 whose resolved IPs the firewall permits permanently.
 _Avoid_: whitelist, ACL, rules
 
@@ -669,7 +669,8 @@ _Avoid_: boxa check, boxa repair, boxa heal
 - A **Container** can contain zero or more **Compose projects** and zero or
   more **Unmanaged inner containers**; both consist of **Inner containers**.
 - An **Allowlist** is shared across all of a user's **Containers**
-  (bind-mounted `:ro` from `~/.config/boxa/allowed-domains.conf`).
+  (available through the read-only directory mount from
+  `~/.config/boxa/shared/allowed-domains.conf`).
 - An **Allow-for window** runs in exactly one **Container** at a time;
   starting a second window in the same container *resets the clock* (does
   not stack).

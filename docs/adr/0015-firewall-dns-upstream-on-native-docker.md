@@ -103,13 +103,14 @@ own upstream forward, and only when the daemon DNS is non-loopback.
    writes them (space-separated — `daemon.json` may declare several servers and
    Docker falls back to later entries, so each must be allowed) to a host file
    bind-mounted read-only into the container at
-   `/etc/boxa-shared/dns-upstream.conf`. A **bind-mounted file, not a
-   `-e` env var**: env is frozen at container create, but `docker start`
+   `/etc/boxa-shared/config/dns-upstream.conf`. A **file in the bind-mounted
+   shared-config directory, not a `-e` env var**: env is frozen at container create, but `docker start`
    re-runs the entrypoint firewall, so `write_dns_upstream_file` is called on
    **both** the create and the restart paths and the file is re-read each time
    — a daemon-DNS change is picked up on the next restart without recreating
-   the container. The file is truncated in place (memory: Docker Desktop
-   snapshots bind mounts by inode). Detection is two tiers, matching Docker's
+   the container. Amendment (ADR 0036): the old need to truncate in place
+   because Docker snapshots file bind mounts by inode is obsolete now that the
+   parent directory is mounted. Detection is two tiers, matching Docker's
    own precedence, parsed **without jq** (`install.sh` does not provision jq
    host-side, so requiring it would no-op the fix on the very hosts it
    targets):

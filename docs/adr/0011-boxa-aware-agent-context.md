@@ -69,7 +69,8 @@ The container entrypoint (root phase, mirroring its existing
 - Root-owned, world-readable (`0644`), `/etc/boxa/` directory
   created idempotently. Mirrors the existing `/etc/boxa-shared/`
   naming convention (per-container, container-only). Distinct from
-  `/etc/boxa-shared/` which is bind-mounted shared state.
+  `/etc/boxa-shared/config/`, which is bind-mounted shared config; its parent
+  remains an image directory for container-local state.
 - Single field today: `project`. JSON for future extensibility
   (`image_version`, `started_at`, etc., should diagnostic need arise).
 - Container hostname is the same value (`boxa-<project>`), but the

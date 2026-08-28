@@ -152,7 +152,11 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(report.hints, ["boxa allow mcp.dozzle.example.test"])
 
         allowlist = os.path.join(
-            self.tmp.name, ".config", "boxa", "allowed-domains.conf"
+            self.tmp.name,
+            ".config",
+            "boxa",
+            "shared",
+            "allowed-domains.conf",
         )
         os.makedirs(os.path.dirname(allowlist), exist_ok=True)
         with open(allowlist, "w", encoding="utf-8") as fh:

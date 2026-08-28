@@ -9,6 +9,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOOK="$SCRIPT_DIR/../scripts/hooks/boxa-memory-context.sh"
 
+# shellcheck disable=SC2034  # Consumed by the dynamically sourced hook below.
 BOXA_MEMHOOK_NO_MAIN=1
 # shellcheck source-path=SCRIPTDIR source=../scripts/hooks/boxa-memory-context.sh disable=SC1091
 source "$HOOK"

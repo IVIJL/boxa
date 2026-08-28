@@ -12,7 +12,7 @@ populated from two sources:
 1. **GitHub IP ranges** — fetched once at container startup from
    `api.github.com/meta` and inserted into the ipset as static CIDRs.
 2. **Domain-based rules** — for every domain in
-   `~/.config/boxa/allowed-domains.conf`, a dnsmasq `ipset=/<domain>/allowed-domains`
+   `~/.config/boxa/shared/allowed-domains.conf`, a dnsmasq `ipset=/<domain>/allowed-domains`
    directive is generated. dnsmasq then adds the resolved IP to the ipset
    **at DNS lookup time**, every time, automatically.
 

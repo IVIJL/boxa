@@ -41,7 +41,7 @@ fi
 # --- Runtime-state probe -----------------------------------------------------
 # A sentinel alone doesn't guarantee a *working* window: a container restart
 # runs init-firewall.sh, which flushes iptables and destroys ipsets, but
-# leaves /etc/boxa-shared/.allow-for.state untouched (that's a bind-mount).
+# leaves /etc/boxa-shared/.allow-for.state untouched in the Container rootfs.
 # If the runtime state is gone, taking the reset-clock fast path would lie
 # to the user — sentinel says "active" while the firewall blocks everything
 # outside the permanent allowlist.

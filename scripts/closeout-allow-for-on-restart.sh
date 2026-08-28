@@ -9,7 +9,7 @@ set -euo pipefail
 #
 # Reason this script exists: the teardown daemon owns the normal close path,
 # but it dies on container restart. A live sentinel that survives restart
-# (it lives on the bind-mounted `boxa-shared` volume) would otherwise leave
+# (it lives in the Container rootfs) would otherwise leave
 # a phantom "active window" forever, and the user would never get a
 # notification with the harvest summary.
 #

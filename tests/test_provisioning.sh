@@ -224,12 +224,21 @@ boxa::run_provisioning() {
 }
 boxa::prereq_remedy() { :; }
 EOF
+mkdir -p "$tmp/doctor-home/.config/boxa/shared"
+unexpected_shared_name="unexpected.conf"
+touch "$tmp/doctor-home/.config/boxa/shared/$unexpected_shared_name"
 doctor_output="$(HOME="$tmp/doctor-home" \
     bash "$doctor_cli_dir/docker-run.sh" doctor --fix ssh-gate 2>&1)"
 check "doctor repaired ssh-gate includes disable hint" \
     "yes" \
     "$([[ "$doctor_output" == *'  - ssh-gate    (disable: boxa ssh off --global)'* ]] \
         && printf yes || printf no)"
+check "doctor warns about a file outside the shared-config manifest" \
+    "yes" \
+    "$([[ "$doctor_output" == *'WARNING: Unexpected files in ~/.config/boxa/shared/'* ]] \
+        && [[ "$doctor_output" == *"  - $unexpected_shared_name"* ]] \
+        && printf yes || printf no)"
+rm -f "$tmp/doctor-home/.config/boxa/shared/$unexpected_shared_name"
 
 # Doctor reports a missing required host binary as an actionable prerequisite
 # and exits non-zero, without attempting to repair it.

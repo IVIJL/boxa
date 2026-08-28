@@ -89,13 +89,13 @@ allow_for::is_expired() {
 #
 # Usage: allow_for::harvest_domains <start_byte> [allowlist_file]
 #   - start_byte:     0 reads the whole file; non-zero starts after that offset.
-#   - allowlist_file: defaults to /etc/boxa-shared/allowed-domains.conf.
+#   - allowlist_file: defaults to the shared-config allowlist.
 #
 # Prints one domain per line, sorted, deduplicated. Empty output is normal
 # (no non-allowlist queries yet).
 allow_for::harvest_domains() {
     local start_byte="${1:-0}"
-    local allowlist_file="${2:-/etc/boxa-shared/allowed-domains.conf}"
+    local allowlist_file="${2:-/etc/boxa-shared/config/allowed-domains.conf}"
 
     [ -f "$ALLOW_FOR_DNSMASQ_QUERIES" ] || return 0
 

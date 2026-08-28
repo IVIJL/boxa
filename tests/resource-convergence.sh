@@ -197,12 +197,12 @@ else
     source "$extracted"
     calls="$_TMPROOT/restart.calls"
     : > "$calls"
-    DNS_UPSTREAM_CONTAINER_FILE=/etc/boxa-shared/docker-dns-upstream.conf
+    SHARED_CONFIG_CONTAINER_DIR=/etc/boxa-shared/config
 
     # shellcheck disable=SC2317
     docker() {
         if [ "$1" = inspect ]; then
-            printf '%s\n' "$DNS_UPSTREAM_CONTAINER_FILE"
+            printf '%s\n' "$SHARED_CONFIG_CONTAINER_DIR"
         else
             printf 'docker:%s\n' "$*" >> "$calls"
         fi

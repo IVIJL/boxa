@@ -85,7 +85,11 @@ def remote_domain(entry: dict[str, Any]) -> str:
 
 def _host_allowlist_path() -> str:
     return os.path.join(
-        os.path.expanduser("~"), ".config", "boxa", "allowed-domains.conf"
+        os.path.expanduser("~"),
+        ".config",
+        "boxa",
+        "shared",
+        "allowed-domains.conf",
     )
 
 

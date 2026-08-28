@@ -3,7 +3,7 @@
 # Boxa firewall allowlist — single source of truth
 # =============================================================================
 # Sourced by:
-#   - docker-run.sh (host)         to read/edit ~/.config/boxa/allowed-domains.conf
+#   - docker-run.sh (host)         to read/edit the shared allowlist
 #   - init-firewall.sh (container) to render dnsmasq runtime config at startup
 #   - boxa-firewall-reload (container) to regenerate dnsmasq config on allow/deny
 #
@@ -18,21 +18,27 @@
 # All constants are consumed by sourcing scripts; shellcheck can't see that.
 # shellcheck disable=SC2034
 
+# Shared-config manifest. Only these files may live in the directory mounted
+# into Containers (ADR 0036).
+SHARED_CONFIG_FILES=(allowed-domains.conf dns-upstream.conf)
+
 # Host (set by docker-run.sh callers)
-ALLOWLIST_HOST_FILE="${HOME:-/root}/.config/boxa/allowed-domains.conf"
 ALLOWLIST_HOST_DIR="${HOME:-/root}/.config/boxa"
+SHARED_CONFIG_HOST_DIR="$ALLOWLIST_HOST_DIR/shared"
+ALLOWLIST_HOST_FILE="$SHARED_CONFIG_HOST_DIR/allowed-domains.conf"
 
 # Container (set by init-firewall.sh and boxa-firewall-reload callers)
-ALLOWLIST_CONTAINER_FILE="/etc/boxa-shared/allowed-domains.conf"
+SHARED_CONFIG_CONTAINER_DIR="/etc/boxa-shared/config"
+ALLOWLIST_CONTAINER_FILE="$SHARED_CONFIG_CONTAINER_DIR/allowed-domains.conf"
 DNSMASQ_RUNTIME_FILE="/etc/dnsmasq.d/boxa-runtime.conf"
 
 # Docker DNS upstream allow-list (ADR 0015). Host detects the embedded
 # resolver's non-loopback upstream(s) and writes them here; the container
-# reads them at firewall init to allow that one forward. A bind-mounted file
-# (not a docker -e env var) so it is re-read on `docker start` restarts, not
-# frozen at create time.
-DNS_UPSTREAM_HOST_FILE="${HOME:-/root}/.config/boxa/dns-upstream.conf"
-DNS_UPSTREAM_CONTAINER_FILE="/etc/boxa-shared/dns-upstream.conf"
+# reads them at firewall init to allow that one forward. A file in the mounted
+# shared-config directory (not a docker -e env var) so it is re-read on
+# `docker start` restarts, not frozen at create time.
+DNS_UPSTREAM_HOST_FILE="$SHARED_CONFIG_HOST_DIR/dns-upstream.conf"
+DNS_UPSTREAM_CONTAINER_FILE="$SHARED_CONFIG_CONTAINER_DIR/dns-upstream.conf"
 
 # Shared
 IPSET_NAME="allowed-domains"
@@ -69,13 +75,11 @@ allowlist::add() {
 # Returns 0 if removed, 1 if not present.
 #
 # Rewrites the file IN PLACE (preserving its inode) rather than via a
-# temp-file `mv`. This file is bind-mounted into every running boxa container
-# (`-v allowed-domains.conf:/etc/boxa-shared/...:ro`); a Docker file bind-mount
-# pins to the source inode at container start. Replacing the file with a fresh
-# inode (what `mv` does) silently detaches every already-running container from
-# this and all future allowlist changes until it is restarted — so a `boxa
-# deny` would leave other containers reading a stale allowlist. `allowlist::add`
-# already appends with `>>` (inode-preserving) for the same reason.
+# temp-file `mv`. New Containers mount the parent directory and do not depend
+# on the member's inode, but Containers still running across the ADR 0036
+# transition retain the legacy single-file mount until restarted. Keeping the
+# rewrite in place protects that finite transition window. `allowlist::add`
+# already appends with `>>` and is safe for both layouts.
 #
 # Usage: allowlist::remove <file> <domain>
 allowlist::remove() {
