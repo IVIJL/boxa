@@ -67,3 +67,14 @@ Round-1 review found two gaps, fixed in a follow-up commit:
   dnsmasq runtime rules. It now fetches and filters each Container's
   queries against that same Container's own rules, then unions the
   per-Container blocked sets.
+
+Round-2 review found the dot-less exclusion above was itself wrong: the
+dnsmasq config has no `domain-needed` (and can't get one — it would break
+`boxa-<name>` resolution via Docker's embedded DNS), so single-label queries
+are genuinely forwarded upstream and can be real denials (e.g. an
+unallowlisted `boxa-<name>`). The true reason `localhost` never appears is
+that the config also has no `no-hosts`, so dnsmasq answers any name present
+in `/etc/hosts` locally without forwarding. `blocked_domains_from_dnsmasq()`
+now takes the querying Container's own `/etc/hosts` names as a third
+argument (fetched per-Container, like the dnsmasq rules) and excludes only
+those, so other single-label denials reappear in `boxa blocked`.

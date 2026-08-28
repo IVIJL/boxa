@@ -6426,11 +6426,15 @@ fi
 
 # Print queried domains that are not covered by dnsmasq ipset or address
 # rules. Address rules route dev URLs locally, so those queries are not
-# firewall denials and must not be offered for the Allowlist.
+# firewall denials and must not be offered for the Allowlist. dnsmasq has no
+# no-hosts setting, so names in the Container's /etc/hosts are resolved locally
+# without upstream forwarding and can never be firewall denials. domain-needed
+# cannot suppress all single-label forwarding because boxa-<name> resolution
+# must reach Docker's embedded DNS server at 127.0.0.11.
 blocked_domains_from_dnsmasq() {
-    local dnsmasq_rules="$1" queried_domains="$2"
-    local rule covered domain is_covered
-    local -a covered_domains=()
+    local dnsmasq_rules="$1" queried_domains="$2" hosts_names="$3"
+    local rule covered domain hosts_name is_covered is_local
+    local -a covered_domains=() local_names=()
 
     while IFS= read -r rule; do
         case "$rule" in
@@ -6442,11 +6446,20 @@ blocked_domains_from_dnsmasq() {
         esac
     done <<< "$dnsmasq_rules"
 
+    while IFS= read -r hosts_name; do
+        [ -n "$hosts_name" ] && local_names+=("$hosts_name")
+    done <<< "$hosts_names"
+
     while IFS= read -r domain; do
         [ -z "$domain" ] && continue
-        # Single-label names are resolved locally by dnsmasq or /etc/hosts;
-        # they are never forwarded upstream or subject to firewall ipsets.
-        [[ "$domain" != *.* ]] && continue
+        is_local=false
+        for hosts_name in "${local_names[@]}"; do
+            if [ "$domain" = "$hosts_name" ]; then
+                is_local=true
+                break
+            fi
+        done
+        [ "$is_local" = true ] && continue
         is_covered=false
         for covered in "${covered_domains[@]}"; do
             # dnsmasq covers the named domain and all of its subdomains.
@@ -6483,9 +6496,14 @@ if [ "$MODE" = "blocked" ]; then
                 grep -hE "^(ipset|address)=" /etc/dnsmasq.d/*.conf 2>/dev/null \
                     | sort -u || true
             ' 2>/dev/null || true)
+            hosts_names=$(docker exec -u root "$container" bash -c '
+                awk '\''!/^[[:space:]]*#/ && NF >= 2 {
+                    for (i = 2; i <= NF && $i !~ /^#/; i++) print $i
+                }'\'' /etc/hosts
+            ' 2>/dev/null || true)
 
             [ -z "$queried" ] && continue
-            blocked=$(blocked_domains_from_dnsmasq "$dnsmasq_rules" "$queried")
+            blocked=$(blocked_domains_from_dnsmasq "$dnsmasq_rules" "$queried" "$hosts_names")
             [ -n "$blocked" ] && all_blocked=$(printf '%s\n%s' "$all_blocked" "$blocked")
         done <<< "$containers"
 
