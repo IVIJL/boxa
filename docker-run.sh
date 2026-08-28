@@ -6424,6 +6424,38 @@ fi
 
 # --- boxa blocked -----------------------------------------------------------
 
+# Print queried domains that are not covered by dnsmasq ipset or address
+# rules. Address rules route dev URLs locally, so those queries are not
+# firewall denials and must not be offered for the Allowlist.
+blocked_domains_from_dnsmasq() {
+    local dnsmasq_rules="$1" queried_domains="$2"
+    local rule covered domain is_covered
+    local -a covered_domains=()
+
+    while IFS= read -r rule; do
+        case "$rule" in
+            ipset=/*|address=/*)
+                covered="${rule#*=/}"
+                covered="${covered%%/*}"
+                [ -n "$covered" ] && covered_domains+=("$covered")
+                ;;
+        esac
+    done <<< "$dnsmasq_rules"
+
+    while IFS= read -r domain; do
+        [ -z "$domain" ] && continue
+        is_covered=false
+        for covered in "${covered_domains[@]}"; do
+            # dnsmasq covers the named domain and all of its subdomains.
+            if [ "$domain" = "$covered" ] || [[ "$domain" == *."$covered" ]]; then
+                is_covered=true
+                break
+            fi
+        done
+        [ "$is_covered" = false ] && printf '%s\n' "$domain"
+    done <<< "$queried_domains"
+}
+
 if [ "$MODE" = "blocked" ]; then
     containers=$(docker ps --filter "name=^boxa-" --format '{{.Names}}' | filter_user_containers)
     # NOTE: the agent-browser side (denied-hosts-global) is scoped to LIVE
@@ -6449,34 +6481,18 @@ if [ "$MODE" = "blocked" ]; then
         all_queried=$(echo "$all_queried" | grep -v '^$' | sort -u)
 
         if [ -n "$all_queried" ]; then
-            # Get list of allowed domains from dnsmasq ipset config (inside
-            # first container). Allowlist is identical across containers
-            # (rendered from the same allowed-domains.conf).
+            # Get firewall and local-routing rules from dnsmasq config inside
+            # the first container. The runtime config is identical across
+            # containers because it is rendered from the same inputs.
             first_container=$(echo "$containers" | head -1)
-            allowed_domains=$(docker exec -u node "$first_container" bash -c '
-                grep "^ipset=" /etc/dnsmasq.d/*.conf 2>/dev/null \
-                    | grep -oP "ipset=/\K[^/]+" \
-                    | sort -u
+            dnsmasq_rules=$(docker exec -u node "$first_container" bash -c '
+                grep -hE "^(ipset|address)=" /etc/dnsmasq.d/*.conf 2>/dev/null \
+                    | sort -u || true
             ' 2>/dev/null || true)
 
-            # Filter: show only domains NOT covered by allowed list
-            blocked=""
-            while IFS= read -r domain; do
-                [ -z "$domain" ] && continue
-                is_allowed=false
-                while IFS= read -r allowed; do
-                    [ -z "$allowed" ] && continue
-                    # Check exact match or subdomain match (queried is *.allowed)
-                    if [ "$domain" = "$allowed" ] || [[ "$domain" == *."$allowed" ]]; then
-                        is_allowed=true
-                        break
-                    fi
-                done <<< "$allowed_domains"
-                if [ "$is_allowed" = false ]; then
-                    blocked=$(printf '%s\n%s' "$blocked" "$domain")
-                fi
-            done <<< "$all_queried"
-            blocked=$(echo "$blocked" | grep -v '^$' | sort -u)
+            # Show only domains that dnsmasq neither allows nor routes locally.
+            blocked=$(blocked_domains_from_dnsmasq "$dnsmasq_rules" "$all_queried" \
+                | sort -u)
 
             while IFS= read -r d; do
                 [ -z "$d" ] && continue

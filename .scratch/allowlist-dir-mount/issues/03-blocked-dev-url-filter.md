@@ -1,0 +1,56 @@
+# 03 — `boxa blocked` stops listing dev URLs
+
+Status: done
+
+## Parent
+
+ADR 0036 (proposed), section 6 of `../NOTES.md`. None of the mount work
+blocks this — the bug predates it.
+
+## What to build
+
+`boxa blocked` currently treats every logged dnsmasq query without an
+`ipset=` line as blocked. Dev URLs (`localhost`, `*.test`,
+`*.127.0.0.1.sslip.io`) are routed by `address=` lines in the same dnsmasq
+config, so they show up as "blocked" and get offered for `boxa allow` even
+though they are routing, not firewall denials.
+
+Extend the blocked-set definition to also exclude queries covered by the
+`address=` lines read from the same dnsmasq config the handler already opens.
+No hardcoded suffix list: whatever the firewall routes as a dev URL is
+automatically excluded, and anything it stops routing reappears.
+
+## Acceptance criteria
+
+- [x] Queries for `*.test`, `*.127.0.0.1.sslip.io` and `localhost` no longer
+      appear in `boxa blocked` output on a Container that has made such
+      queries. Proven via `tests/blocked.sh` ("dnsmasq ipset and address rules
+      exclude covered queries") against synthetic dnsmasq config + query
+      fixtures, since `blocked_domains_from_dnsmasq()` was extracted into a
+      pure, Docker-free function. Live verification on a real running
+      Container is deferred (host-only step, not available in this session).
+- [x] A genuinely blocked domain (no `ipset=`, no `address=` coverage) still
+      appears and is still offered for `boxa allow`. Proven by the same test
+      plus `tests/blocked.sh` ("an arbitrary runtime address suffix excludes
+      its subdomains" / "removing an address rule makes its query blocked
+      again", which also cover unrelated non-covered domains staying
+      blocked).
+- [x] The exclusion is derived from `address=` config at query time, not from
+      a literal suffix list in the handler. Proven by
+      `tests/blocked.sh` ("removing an address rule makes its query blocked
+      again"): removing an `address=` line from the fixture config makes the
+      corresponding domain reappear as blocked, and the handler
+      (`blocked_domains_from_dnsmasq` in `docker-run.sh`) contains no
+      hardcoded suffix list — confirmed by inspection of the diff.
+- [x] Existing test suites pass; shellcheck clean on touched scripts. All 34
+      `tests/*.sh` suites pass (exit 0 each, including the new
+      `tests/blocked.sh`); `shellcheck -S style` clean on `docker-run.sh` and
+      `tests/blocked.sh`. Python `pytest` suite was not independently
+      re-verified in this session (pytest not installed in this container);
+      unaffected by this change (no Python files touched).
+
+## Blocked by
+
+None — can start immediately.
+
+## Comments
