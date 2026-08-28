@@ -38,17 +38,27 @@ shared config directory", covering the one new risk the directory mount adds
       "manifest-only shared directory is clean").
 - [x] Existing test suites pass; shellcheck clean on touched scripts.
 
-## Comments
-
-Both guard rails were already implemented opportunistically in the issue-01
-commit (`91027a2`), which added `shared_config_unexpected_files()` and the
-static `scan_unlisted_shared_filenames` guard together with the manifest and
-directory mount. No further code changes were needed for this issue; verified
-by re-running the full proof (see below) rather than re-implementing.
-
 ## Blocked by
 
 `01-directory-mount-manifest-transition.md` (needs the manifest and directory
 to exist).
 
 ## Comments
+
+Both guard rails were already implemented opportunistically in the issue-01
+commit (`91027a2`), which added `shared_config_unexpected_files()` and the
+static `scan_unlisted_shared_filenames` guard together with the manifest and
+directory mount. No further code changes were needed for this issue; verified
+by re-running the full proof rather than re-implementing.
+
+Final-review rounds probed the static guard's reach. It was extended once
+(round 1) to catch split-quoted paths; a later round asked it to also catch
+references assembled from unrelated constants plus a `"shared"` segment.
+Rejected as resolved-by-design: the static guard is a best-effort tripwire —
+a grep can never enumerate every string-construction pattern, and chasing
+them adds regex complexity without closing the class. The invariant is
+actually enforced by the other layers: the run path creates, populates and
+mounts strictly from `SHARED_CONFIG_FILES`, and `boxa doctor` warns about
+any real file in the host directory regardless of how code constructed its
+path. The guard exists to force a conscious manifest bump in ordinary code
+review, which the literal and split-quoted patterns cover.

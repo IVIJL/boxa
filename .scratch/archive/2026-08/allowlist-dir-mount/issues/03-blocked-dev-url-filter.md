@@ -95,3 +95,15 @@ answers are per address family, so an `A` query for an IPv6-only hosts name
 not be blanket-excluded. `blocked_domains_from_dnsmasq()` now takes the
 query's type (`A`/`AAAA`, parsed from the query log) and each `/etc/hosts`
 entry's own address family, and excludes a query only when they match.
+
+Round-5 review asked for the same family-awareness on `address=` coverage
+(an IPv4 `address=` rule does let an AAAA query for the same name go
+upstream — empirically confirmed). Rejected as a deliberate design decision,
+not fixed: `address=` coverage is intentionally name-based. Dev-URL clients
+routinely issue parallel A+AAAA lookups; family-aware coverage would put
+every `*.test` / `*.sslip.io` name back into `boxa blocked` via its AAAA
+query and re-offer it for `boxa allow`, which is exactly the bug this issue
+removes (acceptance criterion 1). An `address=` line expresses "this name
+subtree is routed by the firewall, connecting to it works" — the name is
+never a firewall denial regardless of query family, unlike `/etc/hosts`
+entries, which are per-family host records.
