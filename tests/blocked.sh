@@ -31,16 +31,23 @@ awk '
 # shellcheck source=/dev/null
 source "$function_file"
 
-queries=$'api.test\napp.127.0.0.1.sslip.io\nlocalhost\ncdn.allowed.example\nblocked.example'
-rules=$'ipset=/allowed.example/allowed-domains\naddress=/test/172.30.0.4\naddress=/127.0.0.1.sslip.io/172.30.0.4\naddress=/localhost/172.30.0.4'
+queries=$'api.test\napp.127.0.0.1.sslip.io\nlocalhost\nprinter\ncdn.allowed.example\nblocked.example'
+rules=$'ipset=/allowed.example/allowed-domains\naddress=/test/172.30.0.4\naddress=/127.0.0.1.sslip.io/172.30.0.4'
 assert_eq "dnsmasq ipset and address rules exclude covered queries" \
     'blocked.example' \
     "$(blocked_domains_from_dnsmasq "$rules" "$queries")"
 
-rules_without_test=$'ipset=/allowed.example/allowed-domains\naddress=/127.0.0.1.sslip.io/172.30.0.4\naddress=/localhost/172.30.0.4'
+rules_without_test=$'ipset=/allowed.example/allowed-domains\naddress=/127.0.0.1.sslip.io/172.30.0.4'
 assert_eq "removing an address rule makes its query blocked again" \
     $'api.test\nblocked.example' \
     "$(blocked_domains_from_dnsmasq "$rules_without_test" "$queries")"
+
+# Bare names such as localhost and printer are deliberately excluded even
+# without a matching rule: dnsmasq resolves single-label local names without
+# upstream forwarding, while the multi-label denial remains visible.
+assert_eq "single-label local names are structurally excluded" \
+    'blocked.example' \
+    "$(blocked_domains_from_dnsmasq '' $'localhost\nprinter\nblocked.example')"
 
 assert_eq "an arbitrary runtime address suffix excludes its subdomains" \
     'blocked.example' \
@@ -48,10 +55,24 @@ assert_eq "an arbitrary runtime address suffix excludes its subdomains" \
         'address=/runtime.internal/172.30.0.4' \
         $'service.runtime.internal\nblocked.example')"
 
+# Applying the pure filter separately models two Containers with inverse
+# runtime allow rules. Both actual per-Container denials survive the union.
+divergent_queries=$'blocked-by-a.example\nblocked-by-b.example'
+divergent_blocked=$(printf '%s\n%s\n' \
+    "$(blocked_domains_from_dnsmasq \
+        'ipset=/blocked-by-b.example/allowed-domains' "$divergent_queries")" \
+    "$(blocked_domains_from_dnsmasq \
+        'ipset=/blocked-by-a.example/allowed-domains' "$divergent_queries")" \
+    | sort -u)
+assert_eq "divergent per-container rules preserve both blocked domains" \
+    "$divergent_queries" "$divergent_blocked"
+
 # shellcheck disable=SC2016  # Matching literal shell source text below.
-assert_eq "the blocked handler calls the shared filter once" 1 \
-    "$(grep -c 'blocked_domains_from_dnsmasq "\$dnsmasq_rules" "\$all_queried"' \
+assert_eq "the blocked handler filters each container's own queries" 1 \
+    "$(grep -c 'blocked_domains_from_dnsmasq "\$dnsmasq_rules" "\$queried"' \
         "$BOXA_DIR/docker-run.sh")"
+assert_eq "the blocked handler does not pool queries before filtering" 0 \
+    "$(grep -cE 'all_queried|first_container' "$BOXA_DIR/docker-run.sh" || true)"
 
 if [ "$fail_count" -gt 0 ]; then
     printf '\n%d blocked test(s) failed.\n' "$fail_count" >&2

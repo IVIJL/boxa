@@ -6444,6 +6444,9 @@ blocked_domains_from_dnsmasq() {
 
     while IFS= read -r domain; do
         [ -z "$domain" ] && continue
+        # Single-label names are resolved locally by dnsmasq or /etc/hosts;
+        # they are never forwarded upstream or subject to firewall ipsets.
+        [[ "$domain" != *.* ]] && continue
         is_covered=false
         for covered in "${covered_domains[@]}"; do
             # dnsmasq covers the named domain and all of its subdomains.
@@ -6466,9 +6469,9 @@ if [ "$MODE" = "blocked" ]; then
     # `boxa agent-browser blocked` instead.
     declare -a fw_domains=()
     if [ -n "$containers" ]; then
-        # Collect queried domains from dnsmasq logs across all containers
-        # then filter out domains that are already allowed (have ipset rules)
-        all_queried=""
+        # Filter each Container's queries against that same Container's
+        # runtime rules, then union the per-Container blocked sets.
+        all_blocked=""
         while IFS= read -r container; do
             queried=$(docker exec -u root "$container" bash -c '
                 [ -f /var/log/dnsmasq-queries.log ] || exit 0
@@ -6476,28 +6479,21 @@ if [ "$MODE" = "blocked" ]; then
                     | grep -oP "query\[A\] \K[^ ]+" \
                     | sort -u
             ' 2>/dev/null || true)
-            [ -n "$queried" ] && all_queried=$(printf '%s\n%s' "$all_queried" "$queried")
-        done <<< "$containers"
-        all_queried=$(echo "$all_queried" | grep -v '^$' | sort -u)
-
-        if [ -n "$all_queried" ]; then
-            # Get firewall and local-routing rules from dnsmasq config inside
-            # the first container. The runtime config is identical across
-            # containers because it is rendered from the same inputs.
-            first_container=$(echo "$containers" | head -1)
-            dnsmasq_rules=$(docker exec -u node "$first_container" bash -c '
+            dnsmasq_rules=$(docker exec -u node "$container" bash -c '
                 grep -hE "^(ipset|address)=" /etc/dnsmasq.d/*.conf 2>/dev/null \
                     | sort -u || true
             ' 2>/dev/null || true)
 
-            # Show only domains that dnsmasq neither allows nor routes locally.
-            blocked=$(blocked_domains_from_dnsmasq "$dnsmasq_rules" "$all_queried" \
-                | sort -u)
+            [ -z "$queried" ] && continue
+            blocked=$(blocked_domains_from_dnsmasq "$dnsmasq_rules" "$queried")
+            [ -n "$blocked" ] && all_blocked=$(printf '%s\n%s' "$all_blocked" "$blocked")
+        done <<< "$containers"
 
+        if [ -n "$all_blocked" ]; then
             while IFS= read -r d; do
                 [ -z "$d" ] && continue
                 fw_domains+=("$d")
-            done <<< "$blocked"
+            done < <(printf '%s\n' "$all_blocked" | grep -v '^$' | sort -u)
         fi
     fi
 

@@ -151,22 +151,25 @@ scan_unlisted_shared_filenames() {
         --exclude=shared-config.sh \
         --exclude-dir=.git \
         --exclude-dir=.scratch \
-        '(/etc/boxa-shared/config/|[.]config/boxa/shared/|[$][{]?SHARED_CONFIG_(HOST|CONTAINER)_DIR[}]?/)[.]?[[:alnum:]_][[:alnum:]_.-]*' \
+        '(/etc/boxa-shared/config/|[.]config/boxa/shared/|[$][{]?SHARED_CONFIG_(HOST|CONTAINER)_DIR[}]?"?/)[.]?[[:alnum:]_][[:alnum:]_.-]*' \
         "$root" 2>/dev/null | sort -u || true)
 }
 
 fixture="$_TMPROOT/static-fixture"
 mkdir -p "$fixture"
+# shellcheck disable=SC2016  # Fixture must contain a literal variable reference.
 printf '%s\n' \
     '/etc/boxa-shared/config/allowed-domains.conf' \
     '/home/test/.config/boxa/shared/unexpected.conf' \
+    '"${SHARED_CONFIG_HOST_DIR}"/split-unexpected.conf' \
     > "$fixture/references.txt"
-assert_eq "static guard rejects an unlisted fixture filename" unexpected.conf \
+assert_eq "static guard rejects unlisted fixture filenames" \
+    $'split-unexpected.conf\nunexpected.conf' \
     "$(scan_unlisted_shared_filenames "$fixture")"
-SHARED_CONFIG_FILES+=(unexpected.conf)
-assert_eq "manifest addition admits the fixture filename" "" \
+SHARED_CONFIG_FILES+=(unexpected.conf split-unexpected.conf)
+assert_eq "manifest additions admit fixture filenames" "" \
     "$(scan_unlisted_shared_filenames "$fixture")"
-unset 'SHARED_CONFIG_FILES[2]'
+unset 'SHARED_CONFIG_FILES[2]' 'SHARED_CONFIG_FILES[3]'
 assert_eq "codebase shared filenames match the manifest" "" \
     "$(scan_unlisted_shared_filenames "$BOXA_DIR")"
 

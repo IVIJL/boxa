@@ -54,3 +54,16 @@ automatically excluded, and anything it stops routing reappears.
 None — can start immediately.
 
 ## Comments
+
+Round-1 review found two gaps, fixed in a follow-up commit:
+- `localhost` has no `address=` rule in production (`init-firewall.sh` only
+  emits `address=/test/…` and `address=/127.0.0.1.sslip.io/…`); it is
+  answered locally via dnsmasq's built-in/`/etc/hosts` single-label
+  handling. `blocked_domains_from_dnsmasq()` now excludes any domain with no
+  `.` in it structurally, instead of relying on a fabricated
+  `address=/localhost/…` test fixture.
+- The `boxa blocked` handler previously pooled queried domains from all
+  running Containers and filtered them against only the first Container's
+  dnsmasq runtime rules. It now fetches and filters each Container's
+  queries against that same Container's own rules, then unions the
+  per-Container blocked sets.
