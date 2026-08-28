@@ -17,8 +17,8 @@ Thumbs.db
 __pycache__/
 *.pyc
 
-# Local issue tracker (Matt Pocock skills convention)
-.scratch/
+# The local issue tracker is versioned. Only .scratch/tmp/ is disposable;
+# its nested .gitignore owns that boundary.
 
 # Local plans / scratch notes
 local-*

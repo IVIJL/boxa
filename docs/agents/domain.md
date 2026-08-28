@@ -6,8 +6,8 @@ when exploring the codebase. This repo is **single-context**.
 ## Before exploring, read these
 
 - **`CONTEXT.md`** at the repo root — the canonical glossary.
-- **`docs/adr/`** — read the ADRs that touch the area you're about to work
-  in (currently `0001`–`0014`). Respect accepted decisions.
+- **`docs/adr/`** — read the ADRs that touch the area you're about to work in.
+  Respect accepted decisions.
 
 If any of these files don't exist for a given area, **proceed silently**.
 Don't flag their absence or suggest creating them upfront. The producer
@@ -22,7 +22,7 @@ decisions actually get resolved.
 ├── docs/adr/
 │   ├── 0001-dnsmasq-dynamic-allowlist.md
 │   ├── …
-│   └── 0014-container-mcp-broker-and-secret-isolation.md
+│   └── NNNN-decision-title.md
 └── …
 ```
 
