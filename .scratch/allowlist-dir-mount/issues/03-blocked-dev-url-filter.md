@@ -78,3 +78,20 @@ in `/etc/hosts` locally without forwarding. `blocked_domains_from_dnsmasq()`
 now takes the querying Container's own `/etc/hosts` names as a third
 argument (fetched per-Container, like the dnsmasq rules) and excludes only
 those, so other single-label denials reappear in `boxa blocked`.
+
+Round-3 review flagged aliases on IPv6-only `/etc/hosts` lines (e.g.
+`ip6-allnodes`): the claim was that dnsmasq forwards A queries for names that
+have no IPv4 hosts entry, making them possible real denials. Initially
+rejected as a false positive, but a deeper experiment confirmed it: the
+original `aa`-flag "authoritative, no forwarding" evidence came from an
+environment where the query could also be answered by an upstream chain, so
+it didn't isolate dnsmasq's own hosts-file behaviour. Re-run with the
+upstream forced unreachable, `dig A ip6-allnodes @127.0.0.1` REFUSED (dnsmasq
+attempted to forward it — no IPv4 hosts entry to answer locally), while
+`dig AAAA ip6-allnodes @127.0.0.1` and `dig A localhost @127.0.0.1` both
+still answered authoritatively from `/etc/hosts`. dnsmasq's hosts-file
+answers are per address family, so an `A` query for an IPv6-only hosts name
+(or an `AAAA` query for an IPv4-only name) is not answered locally and must
+not be blanket-excluded. `blocked_domains_from_dnsmasq()` now takes the
+query's type (`A`/`AAAA`, parsed from the query log) and each `/etc/hosts`
+entry's own address family, and excludes a query only when they match.

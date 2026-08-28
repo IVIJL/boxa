@@ -31,35 +31,46 @@ awk '
 # shellcheck source=/dev/null
 source "$function_file"
 
-queries=$'api.test\napp.127.0.0.1.sslip.io\nlocalhost\nprinter\ncdn.allowed.example\nblocked.example'
+queries=$'A\tapi.test\nA\tapp.127.0.0.1.sslip.io\nA\tlocalhost\nA\tprinter\nA\tcdn.allowed.example\nA\tblocked.example'
 rules=$'ipset=/allowed.example/allowed-domains\naddress=/test/172.30.0.4\naddress=/127.0.0.1.sslip.io/172.30.0.4'
-hosts_names=$'localhost\nprinter'
+hosts_entries=$'A\tlocalhost\nA\tprinter'
 assert_eq "dnsmasq ipset and address rules exclude covered queries" \
     'blocked.example' \
-    "$(blocked_domains_from_dnsmasq "$rules" "$queries" "$hosts_names")"
+    "$(blocked_domains_from_dnsmasq "$rules" "$queries" "$hosts_entries")"
 
 rules_without_test=$'ipset=/allowed.example/allowed-domains\naddress=/127.0.0.1.sslip.io/172.30.0.4'
 assert_eq "removing an address rule makes its query blocked again" \
     $'api.test\nblocked.example' \
-    "$(blocked_domains_from_dnsmasq "$rules_without_test" "$queries" "$hosts_names")"
+    "$(blocked_domains_from_dnsmasq "$rules_without_test" "$queries" "$hosts_entries")"
 
-assert_eq "a name from the container hosts file is excluded" \
+assert_eq "an A query with an IPv4 hosts entry is excluded" \
     'blocked.example' \
-    "$(blocked_domains_from_dnsmasq '' $'localhost\nblocked.example' 'localhost')"
+    "$(blocked_domains_from_dnsmasq '' $'A\tlocalhost\nA\tblocked.example' \
+        $'A\tlocalhost\nAAAA\tip6-allnodes')"
+
+assert_eq "an AAAA query with an IPv6 hosts entry is excluded" \
+    'blocked.example' \
+    "$(blocked_domains_from_dnsmasq '' $'AAAA\tip6-allnodes\nA\tblocked.example' \
+        $'A\tlocalhost\nAAAA\tip6-allnodes')"
+
+assert_eq "an A query with only an IPv6 hosts entry remains blocked" \
+    'ip6-allnodes' \
+    "$(blocked_domains_from_dnsmasq '' 'A ip6-allnodes' \
+        'AAAA ip6-allnodes')"
 
 assert_eq "a single-label name absent from the hosts file remains blocked" \
     'boxa-other' \
-    "$(blocked_domains_from_dnsmasq '' 'boxa-other' 'localhost')"
+    "$(blocked_domains_from_dnsmasq '' 'A boxa-other' 'A localhost')"
 
 assert_eq "an arbitrary runtime address suffix excludes its subdomains" \
     'blocked.example' \
     "$(blocked_domains_from_dnsmasq \
         'address=/runtime.internal/172.30.0.4' \
-        $'service.runtime.internal\nblocked.example' '')"
+        $'A\tservice.runtime.internal\nA\tblocked.example' '')"
 
 # Applying the pure filter separately models two Containers with inverse
 # runtime allow rules. Both actual per-Container denials survive the union.
-divergent_queries=$'blocked-by-a.example\nblocked-by-b.example'
+divergent_queries=$'A\tblocked-by-a.example\nA\tblocked-by-b.example'
 divergent_blocked=$(printf '%s\n%s\n' \
     "$(blocked_domains_from_dnsmasq \
         'ipset=/blocked-by-b.example/allowed-domains' "$divergent_queries" '')" \
@@ -67,11 +78,11 @@ divergent_blocked=$(printf '%s\n%s\n' \
         'ipset=/blocked-by-a.example/allowed-domains' "$divergent_queries" '')" \
     | sort -u)
 assert_eq "divergent per-container rules preserve both blocked domains" \
-    "$divergent_queries" "$divergent_blocked"
+    $'blocked-by-a.example\nblocked-by-b.example' "$divergent_blocked"
 
 # shellcheck disable=SC2016  # Matching literal shell source text below.
 assert_eq "the blocked handler filters each container's own queries" 1 \
-    "$(grep -c 'blocked_domains_from_dnsmasq "\$dnsmasq_rules" "\$queried" "\$hosts_names"' \
+    "$(grep -c 'blocked_domains_from_dnsmasq "\$dnsmasq_rules" "\$queried" "\$hosts_entries"' \
         "$BOXA_DIR/docker-run.sh")"
 assert_eq "the blocked handler does not pool queries before filtering" 0 \
     "$(grep -cE 'all_queried|first_container' "$BOXA_DIR/docker-run.sh" || true)"

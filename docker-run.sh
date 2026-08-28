@@ -6426,15 +6426,17 @@ fi
 
 # Print queried domains that are not covered by dnsmasq ipset or address
 # rules. Address rules route dev URLs locally, so those queries are not
-# firewall denials and must not be offered for the Allowlist. dnsmasq has no
-# no-hosts setting, so names in the Container's /etc/hosts are resolved locally
-# without upstream forwarding and can never be firewall denials. domain-needed
-# cannot suppress all single-label forwarding because boxa-<name> resolution
-# must reach Docker's embedded DNS server at 127.0.0.11.
+# firewall denials and must not be offered for the Allowlist. dnsmasq answers
+# names from the Container's /etc/hosts only for the matching address family;
+# an A query for an IPv6-only hosts entry (or vice versa) is forwarded upstream
+# and must not be blanket-excluded. domain-needed cannot suppress all
+# single-label forwarding because boxa-<name> resolution must reach Docker's
+# embedded DNS server at 127.0.0.11.
 blocked_domains_from_dnsmasq() {
-    local dnsmasq_rules="$1" queried_domains="$2" hosts_names="$3"
-    local rule covered domain hosts_name is_covered is_local
-    local -a covered_domains=() local_names=()
+    local dnsmasq_rules="$1" queried_domains="$2" hosts_entries="$3"
+    local rule covered qtype domain hosts_qtype hosts_name hosts_entry
+    local is_covered is_local
+    local -a covered_domains=() local_entries=()
 
     while IFS= read -r rule; do
         case "$rule" in
@@ -6446,15 +6448,18 @@ blocked_domains_from_dnsmasq() {
         esac
     done <<< "$dnsmasq_rules"
 
-    while IFS= read -r hosts_name; do
-        [ -n "$hosts_name" ] && local_names+=("$hosts_name")
-    done <<< "$hosts_names"
+    while read -r hosts_qtype hosts_name; do
+        [ -n "$hosts_qtype" ] && [ -n "$hosts_name" ] \
+            && local_entries+=("$hosts_qtype"$'\t'"$hosts_name")
+    done <<< "$hosts_entries"
 
-    while IFS= read -r domain; do
-        [ -z "$domain" ] && continue
+    while read -r qtype domain; do
+        if [ -z "$qtype" ] || [ -z "$domain" ]; then
+            continue
+        fi
         is_local=false
-        for hosts_name in "${local_names[@]}"; do
-            if [ "$domain" = "$hosts_name" ]; then
+        for hosts_entry in "${local_entries[@]}"; do
+            if [ "$qtype"$'\t'"$domain" = "$hosts_entry" ]; then
                 is_local=true
                 break
             fi
@@ -6486,24 +6491,41 @@ if [ "$MODE" = "blocked" ]; then
         # runtime rules, then union the per-Container blocked sets.
         all_blocked=""
         while IFS= read -r container; do
+            # Preserve each query's address family: /etc/hosts answers are
+            # family-specific, so the filter must compare A with IPv4 and
+            # AAAA with IPv6 entries.
             queried=$(docker exec -u root "$container" bash -c '
                 [ -f /var/log/dnsmasq-queries.log ] || exit 0
-                grep "^.*query\[A\]" /var/log/dnsmasq-queries.log \
-                    | grep -oP "query\[A\] \K[^ ]+" \
+                sed -nE "s/^.*query\[(A|AAAA)\] ([^ ]+).*/\1\\t\2/p" \
+                    /var/log/dnsmasq-queries.log \
                     | sort -u
             ' 2>/dev/null || true)
             dnsmasq_rules=$(docker exec -u node "$container" bash -c '
                 grep -hE "^(ipset|address)=" /etc/dnsmasq.d/*.conf 2>/dev/null \
                     | sort -u || true
             ' 2>/dev/null || true)
-            hosts_names=$(docker exec -u root "$container" bash -c '
-                awk '\''!/^[[:space:]]*#/ && NF >= 2 {
-                    for (i = 2; i <= NF && $i !~ /^#/; i++) print $i
+            hosts_entries=$(docker exec -u root "$container" bash -c '
+                awk '\''
+                function ipv4_literal(ip, octets, count, i) {
+                    count = split(ip, octets, ".")
+                    if (count != 4) return 0
+                    for (i = 1; i <= 4; i++) {
+                        if (octets[i] !~ /^[0-9]+$/ || octets[i] > 255) return 0
+                    }
+                    return 1
+                }
+                !/^[[:space:]]*#/ && NF >= 2 {
+                    if ($1 ~ /:/) qtype = "AAAA"
+                    else if (ipv4_literal($1)) qtype = "A"
+                    else next
+                    for (i = 2; i <= NF && $i !~ /^#/; i++) {
+                        print qtype "\t" $i
+                    }
                 }'\'' /etc/hosts
             ' 2>/dev/null || true)
 
             [ -z "$queried" ] && continue
-            blocked=$(blocked_domains_from_dnsmasq "$dnsmasq_rules" "$queried" "$hosts_names")
+            blocked=$(blocked_domains_from_dnsmasq "$dnsmasq_rules" "$queried" "$hosts_entries")
             [ -n "$blocked" ] && all_blocked=$(printf '%s\n%s' "$all_blocked" "$blocked")
         done <<< "$containers"
 
