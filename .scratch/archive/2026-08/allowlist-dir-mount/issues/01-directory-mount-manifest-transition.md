@@ -33,15 +33,15 @@ changes. No auto-restart.
 
 ## Acceptance criteria
 
-- [ ] A fresh install and an upgraded old-layout install both end with
+- [x] A fresh install and an upgraded old-layout install both end with
       `~/.config/boxa/shared/` containing exactly the manifest files, and a
       newly created Container's firewall works (allowlisted domain resolves,
       other domains rejected).
-      Deferred host verification: covered by static/stub tests
-      (`tests/shared-config.sh`, `tests/test_provisioning.sh`) for
-      layout/manifest/migration logic; the live "Container's firewall
-      actually resolves/rejects" half needs a real `docker run` and was not
-      exercised (no `ivijl/boxa:latest` image locally).
+      Was deferred to host (static/stub tests only in-box); verified live by
+      the user on host 2026-08-29: migration + one-time warning, `shared/`
+      layout, doctor clean, allowlisted resolves / other domains REJECTed,
+      and host-side inode swap (`mv` over `allowed-domains.conf`) visible in
+      a running Container without restart.
 - [x] Host-side inode swap of `allowed-domains.conf` (temp-file + `mv`)
       followed by `boxa allow`/`deny` reload is picked up by a running
       Container created after the upgrade — the footgun is gone.
