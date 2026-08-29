@@ -34,20 +34,25 @@ inspect_processes() {
                 next
             }
             parent[$1] = $2
-            command[$1] = $3
+            # Claude Code may run as a plain "claude" binary or as a
+            # versioned binary (.../claude/versions/<v>) whose comm is the
+            # bare version string, so match comm, argv[0], and that layout.
+            comm_name = $3
+            sub(/^.*\//, "", comm_name)
+            arg0 = $4
+            arg0_name = arg0
+            sub(/^.*\//, "", arg0_name)
+            claude_process[$1] = comm_name == "claude" \
+                || arg0_name == "claude" \
+                || arg0 ~ /\/claude\/versions\/[^\/]+$/
             snapshot[$1] = index($0, "shell-snapshots/snapshot-") != 0
             process_count++
-        }
-        function command_name(pid, name) {
-            name = command[pid]
-            sub(/^.*\//, "", name)
-            return name
         }
         function find_owner(pid, walked) {
             for (walked = 0; walked <= process_count; walked++) {
                 if (!(pid in parent))
                     return ""
-                if (command_name(pid) == "claude")
+                if (claude_process[pid])
                     return pid
                 if (parent[pid] == 0 || parent[pid] == pid)
                     return ""

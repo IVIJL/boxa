@@ -167,6 +167,41 @@ against the frozen design, all review-driven:
   `src=hook|refresher-<pid>` on busy requests, daemon logs refreshes of an
   existing holder at most once per holder per 5 min.
 
+## Live container verification (2026-08-29, after host refresh + box restart)
+
+Functional pass from a live box against the refreshed daemon; found and fixed
+two defects the automated suite had masked (uncommitted on top of `5360a16`):
+
+- **Owner detection never matched the live Claude.** Claude Code now installs
+  as a versioned binary (`~/.local/share/claude/versions/2.1.245`, comm
+  `2.1.245`), so the comm==`claude` owner walk found nothing: no refresher ever
+  spawned, and the `fb47c3d` shell-snapshot guard was silently dead too. Fixed
+  in `config/claude/hooks/agent-awake.sh` — a process is Claude when comm or
+  argv[0] basename is `claude`, or argv[0] matches `/claude/versions/[^/]+$`
+  (version-independent). The test ps stub's `owned` tree now uses the
+  versioned layout, so reverting the fix fails the heartbeat scenarios.
+- **Test-suite leakage into the live machine.** Early hook scenarios ran with
+  the real `ps` and the default state dir, so a suite run inside a live
+  session wrote flapping transitions into the real `refresher.log` and leaked
+  a refresher that inherited test env (after TMPROOT cleanup it heartbeated
+  the real daemon as `claude/sample-project`). Fixed by exporting
+  `BOXA_AWAKE_STATE_DIR` + `BOXA_PS_COMMAND=false` before the first hook
+  invocation in `tests/keep-awake.sh`.
+
+Verified live after the fixes (shellcheck clean, 265 tests green 3×):
+
+- Daemon linger: synthetic `probe` holder shows `remainingTTLSeconds: 120`
+  after idle instead of vanishing — the refreshed host binary is live.
+- Refresher lifecycle across turns: start → `exit reason=state-idle` on Stop
+  → new start on the next turn, recorded in the live `refresher.log`.
+- 200 s silent background soak: holder at 822 s remaining (≈700 without a
+  heartbeat), state `shell` — Stop kept the refresher alive for the running
+  background shell and the heartbeat refreshed the lease with no failures.
+
+Note: a refresher survives a bare SIGTERM until its current 90 s sleep ends
+(POSIX sh runs traps after the foreground child exits); `stop_refresher`
+group-kills, so the production Stop path is unaffected.
+
 ## Live soak procedure (required before `done`)
 
 1. On the host: `boxa keep-awake refresh` (rebuilds the daemon with

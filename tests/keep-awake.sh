@@ -307,6 +307,12 @@ agent_awake="$BOXA_DIR/config/claude/hooks/agent-awake.sh"
 assert_eq "refresher default stays below the daemon idle grace" 90 \
     "$(sed -n 's/.*BOXA_AWAKE_REFRESH_INTERVAL:-\([0-9][0-9]*\).*/\1/p' \
         "$agent_awake")"
+# Every hook invocation below gets an isolated state dir and, until the ps
+# stub is installed, no real process walk: with the real ps a busy hook run
+# from a live Claude session would find that session as owner, spawn a
+# refresher inheriting the test stubs, and leak state into the shared /tmp.
+export BOXA_AWAKE_STATE_DIR="$TMPROOT/agent-awake-state"
+export BOXA_PS_COMMAND=false
 : > "$KEEP_AWAKE_TEST_LOG"
 BOXA_PROJECT_NAME=sample-project "$agent_awake" busy
 assert_contains "busy hook calls versioned Host connection endpoint" \
@@ -405,8 +411,10 @@ case "${KEEP_AWAKE_TEST_PROCESS_TREE:-absent}" in
         ;;
     owned)
         [ ! -e "${KEEP_AWAKE_TEST_PS_FAILURE_MARKER:-}" ] || exit 1
+        # Versioned-binary layout: comm is the bare version string, so the
+        # owner walk must match the argv[0] path, not the comm name.
         printf '%s\n' \
-            "$owner_pid 1 claude /usr/bin/claude" \
+            "$owner_pid 1 2.1.245 /home/node/.local/share/claude/versions/2.1.245 --flag" \
             "$hook_pid $owner_pid agent-awake.sh agent-awake.sh"
         if [ -e "${KEEP_AWAKE_TEST_SNAPSHOT_MARKER:-}" ]; then
             printf '%s\n' \
@@ -442,7 +450,6 @@ assert_contains "Stop falls back to idle when process detection fails" \
 # One hook event starts a turn-scoped refresher. Accelerated intervals prove
 # repeated heartbeats without another Claude event and exercise both Stop
 # paths without any production-length sleeps.
-export BOXA_AWAKE_STATE_DIR="$TMPROOT/agent-awake-state"
 export BOXA_AWAKE_REFRESH_INTERVAL=0.1
 # Pin the session so a host with BOXA_PROJECT_NAME set cannot skew the URLs.
 export BOXA_PROJECT_NAME=default

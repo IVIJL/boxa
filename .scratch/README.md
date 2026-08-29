@@ -20,7 +20,7 @@ None.
 
 | Feature | Artifact | Next action | Last reviewed |
 | ------- | -------- | ----------- | ------------- |
-| Keep-awake during long-running agent work | `keep-awake-long-running-agent/issues/01-long-running-agent-awake-lease.md` | Fix implemented, reviewed clean and committed (idle linger + heartbeat + logging). Run `boxa keep-awake refresh` on the host, then the recorded live WSL soak; on pass promote the issue to `done` and archive the feature. | 2026-08-29 |
+| Keep-awake during long-running agent work | `keep-awake-long-running-agent/issues/01-long-running-agent-awake-lease.md` | Host refreshed; live container verification passed after fixing owner detection for versioned Claude binaries + test-suite state leakage (uncommitted). Review/commit the fix (`/cr`), sync the container hook, then run the recorded live WSL soak; on pass promote the issue to `done` and archive the feature. | 2026-08-29 |
 
 ### Cancelled
 
