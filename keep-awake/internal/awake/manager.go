@@ -2,6 +2,7 @@ package awake
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
 
@@ -19,16 +20,21 @@ type Manager struct {
 	mu        sync.Mutex
 	registry  *Registry
 	inhibitor inhibit.Inhibitor
+	logger    *log.Logger
 }
 
-func NewManager(registry *Registry, inhibitor inhibit.Inhibitor) *Manager {
-	return &Manager{registry: registry, inhibitor: inhibitor}
+func NewManager(registry *Registry, inhibitor inhibit.Inhibitor, logger *log.Logger) *Manager {
+	return &Manager{registry: registry, inhibitor: inhibitor, logger: logger}
 }
 
 func (m *Manager) Busy(agent, session string, ttl time.Duration) error {
+	return m.BusyFrom(agent, session, ttl, "")
+}
+
+func (m *Manager) BusyFrom(agent, session string, ttl time.Duration, source string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.registry.Busy(agent, session, ttl); err != nil {
+	if err := m.registry.BusyFrom(agent, session, ttl, source); err != nil {
 		return err
 	}
 	return m.reconcileLocked()
@@ -64,10 +70,20 @@ func (m *Manager) reconcileLocked() error {
 
 func (m *Manager) setInhibitionLocked(want bool) error {
 	if want && !m.inhibitor.Active() {
-		return m.inhibitor.Acquire()
+		if err := m.inhibitor.Acquire(); err != nil {
+			return err
+		}
+		if m.logger != nil {
+			m.logger.Printf("sleep inhibitor acquired")
+		}
 	}
 	if !want && m.inhibitor.Active() {
-		return m.inhibitor.Release()
+		if err := m.inhibitor.Release(); err != nil {
+			return err
+		}
+		if m.logger != nil {
+			m.logger.Printf("sleep inhibitor released")
+		}
 	}
 	return nil
 }

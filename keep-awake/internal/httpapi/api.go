@@ -94,7 +94,7 @@ func (a *API) busy(w http.ResponseWriter, r *http.Request, agent string) {
 		}
 		ttl = time.Duration(seconds) * time.Second
 	}
-	if err := a.manager.Busy(agent, session, ttl); err != nil {
+	if err := a.manager.BusyFrom(agent, session, ttl, r.URL.Query().Get("src")); err != nil {
 		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("sleep inhibitor unavailable: %v", err))
 		return
 	}

@@ -5,7 +5,9 @@ BOXA_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 export BOXA_DIR
 KEEP_AWAKE="$BOXA_DIR/scripts/ensure-keep-awake.sh"
 TMPROOT="$(mktemp -d)"
-trap 'rm -rf "$TMPROOT"' EXIT
+KEEP_AWAKE_TEST_SHELL_PID=$BASHPID
+trap 'if [ "$BASHPID" = "$KEEP_AWAKE_TEST_SHELL_PID" ]; then
+    rm -rf "$TMPROOT"; fi' EXIT
 
 export HOME="$TMPROOT/home"
 export XDG_CONFIG_HOME="$HOME/.config"
@@ -229,10 +231,19 @@ EOF
 
 cat > "$TMPROOT/bin/curl" <<'EOF'
 #!/usr/bin/env bash
+url="${*: -1}"
 case "$*" in
     *'/v1/busy/'*|*'/v1/idle/'*)
+        if [[ "$url" == *'src=refresher-'* ]] \
+            && [ -n "${KEEP_AWAKE_TEST_BLOCK_REFRESHER:-}" ] \
+            && [ -e "$KEEP_AWAKE_TEST_BLOCK_REFRESHER" ]; then
+            : > "${KEEP_AWAKE_TEST_REFRESHER_ENTERED:?}"
+            while [ ! -e "${KEEP_AWAKE_TEST_RELEASE_REFRESHER:?}" ]; do
+                /bin/sleep 0.01
+            done
+        fi
         printf 'curl %s\n' "$*" >> "$KEEP_AWAKE_TEST_LOG"
-        case "${*: -1}" in
+        case "$url" in
             http://127.0.0.1:*) [ "$KEEP_AWAKE_TEST_LOOPBACK_HEALTHY" = true ] || exit 7 ;;
             *)                  [ "$KEEP_AWAKE_TEST_GATEWAY_HEALTHY" = true ] || exit 7 ;;
         esac
@@ -293,10 +304,13 @@ export PATH="$TMPROOT/bin:$PATH"
 # The managed client hook uses the Host connection API, is project-scoped,
 # bounds curl to one second, and silently succeeds when the daemon is absent.
 agent_awake="$BOXA_DIR/config/claude/hooks/agent-awake.sh"
+assert_eq "refresher default stays below the daemon idle grace" 90 \
+    "$(sed -n 's/.*BOXA_AWAKE_REFRESH_INTERVAL:-\([0-9][0-9]*\).*/\1/p' \
+        "$agent_awake")"
 : > "$KEEP_AWAKE_TEST_LOG"
 BOXA_PROJECT_NAME=sample-project "$agent_awake" busy
 assert_contains "busy hook calls versioned Host connection endpoint" \
-    "http://127.0.0.1:17777/v1/busy/claude?ttl=900&session=sample-project" \
+    "http://127.0.0.1:17777/v1/busy/claude?ttl=900&session=sample-project&src=hook" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
 assert_contains "busy hook caps curl at one second" \
     "-m 1" "$(cat "$KEEP_AWAKE_TEST_LOG")"
@@ -319,7 +333,7 @@ export BOXA_CONTAINER_IDENTITY_FILE="$hook_fixtures/absent-identity.json"
 export KEEP_AWAKE_TEST_LOOPBACK_HEALTHY=false
 BOXA_PROJECT_NAME=sample-project "$agent_awake" busy
 assert_contains "unreachable loopback falls back to the gateway on a WSL2 host" \
-    "http://172.30.96.1:17777/v1/busy/claude?ttl=900&session=sample-project" \
+    "http://172.30.96.1:17777/v1/busy/claude?ttl=900&session=sample-project&src=hook" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
 
 # Off a WSL2 host the default gateway is an unrelated machine: signalling it
@@ -366,7 +380,8 @@ export KEEP_AWAKE_TEST_CURL_HEALTHY=true
 # no real background process is involved in these checks.
 cat > "$TMPROOT/bin/agent-awake-ps" <<'EOF'
 #!/usr/bin/env bash
-hook_pid="${BOXA_AGENT_AWAKE_HOOK_PID:?}"
+hook_pid="${BOXA_AGENT_AWAKE_HOOK_PID:-}"
+owner_pid="${KEEP_AWAKE_TEST_CLAUDE_PID:-100}"
 case "${KEEP_AWAKE_TEST_PROCESS_TREE:-absent}" in
     background)
         printf '%s\n' \
@@ -388,6 +403,16 @@ case "${KEEP_AWAKE_TEST_PROCESS_TREE:-absent}" in
     failure)
         exit 1
         ;;
+    owned)
+        [ ! -e "${KEEP_AWAKE_TEST_PS_FAILURE_MARKER:-}" ] || exit 1
+        printf '%s\n' \
+            "$owner_pid 1 claude /usr/bin/claude" \
+            "$hook_pid $owner_pid agent-awake.sh agent-awake.sh"
+        if [ -e "${KEEP_AWAKE_TEST_SNAPSHOT_MARKER:-}" ]; then
+            printf '%s\n' \
+                "999999 $owner_pid zsh zsh -c source ~/.claude/shell-snapshots/snapshot-zsh-bg.sh"
+        fi
+        ;;
 esac
 EOF
 chmod +x "$TMPROOT/bin/agent-awake-ps"
@@ -396,7 +421,7 @@ export BOXA_PS_COMMAND="$TMPROOT/bin/agent-awake-ps"
 : > "$KEEP_AWAKE_TEST_LOG"
 env -u BOXA_PROJECT_NAME KEEP_AWAKE_TEST_PROCESS_TREE=background "$agent_awake" idle
 assert_contains "Stop stays busy while a background shell-snapshot child runs" \
-    "/v1/busy/claude?ttl=900&session=default" \
+    "/v1/busy/claude?ttl=900&session=default&src=hook" \
     "$(cat "$KEEP_AWAKE_TEST_LOG")"
 
 : > "$KEEP_AWAKE_TEST_LOG"
@@ -413,6 +438,178 @@ assert_contains "Stop excludes its own shell-snapshot process chain" \
 env -u BOXA_PROJECT_NAME KEEP_AWAKE_TEST_PROCESS_TREE=failure "$agent_awake" idle
 assert_contains "Stop falls back to idle when process detection fails" \
     "/v1/idle/claude?session=default" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+
+# One hook event starts a turn-scoped refresher. Accelerated intervals prove
+# repeated heartbeats without another Claude event and exercise both Stop
+# paths without any production-length sleeps.
+export BOXA_AWAKE_STATE_DIR="$TMPROOT/agent-awake-state"
+export BOXA_AWAKE_REFRESH_INTERVAL=0.1
+# Pin the session so a host with BOXA_PROJECT_NAME set cannot skew the URLs.
+export BOXA_PROJECT_NAME=default
+export KEEP_AWAKE_TEST_PROCESS_TREE=owned
+export KEEP_AWAKE_TEST_SNAPSHOT_MARKER="$TMPROOT/snapshot-alive"
+export KEEP_AWAKE_TEST_PS_FAILURE_MARKER="$TMPROOT/ps-failure"
+export KEEP_AWAKE_TEST_BLOCK_REFRESHER="$TMPROOT/block-refresher"
+export KEEP_AWAKE_TEST_REFRESHER_ENTERED="$TMPROOT/refresher-entered"
+export KEEP_AWAKE_TEST_RELEASE_REFRESHER="$TMPROOT/release-refresher"
+/bin/sleep 20 &
+KEEP_AWAKE_TEST_CLAUDE_PID=$!
+export KEEP_AWAKE_TEST_CLAUDE_PID
+awake_owner_pid=$KEEP_AWAKE_TEST_CLAUDE_PID
+awake_owner_dir="$BOXA_AWAKE_STATE_DIR/$awake_owner_pid"
+
+wait_for_busy_count() {
+    local wanted=$1 count=0
+    for _ in {1..100}; do
+        count=$(grep -c '/v1/busy/' "$KEEP_AWAKE_TEST_LOG" || true)
+        [ "$count" -ge "$wanted" ] && {
+            printf true
+            return 0
+        }
+        /bin/sleep 0.05
+    done
+    printf false
+}
+
+wait_for_file_absent() {
+    local path=$1
+    for _ in {1..100}; do
+        [ -e "$path" ] || return 0
+        /bin/sleep 0.05
+    done
+    return 1
+}
+
+: > "$KEEP_AWAKE_TEST_LOG"
+"$agent_awake" busy
+assert_eq "one in-flight operation receives at least two heartbeat refreshes" true \
+    "$(wait_for_busy_count 3)"
+refresher_pid=$(cat "$awake_owner_dir/refresher.pid")
+assert_eq "busy action leaves one live detached refresher" true \
+    "$(kill -0 "$refresher_pid" 2>/dev/null && printf true || printf false)"
+assert_contains "refresher lifecycle log records its owner and interval" \
+    "refresher start owner=$awake_owner_pid pid=$refresher_pid interval=0.1" \
+    "$(cat "$awake_owner_dir/refresher.log")"
+
+: > "$KEEP_AWAKE_TEST_LOG"
+touch "$KEEP_AWAKE_TEST_BLOCK_REFRESHER"
+rm -f "$KEEP_AWAKE_TEST_REFRESHER_ENTERED" "$KEEP_AWAKE_TEST_RELEASE_REFRESHER"
+for _ in {1..100}; do
+    [ -e "$KEEP_AWAKE_TEST_REFRESHER_ENTERED" ] && break
+    /bin/sleep 0.05
+done
+"$agent_awake" idle
+touch "$KEEP_AWAKE_TEST_RELEASE_REFRESHER"
+wait_for_file_absent "$awake_owner_dir/refresher.pid" || true
+/bin/sleep 0.1
+assert_contains "idle Stop sends idle while ending the refresher" \
+    "/v1/idle/claude?session=default" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_eq "idle Stop removes the refresher pidfile" false \
+    "$([ -e "$awake_owner_dir/refresher.pid" ] && printf true || printf false)"
+assert_eq "idle Stop terminates the recorded refresher" false \
+    "$(kill -0 "$refresher_pid" 2>/dev/null && printf true || printf false)"
+assert_eq "no busy request lands after Stop's idle request" 0 \
+    "$(awk '/\/v1\/idle\// { idle = 1; next }
+        idle && /\/v1\/busy\// { late++ }
+        END { print late + 0 }' "$KEEP_AWAKE_TEST_LOG")"
+assert_contains "refresher lifecycle log records Stop exit" \
+    "refresher exit owner=$awake_owner_pid pid=$refresher_pid reason=state-idle" \
+    "$(cat "$awake_owner_dir/refresher.log")"
+rm -f "$KEEP_AWAKE_TEST_BLOCK_REFRESHER"
+
+rm -f "$awake_owner_dir/send-hook.status"
+export KEEP_AWAKE_TEST_CURL_HEALTHY=false
+for _ in 1 2 3; do
+    "$agent_awake" idle
+done
+assert_eq "hook logs an initial daemon failure exactly once" 1 \
+    "$(grep -c 'initial send failure: daemon unreachable src=hook addresses=127.0.0.1' \
+        "$awake_owner_dir/refresher.log" || true)"
+export KEEP_AWAKE_TEST_CURL_HEALTHY=true
+"$agent_awake" idle
+export KEEP_AWAKE_TEST_CURL_HEALTHY=false
+"$agent_awake" idle
+export KEEP_AWAKE_TEST_CURL_HEALTHY=true
+"$agent_awake" idle
+assert_contains "hook logs daemon failure after a previous success" \
+    "send failure after previous success: daemon unreachable src=hook addresses=127.0.0.1" \
+    "$(cat "$awake_owner_dir/refresher.log")"
+assert_contains "hook logs daemon recovery" \
+    "send recovery after failure src=hook" \
+    "$(cat "$awake_owner_dir/refresher.log")"
+
+: > "$KEEP_AWAKE_TEST_LOG"
+mkdir -p "$awake_owner_dir/spawn.lock"
+touch -d '3 minutes ago' "$awake_owner_dir/spawn.lock"
+"$agent_awake" busy
+ownerless_recovery_pid=$(cat "$awake_owner_dir/refresher.pid")
+assert_eq "busy action reclaims an aged ownerless spawn lock" true \
+    "$(kill -0 "$ownerless_recovery_pid" 2>/dev/null && printf true || printf false)"
+kill "$ownerless_recovery_pid" 2>/dev/null || true
+wait_for_file_absent "$awake_owner_dir/refresher.pid" || true
+
+stale_lock_pid=""
+/bin/sleep 0.01 &
+stale_lock_pid=$!
+wait "$stale_lock_pid" 2>/dev/null || true
+mkdir -p "$awake_owner_dir/spawn.lock"
+printf '%s\n' "$stale_lock_pid" > "$awake_owner_dir/spawn.lock/owner.pid"
+"$agent_awake" busy
+stale_recovery_pid=$(cat "$awake_owner_dir/refresher.pid")
+assert_eq "busy action reclaims a spawn lock owned by a dead process" true \
+    "$(kill -0 "$stale_recovery_pid" 2>/dev/null && printf true || printf false)"
+touch "$KEEP_AWAKE_TEST_SNAPSHOT_MARKER"
+shell_refresher_pid=$(cat "$awake_owner_dir/refresher.pid")
+touch "$KEEP_AWAKE_TEST_BLOCK_REFRESHER"
+rm -f "$KEEP_AWAKE_TEST_REFRESHER_ENTERED" "$KEEP_AWAKE_TEST_RELEASE_REFRESHER"
+for _ in {1..100}; do
+    [ -e "$KEEP_AWAKE_TEST_REFRESHER_ENTERED" ] && break
+    /bin/sleep 0.05
+done
+"$agent_awake" idle
+touch "$KEEP_AWAKE_TEST_PS_FAILURE_MARKER"
+touch "$KEEP_AWAKE_TEST_RELEASE_REFRESHER"
+assert_eq "snapshot Stop keeps the same refresher alive" true \
+    "$(kill -0 "$shell_refresher_pid" 2>/dev/null && printf true || printf false)"
+assert_eq "snapshot Stop records shell state" shell \
+    "$(cat "$awake_owner_dir/state")"
+: > "$KEEP_AWAKE_TEST_LOG"
+/bin/sleep 0.3
+assert_eq "failed shell snapshot sends no idle request" 0 \
+    "$(grep -c '/v1/idle/' "$KEEP_AWAKE_TEST_LOG" || true)"
+assert_eq "failed shell snapshot keeps the refresher running" true \
+    "$(kill -0 "$shell_refresher_pid" 2>/dev/null && printf true || printf false)"
+rm -f "$KEEP_AWAKE_TEST_PS_FAILURE_MARKER"
+assert_eq "recovered shell snapshot resumes heartbeat refreshes" true \
+    "$(wait_for_busy_count 1)"
+rm -f "$KEEP_AWAKE_TEST_SNAPSHOT_MARKER"
+for _ in {1..100}; do
+    grep -q '/v1/idle/' "$KEEP_AWAKE_TEST_LOG" && break
+    /bin/sleep 0.05
+done
+wait_for_file_absent "$awake_owner_dir/refresher.pid" || true
+assert_contains "refresher idles after the snapshot child exits" \
+    "/v1/idle/claude?session=default" "$(cat "$KEEP_AWAKE_TEST_LOG")"
+assert_eq "refresher exits after the snapshot child exits" false \
+    "$(kill -0 "$shell_refresher_pid" 2>/dev/null && printf true || printf false)"
+
+/bin/sleep 0.05 &
+dead_owner_pid=$!
+wait "$dead_owner_pid" 2>/dev/null || true
+mkdir -p "$BOXA_AWAKE_STATE_DIR/$dead_owner_pid"
+printf 'busy\n' > "$BOXA_AWAKE_STATE_DIR/$dead_owner_pid/state"
+: > "$KEEP_AWAKE_TEST_LOG"
+"$agent_awake" __refresher "$dead_owner_pid"
+assert_eq "dead claude PID makes the refresher send no request" 0 \
+    "$(grep -Ec '/v1/(busy|idle)/' "$KEEP_AWAKE_TEST_LOG" || true)"
+
+kill "$awake_owner_pid" 2>/dev/null || true
+wait "$awake_owner_pid" 2>/dev/null || true
+unset BOXA_AWAKE_STATE_DIR BOXA_AWAKE_REFRESH_INTERVAL BOXA_PROJECT_NAME
+unset KEEP_AWAKE_TEST_CLAUDE_PID KEEP_AWAKE_TEST_PROCESS_TREE
+unset KEEP_AWAKE_TEST_SNAPSHOT_MARKER KEEP_AWAKE_TEST_PS_FAILURE_MARKER
+unset KEEP_AWAKE_TEST_BLOCK_REFRESHER KEEP_AWAKE_TEST_REFRESHER_ENTERED
+unset KEEP_AWAKE_TEST_RELEASE_REFRESHER
 unset BOXA_PS_COMMAND
 
 # Existing shared settings are merged rather than replaced. Calling the

@@ -36,6 +36,7 @@ type config struct {
 	extra        stringList
 	listenUnsafe bool
 	defaultTTL   time.Duration
+	idleGrace    time.Duration
 	logFile      string
 }
 
@@ -47,6 +48,7 @@ func realMain() (exitCode int) {
 	flag.Var(&cfg.extra, "listen-address", "additional IP address (repeatable; non-loopback requires -listen-unsafe; wildcards forbidden)")
 	flag.BoolVar(&cfg.listenUnsafe, "listen-unsafe", false, "WARNING: allow -listen-address to bind non-loopback interfaces, including LAN-facing ones")
 	flag.DurationVar(&cfg.defaultTTL, "default-ttl", 15*time.Minute, "lease TTL when the request omits ttl")
+	flag.DurationVar(&cfg.idleGrace, "idle-grace", 120*time.Second, "grace period before an idle lease is released (0 releases immediately); gap coverage assumes idle grace is at least the hook heartbeat interval (90s by default), and lower values give up that protection")
 	flag.StringVar(&cfg.logFile, "log-file", "keep-awake.log", "append-only daemon and crash log")
 	flag.Parse()
 
@@ -66,6 +68,10 @@ func realMain() (exitCode int) {
 
 	if cfg.defaultTTL <= 0 {
 		logger.Printf("default TTL must be positive")
+		return 2
+	}
+	if cfg.idleGrace < 0 {
+		logger.Printf("idle grace must not be negative")
 		return 2
 	}
 	if cfg.port < 1 || cfg.port > 65535 {
@@ -96,8 +102,8 @@ func realMain() (exitCode int) {
 func run(ctx context.Context, cfg config, addresses []string, listeners []net.Listener, logger *log.Logger) error {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
-	registry := awake.NewRegistry(awake.RealClock{})
-	manager := awake.NewManager(registry, inhibit.New())
+	registry := awake.NewRegistry(awake.RealClock{}, cfg.idleGrace, logger)
+	manager := awake.NewManager(registry, inhibit.New(), logger)
 	defer func() {
 		if err := manager.Close(); err != nil {
 			logger.Printf("release sleep inhibitor: %v", err)

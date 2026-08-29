@@ -15,9 +15,19 @@ GET /v1/status
 ```
 
 Busy calls create or re-arm an agent/session lease. The default TTL is 15
-minutes. Idle releases exactly the matching lease; omitting `session` affects
-only the sessionless lease. Status returns active holders, rounded-up remaining
-TTL seconds, current inhibitor state, and daemon version.
+minutes. By default, idle shortens exactly the matching existing lease to a
+two-minute grace period; it never creates an absent lease. Omitting `session`
+affects only the sessionless lease. Set `-idle-grace=0` for legacy immediate
+release behavior. Status returns active holders, rounded-up remaining TTL
+seconds, current inhibitor state, and daemon version, so a lingering holder is
+visible with its small remaining TTL.
+
+Relevant lease flags are:
+
+```text
+-default-ttl duration   lease TTL when busy omits ttl (default 15m)
+-idle-grace duration    grace before an idle lease is released (default 2m; 0 disables)
+```
 
 ## Binding and files
 

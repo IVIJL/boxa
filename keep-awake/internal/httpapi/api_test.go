@@ -40,10 +40,35 @@ type decodedStatus struct {
 }
 
 func newTestAPI() (*API, *fakeClock, *inhibit.Fake) {
+	return newTestAPIWithGrace(0)
+}
+
+func newTestAPIWithGrace(idleGrace time.Duration) (*API, *fakeClock, *inhibit.Fake) {
 	clock := &fakeClock{now: time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)}
 	fake := &inhibit.Fake{}
-	manager := awake.NewManager(awake.NewRegistry(clock), fake)
+	manager := awake.NewManager(awake.NewRegistry(clock, idleGrace, nil), fake, nil)
 	return New(manager, 15*time.Minute, "test-version", nil), clock, fake
+}
+
+func TestIdleResponseAndStatusShowGraceTTL(t *testing.T) {
+	api, _, fake := newTestAPIWithGrace(2 * time.Minute)
+	if response := request(t, api, http.MethodGet, "/v1/busy/claude?session=box-a"); response.Code != http.StatusOK {
+		t.Fatalf("busy code=%d body=%s", response.Code, response.Body.String())
+	}
+	response := request(t, api, http.MethodGet, "/v1/idle/claude?session=box-a")
+	if response.Code != http.StatusOK || response.Body.String() != "{\"status\":\"ok\"}\n" {
+		t.Fatalf("idle code=%d body=%q", response.Code, response.Body.String())
+	}
+	status := getStatus(t, api)
+	if !status.IsInhibited || len(status.ActiveHolders) != 1 {
+		t.Fatalf("unexpected linger status: %+v", status)
+	}
+	if status.ActiveHolders[0].RemainingTTLSeconds != 120 {
+		t.Fatalf("remaining TTL=%d, want 120", status.ActiveHolders[0].RemainingTTLSeconds)
+	}
+	if fake.ReleaseCalls() != 0 {
+		t.Fatalf("idle released inhibitor during grace; calls=%d", fake.ReleaseCalls())
+	}
 }
 
 func request(t *testing.T, handler http.Handler, method, target string) *httptest.ResponseRecorder {

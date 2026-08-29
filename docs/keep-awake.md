@@ -58,17 +58,27 @@ The installer offers this elective once. A decline is remembered; plain
 
 Boxa's managed Claude config includes the **Activity hook**, `agent-awake.sh`,
 in every Container. It refreshes a 15-minute **Awake lease** on
-`UserPromptSubmit` and `PreToolUse`. On `Stop`, it releases the same
-project-scoped lease unless the owning Claude process still has a live
-background shell-snapshot child, in which case it refreshes the lease instead.
-The hook calls the Host connection on local port 17777 with a one-second timeout
-and always exits successfully, so it is a silent fast no-op until the daemon is
-made reachable with `boxa keep-awake enable`. Existing Claude configs receive
-the hook and settings entries additively during Container setup.
+`UserPromptSubmit` and `PreToolUse`. Each active turn also has one detached,
+Claude-process-scoped refresher. It renews the lease every 90 seconds while the
+owning Claude process and turn remain active, so a single long tool or MCP call
+cannot outlive the lease. The interval must stay below the daemon's two-minute
+idle grace because concurrent Claude processes share the project holder. On
+`Stop`, the hook moves the same project-scoped lease into the daemon's
+two-minute idle grace. A live background shell-snapshot child keeps the
+refresher active until that child exits; the refresher then sends idle itself.
+The hook calls the Host connection on local port 17777 with a one-second
+timeout and always exits successfully, so it is a silent fast no-op until the
+daemon is made reachable with `boxa keep-awake enable`. Existing Claude configs
+receive the hook and settings entries additively during Container setup.
 
 Third-party agents can implement the same activity/stop protocol. The
-**Keep-awake daemon** gives each **Awake lease** a default TTL of 15 minutes, so
-a missed stop event cannot hold the machine awake forever:
+**Keep-awake daemon** gives each **Awake lease** a default TTL of 15 minutes.
+Idle requests shorten an existing lease to a two-minute grace period instead of
+removing it immediately. The grace closes brief gaps between turns or
+subagents, while an idle request for an absent holder remains a no-op. This
+gap-coverage guarantee assumes idle grace is at least the hook heartbeat
+interval (90 seconds by default); lowering `-idle-grace` below it, including to
+zero, gives up that protection:
 
 ```bash
 #!/usr/bin/env bash
@@ -115,6 +125,27 @@ probe `localhost`, then the Windows vEthernet/default-gateway IP; boxa Container
 → `localhost` on the Host connection's local port (17777 by default).
 `GET /v1/status` returns the active holders, remaining TTLs, inhibitor state,
 and daemon version.
+
+### Bounded expiry guarantees
+
+| Failure or completion mode | Maximum lease lifetime without new activity |
+| --- | --- |
+| Claude or the refresher crashes | One lease TTL (15 minutes by default) |
+| A session reaches `Stop` and is abandoned | One idle grace (2 minutes by default) |
+| Claude, hook, and refresher are all killed with `SIGKILL` | One lease TTL (15 minutes by default) |
+
+The daemon logs holder add, idle-linger, removal, and expiry transitions, plus
+sleep-inhibitor acquisition and release. It also logs one successful refresh
+per holder at most every five minutes; the line includes the heartbeat `src`
+(such as `hook` or `refresher-<claude-pid>`) when the client supplied it.
+Higher-frequency busy refreshes remain suppressed between those marks.
+
+Client-side refresher lifecycle and connectivity transitions are appended to
+`$TMPDIR/boxa-agent-awake/<claude-pid>/refresher.log` (or the equivalent path
+under `BOXA_AWAKE_STATE_DIR`). It records refresher start/exit, daemon failure
+after a prior success, and recovery, without logging each successful send. The
+hook remains silent and successful even when this best-effort log cannot be
+written.
 
 The daemon does not react to shutdown, poweroff, or sleep: those transitions
 leave boxes untouched, and after a resume they remain available. Stop boxes

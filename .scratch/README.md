@@ -13,13 +13,14 @@ None.
 
 | Feature | Artifact | Next action | Last reviewed |
 | ------- | -------- | ----------- | ------------- |
-| Keep-awake during long-running agent work | `keep-awake-long-running-agent/issues/01-long-running-agent-awake-lease.md` | Diagnose the 2026-08-25 sleep incident, capture lease/reachability evidence, then freeze the fix or split follow-up implementation and live-verification slices. | 2026-08-28 |
 | Forge access broker | `forge-access-broker/NOTES.md` | Grill the `glab`, `gh` and Git transport threat model, then decide whether to create a PRD. | 2026-08-28 |
 | Memory-pressure livelock | `memory-pressure-livelock/PRD.md` | Grill the PRD and validate nested-cgroup feasibility before splitting it into issues. | 2026-08-28 |
 
 ### Waiting for human
 
-None.
+| Feature | Artifact | Next action | Last reviewed |
+| ------- | -------- | ----------- | ------------- |
+| Keep-awake during long-running agent work | `keep-awake-long-running-agent/issues/01-long-running-agent-awake-lease.md` | Fix implemented, reviewed clean and committed (idle linger + heartbeat + logging). Run `boxa keep-awake refresh` on the host, then the recorded live WSL soak; on pass promote the issue to `done` and archive the feature. | 2026-08-29 |
 
 ### Cancelled
 
