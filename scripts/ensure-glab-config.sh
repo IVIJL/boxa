@@ -54,6 +54,11 @@ def normalize_entry_key(key: bytes) -> bytes:
     return key
 
 
+def is_token_key(line: bytes, indent: bytes) -> bool:
+    key, separator, _ = line[len(indent) :].partition(b":")
+    return bool(separator) and normalize_entry_key(key) == b"token"
+
+
 def is_separator(line: bytes) -> bool:
     return not line.strip() or line.lstrip(b" \t").startswith(b"#")
 
@@ -133,13 +138,21 @@ else:
             trailing_start -= 1
         entry_block = block[:trailing_start]
         trailing = block[trailing_start:]
+        child_indent = next(
+            (
+                leading_whitespace(line)
+                for line in entry_block[1:]
+                if not is_separator(line)
+            ),
+            None,
+        )
         token_indexes = [
             index
             for index, line in enumerate(entry_block)
             if index > 0
-            and leading_whitespace(line).startswith(entry_indent)
-            and len(leading_whitespace(line)) > len(entry_indent)
-            and re.match(br"^token:", line[len(leading_whitespace(line)) :])
+            and child_indent is not None
+            and leading_whitespace(line) == child_indent
+            and is_token_key(line, child_indent)
         ]
 
         if host == target:

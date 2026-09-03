@@ -189,6 +189,52 @@ class EnsureGlabConfigTests(unittest.TestCase):
         self.assertNotIn(b"  gitlab.com:\n", content)
         self.assertIn(b"  forge.example.test:\n", content)
 
+    def test_token_keys_are_normalized_for_foreign_and_target_hosts(self) -> None:
+        self._write_config(
+            b"host: old.example.test\nhosts:\n"
+            b"  quoted.example.test:\n"
+            b'    "token": keep\n'
+            b"  spaced.example.test:\n"
+            b"    token : keep2\n"
+            b"  forge.example.test:\n"
+            b"    'token': stale\n"
+            b"    api_host: forge.example.test\n"
+        )
+
+        result = self._run("forge.example.test", token="current")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._read_config(),
+            b"host: forge.example.test\nhosts:\n"
+            b"  quoted.example.test:\n"
+            b'    "token": keep\n'
+            b"  spaced.example.test:\n"
+            b"    token : keep2\n"
+            b"  forge.example.test:\n"
+            b"    api_host: forge.example.test\n",
+        )
+
+    def test_environment_token_removes_only_direct_child_token(self) -> None:
+        self._write_config(
+            b"host: somehost\nhosts:\n"
+            b"  somehost:\n"
+            b"    token: outer\n"
+            b"    extra:\n"
+            b"      token: nested\n"
+        )
+
+        result = self._run("somehost", token="current")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._read_config(),
+            b"host: somehost\nhosts:\n"
+            b"  somehost:\n"
+            b"    extra:\n"
+            b"      token: nested\n",
+        )
+
     def test_foreign_host_with_nonstandard_token_indent_is_preserved(self) -> None:
         foreign = b"  gitlab.other.test:\n   token: keep\n"
         self._write_config(b"host: gitlab.com\nhosts:\n" + foreign)
