@@ -169,3 +169,15 @@ remains the recommended default.
   full account reach for its granted scopes. Use a project or group access
   token for genuinely project-scoped access. SSH remotes cannot authenticate
   as the agent.
+
+## Update 2026-09-03 - glab config seeding and reconciliation
+
+The `glab-config-seeding` feature, tracked under
+`.scratch/glab-config-seeding/`, clarifies Decision 4's statement that
+in-Container `glab auth login` is supported while injected environment
+credentials win over config files. On every Container start, the entrypoint
+seeds or reconciles the Project's glab config from `GITLAB_HOST` and
+`GITLAB_TOKEN`. While the Forge gate delivers `GITLAB_TOKEN`, it removes any
+config `token:` under the Forge host, so an in-box login to that host does not
+survive a restart. Tokened entries for other hosts remain, so an in-box login
+to a different GitLab host does survive.

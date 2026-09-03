@@ -179,6 +179,27 @@ gh auth login
 glab auth login
 ```
 
+On every Container start that receives `GITLAB_HOST`, the entrypoint prepares
+the Project's `~/.config/glab-cli/config.yml`:
+
+- If the file does not exist, it seeds a minimal config whose default `host:`
+  is `GITLAB_HOST` and whose `hosts:` map contains only that host. The file has
+  no token, no `gitlab.com` stub, and mode 0600.
+- If the file exists, the entrypoint reconciles it idempotently. It sets the
+  default `host:` to `GITLAB_HOST`, creating the `hosts:` section and Forge host
+  entry when missing. It drops entries for other hosts that have no token,
+  including glab's default `gitlab.com` stub. If `GITLAB_TOKEN` is also set, it
+  removes the `token:` under the Forge host because the environment token wins
+  and a stored token there can only be stale. Tokened entries for other hosts
+  remain verbatim, and all other top-level settings remain untouched. The file
+  mode is enforced to 0600.
+
+Without `GITLAB_HOST`, the entrypoint creates no config and does not touch an
+existing one. If `glab auth login` targets the same host as `GITLAB_HOST`, its
+stored token is stripped on the next Container start while the Forge gate
+delivers `GITLAB_TOKEN`, so that login does not stick. A login to a different
+GitLab host does stick because its tokened host entry is preserved.
+
 Injected environment credentials take precedence over those config files. To
 use a persisted in-Container login instead, turn the Forge gate off and recreate
 the Container. Host CLI login files are never mounted or modified by this flow.
