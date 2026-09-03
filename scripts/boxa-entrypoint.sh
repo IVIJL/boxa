@@ -199,6 +199,10 @@ if [ "$(id -u)" = "0" ]; then
     exec setpriv --reuid=node --regid=node --init-groups -- "$0" "$@"
 fi
 
+# Seed after the privilege drop so the per-Project glab config stays node-owned.
+/usr/local/bin/ensure-glab-config || \
+    echo "boxa: WARNING: Failed to seed glab config; glab may be misconfigured." >&2
+
 # Node phase: keep PID 1 alive with graceful shutdown for Inner containers.
 shutdown_handler() {
     echo "boxa: SIGTERM received, stopping inner containers..."

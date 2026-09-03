@@ -85,6 +85,15 @@ class EntrypointBrokerTests(unittest.TestCase):
             "exec setpriv --reuid=node --regid=node --init-groups", self.text
         )
 
+    def test_glab_config_seed_runs_after_node_drop(self):
+        node_drop_idx = self.text.find("--reuid=node")
+        seed_idx = self.text.find("/usr/local/bin/ensure-glab-config")
+        self.assertNotEqual(node_drop_idx, -1, "node drop missing")
+        self.assertNotEqual(seed_idx, -1, "glab config seed missing")
+        self.assertGreater(
+            seed_idx, node_drop_idx, "glab config seed must run as node"
+        )
+
     def test_socket_dir_on_neutral_bridge_path(self):
         # The broker socket dir lives on the NEUTRAL boxa-bridge path (ADR 0014
         # issue 19), owned boxa-mcp:boxa-bridge mode 2770 (setgid) — NOT
@@ -295,6 +304,14 @@ class DockerfileAccountTests(unittest.TestCase):
             self.text,
         )
         self.assertIn("/usr/local/bin/stage-mcp-secrets", self.text)
+
+    def test_glab_config_seed_shipped_and_executable(self):
+        self.assertIn(
+            "COPY scripts/ensure-glab-config.sh "
+            "/usr/local/bin/ensure-glab-config",
+            self.text,
+        )
+        self.assertIn("/usr/local/bin/ensure-glab-config", self.text)
 
     def test_broker_namespace_wrapper_shipped_and_executable(self):
         # ADR 0014 issue 21: the mount-namespace wrapper (idmap remount +

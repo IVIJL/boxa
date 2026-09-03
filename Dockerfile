@@ -408,6 +408,7 @@ COPY scripts/mcp-broker-namespace.sh /usr/local/bin/mcp-broker-namespace
 COPY scripts/stage-mcp-secrets.sh /usr/local/bin/stage-mcp-secrets
 COPY init-firewall.sh /usr/local/bin/
 COPY scripts/setup-chezmoi.sh /usr/local/bin/
+COPY scripts/ensure-glab-config.sh /usr/local/bin/ensure-glab-config
 # Bundled default dotfiles starter (chezmoi source), applied locally on start
 # by setup-chezmoi.sh when CHEZMOI_REPO=bundled — no network, no clone.
 COPY --chown=node:node dotfiles/ /usr/local/share/boxa/dotfiles/
@@ -452,6 +453,7 @@ COPY managed-settings/claude-code/51-boxa-memory.json \
      /etc/claude-code/managed-settings.d/51-boxa-memory.json
 
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
+    /usr/local/bin/ensure-glab-config \
     /usr/local/bin/n /usr/local/bin/nx /usr/local/bin/start-rootless-docker.sh \
     /usr/local/bin/boxa-entrypoint.sh /usr/local/bin/boxa-shutdown-inner \
     /usr/local/bin/boxa-firewall-reload \
