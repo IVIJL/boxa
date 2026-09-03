@@ -52,3 +52,28 @@ Running the script twice on the same input produces the same file. Without
 - [01 — Seed a minimal glab config](01-seed-minimal-glab-config.md)
 
 ## Comments
+
+2026-09-03 final review: the reviewer asked for de-duplication of multiple
+semantically equal entries for the Forge host (for example `gitlab.example.com:`
+and `"gitlab.example.com":` in one `hosts:` map). Declined as out of scope: a
+YAML map with duplicate keys is already invalid input that glab itself does not
+produce, and no shipped image ever contained the earlier parser that could have
+created it (the image is built on the host only after this batch). The script
+keeps such a file as it is, apart from the documented reconciliation, rather
+than guessing which duplicate to keep.
+
+2026-09-03 final review, third round: decoding YAML escape sequences inside
+quoted host keys (for example `"\x66orge.example.test":`) was also declined.
+glab writes plain unquoted keys; the parser deliberately handles only the
+shapes glab and a hand edit realistically produce (plain, quoted, extra
+whitespace, inline comments, `hosts: {}`). A key that only matches the Forge
+host after escape decoding is treated as a foreign tokenless or tokened host,
+which at worst leaves an extra entry in place. Further findings on YAML shapes
+glab never produces count as hardening, not correctness, and are out of scope.
+
+2026-09-03 final review, fifth round: quoted top-level keys (`"host":`,
+`"hosts":`) after a hand edit were declined for the same reason. The review
+loop was stopped here: rounds 3 to 5 each produced one new YAML shape glab does
+not write, with no finding against glab-written input. Reviewer thread
+01a06720-a4f8-7361-9f9b-12cc0a3660f8; fixes landed in f578a8e, 8eda009,
+34f6e21, 8588028.

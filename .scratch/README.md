@@ -20,6 +20,7 @@ None.
 
 | Feature | Artifact | Next action | Last reviewed |
 | ------- | -------- | ----------- | ------------- |
+| glab config seeding | `glab-config-seeding/issues/03-live-proof-docs-adr-note.md` | Issues 01+02 done, 03 docs landed; final Codex review clean apart from declined YAML hardening (recorded in issue 02). On the host: rebuild the image, then `boxa stop --clean playground && boxa` and the plain-restart test per issue 03; record redacted `glab auth status` / `glab api user` output, set 03 to `done`, archive the feature. | 2026-09-03 |
 | Keep-awake during long-running agent work | `keep-awake-long-running-agent/issues/01-long-running-agent-awake-lease.md` | Host refreshed; live container verification passed after fixing owner detection for versioned Claude binaries + test-suite state leakage (uncommitted). Review/commit the fix (`/cr`), sync the container hook, then run the recorded live WSL soak; on pass promote the issue to `done` and archive the feature. | 2026-08-29 |
 
 ### Cancelled
