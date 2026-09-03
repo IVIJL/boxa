@@ -335,6 +335,51 @@ class EnsureGlabConfigTests(unittest.TestCase):
             b"host: forge.example.test\nhosts:\n  forge.example.test:\n",
         )
 
+    def test_empty_flow_map_hosts_section_is_reused_idempotently(self) -> None:
+        self._write_config(b"host: gitlab.com\nhosts: {} # keep this\n")
+
+        first = self._run("forge.example.test")
+        first_content = self._read_config()
+        first_stat = os.stat(self.config_file)
+        second = self._run("forge.example.test")
+        second_stat = os.stat(self.config_file)
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(
+            first_content,
+            b"host: forge.example.test\nhosts: # keep this\n"
+            b"  forge.example.test:\n",
+        )
+        self.assertEqual(
+            sum(line.startswith(b"hosts:") for line in first_content.splitlines()),
+            1,
+        )
+        self.assertEqual(self._read_config(), first_content)
+        self.assertEqual(second_stat.st_ino, first_stat.st_ino)
+        self.assertEqual(second_stat.st_mtime_ns, first_stat.st_mtime_ns)
+
+    def test_inline_comment_colon_does_not_hide_target_host_or_token(self) -> None:
+        self._write_config(
+            b"host: old.example.test\nhosts:\n"
+            b"  gitlab.example.com: # note: \n"
+            b"    token: stale # rotated: \n"
+            b"    api_host: gitlab.example.com\n"
+        )
+
+        result = self._run("gitlab.example.com", token="current")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = self._read_config()
+        self.assertEqual(
+            content,
+            b"host: gitlab.example.com\nhosts:\n"
+            b"  gitlab.example.com: # note: \n"
+            b"    api_host: gitlab.example.com\n",
+        )
+        self.assertEqual(content.count(b"  gitlab.example.com:"), 1)
+        self.assertNotIn(b"token:", content)
+
     def test_non_default_top_level_keys_survive_unchanged(self) -> None:
         self._write_config(
             b"host: gitlab.com\n"

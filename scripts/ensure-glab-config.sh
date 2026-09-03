@@ -54,8 +54,28 @@ def normalize_entry_key(key: bytes) -> bytes:
     return key
 
 
+def strip_inline_comment(line: bytes) -> bytes:
+    body = line.removesuffix(ending(line))
+    content = body.lstrip(b" \t")
+    search_from = 0
+
+    # A quoted key may contain whitespace followed by '#', which is key data.
+    if content[:1] in (b'"', b"'"):
+        closing_quote = content.find(content[:1], 1)
+        if closing_quote != -1:
+            separator = content.find(b":", closing_quote + 1)
+            if separator != -1:
+                search_from = len(body) - len(content) + separator + 1
+
+    comment = re.search(br"[ \t]+#.*$", body[search_from:])
+    if comment:
+        return body[: search_from + comment.start()]
+    return body
+
+
 def is_token_key(line: bytes, indent: bytes) -> bool:
-    key, separator, _ = line[len(indent) :].partition(b":")
+    working_line = strip_inline_comment(line)
+    key, separator, _ = working_line[len(indent) :].partition(b":")
     return bool(separator) and normalize_entry_key(key) == b"token"
 
 
@@ -79,14 +99,22 @@ if host_indexes:
 else:
     lines.insert(0, b"host: " + target + newline)
 
-hosts_index = next(
-    (
-        index
-        for index, line in enumerate(lines)
-        if re.match(br"^hosts:[ \t]*(?:#.*)?(?:\r?\n)?$", line)
-    ),
-    None,
-)
+hosts_index = None
+for index, line in enumerate(lines):
+    if re.match(br"^hosts:[ \t]*(?:#.*)?(?:\r?\n)?$", line):
+        hosts_index = index
+        break
+
+    body = line.removesuffix(ending(line))
+    empty_flow_map = re.match(
+        br"^hosts:[ \t]*\{[ \t]*\}([ \t]*(?:#.*)?)$", body
+    )
+    if empty_flow_map:
+        suffix = empty_flow_map.group(1)
+        comment = suffix if b"#" in suffix else b""
+        lines[index] = b"hosts:" + comment + ending(line)
+        hosts_index = index
+        break
 
 if hosts_index is None:
     if lines and not ending(lines[-1]):
@@ -118,7 +146,7 @@ else:
         entry_indexes = [
             index
             for index in range(hosts_index + 1, section_end)
-            if entry_pattern.match(lines[index])
+            if entry_pattern.match(strip_inline_comment(lines[index]))
         ]
 
     append_indent = entry_indent if entry_indexes else b"  "
@@ -132,7 +160,8 @@ else:
             else section_end
         )
         block = lines[entry_index:next_index]
-        host = normalize_entry_key(entry_pattern.match(block[0]).group(1))
+        working_entry = strip_inline_comment(block[0])
+        host = normalize_entry_key(entry_pattern.match(working_entry).group(1))
         trailing_start = len(block)
         while trailing_start > 1 and is_separator(block[trailing_start - 1]):
             trailing_start -= 1
