@@ -43,6 +43,21 @@ def ending(line: bytes) -> bytes:
     return b""
 
 
+def leading_whitespace(line: bytes) -> bytes:
+    return re.match(br"^[ \t]*", line).group(0)
+
+
+def normalize_entry_key(key: bytes) -> bytes:
+    key = key.strip()
+    if len(key) >= 2 and key[:1] == key[-1:] and key[:1] in (b'"', b"'"):
+        key = key[1:-1]
+    return key
+
+
+def is_separator(line: bytes) -> bool:
+    return not line.strip() or line.lstrip(b" \t").startswith(b"#")
+
+
 def replace_default_host(line: bytes) -> bytes:
     body = line.removesuffix(ending(line))
     comment = re.search(br"[ \t]+#.*$", body)
@@ -80,14 +95,28 @@ else:
             section_end = index
             break
 
-    entry_pattern = re.compile(
-        br"^  ([^ \t#].*):[ \t]*(?:#.*)?(?:\r?\n)?$"
-    )
-    entry_indexes = [
-        index
-        for index in range(hosts_index + 1, section_end)
-        if entry_pattern.match(lines[index])
-    ]
+    entry_indent = None
+    for index in range(hosts_index + 1, section_end):
+        line = lines[index]
+        if line.strip() and not line.lstrip(b" \t").startswith(b"#"):
+            entry_indent = leading_whitespace(line)
+            break
+
+    if entry_indent is None:
+        entry_indexes = []
+    else:
+        entry_pattern = re.compile(
+            br"^"
+            + re.escape(entry_indent)
+            + br"([^ \t#].*):[ \t]*(?:#.*)?(?:\r?\n)?$"
+        )
+        entry_indexes = [
+            index
+            for index in range(hosts_index + 1, section_end)
+            if entry_pattern.match(lines[index])
+        ]
+
+    append_indent = entry_indent if entry_indexes else b"  "
     rebuilt = lines[hosts_index + 1 : entry_indexes[0] if entry_indexes else section_end]
     found_target = False
 
@@ -98,27 +127,42 @@ else:
             else section_end
         )
         block = lines[entry_index:next_index]
-        host = entry_pattern.match(block[0]).group(1)
+        host = normalize_entry_key(entry_pattern.match(block[0]).group(1))
+        trailing_start = len(block)
+        while trailing_start > 1 and is_separator(block[trailing_start - 1]):
+            trailing_start -= 1
+        entry_block = block[:trailing_start]
+        trailing = block[trailing_start:]
         token_indexes = [
             index
-            for index, line in enumerate(block)
-            if re.match(br"^    token:[^\r\n]*(?:\r?\n)?$", line)
+            for index, line in enumerate(entry_block)
+            if index > 0
+            and leading_whitespace(line).startswith(entry_indent)
+            and len(leading_whitespace(line)) > len(entry_indent)
+            and re.match(br"^token:", line[len(leading_whitespace(line)) :])
         ]
 
         if host == target:
             found_target = True
             if remove_target_token:
-                block = [
-                    line for index, line in enumerate(block) if index not in token_indexes
+                entry_block = [
+                    line
+                    for index, line in enumerate(entry_block)
+                    if index not in token_indexes
                 ]
-            rebuilt.extend(block)
+            rebuilt.extend(entry_block)
         elif token_indexes:
-            rebuilt.extend(block)
+            rebuilt.extend(entry_block)
+
+        # Inter-entry context must survive even when the preceding host is pruned.
+        rebuilt.extend(trailing)
 
     if not found_target:
         if rebuilt and not ending(rebuilt[-1]):
             rebuilt[-1] += newline
-        rebuilt.append(b"  " + target + b":" + newline)
+        elif not rebuilt and not ending(lines[hosts_index]):
+            lines[hosts_index] += newline
+        rebuilt.append(append_indent + target + b":" + newline)
 
     lines[hosts_index + 1 : section_end] = rebuilt
 

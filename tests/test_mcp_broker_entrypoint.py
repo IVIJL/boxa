@@ -311,7 +311,10 @@ class DockerfileAccountTests(unittest.TestCase):
             "/usr/local/bin/ensure-glab-config",
             self.text,
         )
-        self.assertIn("/usr/local/bin/ensure-glab-config", self.text)
+        self.assertRegex(
+            self.text,
+            r"RUN chmod \+x(?:[^\n]|\\\n)*?/usr/local/bin/ensure-glab-config",
+        )
 
     def test_broker_namespace_wrapper_shipped_and_executable(self):
         # ADR 0014 issue 21: the mount-namespace wrapper (idmap remount +

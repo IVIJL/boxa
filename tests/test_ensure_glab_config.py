@@ -103,6 +103,56 @@ class EnsureGlabConfigTests(unittest.TestCase):
             b"    api_host: forge.example.test\n",
         )
 
+    def test_quoted_target_host_is_recognized_without_duplication(self) -> None:
+        self._write_config(
+            b"host: old.example.test\nhosts:\n"
+            b'  "forge.example.test":\n'
+            b"    token: stale\n"
+            b"    api_host: forge.example.test\n"
+        )
+
+        result = self._run("forge.example.test", token="current")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._read_config(),
+            b"host: forge.example.test\nhosts:\n"
+            b'  "forge.example.test":\n'
+            b"    api_host: forge.example.test\n",
+        )
+
+    def test_single_quoted_target_host_is_recognized_without_duplication(self) -> None:
+        self._write_config(
+            b"host: old.example.test\nhosts:\n"
+            b"  'forge.example.test':\n"
+            b"    token: stale\n"
+        )
+
+        result = self._run("forge.example.test", token="current")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._read_config(),
+            b"host: forge.example.test\nhosts:\n"
+            b"  'forge.example.test':\n",
+        )
+
+    def test_target_host_with_space_before_colon_is_not_duplicated(self) -> None:
+        self._write_config(
+            b"host: old.example.test\nhosts:\n"
+            b"  forge.example.test   :\n"
+            b"    token: stale\n"
+        )
+
+        result = self._run("forge.example.test", token="current")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._read_config(),
+            b"host: forge.example.test\nhosts:\n"
+            b"  forge.example.test   :\n",
+        )
+
     def test_config_token_is_kept_without_environment_token(self) -> None:
         original = (
             b"host: forge.example.test\nhosts:\n"
@@ -139,8 +189,97 @@ class EnsureGlabConfigTests(unittest.TestCase):
         self.assertNotIn(b"  gitlab.com:\n", content)
         self.assertIn(b"  forge.example.test:\n", content)
 
+    def test_foreign_host_with_nonstandard_token_indent_is_preserved(self) -> None:
+        foreign = b"  gitlab.other.test:\n   token: keep\n"
+        self._write_config(b"host: gitlab.com\nhosts:\n" + foreign)
+
+        result = self._run("forge.example.test")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._read_config(),
+            b"host: forge.example.test\nhosts:\n"
+            + foreign
+            + b"  forge.example.test:\n",
+        )
+
+    def test_tab_indented_hosts_are_reconciled(self) -> None:
+        self._write_config(
+            b"host: old.example.test\nhosts:\n"
+            b"\tgitlab.other.test:\n"
+            b"\t\ttoken: keep\n"
+            b"\tforge.example.test:\n"
+            b"\t\ttoken: stale\n"
+            b"\t\tapi_host: forge.example.test\n"
+        )
+
+        result = self._run("forge.example.test", token="current")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._read_config(),
+            b"host: forge.example.test\nhosts:\n"
+            b"\tgitlab.other.test:\n"
+            b"\t\ttoken: keep\n"
+            b"\tforge.example.test:\n"
+            b"\t\tapi_host: forge.example.test\n",
+        )
+
+    def test_new_target_uses_detected_tab_entry_indent(self) -> None:
+        self._write_config(
+            b"host: old.example.test\nhosts:\n"
+            b"\tgitlab.other.test:\n"
+            b"\t\ttoken: keep\n"
+        )
+
+        result = self._run("forge.example.test")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._read_config(),
+            b"host: forge.example.test\nhosts:\n"
+            b"\tgitlab.other.test:\n"
+            b"\t\ttoken: keep\n"
+            b"\tforge.example.test:\n",
+        )
+
+    def test_comments_between_entries_survive_dropped_foreign_host(self) -> None:
+        self._write_config(
+            b"host: gitlab.com\nhosts:\n"
+            b"  tokenless.example.test:\n"
+            b"    api_host: tokenless.example.test\n"
+            b"  # Keep context for the following login.\n"
+            b"\n"
+            b"  gitlab.other.test:\n"
+            b"    token: keep\n"
+        )
+
+        result = self._run("forge.example.test")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._read_config(),
+            b"host: forge.example.test\nhosts:\n"
+            b"  # Keep context for the following login.\n"
+            b"\n"
+            b"  gitlab.other.test:\n"
+            b"    token: keep\n"
+            b"  forge.example.test:\n",
+        )
+
     def test_missing_hosts_section_is_created(self) -> None:
         self._write_config(b"host: gitlab.com\n")
+
+        result = self._run("forge.example.test")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._read_config(),
+            b"host: forge.example.test\nhosts:\n  forge.example.test:\n",
+        )
+
+    def test_empty_hosts_section_without_final_newline_gets_valid_entry(self) -> None:
+        self._write_config(b"host: gitlab.com\nhosts:")
 
         result = self._run("forge.example.test")
 
