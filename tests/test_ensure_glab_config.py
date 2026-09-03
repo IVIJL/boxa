@@ -359,6 +359,24 @@ class EnsureGlabConfigTests(unittest.TestCase):
         self.assertEqual(second_stat.st_ino, first_stat.st_ino)
         self.assertEqual(second_stat.st_mtime_ns, first_stat.st_mtime_ns)
 
+    def test_space_before_colon_on_top_level_keys_is_not_duplicated(self) -> None:
+        self._write_config(
+            b"host : gitlab.com\nhosts :\n  gitlab.com:\n"
+            b"  forge.example.test:\n    token: stale\n"
+        )
+
+        result = self._run("forge.example.test", token="fresh")
+        content = self._read_config()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            content,
+            b"host: forge.example.test\nhosts :\n  forge.example.test:\n",
+        )
+        self.assertEqual(
+            sum(line.startswith(b"host") for line in content.splitlines()), 2
+        )
+
     def test_inline_comment_colon_does_not_hide_target_host_or_token(self) -> None:
         self._write_config(
             b"host: old.example.test\nhosts:\n"

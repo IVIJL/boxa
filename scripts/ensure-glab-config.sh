@@ -90,8 +90,10 @@ def replace_default_host(line: bytes) -> bytes:
     return b"host: " + target + suffix + ending(line)
 
 
+# YAML allows whitespace before the colon, so a hand-edited `host :` line is
+# still the default-host key and must be rewritten rather than duplicated.
 host_indexes = [
-    index for index, line in enumerate(lines) if re.match(br"^host:[ \t]*", line)
+    index for index, line in enumerate(lines) if re.match(br"^host[ \t]*:", line)
 ]
 if host_indexes:
     for index in host_indexes:
@@ -101,13 +103,13 @@ else:
 
 hosts_index = None
 for index, line in enumerate(lines):
-    if re.match(br"^hosts:[ \t]*(?:#.*)?(?:\r?\n)?$", line):
+    if re.match(br"^hosts[ \t]*:[ \t]*(?:#.*)?(?:\r?\n)?$", line):
         hosts_index = index
         break
 
     body = line.removesuffix(ending(line))
     empty_flow_map = re.match(
-        br"^hosts:[ \t]*\{[ \t]*\}([ \t]*(?:#.*)?)$", body
+        br"^hosts[ \t]*:[ \t]*\{[ \t]*\}([ \t]*(?:#.*)?)$", body
     )
     if empty_flow_map:
         suffix = empty_flow_map.group(1)
