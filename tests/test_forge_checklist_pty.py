@@ -129,7 +129,8 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                 "done\n"
                 "[ -z \"$header\" ] || printf '%s\\n' \"$header\" >&2\n"
                 "IFS= read -r selected\n"
-                "printf '%s\\n' \"$selected\"\n"
+                "# Mirror fzf --print-query: the (empty) query line comes first.\n"
+                "printf '\\n%s\\n' \"$selected\"\n"
             )
         os.chmod(gh, 0o700)
         os.chmod(glab, 0o700)
@@ -279,7 +280,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                     (b"Persona kind: (number/q)", b"2\n"),
                     (b"Forge: (number/q)", b"1\n"),
                     (b"Expected account username", b"machine-user\n"),
-                    (b"GitHub token: (number/q)", b"1\n"),
+                    (b"Token source: (number/q)", b"1\n"),
                     (b"Paste GitHub token:", secret.encode() + b"\n"),
                     (b"Token verification: (number/q)", b"1\n"),
                     (b"durable Allowlist? [y/N]", b"\n"),
@@ -325,7 +326,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                     (b"Persona kind: (number/q)", b"1\n"),
                     (b"Forge: (number/q)", b"1\n"),
                     (b"Expected account username", b"entered-user\n"),
-                    (b"GitHub token: (number/q)", b"1\n"),
+                    (b"Token source: (number/q)", b"1\n"),
                     (b"Paste GitHub token:", secret.encode() + b"\n"),
                     (b"durable Allowlist? [y/N]", b"\n"),
                     (b"GitHub SSH key: (number/q)", b"1\n"),
@@ -351,7 +352,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                 transcript,
             )
             self.assertLess(
-                transcript.index(mint_url), transcript.index("GitHub token:")
+                transcript.index(mint_url), transcript.index("Token source:")
             )
             self.assertNotIn("Create a separate automation-only GitHub", transcript)
             self.assertIn(
@@ -457,7 +458,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                     (b"Persona name:", b"picked-keys\n"),
                     (b"Persona kind: (number/q)", b"2\n"),
                     (b"Expected account username", b"machine-user\n"),
-                    (b"GitHub token: (number/q)", b"1\n"),
+                    (b"Token source: (number/q)", b"1\n"),
                     (b"Paste GitHub token:", secret.encode() + b"\n"),
                     (b"durable Allowlist? [y/N]", b"\n"),
                     (b"GitHub SSH key: (number/q)", b"1\n"),
@@ -519,7 +520,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                     (b"Persona name:", b"token-only\n"),
                     (b"Persona kind: (number/q)", b"2\n"),
                     (b"Expected account username", b"machine-user\n"),
-                    (b"GitHub token: (number/q)", b"1\n"),
+                    (b"Token source: (number/q)", b"1\n"),
                     (b"Paste GitHub token:", secret.encode() + b"\n"),
                     (b"durable Allowlist? [y/N]", b"\n"),
                     (b"GitHub SSH key: (number/q)", b"1\n"),
@@ -585,7 +586,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                     (b"Persona name:", b"chosen-key\n"),
                     (b"Persona kind: (number/q)", b"2\n"),
                     (b"Expected account username", b"machine-user\n"),
-                    (b"GitHub token: (number/q)", b"1\n"),
+                    (b"Token source: (number/q)", b"1\n"),
                     (b"Paste GitHub token:", secret.encode() + b"\n"),
                     (b"durable Allowlist? [y/N]", b"\n"),
                     (b"GitHub SSH key: (number/q)", b"2\n"),
@@ -657,7 +658,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                     (b"Persona name:", persona_name.encode() + b"\n"),
                     (b"Persona kind: (number/q)", b"1\n"),
                     (b"Expected account username", b"machine-user\n"),
-                    (b"GitHub token: (number/q)", b"1\n"),
+                    (b"Token source: (number/q)", b"1\n"),
                     (b"Paste GitHub token:", secret.encode() + b"\n"),
                     (b"durable Allowlist? [y/N]", b"\n"),
                     (
@@ -718,7 +719,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                         (b"Persona name:", f"{kind}-persona\n".encode()),
                         (b"Persona kind: (number/q)", selection.encode() + b"\n"),
                         (b"Expected account username", b"machine-user\n"),
-                        (b"GitHub token: (number/q)", b"1\n"),
+                        (b"Token source: (number/q)", b"1\n"),
                         (b"Paste GitHub token:", secret.encode() + b"\n"),
                         (b"durable Allowlist? [y/N]", b"\n"),
                         (
@@ -759,12 +760,79 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                     (b"Persona name:", b"key-only\n"),
                     (b"Persona kind: (number/q)", b"1\n"),
                     (b"Expected account username", b"machine-user\n"),
-                    (b"GitHub token: (number/q)", b"1\n"),
+                    (b"Token source: (number/q)", b"1\n"),
                     (b"Paste GitHub token:", b"\n"),
                 ],
             )
 
             self.assertNotEqual(returncode, 0, transcript)
+            self.assertIn("verified token is mandatory", transcript)
+            self.assertNotIn("GitHub SSH key:", transcript)
+            self.assertFalse(
+                os.path.exists(os.path.join(env["BOXA_FORGE_DIR"], "identities"))
+            )
+
+    def test_registration_accepts_token_pasted_into_source_menu(self) -> None:
+        # Regression: a token pasted into the token-source menu was silently
+        # dropped and the checklist ended with "verified token is mandatory".
+        with tempfile.TemporaryDirectory() as home:
+            env = self._environment(home)
+            harness = self._write_harness(home)
+            self._write_fake_forges(home, env)
+            self._generate_agent_key(env)
+            secret = "glpat-pasted-into-the-menu-secret"
+            env["BOXA_TEST_GH_EXPECTED"] = "unused"
+            env["BOXA_TEST_GH_HOST_TOKEN"] = "unused"
+            env["BOXA_TEST_GLAB_EXPECTED"] = secret
+            env["BOXA_TEST_GLAB_HOST_TOKEN"] = "unused"
+            env["BOXA_TEST_GLAB_FAILS"] = "0"
+
+            returncode, transcript = self._run_pty(
+                [harness, "add", "gitlab"],
+                env,
+                [
+                    (b"Persona name:", b"menu-paste\n"),
+                    (b"Persona kind: (number/q)", b"1\n"),
+                    (b"GitLab host [gitlab.com]", b"gitlab.example\n"),
+                    (b"Expected account username", b"service-account\n"),
+                    (b"Token source: (number/q)", secret.encode() + b"\n"),
+                    (b"durable Allowlist? [y/N]", b"\n"),
+                    (b"GitLab SSH key: (number/q)", b"1\n"),
+                    (b"GitLab account: (number/q)", b"2\n"),
+                ],
+            )
+            self.assertEqual(returncode, 0, transcript)
+            self.assertIn("Token source: (typed value accepted)", transcript)
+            self.assertIn("visible on screen", transcript)
+            self.assertNotIn("Paste GitLab token:", transcript)
+            self.assertIn("Authenticated as: service-account", transcript)
+            self.assertIn("Registered persona: menu-paste", transcript)
+
+    def test_registration_explains_cancelled_token_source_menu(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            env = self._environment(home)
+            harness = self._write_harness(home)
+            self._write_fake_forges(home, env)
+            self._generate_agent_key(env)
+            env["BOXA_TEST_GH_EXPECTED"] = "unused"
+            env["BOXA_TEST_GH_HOST_TOKEN"] = "unused"
+            env["BOXA_TEST_GLAB_EXPECTED"] = "unused"
+            env["BOXA_TEST_GLAB_HOST_TOKEN"] = "unused"
+
+            returncode, transcript = self._run_pty(
+                [harness, "add", "github"],
+                env,
+                [
+                    (b"Persona name:", b"menu-cancel\n"),
+                    (b"Persona kind: (number/q)", b"1\n"),
+                    (b"Expected account username", b"machine-user\n"),
+                    # Short free text is not token-shaped: treated as a
+                    # cancelled choice, never stored as a credential.
+                    (b"Token source: (number/q)", b"nope-x\n"),
+                ],
+            )
+            self.assertNotEqual(returncode, 0, transcript)
+            self.assertIn("No token source was chosen", transcript)
             self.assertIn("verified token is mandatory", transcript)
             self.assertNotIn("GitHub SSH key:", transcript)
             self.assertFalse(
@@ -797,7 +865,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                     (b"Persona name:", b"imported\n"),
                     (b"Persona kind: (number/q)", b"2\n"),
                     (b"Expected account username", b"machine-user\n"),
-                    (b"GitHub token: (number/q)", b"2\n"),
+                    (b"Token source: (number/q)", b"2\n"),
                     (b"host-only forge store? [y/N]", b"y\n"),
                     (b"durable Allowlist? [y/N]", b"\n"),
                     (b"GitHub SSH key: (number/q)", b"3\n"),
@@ -1162,7 +1230,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                     (b"Persona kind: (number/q)", b"1\n"),
                     (b"GitLab host [gitlab.com]", b"gitlab.example\n"),
                     (b"Expected account username", b"service-account\n"),
-                    (b"GitLab token: (number/q)", b"1\n"),
+                    (b"Token source: (number/q)", b"1\n"),
                     (b"Paste GitLab token:", secret.encode() + b"\n"),
                     (b"durable Allowlist? [y/N]", b"\n"),
                     (b"GitLab SSH key: (number/q)", b"1\n"),
@@ -1186,7 +1254,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                 transcript,
             )
             self.assertLess(
-                transcript.index(mint_url), transcript.index("GitLab token:")
+                transcript.index(mint_url), transcript.index("Token source:")
             )
             self.assertIn("Authenticated as: service-account", transcript)
             self.assertIn("Registered persona: gitlab-automation", transcript)
@@ -1229,7 +1297,7 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                     (b"Persona name:", b"machine-user\n"),
                     (b"Persona kind: (number/q)", b"1\n"),
                     (b"Expected account username", b"machine-user\n"),
-                    (b"GitHub token: (number/q)", b"1\n"),
+                    (b"Token source: (number/q)", b"1\n"),
                     (b"Paste GitHub token:", secret.encode() + b"\n"),
                     (b"durable Allowlist? [y/N]", b"\n"),
                     (b"GitHub SSH key: (number/q)", b"1\n"),

@@ -2080,16 +2080,16 @@ _boxa::forge_token_choice() {
         header="$context — the token is mandatory for the CLI, API, review requests, and committer identity; SSH keys only provide git transport."$'\n''Question: How should Boxa obtain the required token?'
         [ -z "$guidance" ] || header="$guidance"$'\n'"$header"
         selected="$(printf '%s\n' "$paste" "$adopt" \
-            | picker::one --prompt "$display_name token:" \
+            | picker::one --prompt 'Token source:' --accept-query \
                 --header "$header")" \
-            || return 1
+            || { _boxa::forge_token_source_cancelled "$display_name"; return 1; }
     else
         header="$context — the SSH key only covers git push/pull; the token enables the CLI, API, review requests, and committer identity."$'\n''Question: How should Boxa obtain the token?'
         [ -z "$guidance" ] || header="$guidance"$'\n'"$header"
         selected="$(printf '%s\n' "$paste" "$adopt" "$skip" \
-            | picker::one --prompt "$display_name token:" \
+            | picker::one --prompt 'Token source:' --accept-query \
                 --header "$header")" \
-            || return 0
+            || { _boxa::forge_token_source_cancelled "$display_name"; return 0; }
     fi
     case "$selected" in
         "$paste")
@@ -2104,10 +2104,28 @@ _boxa::forge_token_choice() {
             _boxa::forge_adopt_existing "$forge" "$host" defer-catalog \
                 || { [ "$required" != required ] || return 1; return 0; }
             ;;
-        *)
+        "$skip")
             _boxa::forge_checklist_add_skipped 'token setup'
             [ "$required" != required ] || return 1
             return 0
+            ;;
+        *)
+            # Free text typed into the source menu. A token-shaped value is
+            # taken as the paste the user intended; anything else is treated
+            # as a cancelled choice so a stray keystroke never becomes a token.
+            if ! _boxa::forge_token_shaped "$selected"; then
+                _boxa::forge_token_source_cancelled "$display_name"
+                [ "$required" != required ] || return 1
+                return 0
+            fi
+            printf 'Using the token typed into the source menu. It was visible on screen while typing; rotate it if that terminal was shared or recorded.\n' \
+                >&2
+            if ! _boxa::forge_set "$forge" skip "$host" '' "$selected"; then
+                printf '%s token entry failed; existing credential was not verified.\n' \
+                    "$display_name" >&2
+                [ "$required" != required ] || return 1
+                return 0
+            fi
             ;;
     esac
     if ! _boxa::forge_load_credential "$forge" >/dev/null 2>&1; then
@@ -2118,6 +2136,21 @@ _boxa::forge_token_choice() {
         "$required" || return 1
     [ -z "$result_var" ] \
         || printf -v "$result_var" '%s' "$verified_username"
+}
+
+_boxa::forge_token_source_cancelled() {
+    local display_name="$1"
+    printf 'No token source was chosen. Pick "Paste a new token" with Enter; the %s token is requested on the next prompt, not in this menu.\n' \
+        "$display_name" >&2
+}
+
+# Heuristic for text typed into the token-source menu instead of a menu
+# answer: one line, no whitespace, at least 20 characters. Real gh/glab tokens
+# (ghp_, github_pat_, glpat-) are all longer; short words are not tokens.
+_boxa::forge_token_shaped() {
+    local value="$1"
+    [ "${#value}" -ge 20 ] || return 1
+    [[ "$value" != *[[:space:]]* ]]
 }
 
 _boxa::forge_warn_identity_mismatch() {
@@ -2746,9 +2779,12 @@ _boxa::forge_guided_setup() {
     _boxa::forge_dashboard "${2:-}" "${1:-}"
 }
 
+# Arguments: forge, skip-allowlist-offer flag, host, defer-catalog-write flag,
+# preset token. A non-empty preset token replaces the hidden tty prompt (the
+# token-source menu passes text the user typed there).
 _boxa::forge_set_locked() {
     local forge="$1" skip_allowlist_offer="${2:-}" host="${3:-}"
-    local defer_catalog_write="${4:-}"
+    local defer_catalog_write="${4:-}" preset_token="${5:-}"
     local token username='' created_at display_name cli identity_id kind auth
 
     case "$forge" in
@@ -2778,13 +2814,17 @@ _boxa::forge_set_locked() {
     esac
 
     _boxa::forge_require_probe_cli "$forge" || return 1
-    printf 'This token enables %s CLI and API operations, review requests, and committer identity; keep it private.\n' \
-        "$cli" >&2
-    IFS= read -r -s -p "Paste $display_name token: " token </dev/tty || {
+    if [ -n "$preset_token" ]; then
+        token="$preset_token"
+    else
+        printf 'This token enables %s CLI and API operations, review requests, and committer identity; keep it private.\n' \
+            "$cli" >&2
+        IFS= read -r -s -p "Paste $display_name token: " token </dev/tty || {
+            printf '\n' >&2
+            return 1
+        }
         printf '\n' >&2
-        return 1
-    }
-    printf '\n' >&2
+    fi
     if [ -z "$token" ]; then
         printf 'Token cannot be empty.\n' >&2
         return 1

@@ -60,6 +60,17 @@ Added 2026-05-21 for `agent-browser-broker.sh`'s missing-session fallback
 (ADR 0010), but generally applicable to any picker site that needs the
 user to see *why* they're picking.
 
+**`--accept-query` for prompts that invite a paste.** A picker whose prompt
+reads like a value prompt (the forge token-source menu, for example) gets
+values pasted into it: fzf matches nothing, Enter exits 1, and the paste is
+lost with no explanation. With `--accept-query`, free text that matches no
+item is returned on stdout with exit 0 (fzf via `--print-query`; the
+fallback returns any input that is not a letter, number, `q` or comma
+list). Esc, `q` and empty input still cancel. The picker never echoes the
+accepted text to stderr because it may be a secret; the caller decides
+whether the text is meaningful. Added 2026-09-07 after a GitLab token was
+pasted into the `forge` token-source menu.
+
 **Pure-logic core (`_picker::select`).** The selection parser is split out
 from the I/O-rendering wrapper so it can be exercised by `tests/picker.sh`
 without a tty or fzf. The wrapper renders the menu to stderr, reads from

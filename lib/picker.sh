@@ -20,6 +20,13 @@
 # via its --header option; the numbered fallback prints it to stderr just above
 # the option list. Use it for context the user needs to see while picking.
 #
+# --accept-query makes a free-text entry that matches no item a valid answer:
+# the picker prints the raw text on stdout and returns 0 instead of failing.
+# Use it only for prompts where a user may paste a value into the picker (a
+# token menu, for example) so the paste is not lost; the caller decides what
+# the text means. Esc/q/empty input still cancel with return 1. The picker
+# never echoes the accepted text to stderr because it may be a secret.
+#
 # Override fzf detection (for tests): export BOXA_PICKER_FZF=0
 # See docs/adr/0006-interactive-picker-conventions.md.
 # =============================================================================
@@ -40,13 +47,14 @@ picker::many() {
 
 _picker::run() {
     local mode="$1"; shift
-    local prompt="" header=""
+    local prompt="" header="" accept_query=0
     local -a first_options=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --prompt)       prompt="$2"; shift 2 ;;
             --header)       header="$2"; shift 2 ;;
             --first-option) first_options+=("$2"); shift 2 ;;
+            --accept-query) accept_query=1; shift ;;
             *) echo "picker: unknown arg: $1" >&2; return 1 ;;
         esac
     done
@@ -68,9 +76,9 @@ _picker::run() {
     done <<< "$raw_items"
 
     if _picker::fzf_available; then
-        _picker::fzf "$mode" "$prompt" "$header" ${items[@]+"${items[@]}"}
+        _picker::fzf "$mode" "$prompt" "$header" "$accept_query" ${items[@]+"${items[@]}"}
     else
-        _picker::fallback "$mode" "$prompt" "$header" "${#first_options[@]}" ${items[@]+"${items[@]}"}
+        _picker::fallback "$mode" "$prompt" "$header" "${#first_options[@]}" "$accept_query" ${items[@]+"${items[@]}"}
     fi
 }
 
@@ -79,7 +87,7 @@ _picker::fzf_available() {
 }
 
 _picker::fzf() {
-    local mode="$1" prompt="$2" header="$3"; shift 3
+    local mode="$1" prompt="$2" header="$3" accept_query="$4"; shift 4
     local height='40%'
     if fzf --height='~40%' --version >/dev/null 2>&1; then
         height='~40%'
@@ -91,14 +99,30 @@ _picker::fzf() {
     fi
     [ -n "$header" ] && args+=(--header="$header")
     [ "$mode" = many ] && args+=(--multi)
-    local selection
-    selection="$(printf '%s\n' "$@" | fzf "${args[@]}")" || return 1
+    # --print-query puts the typed filter on the first output line so a
+    # no-match Enter (exit 1) can still hand the text back under
+    # --accept-query. Esc/Ctrl-C exit 130 and always cancel.
+    local output status=0 query selection
+    output="$(printf '%s\n' "$@" | fzf "${args[@]}" --print-query)" || status=$?
+    query="${output%%$'\n'*}"
+    if [ "$status" -ne 0 ]; then
+        if [ "$status" -eq 1 ] && [ "$accept_query" = 1 ] && [ -n "$query" ]; then
+            _picker::echo_selection "$prompt" '(typed value accepted)'
+            printf '%s\n' "$query"
+            return 0
+        fi
+        return 1
+    fi
+    case "$output" in
+        *$'\n'*) selection="${output#*$'\n'}" ;;
+        *) return 1 ;;
+    esac
     _picker::echo_selection "$prompt" "$selection"
     printf '%s\n' "$selection"
 }
 
 _picker::fallback() {
-    local mode="$1" prompt="$2" header="$3" first_count="$4"; shift 4
+    local mode="$1" prompt="$2" header="$3" first_count="$4" accept_query="$5"; shift 5
     [ -n "$header" ] && printf '%s\n' "$header" >&2
     local -a items=("$@")
 
@@ -135,11 +159,31 @@ _picker::fallback() {
 
     local choice
     choice=$(_picker::read_choice) || return 1
+    if [ "$accept_query" = 1 ] && _picker::is_free_text "$mode" "$choice"; then
+        _picker::echo_selection "$prompt" '(typed value accepted)'
+        printf '%s\n' "$choice"
+        return 0
+    fi
     local selection
     selection="$(_picker::select "$mode" "$first_count" "$choice" "${items[@]}")" \
         || return 1
     _picker::echo_selection "$prompt" "$selection"
     printf '%s\n' "$selection"
+}
+
+# True when the fallback input cannot be a menu answer (letter, number, q,
+# or a comma list in many-mode). Checked before _picker::select so the raw
+# text never reaches its "Invalid choice" message on stderr.
+_picker::is_free_text() {
+    local mode="$1" choice="$2"
+    choice="${choice#"${choice%%[![:space:]]*}"}"
+    choice="${choice%"${choice##*[![:space:]]}"}"
+    [ -n "$choice" ] || return 1
+    if [ "$mode" = many ]; then
+        ! [[ "$choice" =~ ^[a-z0-9,[:space:]]+$ ]]
+    else
+        ! [[ "$choice" =~ ^([a-z]|[0-9]+)$ ]]
+    fi
 }
 
 _picker::echo_selection() {

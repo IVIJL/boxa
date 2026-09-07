@@ -198,7 +198,7 @@ wizard_projects_fzf="$(
             local rows
             rows="$(cat)"
             printf "FZF_ROWS:%s\n" "$rows" >&2
-            printf "%s\n" "${rows%%$'"'"'\n'"'"'*}"
+            printf "\n%s\n" "${rows%%$'"'"'\n'"'"'*}"
         }
         _wizard_project_picker server "" one
     ' "$SCRIPT_DIR/../scripts/_harness.sh" \
@@ -315,10 +315,11 @@ fzf() {
         return 0
     fi
     printf 'FZF_ARGS:%s\n' "$*" >&2
-    printf 'alpha\nbeta\n'
+    # Real fzf --print-query emits the typed filter (empty here) first.
+    printf '\nalpha\nbeta\n'
 }
 fzf_stderr_file="$(mktemp "${TMPDIR:-/tmp}/boxa-picker-fzf.XXXXXX")"
-fzf_stdout="$(_picker::fzf many "P:" "Choose items" alpha beta \
+fzf_stdout="$(_picker::fzf many "P:" "Choose items" 0 alpha beta \
     2>"$fzf_stderr_file")"
 fzf_stderr="$(<"$fzf_stderr_file")"
 rm -f "$fzf_stderr_file"
@@ -326,6 +327,7 @@ unset -f fzf
 if [[ "$fzf_stdout" = $'alpha\nbeta' \
     && "$fzf_stderr" = *"FZF_ARGS:"*"--height=~40%"*"--min-height=10"*"--layout=reverse"* \
     && "$fzf_stderr" = *"--multi"* \
+    && "$fzf_stderr" = *"--print-query"* \
     && "$fzf_stderr" = *"Choose items"*"Tab selects multiple"* \
     && "$fzf_stderr" = *'P: alpha, beta' ]]; then
     printf 'PASS  fzf many: renders inline and echoes the multi-selection\n'
@@ -341,9 +343,9 @@ fzf() {
         return 2
     fi
     printf 'FZF_ARGS:%s\n' "$*" >&2
-    printf 'alpha\n'
+    printf '\nalpha\n'
 }
-legacy_fzf_stderr="$(_picker::fzf one "P:" "" alpha beta 2>&1 1>/dev/null)"
+legacy_fzf_stderr="$(_picker::fzf one "P:" "" 0 alpha beta 2>&1 1>/dev/null)"
 unset -f fzf
 if [[ "$legacy_fzf_stderr" = *"FZF_ARGS:"*"--height=40%"* \
     && "$legacy_fzf_stderr" != *"--height=~40%"* \
@@ -353,6 +355,75 @@ if [[ "$legacy_fzf_stderr" = *"FZF_ARGS:"*"--height=40%"* \
 else
     printf 'FAIL  fzf legacy: falls back to plain inline height\n      stderr: %q\n' \
         "$legacy_fzf_stderr"
+    fail_count=$((fail_count + 1))
+fi
+
+# --- accept-query: text typed into the picker instead of a choice -----------
+# Regression: a user pasted a GitLab token into the fzf token-source menu; fzf
+# matched nothing, Enter exited 1 and the paste was silently lost.
+
+# shellcheck disable=SC2317
+fzf() {
+    if [[ "$*" = *--version* ]]; then
+        return 0
+    fi
+    # No item matched: fzf prints only the query line and exits 1.
+    printf 'glpat-typed-into-the-menu-1234\n'
+    return 1
+}
+aq_stderr_file="$(mktemp "${TMPDIR:-/tmp}/boxa-picker-aq.XXXXXX")"
+aq_stdout="$(_picker::fzf one "Token source:" "" 1 alpha beta 2>"$aq_stderr_file")"
+aq_status=$?
+aq_stderr="$(<"$aq_stderr_file")"
+rm -f "$aq_stderr_file"
+if [ "$aq_status" -eq 0 ] && [ "$aq_stdout" = 'glpat-typed-into-the-menu-1234' ] \
+    && [[ "$aq_stderr" != *glpat-* ]] \
+    && [[ "$aq_stderr" = *'Token source: (typed value accepted)'* ]]; then
+    printf 'PASS  fzf accept-query: no-match query is returned and not echoed\n'
+else
+    printf 'FAIL  fzf accept-query: no-match query is returned and not echoed\n      status: %s stdout: %q stderr: %q\n' \
+        "$aq_status" "$aq_stdout" "$aq_stderr"
+    fail_count=$((fail_count + 1))
+fi
+assert_fail "fzf accept-query off: no-match query still cancels" \
+    _picker::fzf one "P:" "" 0 alpha beta
+
+# Esc (exit 130) cancels even with accept-query on.
+# shellcheck disable=SC2317
+fzf() {
+    if [[ "$*" = *--version* ]]; then
+        return 0
+    fi
+    printf 'glpat-typed-then-escaped-1234\n'
+    return 130
+}
+assert_fail "fzf accept-query: Esc cancels despite typed query" \
+    _picker::fzf one "P:" "" 1 alpha beta
+unset -f fzf
+
+# Fallback: the same guarantee without fzf.
+export BOXA_PICKER_FZF=0
+aq_fallback() {
+    local choice="$1"; shift
+    printf 'alpha\nbeta\n' | BOXA_PICKER_TEST_CHOICE="$choice" \
+        picker::one --prompt 'P:' "$@"
+}
+assert_eq "fallback accept-query: free text returned" \
+    "glpat-typed-into-the-menu-1234" \
+    "$(aq_fallback 'glpat-typed-into-the-menu-1234' --accept-query 2>/dev/null)"
+assert_eq "fallback accept-query: numbers still select" "beta" \
+    "$(aq_fallback 2 --accept-query 2>/dev/null)"
+assert_fail "fallback accept-query: q still cancels" aq_fallback q --accept-query
+assert_fail "fallback accept-query off: free text is invalid" aq_fallback glpat-x
+assert_fail "is_free_text: letter"     _picker::is_free_text one a
+assert_fail "is_free_text: number"     _picker::is_free_text one 12
+assert_fail "is_free_text: q"          _picker::is_free_text one q
+assert_fail "is_free_text: empty"      _picker::is_free_text one ""
+assert_fail "is_free_text many: list"  _picker::is_free_text many "a, 2,3"
+if _picker::is_free_text one "glpat-abc" && _picker::is_free_text many "glpat-abc"; then
+    printf 'PASS  is_free_text: token-like text\n'
+else
+    printf 'FAIL  is_free_text: token-like text\n'
     fail_count=$((fail_count + 1))
 fi
 
