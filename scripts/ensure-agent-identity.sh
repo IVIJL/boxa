@@ -12,6 +12,10 @@ source "$BOXA_DIR/lib/resources.sh"
 source "$BOXA_DIR/lib/picker.sh"
 # shellcheck source=../lib/ssh.sh disable=SC1091
 source "$BOXA_DIR/lib/ssh.sh"
+# The forge dashboard offers the Allowlist entry for a new forge host and
+# reads ALLOWLIST_HOST_FILE from lib/allowlist.sh.
+# shellcheck source=../lib/allowlist.sh disable=SC1091
+source "$BOXA_DIR/lib/allowlist.sh"
 # shellcheck source=../lib/forge.sh disable=SC1091
 source "$BOXA_DIR/lib/forge.sh"
 

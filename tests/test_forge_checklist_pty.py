@@ -52,6 +52,9 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                 f"source {ROOT!r}/lib/ssh.sh\n"
                 f"source {ROOT!r}/lib/allowlist.sh\n"
                 f"source {ROOT!r}/lib/forge.sh\n"
+                'if [ "${BOXA_TEST_SSH_CONF_FAIL:-}" = 1 ]; then\n'
+                '  _boxa::write_ssh_conf() { return 1; }\n'
+                'fi\n'
                 '_boxa::forge_project_targets() {\n'
                 '  printf "%s\\t%s\\n%s\\t%s\\n" "Current Project" '
                 '"$BOXA_TEST_CURRENT_PROJECT" "Other Project" '
@@ -408,6 +411,249 @@ class ForgeChecklistPtyTest(unittest.TestCase):
                 check=True,
             )
             self.assertIn("Persona: automation", listed.stdout)
+
+    def test_forge_add_generates_missing_agent_key_on_first_persona(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            env = self._environment(home)
+            harness = self._write_harness(home)
+            self._write_fake_forges(home, env)
+            env["BOXA_SSH_CONF"] = os.path.join(home, ".config", "boxa", "ssh.conf")
+            secret = "github-first-persona-secret"
+            env["BOXA_TEST_GH_EXPECTED"] = secret
+            env["BOXA_TEST_GH_HOST_TOKEN"] = secret
+            env["BOXA_TEST_GH_FAILS"] = "0"
+            env["BOXA_TEST_GLAB_EXPECTED"] = "unused"
+            env["BOXA_TEST_GLAB_HOST_TOKEN"] = "unused"
+            agent_key = os.path.join(env["BOXA_AGENT_IDENTITY_DIR"], "id_ed25519")
+            self.assertFalse(os.path.exists(agent_key))
+
+            returncode, transcript = self._run_pty(
+                [harness, "add", "github"],
+                env,
+                [
+                    (b"Persona name:", b"first-agent\n"),
+                    (b"Persona kind: (number/q)", b"1\n"),
+                    (b"Expected account username", b"machine-user\n"),
+                    (b"Token source: (number/q)", b"1\n"),
+                    (b"Paste GitHub token:", secret.encode() + b"\n"),
+                    (b"durable Allowlist? [y/N]", b"\n"),
+                    (b"GitHub SSH key: (number/q)", b"1\n"),
+                    (b"Generate the Agent key now? [Y/n]", b"\n"),
+                    (b"GitHub account: (number/q)", b"1\n"),
+                ],
+            )
+
+            self.assertEqual(returncode, 0, transcript)
+            self.assertNotIn(secret, transcript)
+            self.assertNotIn("The Agent key is not available", transcript)
+            self.assertIn(f"No Agent key exists yet: {agent_key}", transcript)
+            self.assertIn("Generated the Agent key: SHA256:", transcript)
+            self.assertIn(
+                "Dedicated Agent SSH forwarding enabled globally.", transcript
+            )
+            self.assertIn("Authenticated via SSH as: machine-user", transcript)
+            self.assertTrue(os.path.isfile(agent_key))
+            self.assertTrue(os.path.isfile(agent_key + ".pub"))
+            self.assertEqual(os.stat(agent_key).st_mode & 0o777, 0o600)
+            with open(env["BOXA_SSH_CONF"], encoding="utf-8") as fh:
+                self.assertIn("gate = on", fh.read())
+            identity = os.path.join(
+                env["BOXA_FORGE_DIR"], "identities", "first-agent"
+            )
+            with open(identity, encoding="utf-8") as fh:
+                identity_text = fh.read()
+            self.assertIn("kind=agent", identity_text)
+            self.assertIn(f"key={agent_key}\n", identity_text)
+            self._assert_split_token(
+                env, "first-agent", identity_text, "github", secret
+            )
+
+    def test_forge_add_keeps_token_when_agent_key_generation_is_declined(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            env = self._environment(home)
+            harness = self._write_harness(home)
+            self._write_fake_forges(home, env)
+            secret = "github-declined-key-secret"
+            env["BOXA_TEST_GH_EXPECTED"] = secret
+            env["BOXA_TEST_GH_HOST_TOKEN"] = secret
+            env["BOXA_TEST_GH_FAILS"] = "0"
+            env["BOXA_TEST_GLAB_EXPECTED"] = "unused"
+            env["BOXA_TEST_GLAB_HOST_TOKEN"] = "unused"
+            agent_key = os.path.join(env["BOXA_AGENT_IDENTITY_DIR"], "id_ed25519")
+
+            returncode, transcript = self._run_pty(
+                [harness, "add", "github"],
+                env,
+                [
+                    (b"Persona name:", b"token-first\n"),
+                    (b"Persona kind: (number/q)", b"1\n"),
+                    (b"Expected account username", b"machine-user\n"),
+                    (b"Token source: (number/q)", b"1\n"),
+                    (b"Paste GitHub token:", secret.encode() + b"\n"),
+                    (b"durable Allowlist? [y/N]", b"\n"),
+                    (b"GitHub SSH key: (number/q)", b"1\n"),
+                    (b"Generate the Agent key now? [Y/n]", b"n\n"),
+                ],
+            )
+
+            self.assertEqual(returncode, 0, transcript)
+            self.assertNotIn(secret, transcript)
+            self.assertIn("Continuing without an SSH key.", transcript)
+            self.assertIn("boxa doctor --fix agent-identity", transcript)
+            self.assertIn("Registered persona: token-first", transcript)
+            self.assertFalse(os.path.exists(agent_key))
+            identity = os.path.join(
+                env["BOXA_FORGE_DIR"], "identities", "token-first"
+            )
+            with open(identity, encoding="utf-8") as fh:
+                identity_text = fh.read()
+            self.assertIn("kind=agent", identity_text)
+            self.assertNotIn("key=", identity_text)
+            self._assert_split_token(
+                env, "token-first", identity_text, "github", secret
+            )
+
+    def test_forge_add_aborts_after_ssh_gate_write_failure_without_consent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            env = self._environment(home)
+            harness = self._write_harness(home)
+            self._write_fake_forges(home, env)
+            env["BOXA_TEST_SSH_CONF_FAIL"] = "1"
+            secret = "github-key-failure-abort-secret"
+            env["BOXA_TEST_GH_EXPECTED"] = secret
+            env["BOXA_TEST_GH_HOST_TOKEN"] = secret
+            env["BOXA_TEST_GH_FAILS"] = "0"
+            env["BOXA_TEST_GLAB_EXPECTED"] = "unused"
+            env["BOXA_TEST_GLAB_HOST_TOKEN"] = "unused"
+
+            returncode, transcript = self._run_pty(
+                [harness, "add", "github"],
+                env,
+                [
+                    (b"Persona name:", b"failed-agent\n"),
+                    (b"Persona kind: (number/q)", b"1\n"),
+                    (b"Expected account username", b"machine-user\n"),
+                    (b"Token source: (number/q)", b"1\n"),
+                    (b"Paste GitHub token:", secret.encode() + b"\n"),
+                    (b"durable Allowlist? [y/N]", b"\n"),
+                    (b"GitHub SSH key: (number/q)", b"1\n"),
+                    (b"Generate the Agent key now? [Y/n]", b"\n"),
+                    (b"without an SSH key anyway? [y/N]", b"N\n"),
+                ],
+            )
+
+            self.assertNotEqual(returncode, 0, transcript)
+            self.assertNotIn(secret, transcript)
+            self.assertIn(
+                "Enabling the SSH gate failed after the Agent key was generated.",
+                transcript,
+            )
+            self.assertIn("boxa doctor --fix agent-identity", transcript)
+            self.assertIn("Persona was not registered.", transcript)
+            identity = os.path.join(
+                env["BOXA_FORGE_DIR"], "identities", "failed-agent"
+            )
+            self.assertFalse(os.path.exists(identity))
+
+    def test_forge_add_registers_token_only_after_ssh_gate_write_failure_consent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            env = self._environment(home)
+            harness = self._write_harness(home)
+            self._write_fake_forges(home, env)
+            env["BOXA_TEST_SSH_CONF_FAIL"] = "1"
+            secret = "github-key-failure-continue-secret"
+            env["BOXA_TEST_GH_EXPECTED"] = secret
+            env["BOXA_TEST_GH_HOST_TOKEN"] = secret
+            env["BOXA_TEST_GH_FAILS"] = "0"
+            env["BOXA_TEST_GLAB_EXPECTED"] = "unused"
+            env["BOXA_TEST_GLAB_HOST_TOKEN"] = "unused"
+
+            returncode, transcript = self._run_pty(
+                [harness, "add", "github"],
+                env,
+                [
+                    (b"Persona name:", b"token-only-agent\n"),
+                    (b"Persona kind: (number/q)", b"1\n"),
+                    (b"Expected account username", b"machine-user\n"),
+                    (b"Token source: (number/q)", b"1\n"),
+                    (b"Paste GitHub token:", secret.encode() + b"\n"),
+                    (b"durable Allowlist? [y/N]", b"\n"),
+                    (b"GitHub SSH key: (number/q)", b"1\n"),
+                    (b"Generate the Agent key now? [Y/n]", b"\n"),
+                    (b"without an SSH key anyway? [y/N]", b"y\n"),
+                ],
+            )
+
+            self.assertEqual(returncode, 0, transcript)
+            self.assertNotIn(secret, transcript)
+            self.assertIn(
+                "Enabling the SSH gate failed after the Agent key was generated.",
+                transcript,
+            )
+            self.assertIn("boxa doctor --fix agent-identity", transcript)
+            self.assertIn("Registered persona: token-only-agent", transcript)
+            identity = os.path.join(
+                env["BOXA_FORGE_DIR"], "identities", "token-only-agent"
+            )
+            with open(identity, encoding="utf-8") as fh:
+                identity_text = fh.read()
+            self.assertIn("kind=agent", identity_text)
+            self.assertNotIn("key=", identity_text)
+            self._assert_split_token(
+                env, "token-only-agent", identity_text, "github", secret
+            )
+
+    def test_forge_add_treats_eof_on_generate_prompt_as_failure_not_decline(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            env = self._environment(home)
+            harness = self._write_harness(home)
+            self._write_fake_forges(home, env)
+            secret = "github-eof-secret"
+            env["BOXA_TEST_GH_EXPECTED"] = secret
+            env["BOXA_TEST_GH_HOST_TOKEN"] = secret
+            env["BOXA_TEST_GH_FAILS"] = "0"
+            env["BOXA_TEST_GLAB_EXPECTED"] = "unused"
+            env["BOXA_TEST_GLAB_HOST_TOKEN"] = "unused"
+            agent_key = os.path.join(env["BOXA_AGENT_IDENTITY_DIR"], "id_ed25519")
+
+            returncode, transcript = self._run_pty(
+                [harness, "add", "github"],
+                env,
+                [
+                    (b"Persona name:", b"eof-persona\n"),
+                    (b"Persona kind: (number/q)", b"1\n"),
+                    (b"Expected account username", b"machine-user\n"),
+                    (b"Token source: (number/q)", b"1\n"),
+                    (b"Paste GitHub token:", secret.encode() + b"\n"),
+                    (b"durable Allowlist? [y/N]", b"\n"),
+                    (b"GitHub SSH key: (number/q)", b"1\n"),
+                    (b"Generate the Agent key now? [Y/n]", b"\x04"),
+                    (b"Register the persona without an SSH key anyway? [y/N]", b"\x04"),
+                ],
+            )
+
+            self.assertNotEqual(returncode, 0, transcript)
+            self.assertNotIn(secret, transcript)
+            self.assertIn("No answer was read for the Agent key prompt.", transcript)
+            self.assertNotIn("Continuing without an SSH key.", transcript)
+            self.assertIn("Persona was not registered.", transcript)
+            self.assertFalse(os.path.exists(agent_key))
+            self.assertFalse(
+                os.path.exists(
+                    os.path.join(env["BOXA_FORGE_DIR"], "identities", "eof-persona")
+                )
+            )
+            self.assertFalse(
+                os.path.exists(os.path.join(env["BOXA_FORGE_DIR"], "github"))
+            )
 
     def test_forge_add_mine_default_attaches_all_host_keys_in_real_pty(
         self,

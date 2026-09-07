@@ -53,3 +53,14 @@ correctly alongside "env wins".
   `glab auth status` is clean after restart. Record the redacted output
   under these two acceptance criteria in this file, tick them, and flip
   Status to done once both are proven.
+- 2026-09-07: Live proof failed on two hosts: the seeded config still carried
+  the `gitlab.com` stub. Root cause: `boxa-entrypoint.sh` re-execs via
+  `setpriv` which keeps `HOME=/root`, so `ensure-glab-config` tried
+  `/root/.config/glab-cli`, hit `Permission denied` and the entrypoint only
+  logged the warning. Fix: the script resolves the home of the current uid
+  from passwd when `$HOME` is not owned by it (regression test in
+  `tests/test_ensure_glab_config.py`). Verified inside the boxa Container by
+  running the script with `HOME=/root`: `host:` became the Forge host and its
+  section appeared. Needs an image rebuild on the host before the live proof
+  above can pass; a `gitlab.com` entry that carries a token is kept by design
+  (in-box login), so `glab auth logout --hostname gitlab.com` clears its `x`.

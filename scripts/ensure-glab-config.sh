@@ -1,7 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
-readonly config_dir="${GLAB_CONFIG_DIR:-$HOME/.config/glab-cli}"
+# The entrypoint drops to node via setpriv, which keeps HOME=/root from the
+# root phase; resolve the real home of the current uid so the seed lands in
+# the node-owned per-Project volume instead of failing on /root.
+config_home() {
+    local home="${HOME:-}" passwd_home=''
+
+    if [ -n "$home" ] && [ -d "$home" ] && [ -O "$home" ]; then
+        printf '%s\n' "$home"
+        return 0
+    fi
+    passwd_home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    printf '%s\n' "${passwd_home:-$home}"
+}
+
+readonly config_dir="${GLAB_CONFIG_DIR:-$(config_home)/.config/glab-cli}"
 readonly config_file="$config_dir/config.yml"
 
 [ -n "${GITLAB_HOST:-}" ] || exit 0

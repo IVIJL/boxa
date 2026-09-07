@@ -437,6 +437,44 @@ class EnsureGlabConfigTests(unittest.TestCase):
         self.assertEqual(second_stat.st_mtime_ns, first_stat.st_mtime_ns)
         self.assertEqual(stat.S_IMODE(second_stat.st_mode), 0o600)
 
+    def test_home_of_another_user_falls_back_to_passwd_home(self) -> None:
+        # setpriv in the entrypoint keeps HOME=/root while running as node.
+        passwd_home = os.path.join(self.home, "passwd-home")
+        os.makedirs(passwd_home)
+        fake_bin = os.path.join(self.home, "bin")
+        os.makedirs(fake_bin)
+        getent = os.path.join(fake_bin, "getent")
+        with open(getent, "w", encoding="utf-8") as fh:
+            fh.write(
+                "#!/usr/bin/env bash\n"
+                f'printf "node:x:%s:%s::{passwd_home}:/bin/bash\\n" "$(id -u)" "$(id -g)"\n'
+            )
+        os.chmod(getent, 0o700)
+        env = dict(os.environ)
+        env["HOME"] = os.path.join(self.home, "not-my-home")
+        env["PATH"] = fake_bin + os.pathsep + env["PATH"]
+        env["GITLAB_HOST"] = "gitlab.example.test"
+        env.pop("GLAB_CONFIG_DIR", None)
+        env.pop("GITLAB_TOKEN", None)
+
+        result = subprocess.run(
+            ["bash", SCRIPT],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config_file = os.path.join(passwd_home, ".config", "glab-cli", "config.yml")
+        with open(config_file, "r", encoding="utf-8") as config:
+            self.assertEqual(
+                config.read(),
+                "host: gitlab.example.test\nhosts:\n  gitlab.example.test:\n",
+            )
+        self.assertFalse(os.path.exists(env["HOME"]))
+
     def test_missing_gitlab_host_leaves_existing_content_and_mode_unchanged(self) -> None:
         original = b"host: existing.example\nhosts:\n  existing.example:\n"
         self._write_config(original, mode=0o644)

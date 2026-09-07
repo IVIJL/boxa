@@ -135,6 +135,33 @@ class AgentIdentityPtyTest(unittest.TestCase):
         )
         return result.stdout.strip()
 
+    def test_hook_defines_allowlist_constants_for_the_forge_dashboard(self) -> None:
+        # The wizard hands over to the forge dashboard, whose Allowlist offer
+        # reads ALLOWLIST_HOST_FILE; a hook that omits lib/allowlist.sh dies
+        # under set -u right after the token is verified.
+        with tempfile.TemporaryDirectory() as home:
+            env = self._environment(home)
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$0" -h >/dev/null; '
+                    'printf "%s\\n" "${ALLOWLIST_HOST_FILE:?unbound}"',
+                    HOOK,
+                ],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(
+                result.stdout.strip().endswith("allowed-domains.conf"),
+                result.stdout,
+            )
+
     def test_default_no_dismisses_with_real_tty(self) -> None:
         with tempfile.TemporaryDirectory() as home:
             env = self._environment(home)

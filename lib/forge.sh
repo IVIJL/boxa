@@ -2570,6 +2570,41 @@ _boxa::forge_add_ssh_choice() {
     esac
 }
 
+# The Agent key normally comes from the one-time install offer (ADR 0032). A
+# persona registered before that offer was accepted is the first real need for
+# it, so generate it here instead of failing the checklist.
+_boxa::forge_offer_agent_key_generation() {
+    local key_path="$1" answer=''
+
+    printf 'No Agent key exists yet: %s\n' "$key_path" >/dev/tty
+    printf 'Generate the Agent key now? [Y/n] ' >/dev/tty
+    if ! IFS= read -r answer </dev/tty; then
+        printf 'No answer was read for the Agent key prompt.\n' >/dev/tty
+        return 2
+    fi
+    case "$answer" in
+        ''|y|Y|yes|YES) ;;
+        *)
+            printf "Continuing without an SSH key. Create the Agent key later with 'boxa doctor --fix agent-identity' and attach it from the forge dashboard.\n" \
+                >/dev/tty
+            return 1
+            ;;
+    esac
+    if ! _boxa::ssh_generate_agent_key; then
+        printf "Agent key generation failed. Repair it with 'boxa doctor --fix agent-identity'.\n" \
+            >/dev/tty
+        return 2
+    fi
+    if ! _boxa::write_ssh_conf global "" on; then
+        printf "Enabling the SSH gate failed after the Agent key was generated. Repair it with 'boxa doctor --fix agent-identity'.\n" \
+            >/dev/tty
+        return 2
+    fi
+    printf 'Generated the Agent key: %s\n' "$(_boxa::ssh_agent_key_fingerprint)" \
+        >/dev/tty
+    printf 'Dedicated Agent SSH forwarding enabled globally.\n' >/dev/tty
+}
+
 _boxa::forge_add_account_guidance() {
     local forge="$1" account_action="$2" host="$3" kind="$4" keys="$5"
     local key_path
@@ -2634,7 +2669,7 @@ _boxa::forge_add_one_locked() {
     local forge="$1" result_var="${2:-}"
     local name kind account_action host='' keys='' key_path ssh_choice
     local expected_username ssh_username='' key_username token_username=''
-    local credential_path display_name token_guidance
+    local credential_path display_name token_guidance generation_status answer
 
     name="$(_boxa::forge_add_name)" || return 1
     kind="$(_boxa::forge_add_kind)" || return 1
@@ -2672,14 +2707,37 @@ _boxa::forge_add_one_locked() {
         ;;
     agent)
         key_path="$(_boxa::ssh_agent_key_path)"
-        if [ ! -f "$key_path" ] \
-                || { [ -f "$key_path.pub" ] \
-                    && ! _boxa::forge_key_fingerprint "$key_path" >/dev/null; }; then
+        if [ ! -f "$key_path" ]; then
+            if _boxa::forge_offer_agent_key_generation "$key_path"; then
+                keys="$key_path"
+            else
+                generation_status=$?
+                if [ "$generation_status" -eq 2 ]; then
+                    printf 'Register the persona without an SSH key anyway? [y/N] ' \
+                        >/dev/tty
+                    IFS= read -r answer </dev/tty || answer=n
+                    case "$answer" in
+                        y|Y|yes|YES) keys='' ;;
+                        *)
+                            rm -f -- "$credential_path"
+                            printf 'Persona was not registered.\n' >&2
+                            return 1
+                            ;;
+                    esac
+                else
+                    keys=''
+                fi
+            fi
+        elif [ -f "$key_path.pub" ] \
+                && ! _boxa::forge_key_fingerprint "$key_path" >/dev/null; then
             rm -f -- "$credential_path"
             printf 'The Agent key is not available: %s\n' "$key_path" >&2
+            printf "Its public key is unreadable; repair it with 'boxa doctor --fix agent-identity' and run the persona setup again.\n" \
+                >&2
             return 1
+        else
+            keys="$key_path"
         fi
-        keys="$key_path"
         ;;
     esac
     if [ -n "$keys" ]; then
