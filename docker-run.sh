@@ -7191,6 +7191,11 @@ DOCKER_ARGS=(
     # Shared volumes
     -v boxa-nvim-data:/home/node/.local/share/nvim
     -v boxa-npm-global:/usr/local/share/npm-global
+    # Verified immutable Codex runtime copies Jobs run from (ADR 0037 "Codex
+    # runtime"). Shared across Containers: one copy+probe per new version for
+    # the whole host. Nothing is downloaded or copied at start — `boxa-job`
+    # fills it lazily on the first Codex job after a version change.
+    -v boxa-codex-versions:/usr/local/share/boxa-codex-versions
     -v boxa-cursor-server:/home/node/.cursor-server
     -v boxa-vscode-server:/home/node/.vscode-server
     -e CLAUDE_CONFIG_DIR=/home/node/.claude
@@ -7251,6 +7256,32 @@ fi
 # Host ~/.codex directory (RW; Codex CLI auth + config shared with host)
 mkdir -p "$HOME/.codex"
 DOCKER_ARGS+=(-v "$HOME/.codex:/home/node/.codex")
+
+# Host @openai/codex package as a Codex runtime SOURCE for Jobs (ADR 0037).
+# Interactive `codex` in the Container keeps running from the mutable
+# boxa-npm-global volume; Codex jobs run only from a verified immutable copy
+# that `boxa-job` takes from the newest version it can find locally. On
+# Linux/WSL2 host and Container share OS/arch, so the host's package (usually
+# under nvm) is such a source — bind-mounted READ-ONLY, and a host
+# `npm install -g @openai/codex` therefore reaches Jobs without an in-box
+# install. On macOS the host package carries a Mach-O binary that cannot run
+# in a Linux Container (same reasoning as the Claude binary above), so the
+# mount is skipped and the npm volume remains the only source. Resolved from
+# the host `codex` executable: bin/codex.js → package dir two levels up.
+if [ "$(uname -s 2>/dev/null || echo Unknown)" != "Darwin" ]; then
+    host_codex_exe="$(command -v codex 2>/dev/null || true)"
+    if [ -n "$host_codex_exe" ]; then
+        host_codex_entry="$(readlink -f "$host_codex_exe" 2>/dev/null || true)"
+        if [ -n "$host_codex_entry" ]; then
+            host_codex_pkg="$(cd "$(dirname "$host_codex_entry")/.." 2>/dev/null && pwd)" || host_codex_pkg=""
+        else
+            host_codex_pkg=""
+        fi
+        if [ -n "$host_codex_pkg" ] && [ -f "$host_codex_pkg/package.json" ]; then
+            DOCKER_ARGS+=(-v "$host_codex_pkg:/run/boxa-codex-host-pkg:ro")
+        fi
+    fi
+fi
 
 # Host MCP store (ADR 0014, issue 16): the canonical boxa MCP profile +
 # scoped secret stores live in ~/.config/boxa/mcp. They reach the Container

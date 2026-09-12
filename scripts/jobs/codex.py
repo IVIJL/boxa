@@ -25,16 +25,17 @@ plain command Job, and all three live here:
     version captured at start, and per-item-type counts.  The raw events stay
     on disk for ``boxa-job log``.
 
-Binary resolution is deliberately one function, :func:`resolve_binary`: issue
-05 replaces it with the verified runtime copy under the
-``boxa-codex-versions`` volume and nothing else has to change.
+Binary resolution is deliberately one seam, :func:`resolve_runtime`: it hands
+back the verified immutable runtime copy from :mod:`jobs.runtime` (the
+``boxa-codex-versions`` volume), never the mutable npm volume and never
+whatever ``codex`` PATH happens to point at.  ``BOXA_JOB_CODEX_BIN`` overrides
+it, which is how the tests run without a real Codex.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 from typing import Any, Iterable, NamedTuple, Optional
 
@@ -56,6 +57,7 @@ __all__ = [
     "finish",
     "fingerprint_argv",
     "resolve_binary",
+    "resolve_runtime",
     "result_extract",
     "resume_argv",
     "start_argv",
@@ -63,13 +65,13 @@ __all__ = [
     "thread_id_of",
 ]
 
-# Test/override seam for the Codex binary.  Production resolution is PATH (the
-# Container's interactive Codex) until issue 05 pins the verified runtime copy.
+# Test/override seam for the Codex binary: set it and `resolve_runtime` hands
+# it back untouched.  Production resolution is the verified runtime copy.
 CODEX_BIN_ENV = "BOXA_JOB_CODEX_BIN"
 
 # `-o` is the only part of the Codex argv that depends on the job dir, and the
-# binary path changes the day issue 05 lands; neither makes a *different
-# request*, so both stay out of the fingerprint (see `fingerprint_argv`).
+# binary path changes with every new verified runtime copy; neither makes a
+# *different request*, so both stay out of the fingerprint.
 _FINGERPRINT_BINARY = "codex"
 
 # Reasons recorded on a failed Codex job, echoed in `--json` so a skill can
@@ -88,18 +90,50 @@ class CodexNotFound(RuntimeError):
     """No Codex binary to run a Codex job with."""
 
 
-def resolve_binary(explicit: Optional[str] = None) -> str:
-    """Absolute path of the Codex binary a Codex job runs.
+class RuntimeChoice(NamedTuple):
+    """The runtime a Codex job will run from, and how it was chosen."""
 
-    One function on purpose: issue 05 swaps PATH resolution for the verified
-    runtime copy here and the CLI, the worker and the tests follow.
+    binary: str
+    version: Optional[str]
+    source: str
+    probed: bool
+    warnings: list[str]
+    path: Optional[str]
+
+
+def resolve_runtime(explicit: Optional[str] = None) -> RuntimeChoice:
+    """The verified Codex runtime copy a Codex job runs from.
+
+    One function on purpose: the CLI, the worker and the tests all learn the
+    binary, the version and any runtime warning from here.  An explicit path
+    or ``BOXA_JOB_CODEX_BIN`` bypasses the runtime machinery entirely — that
+    is the test seam, and the only way a Job ever runs from anything but a
+    verified copy.
     """
-    candidate = explicit or os.environ.get(CODEX_BIN_ENV) or shutil.which("codex")
-    if not candidate:
-        raise CodexNotFound(
-            "no `codex` binary on PATH: a Codex job needs Codex in the Container"
+    candidate = explicit or os.environ.get(CODEX_BIN_ENV)
+    if candidate:
+        binary = os.path.abspath(candidate)
+        return RuntimeChoice(
+            binary, binary_version(binary), "override", False, [], None
         )
-    return os.path.abspath(candidate)
+    # Imported lazily: `jobs.runtime` builds the probe's argv from this
+    # module, and a Codex-free command Job must not pay for either.
+    from . import runtime as runtime_mod
+
+    chosen = runtime_mod.ensure()
+    return RuntimeChoice(
+        chosen.binary,
+        chosen.version,
+        chosen.source,
+        chosen.probed,
+        list(chosen.warnings),
+        chosen.path,
+    )
+
+
+def resolve_binary(explicit: Optional[str] = None) -> str:
+    """Absolute path of the Codex binary a Codex job runs."""
+    return resolve_runtime(explicit).binary
 
 
 def binary_version(binary: str) -> Optional[str]:

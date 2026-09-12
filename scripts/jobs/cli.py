@@ -2,10 +2,11 @@
 
 Implemented here: ``start``, ``wait``, ``result``, ``list`` and ``log`` for a
 plain command (issue 01), plus ``cancel``, ``adopt`` and the recovery states
-(issue 02), and ``start --codex`` / ``reply`` for a Codex job (issue 04).
-``gc`` and ``runtime`` are documented in ``--help``
-and refuse with a clear "not yet available" message, so the help stays the
-complete command surface the ADR describes.
+(issue 02), and ``start --codex`` / ``reply`` for a Codex job (issue 04), plus the
+verified Codex runtime (``runtime list|refresh|use``, issue 05).
+``gc`` is documented in ``--help`` and refuses with a clear "not yet
+available" message, so the help stays the complete command surface the ADR
+describes.
 
 Every command starts by re-deriving the Project's non-terminal records from
 evidence (:func:`jobs.recovery.refresh_states`): a Job from a foreign
@@ -26,7 +27,8 @@ Exit codes:
   2  usage error
   3  the worker could not start or lost its reservation
   4  unknown Job, or an unclear record that needs ``cancel``/``adopt``
-  5  refused (``--fresh`` while a Job under that key is not finished)
+  5  refused (``--fresh`` while a Job under that key is not finished; a
+     Codex job with no verified runtime: ``no-verified-runtime``)
   6  conflict (same key, different request fingerprint)
   7  command not yet available in this slice
  10  ``wait`` expired while the Job is still running — call ``wait`` again
@@ -49,6 +51,7 @@ import jobs
 from . import ack as ack_mod
 from . import codex as codex_mod
 from . import recovery
+from . import runtime as runtime_mod
 from .env import passthrough_values
 from .identity import IdentityError, project_key
 from .store import (
@@ -93,7 +96,6 @@ RESERVATION_TIMEOUT = 20.0
 # is the whole surface, and refused with a pointer rather than a stack trace.
 PENDING_COMMANDS = {
     "gc": "clean up bulky logs and purge Job records",
-    "runtime": "list or pin the verified Codex runtime version",
 }
 
 
@@ -600,28 +602,94 @@ def _codex_request_spec(
     mode: str,
     model: str,
     effort: str,
+    json_mode: bool = False,
     thread_id: Optional[str] = None,
     parent_job_id: Optional[str] = None,
 ) -> Any:
     """The Codex half of a spec: what was asked, plus the runtime it will use.
+
+    This is where the Codex runtime is refreshed — deliberately BEFORE the
+    Project lock is taken in :func:`_register_job`: a snapshot's probe takes
+    many seconds and the registration lock must stay short.
 
     The version is captured HERE, at start, not read back later: after an
     ``npm install -g @openai/codex`` the Container's Codex is a different
     program and the record must still say which one ran this Job.
     """
     try:
-        binary = codex_mod.resolve_binary()
+        chosen = codex_mod.resolve_runtime()
+    except runtime_mod.NoVerifiedRuntime as exc:
+        _emit_no_runtime(json_mode, exc)
+        return EXIT_REFUSED
     except codex_mod.CodexNotFound as exc:
         return _usage(str(exc))
+    _warn_runtime(chosen.warnings)
     return {
         "mode": mode,
         "model": model,
         "effort": effort,
-        "binary": binary,
-        "version": codex_mod.binary_version(binary),
+        "binary": chosen.binary,
+        "version": chosen.version,
+        "runtimeSource": chosen.source,
+        "runtimePath": chosen.path,
+        "runtimeProbed": chosen.probed,
+        "runtimeWarnings": list(chosen.warnings),
         "threadId": thread_id,
         "parentJobId": parent_job_id,
     }
+
+
+def _warn_runtime(warnings: list[str]) -> None:
+    """Runtime trouble is LOUD: a failed probe must not pass unnoticed.
+
+    Printed to stderr as it happens (before the key lifecycle can hand back
+    an attach or a conflict), and carried in the ``--json`` payload too.
+    """
+    for warning in warnings:
+        print(f"boxa-job: WARNING: {warning}", file=sys.stderr)
+
+
+def _emit_no_runtime(json_mode: bool, exc: "runtime_mod.NoVerifiedRuntime") -> None:
+    """The one hard refusal: there is no verified copy to run anything on.
+
+    Falling back to the mutable npm volume is exactly the failure mode ADR
+    0037 exists to prevent, so a Codex job is refused instead.
+    """
+    _warn_runtime(exc.warnings)
+    _emit(
+        json_mode,
+        {
+            "result": "refused",
+            "reason": runtime_mod.NoVerifiedRuntime.reason,
+            "detail": str(exc),
+            "warnings": exc.warnings,
+        },
+        [
+            f"result: refused ({runtime_mod.NoVerifiedRuntime.reason})",
+            str(exc),
+            "look at `boxa-job runtime list`; `runtime refresh` retries the "
+            "snapshot and the probe",
+        ],
+    )
+
+
+def _codex_extra(spec: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    """What a Codex ``start``/``reply`` adds to its own output payload.
+
+    The runtime facts travel with the answer: which copy ran it, whether this
+    call paid for a probe, and any warning the refresh produced.
+    """
+    payload: dict[str, Any] = {
+        "codex": True,
+        "codexVersion": spec.get("version"),
+        "codexBinary": spec.get("binary"),
+        "runtimeSource": spec.get("runtimeSource"),
+        "runtimeProbed": spec.get("runtimeProbed"),
+    }
+    if spec.get("runtimeWarnings"):
+        payload["warnings"] = list(spec["runtimeWarnings"])
+    payload.update(extra)
+    return payload
 
 
 def _thread_of(record: dict[str, Any]) -> Optional[str]:
@@ -773,7 +841,7 @@ def _start_codex(args: argparse.Namespace, positional: list[str]) -> int:
     if not os.path.isdir(cwd):
         return _usage(f"--cwd is not a directory: {cwd}")
     codex_spec = _codex_request_spec(
-        mode="start", model=args.model, effort=args.effort
+        mode="start", model=args.model, effort=args.effort, json_mode=args.json
     )
     if isinstance(codex_spec, int):
         return codex_spec
@@ -807,7 +875,7 @@ def _start_codex(args: argparse.Namespace, positional: list[str]) -> int:
             json_mode=args.json,
             build_argv=build_argv,
             codex=codex_spec,
-            extra={"codex": True, "codexVersion": codex_spec["version"]},
+            extra=_codex_extra(codex_spec),
         )
     )
 
@@ -832,6 +900,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
         mode="resume",
         model=args.model,
         effort=args.effort,
+        json_mode=args.json,
         thread_id=thread_id,
         parent_job_id=parent.get("jobId"),
     )
@@ -878,12 +947,11 @@ def cmd_reply(args: argparse.Namespace) -> int:
             build_argv=build_argv,
             codex=codex_spec,
             preflight=preflight,
-            extra={
-                "codex": True,
-                "threadId": thread_id,
-                "parentJobId": parent.get("jobId"),
-                "codexVersion": codex_spec["version"],
-            },
+            extra=_codex_extra(
+                codex_spec,
+                threadId=thread_id,
+                parentJobId=parent.get("jobId"),
+            ),
         )
     )
 
@@ -1182,6 +1250,109 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------------------- codex runtime
+
+
+def _runtime_rows(json_mode: bool, warnings: list[str]) -> int:
+    rows = runtime_mod.listing()
+    _emit(
+        json_mode,
+        {
+            "result": "runtime",
+            "versionsDir": runtime_mod.versions_root(),
+            "pin": runtime_mod.read_pin(),
+            "versions": rows,
+            "warnings": warnings,
+        },
+        [f"versions: {runtime_mod.versions_root()}"]
+        + (
+            [
+                "  {} {} {} sources={}".format(
+                    "*" if row["inUse"] else " ",
+                    row["version"],
+                    "verified" if row["verified"] else "unverified",
+                    ",".join(row["sources"]) or "none",
+                )
+                + ("  pinned" if row["pinned"] else "")
+                for row in rows
+            ]
+            or ["  (no Codex version found or published)"]
+        ),
+    )
+    return EXIT_OK
+
+
+def cmd_runtime(args: argparse.Namespace) -> int:
+    """``runtime list|refresh|use``: see, re-check and pin the verified copies.
+
+    Not Project state: the copies and the pin live in the shared versions
+    volume, so a rollback made in one Container is the rollback every
+    Container runs under.
+    """
+    action = args.runtime_action or "list"
+    if action == "list":
+        return _runtime_rows(args.json, [])
+    if action == "refresh":
+        # The same refresh a Codex `start` does, on demand: it snapshots and
+        # probes a newly found version, and says so.
+        try:
+            chosen = runtime_mod.ensure()
+        except runtime_mod.NoVerifiedRuntime as exc:
+            _emit_no_runtime(args.json, exc)
+            return EXIT_REFUSED
+        _warn_runtime(chosen.warnings)
+        _emit(
+            args.json,
+            {
+                "result": "runtime",
+                "version": chosen.version,
+                "binary": chosen.binary,
+                "path": chosen.path,
+                "source": chosen.source,
+                "probed": chosen.probed,
+                "warnings": chosen.warnings,
+            },
+            [
+                f"runtime: {chosen.version}  source: {chosen.source}",
+                f"binary: {chosen.binary}",
+                f"probed: {'yes' if chosen.probed else 'no (already verified)'}",
+            ],
+        )
+        return EXIT_OK
+    # `use`
+    if args.auto:
+        if args.version:
+            return _usage("`runtime use` takes either a version or --auto")
+        runtime_mod.clear_pin()
+        _emit(
+            args.json,
+            {"result": "runtime", "pin": None},
+            ["pin: cleared (the newest verified copy is used again)"],
+        )
+        return EXIT_OK
+    if not args.version:
+        return _usage("`runtime use` needs a version, or --auto to unpin")
+    entry = runtime_mod.published().get(args.version)
+    if entry is None or not entry.verified:
+        # Pinning an unverified copy would mean running an unproven runtime,
+        # which is the whole thing this design refuses to do.
+        _emit(
+            args.json,
+            {
+                "result": "refused",
+                "reason": "not-verified",
+                "version": args.version,
+            },
+            [
+                f"result: refused  version: {args.version} is not a verified copy",
+                "`boxa-job runtime list` shows what can be pinned",
+            ],
+        )
+        return EXIT_REFUSED
+    runtime_mod.pin(args.version)
+    return _runtime_rows(args.json, [])
+
+
 def cmd_pending(args: argparse.Namespace) -> int:
     name = args.pending_command
     print(
@@ -1204,10 +1375,10 @@ available now:
   adopt    take over a Job whose worker died (watch only)
   list     the Jobs of this Project
   log      tail a Job's stdout/stderr (a Codex job: its raw events) on demand
+  runtime  show, re-check or pin the verified Codex runtime copy
 
 not yet available (documented here, refused with exit 7):
   gc       clean up bulky logs and purge Job records
-  runtime  list or pin the verified Codex runtime version
 
 codex jobs (the contract a delegating skill codes against):
   start --key K --codex --model M --effort E [--cwd DIR] "prompt"
@@ -1224,6 +1395,15 @@ codex jobs (the contract a delegating skill codes against):
     under the same key attaches instead of paying for it twice.
   * Codex runs with --dangerously-bypass-approvals-and-sandbox,
     unconditionally: the Container is the boundary (ADR 0037).
+  * a Codex job runs ONLY from a verified immutable runtime copy under the
+    shared boxa-codex-versions volume, never from the mutable npm volume
+    interactive `codex` uses. `start`/`reply` refresh it first (before any
+    lock): a newly found version is copied, content-checked and probed with a
+    real turn + resume, then published. A failed probe keeps the previous
+    verified copy and prints a LOUD warning (also `warnings` in --json); with
+    no verified copy at all the job is refused `no-verified-runtime` (exit 5).
+    `boxa-job runtime list|refresh|use <version>|use --auto` is the whole
+    surface; the Job record keeps `codexVersion` and `codexBinary`.
   * `result` prints one compact object — thread id, final message, usage,
     item counts, model/effort, Codex version. The event stream is NEVER part
     of it; `boxa-job log <jobId> --tail N` shows it on demand.
@@ -1468,6 +1648,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--tail", type=int, default=20, help="lines per stream (default 20)"
     )
     log.set_defaults(func=cmd_log)
+
+    runtime = sub.add_parser(
+        "runtime",
+        help="show, re-check or pin the verified Codex runtime copy",
+        description=(
+            "Codex jobs run only from a verified immutable copy of the Codex "
+            "CLI under the shared boxa-codex-versions volume (ADR 0037). "
+            "`list` shows every version found and published, `refresh` does "
+            "the snapshot + probe a Codex `start` would do, `use` pins one "
+            "verified copy for rollback (--auto goes back to newest)."
+        ),
+    )
+    runtime.add_argument("--json", action="store_true")
+    runtime.set_defaults(
+        func=cmd_runtime, runtime_action=None, version=None, auto=False
+    )
+    runtime_sub = runtime.add_subparsers(dest="runtime_action")
+    runtime_list = runtime_sub.add_parser(
+        "list", help="found sources, verified copies, which one is in use"
+    )
+    runtime_refresh = runtime_sub.add_parser(
+        "refresh", help="snapshot and probe a newly found version now"
+    )
+    runtime_use = runtime_sub.add_parser(
+        "use", help="pin a verified version (rollback), or --auto to unpin"
+    )
+    runtime_use.add_argument("version", nargs="?")
+    runtime_use.add_argument(
+        "--auto",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="clear the pin: use the newest verified copy again",
+    )
+    for parser_obj in (runtime_list, runtime_refresh, runtime_use):
+        # SUPPRESS so `runtime --json list` and `runtime list --json` mean the
+        # same thing: a subparser default would otherwise overwrite the flag
+        # already parsed on the parent.
+        parser_obj.add_argument(
+            "--json", action="store_true", default=argparse.SUPPRESS
+        )
+        parser_obj.set_defaults(func=cmd_runtime)
 
     for name, summary in PENDING_COMMANDS.items():
         pending = sub.add_parser(

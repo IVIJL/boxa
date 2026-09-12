@@ -31,6 +31,15 @@ if [ "$(id -u)" = "0" ]; then
     chown node:node /home/node/.cursor-server /home/node/.vscode-server \
         /home/node/.config/gh /home/node/.config/glab-cli 2>/dev/null || true
 
+    # Shared boxa-codex-versions volume (ADR 0037 "Codex runtime"): `boxa-job`
+    # publishes the verified immutable Codex copies into it as node, so the
+    # root-owned fresh volume has to change hands here — same treatment as
+    # the other shared volumes above. mkdir first so the path also exists on
+    # a Container started without the mount (the CLI then keeps working, with
+    # the copies living in the Container's own filesystem).
+    mkdir -p /usr/local/share/boxa-codex-versions
+    chown node:node /usr/local/share/boxa-codex-versions 2>/dev/null || true
+
     # Bridge $HOST_HOME (host user's home dir) to /home/node (container user's
     # home, where the bind mounts live). Two requirements collide:
     #

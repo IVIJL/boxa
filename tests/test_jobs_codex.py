@@ -39,7 +39,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import shutil
 import signal
 import sys
 import tempfile
@@ -54,6 +53,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 from jobs import cli as jobs_cli  # noqa: E402
 from jobs import codex as jobs_codex  # noqa: E402
 from jobs import identity as jobs_identity  # noqa: E402
+from jobs import runtime as jobs_runtime  # noqa: E402
 from jobs.store import (  # noqa: E402
     STATE_CANCELLED,
     STATE_DONE,
@@ -263,9 +263,25 @@ class ArgvTests(unittest.TestCase):
         )
         self.assertNotEqual(first, changed)
 
-    def test_resolve_binary_refuses_when_codex_is_absent(self) -> None:
-        with mock.patch.dict(os.environ, {jobs_codex.CODEX_BIN_ENV: ""}):
-            with mock.patch.object(shutil, "which", return_value=None):
+    def test_resolve_binary_refuses_when_there_is_no_verified_runtime(self) -> None:
+        """No PATH fallback: a Codex job runs only from a verified copy.
+
+        The runtime itself is tested in ``tests/test_jobs_runtime.py``; what
+        matters here is that the seam still refuses with ``CodexNotFound``
+        when it has nothing to hand back.
+        """
+        with tempfile.TemporaryDirectory() as empty:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    jobs_codex.CODEX_BIN_ENV: "",
+                    jobs_runtime.CODEX_VERSIONS_DIR_ENV: os.path.join(
+                        empty, "versions"
+                    ),
+                    jobs_runtime.CODEX_NPM_PKG_DIR_ENV: os.path.join(empty, "npm"),
+                    jobs_runtime.CODEX_HOST_PKG_DIR_ENV: os.path.join(empty, "host"),
+                },
+            ):
                 with self.assertRaises(jobs_codex.CodexNotFound):
                     jobs_codex.resolve_binary()
 

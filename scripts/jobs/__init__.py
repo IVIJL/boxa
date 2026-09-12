@@ -16,6 +16,9 @@ Modules:
   * ``recovery`` — what of a Job is still alive, the lazy re-derivation of
                  stale records (``orphaned`` / ``interrupted`` /
                  ``finished-unknown``) and ``cancel``.
+  * ``runtime`` — the verified immutable per-version Codex copy a Codex job
+                 runs from (snapshot, content check, real probe, atomic
+                 publish, pin) — ADR 0037 "Codex runtime".
   * ``worker`` — the detached worker entry point (``python3 -m jobs.worker``),
                  in spawn mode and in ``--watch`` (adopt) mode.
   * ``cli``    — the ``boxa-job`` command surface.
