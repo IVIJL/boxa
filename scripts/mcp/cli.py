@@ -32,7 +32,7 @@ import subprocess  # noqa: S404 - the Boxa Project registry is Docker-backed
 import sys
 from typing import Optional
 
-from . import casfile, import_result, inherited_list_result, onboarding, seed, trusted
+from . import casfile, import_result, inherited_list_result, onboarding, trusted
 from .activation import (
     ActivationError,
     _entry_activations,
@@ -62,6 +62,8 @@ from .catalog import (
     CatalogError,
     definition_changes_from_spec,
     isolation_status,
+    retired_codex_delegate_entries,
+    retired_codex_delegate_notice,
 )
 from .catalog import (
     add_entry as catalog_add_entry,
@@ -1586,8 +1588,17 @@ def _cmd_list(argv: list[str], as_json: bool) -> int:
         sys.stderr.write(f"mcp.cli: {exc}\n")
         return 1
     if as_json:
-        return _emit(result.to_dict())
-    return _render_effective_table(result)
+        payload = result.to_dict()
+        payload["retiredCodexDelegate"] = [
+            e["name"] for e in retired_codex_delegate_entries()
+        ]
+        return _emit(payload)
+    rc = _render_effective_table(result)
+    # ADR 0037: a leftover `codex mcp-server` entry can never start. Explain it
+    # here too, so a user who runs `boxa mcp status` without --project still
+    # sees it and gets the removal command.
+    sys.stdout.write(retired_codex_delegate_notice())
+    return rc
 
 
 def _cmd_toggle(argv: list[str], enabled: bool, as_json: bool) -> int:
@@ -3135,6 +3146,9 @@ def _cmd_catalog_effective_list(argv: list[str], as_json: bool) -> int:
             "importProposalCount": status["importProposalCount"],
             "importNudge": status["importNudge"],
             "legacyProfile": legacy.to_dict(),
+            "retiredCodexDelegate": [
+                e["name"] for e in retired_codex_delegate_entries()
+            ],
         })
     if not entries:
         sys.stdout.write("No MCP catalog entries are available; this Project has no activations.\n")
@@ -3206,6 +3220,9 @@ def _cmd_catalog_effective_list(argv: list[str], as_json: bool) -> int:
                 f"Inherited {candidate['name']}: already in catalog as "
                 f"{candidate['catalogName']} ({candidate['catalogId']}).\n"
             )
+    # ADR 0037: the retired Codex delegation entry stays in the catalog until
+    # the user removes it, so the Project view explains it every time.
+    sys.stdout.write(retired_codex_delegate_notice())
     return 0
 
 
@@ -3830,71 +3847,17 @@ def main(argv: list[str]) -> int:
         onboarding.rearm()
         return 0
 
-    if command == "seed-codex-delegate-status":
-        # One-time codex-delegate seed eligibility. The install/update shell
-        # hook reads this to decide whether to offer the seeded entry.
+    if command == "retired-codex-delegate-text":
+        # ADR 0037: report every catalog entry whose command is the removed
+        # `codex mcp-server`. Check-only, used by `boxa doctor`; prints
+        # nothing and exits 0 when the catalog is clean, so doctor stays quiet
+        # on a host that never had the entry.
         if rest:
             sys.stderr.write(
-                "mcp.cli: seed-codex-delegate-status takes no arguments\n"
+                "mcp.cli: retired-codex-delegate-text takes no arguments\n"
             )
             return 2
-        return seed.emit_status(sys.stdout)
-    if command == "seed-codex-delegate-text":
-        # Emit one seed text block: offer / followup / reminder.
-        if len(rest) != 1:
-            sys.stderr.write(
-                "mcp.cli: seed-codex-delegate-text takes exactly one of "
-                "offer|followup|reminder\n"
-            )
-            return 2
-        rc = seed.emit_text(sys.stdout, rest[0])
-        if rc is None:
-            sys.stderr.write(
-                f"mcp.cli: unknown seed text block {rest[0]!r} "
-                "(offer|followup|reminder)\n"
-            )
-            return 2
-        return rc
-    if command == "seed-codex-delegate-apply":
-        # Add the codex-delegate entry and grant agent-trusted mode. Host-only
-        # (the grant path refuses inside a Container) and gated on --yes: the
-        # shell hook passes it only after the interactive access-boundary
-        # confirmation, mirroring `catalog-mode-apply`.
-        if rest != ["--yes"]:
-            sys.stderr.write(
-                "mcp.cli: seed-codex-delegate-apply requires --yes\n"
-            )
-            return 2
-        try:
-            entry = seed.apply()
-        except (CatalogError, ValueError) as exc:
-            sys.stderr.write(f"mcp.cli: {exc}\n")
-            return 2
-        sys.stdout.write(
-            f"MCP catalog entry {entry['name']!r} is ready as "
-            f"{entry['executionMode']} ({entry['id']}).\n"
-        )
-        return 0
-    if command == "seed-codex-delegate-mark-seen":
-        # Record the seed decision (suppresses future prompts). The optional
-        # decision label is informational only.
-        decision = rest[0] if rest else seed.DECISION_NOOP
-        if len(rest) > 1:
-            sys.stderr.write(
-                "mcp.cli: seed-codex-delegate-mark-seen takes at most one "
-                "decision label\n"
-            )
-            return 2
-        seed.mark_seen(decision)
-        return 0
-    if command == "seed-codex-delegate-rearm":
-        # Clear the seed marker so the one-time offer can fire again.
-        if rest:
-            sys.stderr.write(
-                "mcp.cli: seed-codex-delegate-rearm takes no arguments\n"
-            )
-            return 2
-        seed.rearm()
+        sys.stdout.write(retired_codex_delegate_notice())
         return 0
 
     sys.stderr.write(f"mcp.cli: unknown command {command!r}\n")

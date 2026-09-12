@@ -1,4 +1,11 @@
-"""ADR 0021 issue 05: host grant and agent-trusted Codex delegation."""
+"""ADR 0021 issue 05: host grant and agent-trusted execution.
+
+The `codex-delegate` / `codex mcp-server` entry is the fixture throughout: it
+is the legacy agent-trusted entry a host can still carry. ADR 0037 retired it
+(Codex removed the subcommand, so the entry cannot start and `boxa doctor`
+reports it), but the trust, broker, and relay behaviour under test is
+unchanged and applies to every agent-trusted entry.
+"""
 
 from __future__ import annotations
 

@@ -67,15 +67,18 @@ Boundaries:
   effect only when the Container is created; network access to the SSH
   host remains a separate Allowlist or Host connection decision.
 - MCP servers are host-gated per Project. If an expected MCP tool
-  (e.g. mcp__boxa-codex-delegate for Codex delegation) is missing from
-  this session, the server is not exposed here. Ask the user to run on
-  host:
+  (e.g. mcp__boxa-<entry> for a catalog entry named <entry>) is missing
+  from this session, the server is not exposed here. Ask the user to run
+  on host:
     boxa mcp status --project <path>
   and follow what it reports — typically 'boxa mcp readiness <entry>'
-  (e.g. a missing 'codex login') or:
+  or:
     boxa mcp activate <entry> --project <path> --for claude
-  (use '--for codex' for a Codex session; the codex-delegate entry is
-  Claude-only. A new activation appears only in a NEW agent session.)
+  (use '--for codex' for a Codex session. A new activation appears only
+  in a NEW agent session.)
+- Long work and Codex delegation run as Jobs in THIS Container, not over
+  MCP: 'boxa-job' (see docs/jobs.md in the boxa repo) owns a command's
+  lifetime, so it outlives this shell call, subagent, and session.
 - Dev URLs (*.test and *.127.0.0.1.sslip.io) reach this and other live
   boxes through Traefik, bypassing the container and Agent-browser gates.
   Explicit :<port> forms do not work inside containers; use

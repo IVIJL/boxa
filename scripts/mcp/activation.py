@@ -535,6 +535,10 @@ def _validate_activation_request(entry: dict[str, Any], consumers: list[str]) ->
         and len(argv) > 1
         and argv[1] == "mcp-server"
     ):
+        # ADR 0037 retired this entry (the Codex CLI removed `mcp-server`), but
+        # a host can still carry it: keep refusing Codex self-activation so a
+        # leftover entry cannot be activated into a new shape. `boxa doctor`
+        # and `boxa mcp status` are what tell the user to remove it.
         raise ActivationError(
             "codex mcp-server delegation can activate only for Claude; "
             "self-activation for Codex is not implicit"

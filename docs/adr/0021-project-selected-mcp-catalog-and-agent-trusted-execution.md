@@ -1,7 +1,10 @@
 # ADR 0021 — Project-selected MCP catalog and agent-trusted execution
 
-- **Status:** accepted
+- **Status:** accepted, partly revised by ADR 0037
 - **Date:** 2026-07-27
+- **Revised by:** ADR 0037 — the `codex-delegate` catalog seed
+  (`codex mcp-server`) is retired; Codex delegation runs as a Job
+  (`boxa-job`, `docs/jobs.md`). Everything else in this ADR stands.
 - **Revises:** ADR 0013's global-profile and render semantics; ADR 0014's
   peer-equal Docker capability and unconditional secret-isolation claims
 
@@ -173,6 +176,11 @@ rendered. Migration does not infer agent trust.
   every Project remains opt-in.
 - `codex mcp-server` can reuse the mounted ChatGPT login and operate on source and
   Project Docker when explicitly agent-trusted and activated only for Claude.
+  **Revised by ADR 0037:** the Codex CLI removed `codex mcp-server`, so this
+  entry and its one-time seed are retired. A leftover catalog entry is reported
+  by `boxa doctor` and `boxa mcp status` and removed by the user; Codex
+  delegation runs as a Job instead. The agent-trusted mode itself stands for
+  other entries.
 - Rogue service-isolated MCPs retain Project read/write access but cannot use the
   node Docker socket as a path into `/home/node`.
 - Docker-packaged secret-bearing servers remain functional with a prominently

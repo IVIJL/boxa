@@ -118,6 +118,9 @@ class CatalogOperatingPathIntegrationTest(unittest.TestCase):
 
         # Exact Codex delegation: host-authorized agent identity, Claude-only,
         # local Codex login prerequisite, and independent snapshot validation.
+        # The entry is the legacy `codex mcp-server` one ADR 0037 retired; it
+        # stays here as the agent-trusted fixture, because the trust path under
+        # test is the same for any agent-trusted entry.
         delegate = add_entry("codex-delegate", ["codex", "mcp-server"])
         with mock.patch.object(catalog, "_host_mode_command", return_value=True):
             set_execution_mode(delegate["id"], "agent-trusted")

@@ -102,32 +102,13 @@ Mental model and common flow:
   To reuse a prepared entry elsewhere, activate it there or deliberately mark
   it --everywhere.
 
-Trusted Codex delegation to Claude (run on the host):
-  Fresh installs and 'boxa update' offer to seed the 'codex-delegate' entry
-  (definition + confirmed agent-trusted grant) one time; when accepted, the
-  'add' and 'mode' steps below are already done and only per-Project
-  'readiness' + 'activate' remain.
-
-  cd /path/to/my-project
-  boxa up
-  boxa mcp add codex-delegate -- codex mcp-server
-  boxa mcp mode codex-delegate agent-trusted
-  boxa mcp readiness codex-delegate --project "$PWD"
-  boxa mcp activate codex-delegate --project "$PWD" --for claude
-
-  'codex-delegate' is only the catalog name; 'codex mcp-server' after '--' is
-  the command Boxa will launch. Boxa does not install Codex here. The Boxa
-  Container image provides it, and readiness also checks the mounted node
-  user's existing 'codex login' (including ChatGPT subscription login). No API
-  key is required for that login. Agent trust grants the server the same
-  node-user repository/private-state access as the launching agent, so review
-  the preview before confirming. Add and grant trust once; Codex
-  self-activation is refused.
-
-  In another Project the definition and trust grant are reused; only activate:
-  cd /path/to/other-project
-  boxa up
-  boxa mcp activate codex-delegate --project "$PWD" --for claude
+Codex delegation (no longer an MCP entry):
+  Codex delegation runs as a Job inside the Container: 'boxa-job start --codex'
+  (see docs/jobs.md). Current Codex releases removed the 'codex mcp-server'
+  subcommand the old 'codex-delegate' catalog entry ran, so such an entry can
+  never start; ADR 0037 retired it. 'boxa mcp status' and 'boxa doctor' report
+  a leftover entry and print 'boxa mcp remove <entry>'. Boxa never removes a
+  catalog entry for you.
 
 Activation:
   boxa mcp activate <entry> [--project <p>] --for claude|codex|claude,codex

@@ -1,6 +1,6 @@
 ---
 name: boxa
-description: Boxa dev environment guide — invoke when the user mentions the boxa CLI, boxa Containers, MCP catalog or MCP activation, trusted MCP execution, the SSH gate, Forge gate, dev URLs (*.test, *.sslip.io), Allow-for windows, the Allowlist, Agent-browser session lifecycle, ports, mkcert HTTPS, Container identity, or anything about why network/host behaviour differs from a plain shell.
+description: Boxa dev environment guide — invoke when the user mentions the boxa CLI, boxa Containers, MCP catalog or MCP activation, trusted MCP execution, the SSH gate, Forge gate, dev URLs (*.test, *.sslip.io), Allow-for windows, the Allowlist, Agent-browser session lifecycle, ports, mkcert HTTPS, Container identity, Jobs and the boxa-job CLI (long-running commands, Codex delegation), or anything about why network/host behaviour differs from a plain shell.
 user-invocable: false
 ---
 
@@ -64,6 +64,38 @@ persisted address and status. See ADR 0023.
 ### Drive the host browser from inside
 
 Use the upstream `agent-browser` CLI (shadowed by a boxa wrapper that auto-connects to CDP — see § Agent-browser below). Session start/stop is the user's job on the host.
+
+### Run long work as a Job (`boxa-job`)
+
+`boxa-job` is a Container command (ADR 0037, full guide in `docs/jobs.md`). A **Job** is a command whose lifetime, state, and result belong to the Container, not to your shell call, your subagent, or your session.
+
+**Use it for** any command that may outlive one shell call (long builds, test suites, migrations, multi-minute scripts) and for all Codex delegation. `codex mcp-server` no longer exists; there is no MCP path any more.
+
+Start, wait in a loop, then take the result:
+
+```sh
+boxa-job start --key build-01 -- make -j4 all          # returns a jobId at once
+boxa-job wait <jobId>                                  # blocks up to 540 s
+# exit 10 means "still running": call wait again immediately
+boxa-job result <jobId>                                # state, exit code, timings
+boxa-job log <jobId> --tail 40                         # only on demand
+```
+
+A Codex job, with model and effort always explicit:
+
+```sh
+boxa-job start --key review-01 --codex --model gpt-5.6 --effort high \
+    "Review the diff of HEAD and report findings."
+boxa-job reply <threadId> --key review-02 --model gpt-5.6 --effort high "Now fix finding 1."
+```
+
+Rules that matter more than the flags:
+
+- **One subagent = one Codex thread = one Job at a time.** A `reply` into a thread whose Job is unfinished is refused `thread-busy` (exit 12). Steering is `cancel` and then `reply`; a turn in flight cannot be interrupted with a message.
+- **Wait frugally.** Block in `wait`, call it again on exit 10, write no commentary between waits, do not re-analyse the request between waits, and read logs only on demand or for diagnosis. Never return early while the Job runs: that answers nothing. On completion, evaluate the result and hand the main agent a summary with the evidence.
+- **Distinct bad states stay visible.** `failed`, `orphaned`, `exited-with-survivors`, `interrupted`, and `finished-unknown` each need a decision; do not report them as "done".
+- **The Job key stops duplicates, not parallel work.** The same key and the same request attaches to the running Job instead of starting a second one.
+- **Ack only what the orchestrator asked for.** Starting beside other running Jobs is refused with `needs-ack` (exit 11) and a list. Repeat the call with `--ack-concurrent <ids>` only when the orchestrating agent deliberately asked for parallel work; otherwise wait for the other Job instead.
 
 ## On host
 
@@ -172,34 +204,18 @@ Activation writes only Boxa's host-owned store and secret-free runtime snapshot.
 
 Run all `boxa mcp ...` commands on the host. When operating inside a Container, inspect local prerequisites if useful, then give the user the exact host commands.
 
-#### Delegate from Claude to trusted Codex
+#### Codex delegation is not an MCP entry any more
 
-Use this host flow when Claude should call Codex directly as an MCP server.
-Fresh installs and `boxa update` offer to seed the `codex-delegate` catalog
-entry (definition + host-confirmed agent-trusted grant) one time, so the
-`add`/`mode` steps below are usually already done — check `boxa mcp catalog`
-and skip straight to `readiness`/`activate`:
+Do not add `codex mcp-server` to the catalog. Current Codex releases removed
+that subcommand, so such an entry can never start; ADR 0037 retired it. Codex
+delegation runs as a **Job** inside the Container instead: `boxa-job start
+--codex` (see § Jobs and `docs/jobs.md`).
 
-```sh
-cd /path/to/my-project
-boxa up
-boxa mcp add codex-delegate -- codex mcp-server
-boxa mcp mode codex-delegate agent-trusted
-boxa mcp readiness codex-delegate --project "$PWD"
-boxa mcp activate codex-delegate --project "$PWD" --for claude
-boxa mcp status --project "$PWD"
-```
-
-Do not invent a path or API key for `codex-delegate`: the label does not resolve software. The Container image already provides `codex`; the argv after `--` selects its `mcp-server` mode. Readiness checks the mounted `node` user's existing `codex login`, including ChatGPT subscription login.
-
-`agent-trusted` is a host-confirmed grant for the stable catalog identity. It gives the server the same `node`-user repository, mounted private-state, SSH access permitted by the Project's **SSH gate**, and Docker access as the agent that launches it, while excluding ambient bearer tokens and Boxa MCP-store secrets. Review the command/access preview before confirming. Boxa refuses Codex self-activation; select Claude only.
-
-To enable the prepared server in another Project, do not add or trust it again:
+A host that carries the old entry keeps it until the user removes it. `boxa
+doctor` and `boxa mcp status` explain it and print the removal command:
 
 ```sh
-cd /path/to/other-project
-boxa up
-boxa mcp activate codex-delegate --project "$PWD" --for claude
+boxa mcp remove codex-delegate      # use the name the entry really has
 ```
 
 Use `boxa mcp catalog`, `readiness`, `status`, and `doctor` to explain each state. `boxa mcp --help` is the complete user-facing workflow; when working in the Boxa repository, consult `docs/mcp.md` for design detail.
@@ -227,10 +243,12 @@ Three boxa-specific facts:
 - ADR 0023 — Host connections via a durable scoped firewall slot
 - ADR 0026 — opt-in SSH gate and Key picker
 - ADR 0032 — per-installation Agent identity and Forge gate
+- ADR 0037 — Container-owned Jobs replace `codex mcp-server`
 - `docs/ssh.md` — complete **SSH gate**, **Key picker**, and **Boxa SSH config** guide
 - `docs/forge.md` — complete **Agent identity**, **Forge store**, and **Forge gate** guide
 - `docs/networking.md` — complete **Cross-boxa connection** and **Host connection** guide
 - `docs/mcp.md` — complete MCP catalog, readiness, activation and trust guide
+- `docs/jobs.md` — complete **Job** guide: commands, states, keys, ack, runtime snapshots, retention
 - `boxa --help` (on host) for the full CLI surface
 
 ## Common failures
@@ -247,5 +265,6 @@ Short decision tree for the most-frequent symptoms.
 - **Certificate warnings on a `*.test` or `*.sslip.io` URL** → mkcert root CA is not trusted in the current Chrome profile. Check ADR 0008 for graceful-degradation behaviour; the user may need to re-run `boxa dns-install`.
 - **Stale agent-browser CLI behaviour** inside a Container (e.g., `connect 9222` errors after a host Chrome restart) → the auto-connect wrapper reconnects on Chrome restart since `f9e30fa`. If symptoms persist, ask the user to `boxa agent-browser stop <project> && boxa agent-browser start <project>`.
 - **MCP catalog entry exists but the agent cannot see it** → catalog membership never activates a server. Start the target Project, check `boxa mcp readiness <entry> --project <path>`, then explicitly `activate` it for the intended consumer.
-- **`codex-delegate` cannot be found as a binary** → it is only the catalog label. The executable comes from the command after `--` (`codex mcp-server`); verify the Project is running and use `boxa mcp readiness codex-delegate --project <path>`.
-- **`mcp__boxa-codex-delegate` tools are missing from the agent session** → the entry is not activated for this Project (activation is per-Project; the seeded catalog entry alone exposes nothing). Ask the user to run on the host: `boxa mcp readiness codex-delegate --project <path>` (most common gap: no `codex login` yet), then `boxa mcp activate codex-delegate --project <path> --for claude`. If the entry is missing from `boxa mcp catalog` entirely, `boxa update` offers to seed it, or use the manual `add`/`mode` recipe above. A newly activated server appears only in a NEW agent session.
+- **`mcp__boxa-<entry>` tools are missing from the agent session** → the entry is not activated for this Project (activation is per-Project; catalog membership alone exposes nothing). Ask the user to run on the host: `boxa mcp readiness <entry> --project <path>`, then `boxa mcp activate <entry> --project <path> --for claude`. A newly activated server appears only in a NEW agent session.
+- **A `codex-delegate` MCP entry exists but never starts (`CONNECTION_CLOSED`)** → `codex mcp-server` no longer exists in current Codex (ADR 0037). Use `boxa-job start --codex` instead (§ Jobs), and ask the user to run `boxa mcp remove codex-delegate` on the host. `boxa doctor` reports the same thing.
+- **Work is lost when a Bash call, a subagent, or a session ends** → run it as a **Job**. `boxa-job` owns the command's lifetime inside the Container; see § Jobs.

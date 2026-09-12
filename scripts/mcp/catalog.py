@@ -558,13 +558,69 @@ def runtime_kind(argv: list[str]) -> str:
 
 
 def is_codex_delegate_argv(argv: list[str]) -> bool:
-    """True when ``argv`` is the Codex delegation server (``codex mcp-server``)."""
+    """True when ``argv`` is the retired Codex delegation server.
+
+    ``codex mcp-server`` was removed from the Codex CLI (ADR 0037), so an
+    entry with this command can never start. The predicate is what
+    ``boxa doctor`` and ``boxa mcp status`` use to recognize the leftover.
+    """
     return (
         bool(argv)
         and os.path.basename(argv[0]).lower() == "codex"
         and len(argv) > 1
         and argv[1] == "mcp-server"
     )
+
+
+def retired_codex_delegate_entries() -> list[dict[str, Any]]:
+    """Catalog entries running the retired ``codex mcp-server`` command.
+
+    Matched by command, not by name: a user who added the delegation under
+    another label is covered too. Boxa never removes such an entry on its
+    own; removal stays the user's explicit action.
+    """
+    return [
+        dict(entry)
+        for entry in entries_sorted(load_catalog())
+        if is_codex_delegate_argv(entry.get("command", {}).get("argv", []))
+    ]
+
+
+def retired_codex_delegate_notice(
+    entries: Optional[list[dict[str, Any]]] = None,
+) -> str:
+    """The explanation and removal command for retired delegation entries.
+
+    Empty string when there is nothing to report, so a caller can print the
+    result unconditionally and stay silent on a clean catalog.
+    """
+    if entries is None:
+        entries = retired_codex_delegate_entries()
+    if not entries:
+        return ""
+    lines = []
+    for entry in entries:
+        name = entry.get("name", "?")
+        lines.extend(
+            [
+                (
+                    f"WARNING: MCP catalog entry '{name}' runs "
+                    "'codex mcp-server', which current"
+                ),
+                (
+                    "  Codex releases no longer provide, so this entry can "
+                    "never start."
+                ),
+                (
+                    "  Codex delegation now runs as a Job inside the "
+                    "Container: 'boxa-job start --codex'"
+                ),
+                "  (a Container command; see docs/jobs.md and ADR 0037).",
+                "  Boxa does not remove the entry for you. Remove it with:",
+                f"    boxa mcp remove {name}",
+            ]
+        )
+    return "\n".join(lines) + "\n"
 
 
 def degradation_status(entry: dict[str, Any]) -> Optional[str]:

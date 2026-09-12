@@ -31,7 +31,9 @@ node-owned npm symlink, regenerated each Container start so npm updates cannot
 resurrect it). Occupying the canonical path rather than shadowing via PATH
 means absolute-path callers, user skills, hooks, and the codex-delegate's
 `AGENT_PATH` resolution all land on the wrapper; only calling package
-internals bypasses it, which we accept as deliberate surgery.
+internals bypasses it, which we accept as deliberate surgery. (The
+`codex-delegate` entry itself was retired by ADR 0037; the argument holds for
+any agent-trusted entry that resolves an absolute agent path.)
 
 On every invocation the wrapper derives the Project's MCP profile from the
 runtime snapshot (`projects` × `entries`) and injects it as the session's

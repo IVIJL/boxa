@@ -2125,6 +2125,19 @@ host_connection_repair_command() {
     fi
 }
 
+# Check-only doctor finding (ADR 0037, category C in ADR 0017 terms): a
+# catalog entry whose command is `codex mcp-server` can never start, because
+# current Codex releases removed that subcommand. Doctor explains it and prints
+# the removal command; it never removes a user's catalog entry, so there is no
+# `--fix` action and no step id. The whole decision (match by command, wording)
+# lives in the unit-tested Python core (`mcp.catalog`), which prints nothing on
+# a clean catalog so doctor stays silent on a host that never had the entry.
+report_retired_codex_delegate_entries() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    PYTHONPATH="$BOXA_DIR/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m mcp.cli retired-codex-delegate-text 2>/dev/null || true
+}
+
 report_broken_host_connections() {
     local config_file global_config_file source_project source_container all_connections
     local alias target_container target_port local_port finding repair_command
@@ -4980,15 +4993,6 @@ if [ "$MODE" = "update" ]; then
         "$BOXA_DIR/scripts/ensure-ssh-gate.sh" offer || true
     fi
 
-    # Codex-delegate seed (ADR 0021) — one-time offer to prepare the default
-    # 'codex-delegate' catalog entry (the image already bakes the Codex CLI).
-    # Same elective shape as MCP onboarding: its own applied/dismissed marker
-    # keeps steady-state updates silent, and the trust grant is only ever
-    # applied after an interactive confirmation inside the hook.
-    if [ -x "$BOXA_DIR/scripts/ensure-codex-delegate-seed.sh" ]; then
-        "$BOXA_DIR/scripts/ensure-codex-delegate-seed.sh" --quiet-if-noop || true
-    fi
-
     if [ "${BOXA_UPDATE_PULLED:-}" = "1" ]; then
         # HTTPS upgrade prompt (ADR 0008 Phase 6). Offered exactly once per
         # install: a user who declines flips `optout=true` in https.conf and
@@ -5243,6 +5247,8 @@ if [ "$MODE" = "doctor" ]; then
     fi
 
     report_broken_host_connections
+
+    report_retired_codex_delegate_entries
 
     unexpected_shared_config="$(shared_config_unexpected_files)"
     if [ -n "$unexpected_shared_config" ]; then

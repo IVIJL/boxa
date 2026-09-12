@@ -628,7 +628,8 @@ A command and its whole process tree run inside a **Container**, whose
 lifetime, state, and result belong to the Container, not to the agent or tool
 call that started it. It is finished only when the tree is. A Job outlives
 the shell call, subagent, or session that started it; a waiting client can
-disconnect and a new one can find the same Job and its result. See ADR 0037.
+disconnect and a new one can find the same Job and its result. See ADR 0037
+and `docs/jobs.md`.
 _Avoid_: task, background command, run, background process
 
 **Job worker**:

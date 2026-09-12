@@ -86,8 +86,8 @@ It cannot use Boxa MCP-store secrets.
 Only the host can grant this mode:
 
 ```bash
-boxa mcp mode codex-delegate agent-trusted
-boxa mcp mode codex-delegate agent-trusted --yes  # non-interactive
+boxa mcp mode <entry> agent-trusted
+boxa mcp mode <entry> agent-trusted --yes  # non-interactive
 ```
 
 Mode cannot change while an activation exists, and import/discovery never
@@ -97,22 +97,24 @@ Marking an `agent-trusted` entry everywhere extends agent-identity trust to
 every future Project. Boxa prints that scope explicitly and requires interactive
 confirmation or `--yes` for non-interactive use.
 
-### Trusted Codex delegation
+### Codex delegation moved to Jobs
 
-Codex login belongs to the host-mounted `node` context. Readiness runs local
-`codex login status` inside the running Container and performs no network login.
+Codex delegation is no longer an MCP entry. Current Codex releases removed the
+`codex mcp-server` subcommand the `codex-delegate` catalog entry ran, so such
+an entry can never start; ADR 0037 retired it together with its one-time
+install/update seed. Codex delegation now runs as a **Job** inside the
+Container: `boxa-job start --codex`. See [Jobs](jobs.md).
+
+Existing catalog entries are not removed automatically. `boxa doctor` and
+`boxa mcp status` recognize an entry whose command is `codex mcp-server`,
+explain that the subcommand no longer exists, point at `boxa-job`, and print
+the removal command; removing it stays the user's action:
 
 ```bash
-boxa mcp add codex-delegate -- codex mcp-server
-boxa mcp mode codex-delegate agent-trusted
-boxa mcp readiness codex-delegate --project /work/my-project
-boxa mcp activate codex-delegate --project /work/my-project --for claude
+boxa mcp remove codex-delegate   # use the name the entry really has
 ```
 
-Fresh installs and `boxa update` offer to seed this catalog definition and trust
-grant once. Projects activate it explicitly unless the user deliberately marks
-it everywhere with the future-Project trust acknowledgement. Codex
-self-activation is refused.
+`agent-trusted` mode itself is unchanged and still available to other entries.
 
 ## Docker limitation
 

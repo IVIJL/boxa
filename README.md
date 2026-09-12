@@ -110,6 +110,7 @@ Per-feature guides:
 - [Firewall](docs/firewall.md) — default-deny allowlist, `allow`/`deny`/`blocked`, allow-for harvest window.
 - [Agent-browser](docs/agent-browser.md) — sessions, network windows, allowlist, artefacts, per-OS prerequisites.
 - [MCP servers](docs/mcp.md) — catalog, readiness, Project activation, execution identity, and diagnostics.
+- [Jobs](docs/jobs.md) — `boxa-job` inside a Container: long-running commands and Codex delegation that outlive a shell call, states, keys, concurrency ack, retention.
 - [Networking & port routing](docs/networking.md) — local `.test` DNS, sslip.io fallback, HTTPS via mkcert, cross-boxa `connect`.
 - [SSH](docs/ssh.md) — opt-in SSH gate, Key picker, Boxa SSH config, WSL2 keychain.
 - [Docker-in-Docker](docs/docker-in-docker.md) — rootless DinD, persistence, graceful shutdown.
