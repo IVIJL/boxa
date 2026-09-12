@@ -84,6 +84,12 @@ REASON_NONZERO_EXIT = "nonzero-exit"
 # How much of the final message the human output prints; `--json` carries it
 # whole (it is the answer, unlike the event log).
 FINAL_MESSAGE_PREVIEW_CHARS = 300
+# How much of the final message is copied ONTO the record. The record has to
+# outlive `last.md` (retention deletes it after 14 days, ADR 0037 "State and
+# retention"), but the record is the small durable summary and must stay
+# small: a longer message is stored truncated, with `finalMessageTruncated`
+# saying so rather than pretending it is the whole answer.
+FINAL_MESSAGE_RECORD_BYTES = 64 * 1024
 
 
 class CodexNotFound(RuntimeError):
@@ -412,6 +418,22 @@ def final_message(path: str) -> Optional[str]:
     return text or None
 
 
+def _recorded_final_message(path: str) -> dict[str, Any]:
+    """The final message as it goes onto the record: capped, honestly flagged."""
+    message = final_message(path)
+    if message is None:
+        return {"finalMessage": None, "finalMessageTruncated": False}
+    encoded = message.encode("utf-8")
+    if len(encoded) <= FINAL_MESSAGE_RECORD_BYTES:
+        return {"finalMessage": message, "finalMessageTruncated": False}
+    return {
+        "finalMessage": encoded[:FINAL_MESSAGE_RECORD_BYTES].decode(
+            "utf-8", errors="ignore"
+        ),
+        "finalMessageTruncated": True,
+    }
+
+
 # ---------------------------------------------------------------- outcome
 
 
@@ -489,7 +511,7 @@ def stream_extract(
         "codexBinary": spec.get("binary"),
         "parentJobId": spec.get("parentJobId"),
         "mode": spec.get("mode", "start"),
-        "finalMessage": final_message(last_message_path),
+        **_recorded_final_message(last_message_path),
         "malformedEventLines": summary.malformed_lines,
     }
 
@@ -534,6 +556,10 @@ def result_extract(record: dict[str, Any], paths: dict[str, str]) -> dict[str, A
     """
     stored = record.get("codex")
     if isinstance(stored, dict) and stored.get("terminalEvent") is not None:
+        return dict(stored)
+    if isinstance(stored, dict) and record.get("gcAt"):
+        # Retention removed the files this would otherwise re-read; the record
+        # is now the only source, and it is the authoritative one.
         return dict(stored)
     spec = record.get("codexRequest") or {}
     live = stream_extract(

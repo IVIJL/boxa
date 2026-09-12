@@ -31,6 +31,14 @@ if [ "$(id -u)" = "0" ]; then
     chown node:node /home/node/.cursor-server /home/node/.vscode-server \
         /home/node/.config/gh /home/node/.config/glab-cli 2>/dev/null || true
 
+    # Per-Project Job state volume (ADR 0037): Docker creates both the fresh
+    # volume and the `.local/state/boxa` parents it mounts under as root, and
+    # `boxa-job` runs as node. Hand the whole path over, parents included, so
+    # the CLI can write records there on the first start.
+    chown node:node /home/node/.local /home/node/.local/state \
+        /home/node/.local/state/boxa /home/node/.local/state/boxa/jobs \
+        2>/dev/null || true
+
     # Shared boxa-codex-versions volume (ADR 0037 "Codex runtime"): `boxa-job`
     # publishes the verified immutable Codex copies into it as node, so the
     # root-owned fresh volume has to change hands here — same treatment as

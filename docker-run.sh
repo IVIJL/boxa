@@ -6183,12 +6183,18 @@ if [ "$MODE" = "remove" ]; then
         fi
     }
 
-    # Find projects that have per-project volumes. The suffix-strip sed mirrors
-    # BOXA_PROJECT_VOLUME_SUFFIXES — keep them in sync if a suffix is added.
+    # Find projects that have per-project volumes. Both the match and the
+    # suffix strip are derived from BOXA_PROJECT_VOLUME_SUFFIXES, so adding a
+    # suffix (e.g. ADR 0037's `jobs`) needs no edit here.
     list_projects_with_volumes() {
+        local suffix_alternation
+        suffix_alternation="$(
+            IFS='|'
+            printf '%s' "${BOXA_PROJECT_VOLUME_SUFFIXES[*]}"
+        )"
         docker volume ls -q --filter "name=boxa-" 2>/dev/null \
             | grep -E -- "$(boxa::project_volume_regex)" \
-            | sed 's/^boxa-//;s/-\(docker\|gh\|glab\|history\)$//' \
+            | sed -E "s/^boxa-//;s/-($suffix_alternation)\$//" \
             | sort -u || true
     }
 
@@ -7188,6 +7194,11 @@ DOCKER_ARGS=(
     # (gh semantics).
     -v "${BOXA_VOL_GH}:/home/node/.config/gh"
     -v "${BOXA_VOL_GLAB}:/home/node/.config/glab-cli"
+    # Container-owned Job state (ADR 0037 "State and retention"): records,
+    # key reservations and logs of this Project's Jobs, at the XDG state path
+    # `boxa-job` derives. Per-Project so a Job key means one thing, and so it
+    # is removed with the Project by `boxa remove` / `boxa stop --clean`.
+    -v "${BOXA_VOL_JOBS}:/home/node/.local/state/boxa/jobs"
     # Shared volumes
     -v boxa-nvim-data:/home/node/.local/share/nvim
     -v boxa-npm-global:/usr/local/share/npm-global

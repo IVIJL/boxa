@@ -423,7 +423,10 @@ class HelpTests(unittest.TestCase):
             "runtime",
         ):
             self.assertIn(name, help_text, f"--help does not mention {name}")
-        self.assertIn("not yet available", help_text)
+        # Issue 06 closed the last gap: nothing is "not yet available" and
+        # --help is the whole command surface ADR 0037 describes.
+        self.assertNotIn("not yet available", help_text)
+        self.assertEqual(jobs_cli.PENDING_COMMANDS, {})
 
 
 class PendingCommandTests(JobsTestCase):

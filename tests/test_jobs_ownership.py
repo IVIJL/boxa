@@ -493,12 +493,9 @@ class HelpTests(unittest.TestCase):
             "rootless Docker daemon",
         ):
             self.assertIn(token, help_text, f"--help does not mention {token}")
-        # An available command must never appear under the epilog's
-        # "not yet available" heading (split on the heading itself: a pending
-        # subparser's own help line also says "not yet available").
-        pending_section = help_text.split("not yet available (documented")[1]
-        self.assertNotIn("cancel   kill a Job's tree", pending_section)
-        self.assertNotIn("runtime  show", pending_section)
+        # No command is pending any more (issue 06 landed `gc`), so the
+        # epilog has no "not yet available" section for one to hide in.
+        self.assertNotIn("not yet available", help_text)
 
 
 if __name__ == "__main__":

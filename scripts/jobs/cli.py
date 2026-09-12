@@ -3,10 +3,9 @@
 Implemented here: ``start``, ``wait``, ``result``, ``list`` and ``log`` for a
 plain command (issue 01), plus ``cancel``, ``adopt`` and the recovery states
 (issue 02), and ``start --codex`` / ``reply`` for a Codex job (issue 04), plus the
-verified Codex runtime (``runtime list|refresh|use``, issue 05).
-``gc`` is documented in ``--help`` and refuses with a clear "not yet
-available" message, so the help stays the complete command surface the ADR
-describes.
+verified Codex runtime (``runtime list|refresh|use``, issue 05) and ``gc``
+(issue 06).  Every command ADR 0037 describes is implemented; ``--help`` is
+the complete surface.
 
 Every command starts by re-deriving the Project's non-terminal records from
 evidence (:func:`jobs.recovery.refresh_states`): a Job from a foreign
@@ -30,7 +29,6 @@ Exit codes:
   5  refused (``--fresh`` while a Job under that key is not finished; a
      Codex job with no verified runtime: ``no-verified-runtime``)
   6  conflict (same key, different request fingerprint)
-  7  command not yet available in this slice
  10  ``wait`` expired while the Job is still running — call ``wait`` again
  11  other Jobs are running: repeat with ``--ack-concurrent`` (see ``jobs.ack``)
  12  ``reply``: that Codex thread already has a running Job (``thread-busy``)
@@ -50,6 +48,7 @@ from typing import Any, Callable, NamedTuple, Optional
 import jobs
 from . import ack as ack_mod
 from . import codex as codex_mod
+from . import gc as gc_mod
 from . import recovery
 from . import runtime as runtime_mod
 from .env import passthrough_values
@@ -73,7 +72,6 @@ EXIT_WORKER = 3
 EXIT_UNCLEAR = 4
 EXIT_REFUSED = 5
 EXIT_CONFLICT = 6
-EXIT_NOT_YET = 7
 EXIT_STILL_RUNNING = 10
 EXIT_NEEDS_ACK = 11
 EXIT_THREAD_BUSY = 12
@@ -92,11 +90,8 @@ WAIT_REFRESH_SECONDS = 15.0
 # is a failure to report, not something to wait out.
 RESERVATION_TIMEOUT = 20.0
 
-# Commands from ADR 0037 that later slices add.  Listed in --help so the help
-# is the whole surface, and refused with a pointer rather than a stack trace.
-PENDING_COMMANDS = {
-    "gc": "clean up bulky logs and purge Job records",
-}
+# Every command ADR 0037 names is implemented; nothing is pending any more.
+PENDING_COMMANDS: dict[str, str] = {}
 
 
 # --------------------------------------------------------------------- output
@@ -156,6 +151,7 @@ def _result_payload(store: ProjectStore, record: dict[str, Any]) -> dict[str, An
         "interruptedReason": record.get("interruptedReason"),
         "cancel": record.get("cancel"),
         "adopted": bool(record.get("adopted")),
+        "gcAt": record.get("gcAt"),
         "ackConcurrent": record.get("ackConcurrent") or [],
         "paths": record.get("paths", {}),
     }
@@ -187,8 +183,15 @@ def _result_lines(payload: dict[str, Any]) -> list[str]:
         f"job: {payload['jobId']}  key: {payload['key']}",
         f"exit: {payload['exitCode']}  duration: {_duration(payload)}",
     ]
+    if payload.get("gcAt"):
+        # The record outlives its logs: say so rather than printing paths
+        # that no longer resolve (ADR 0037 "State and retention").
+        lines.append(
+            "artefacts: removed by gc "
+            f"{time.strftime('%Y-%m-%d', time.localtime(payload['gcAt']))}"
+        )
     paths = payload.get("paths", {})
-    if paths:
+    if paths and not payload.get("gcAt"):
         # A Codex job's stdout is its event stream, so it is named as one.
         if paths.get("events"):
             lines.append(f"events: {paths['events']}")
@@ -360,6 +363,10 @@ def _register_job(request: JobRequest) -> int:
     """The whole key lifecycle of a start/reply, under one Project lock."""
     store = _store()
     key = request.key
+    # Retention, before the lock and never fatal (ADR 0037 "State and
+    # retention"): the bulky artefacts of Jobs that finished more than
+    # `gc_mod.DEFAULT_RETENTION_DAYS` ago go now, while nothing is held.
+    gc_mod.sweep_quietly(store)
 
     with store.lock():
         existing_id = store.key_job_id(key)
@@ -1111,6 +1118,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         return EXIT_UNCLEAR
     # A Codex job writes its event stream where a plain Job writes stdout;
     # both names are tried so one command tails either kind of Job.
+    shown = False
     for stream, path in (
         ("events", store.events_path(args.job_id)),
         ("stdout", store.stdout_path(args.job_id)),
@@ -1126,6 +1134,16 @@ def cmd_log(args: argparse.Namespace) -> int:
         print(f"--- {stream} (last {len(tail)}) ---")
         for line in tail:
             print(line)
+        shown = True
+    if not shown:
+        if record.get("gcAt"):
+            print(
+                "no logs: gc removed this Job's artefacts on "
+                + time.strftime("%Y-%m-%d", time.localtime(record["gcAt"]))
+                + " (the record is still there: `boxa-job result`)"
+            )
+        else:
+            print("no output recorded for this Job yet")
     return EXIT_OK
 
 
@@ -1353,14 +1371,52 @@ def cmd_runtime(args: argparse.Namespace) -> int:
     return _runtime_rows(args.json, [])
 
 
-def cmd_pending(args: argparse.Namespace) -> int:
-    name = args.pending_command
-    print(
-        f"boxa-job {name}: not yet available — {PENDING_COMMANDS[name]} "
-        "(lands in a later slice of ADR 0037).",
-        file=sys.stderr,
+# -------------------------------------------------------------------------- gc
+
+
+def _human_bytes(count: int) -> str:
+    value = float(count)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{count} B"
+
+
+def cmd_gc(args: argparse.Namespace) -> int:
+    """Retention by hand: the same sweep `start` does, plus `--purge`."""
+    store = _store()
+    if args.older_than < 0:
+        return _usage("--older-than takes a non-negative number of days")
+    outcome = gc_mod.run(
+        store,
+        older_than_days=args.older_than,
+        purge=args.purge,
+        dry_run=args.dry_run,
     )
-    return EXIT_NOT_YET
+    payload = outcome.as_dict()
+    payload["result"] = "dry-run" if args.dry_run else "gc"
+    verb = "would purge" if args.purge else "would remove"
+    done = "purged" if args.purge else "removed"
+    head = (
+        f"gc: {verb} {len(outcome.entries)} job(s), "
+        f"{_human_bytes(outcome.bytes)}"
+        if args.dry_run
+        else f"gc: {done} {len(outcome.entries)} job(s), "
+        f"{_human_bytes(outcome.bytes)} freed"
+    )
+    lines = [
+        f"{head}; {outcome.kept} kept (terminal and older than "
+        f"{args.older_than:g} days is what goes)"
+    ]
+    for entry in outcome.entries:
+        lines.append(
+            f"{entry.job_id}  {entry.state:<21}  key={entry.key}  "
+            f"age={entry.age_seconds / 86400:.1f}d  "
+            f"{_human_bytes(entry.bytes)}  {','.join(entry.files)}"
+        )
+    _emit(args.json, payload, lines)
+    return EXIT_OK
 
 
 # ----------------------------------------------------------------------- main
@@ -1376,9 +1432,8 @@ available now:
   list     the Jobs of this Project
   log      tail a Job's stdout/stderr (a Codex job: its raw events) on demand
   runtime  show, re-check or pin the verified Codex runtime copy
-
-not yet available (documented here, refused with exit 7):
-  gc       clean up bulky logs and purge Job records
+  gc       drop the bulky artefacts of long-finished Jobs; --purge drops
+           whole records (and frees their keys)
 
 codex jobs (the contract a delegating skill codes against):
   start --key K --codex --model M --effort E [--cwd DIR] "prompt"
@@ -1410,6 +1465,21 @@ codex jobs (the contract a delegating skill codes against):
   * a Codex job is `done` only with a `turn.completed` event AND exit 0. Exit
     0 without a terminal event (what a killed `codex exec` looks like) is
     `failed` with reason `no-terminal-event`, never `done`.
+
+state and retention (the Job state directory is a per-Project volume,
+removed with the Project by `boxa remove` / `boxa stop --clean`):
+  * `start` and `reply` sweep first: the bulky artefacts (events.jsonl,
+    stdout, stderr, last.md, heartbeat, worker.err) of TERMINAL Jobs older
+    than 14 days are deleted, the Job record is kept. `result` still answers
+    with state, exit code, thread id and the final message text, and says
+    `artefacts: removed by gc`.
+  * a Job that is not terminal is NEVER touched — `exited-with-survivors`
+    included, its descendants are still writing.
+  * `gc [--older-than DAYS] [--dry-run] [--json]` does that sweep by hand;
+    `gc --purge` removes whole record dirs and frees their keys. Nothing
+    purges on its own.
+  * a Container restart does not clear anything: the records persist and the
+    Jobs of the previous run become `interrupted` on the next call.
 
 states:
   reserved               key taken, the command not spawned yet
@@ -1444,7 +1514,7 @@ worker died, and anything started through the rootless Docker daemon, are
 outside what Boxa can see.
 
 exit codes: 0 finished/ok, 2 usage, 3 worker failed, 4 unknown or unclear Job,
-5 refused, 6 key conflict, 7 not yet available, 10 wait expired while running,
+5 refused, 6 key conflict, 10 wait expired while running,
 11 needs-ack (other Jobs are running), 12 thread-busy (that Codex thread has a
 running Job).
 """
@@ -1690,14 +1760,41 @@ def build_parser() -> argparse.ArgumentParser:
         )
         parser_obj.set_defaults(func=cmd_runtime)
 
-    for name, summary in PENDING_COMMANDS.items():
-        pending = sub.add_parser(
-            name, help=f"(not yet available) {summary}", description=summary
-        )
-        pending.add_argument(
-            "rest", nargs="*", help=argparse.SUPPRESS
-        )
-        pending.set_defaults(func=cmd_pending, pending_command=name)
+    gc_parser = sub.add_parser(
+        "gc",
+        help="drop the bulky artefacts of long-finished Jobs (--purge: records)",
+        description=(
+            "Retention for this Project's Job state (ADR 0037). By default "
+            "the bulky artefacts — events.jsonl, stdout, stderr, last.md, "
+            "the heartbeat, worker.err — of TERMINAL Jobs older than "
+            f"{gc_mod.DEFAULT_RETENTION_DAYS} days are deleted while the Job "
+            "record (key, state, exit code, thread, final message) stays, so "
+            "`result` still answers. `--purge` removes whole record "
+            "directories and frees their keys. A Job that is not terminal "
+            "(running, exited-with-survivors, orphaned, reserved, or "
+            "unreadable) is never touched at either level. `start` and "
+            "`reply` run the default sweep automatically."
+        ),
+    )
+    gc_parser.add_argument(
+        "--older-than",
+        type=float,
+        default=float(gc_mod.DEFAULT_RETENTION_DAYS),
+        metavar="DAYS",
+        help=f"age threshold in days (default {gc_mod.DEFAULT_RETENTION_DAYS})",
+    )
+    gc_parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="remove whole Job records, not just their bulky artefacts",
+    )
+    gc_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list what would go; touch nothing",
+    )
+    gc_parser.add_argument("--json", action="store_true")
+    gc_parser.set_defaults(func=cmd_gc)
 
     return parser
 
