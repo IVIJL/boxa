@@ -9,7 +9,7 @@ local PRDs, issues and handoffs; GitHub Issues is not used for Boxa work.
 
 | Feature | Artifact | Next action | Last reviewed |
 | ------- | -------- | ----------- | ------------- |
-| boxa-jobs | `boxa-jobs/KICKOFF.md` | AFK batch (Prompt A) running in-Container: issue 01 done, 02 in-progress; chain 01→07, then final review, HANDOFF.md for host proofs (05/06) and 08/09. | 2026-09-12 |
+| boxa-jobs | `boxa-jobs/KICKOFF.md` | AFK batch (Prompt A) running in-Container: issues 01–02 done, 03 in-progress; chain 01→07, then final review, HANDOFF.md for host proofs (05/06) and 08/09. | 2026-09-12 |
 
 ### Planned
 

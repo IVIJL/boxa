@@ -29,6 +29,7 @@ Exit codes:
   6  conflict (same key, different request fingerprint)
   7  command not yet available in this slice
  10  ``wait`` expired while the Job is still running — call ``wait`` again
+ 11  other Jobs are running: repeat with ``--ack-concurrent`` (see ``jobs.ack``)
 ===  ============================================================
 """
 
@@ -43,6 +44,7 @@ import time
 from typing import Any, Optional
 
 import jobs
+from . import ack as ack_mod
 from . import recovery
 from .env import passthrough_values
 from .identity import IdentityError, project_key
@@ -66,6 +68,7 @@ EXIT_REFUSED = 5
 EXIT_CONFLICT = 6
 EXIT_NOT_YET = 7
 EXIT_STILL_RUNNING = 10
+EXIT_NEEDS_ACK = 11
 
 # `wait` blocks in-process as long as the verified client limit allows minus a
 # margin: the Bash tool call dies at 600 s, so nothing above this is useful.
@@ -147,6 +150,7 @@ def _result_payload(store: ProjectStore, record: dict[str, Any]) -> dict[str, An
         "interruptedReason": record.get("interruptedReason"),
         "cancel": record.get("cancel"),
         "adopted": bool(record.get("adopted")),
+        "ackConcurrent": record.get("ackConcurrent") or [],
         "paths": record.get("paths", {}),
     }
 
@@ -253,6 +257,50 @@ def _worker_error(store: ProjectStore, job_id: str) -> str:
     except OSError:
         return ""
     return text.splitlines()[-1] if text else ""
+
+
+def _emit_needs_ack(
+    json_mode: bool, key: Optional[str], outcome: ack_mod.AckOutcome
+) -> int:
+    """Print the current concurrent Jobs and how to acknowledge them.
+
+    Shared by ``start`` and (issue 04) ``reply``: one refusal shape, one place
+    that decides what the caller is shown.
+    """
+    ids = ",".join(item.job_id for item in outcome.concurrent)
+    # The hint is the whole protocol in one string, so a --json caller does
+    # not have to have read --help to recover from this refusal.
+    hint = (
+        "the acknowledged Jobs have finished: retry without --ack-concurrent"
+        if outcome.reason == ack_mod.REASON_NOT_NEEDED
+        else f"repeat this start with --ack-concurrent {ids} (exactly this set)"
+    )
+    if outcome.reason == ack_mod.REASON_NOT_NEEDED:
+        lines = [
+            "result: needs-ack (nothing is running in this Project any more)",
+            "the acknowledged Jobs have finished — retry without --ack-concurrent",
+        ]
+    else:
+        count = len(outcome.concurrent)
+        lines = [
+            f"result: needs-ack ({count} other job(s) running in this Project)",
+            *[item.as_line() for item in outcome.concurrent],
+            f"repeat with: --ack-concurrent {ids}",
+        ]
+    _emit(
+        json_mode,
+        {
+            "result": "needs-ack",
+            "reason": outcome.reason,
+            "key": key,
+            "ackGiven": outcome.ack,
+            "ackConcurrent": [item.job_id for item in outcome.concurrent],
+            "concurrent": [item.as_dict() for item in outcome.concurrent],
+            "hint": hint,
+        },
+        lines,
+    )
+    return EXIT_NEEDS_ACK
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -384,6 +432,15 @@ def cmd_start(args: argparse.Namespace) -> int:
                 )
                 return EXIT_CONFLICT
 
+        # A new run (including --fresh) starts beside whatever else this
+        # Project is running, so it needs the ack. Re-derive the states here:
+        # acquiring the lock may have taken a while, and an ack must be
+        # checked against the Project as it is now, not as it was.
+        recovery.refresh_states(store)
+        outcome = ack_mod.gate(store, ack_mod.parse_ids(args.ack_concurrent))
+        if not outcome.ok:
+            return _emit_needs_ack(args.json, args.key, outcome)
+
         job_id = new_job_id()
         store.write_spec(
             job_id,
@@ -394,6 +451,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 "cwd": cwd,
                 "envNames": env_names,
                 "fingerprint": request_fp,
+                "ackConcurrent": outcome.ack,
                 "requestedAt": time.time(),
             },
         )
@@ -428,6 +486,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             "key": args.key,
             "state": record.get("state"),
             "fingerprint": request_fp,
+            "ackConcurrent": record.get("ackConcurrent") or [],
         },
         [
             f"result: started  state: {record.get('state')}",
@@ -769,6 +828,17 @@ states:
   interrupted            a foreign Container run wrote it, or the worker died
                          before spawning: never resumed automatically
 
+concurrency ack (a Job key stops duplicates, not parallel work):
+  1. `start` beside other running Jobs refuses: `needs-ack`, exit 11, listing
+     each (jobId, key, state, start time, first request line).
+  2. repeat that `start` with `--ack-concurrent <id,id>` naming EXACTLY that
+     set (order-free): it starts, its record keeps `ackConcurrent`.
+  3. a Job that appeared or finished meanwhile makes the ack stale: another
+     `needs-ack` with the current list — ack that one instead.
+  4. nothing running: no ack asked, `--ack-concurrent` refused. Same
+     key+request attaches without an ack; `--fresh` is a run and needs one.
+  5. running = reserved, running, exited-with-survivors, orphaned, unreadable.
+
 ownership and its limits: while the worker lives it is a child subreaper, so
 the whole tree is walked through /proc parent links (a `setsid` escapee and a
 child with a wiped environment included). Afterwards only the BOXA_JOB_ID
@@ -778,7 +848,8 @@ worker died, and anything started through the rootless Docker daemon, are
 outside what Boxa can see.
 
 exit codes: 0 finished/ok, 2 usage, 3 worker failed, 4 unknown or unclear Job,
-5 refused, 6 key conflict, 7 not yet available, 10 wait expired while running.
+5 refused, 6 key conflict, 7 not yet available, 10 wait expired while running,
+11 needs-ack (other Jobs are running).
 """
 
 
@@ -803,7 +874,9 @@ def build_parser() -> argparse.ArgumentParser:
             "request (argv + cwd + env names) attaches to the running Job or "
             "returns the finished result; same key with a different request is "
             "a conflict. --fresh starts a new run only when no Job under that "
-            "key is unfinished."
+            "key is unfinished. A new run beside other running Jobs needs "
+            "--ack-concurrent: see the concurrency ack section of `boxa-job "
+            "--help`."
         ),
     )
     start.add_argument("--key", required=True, help="Job key, scoped to the Project")
@@ -812,6 +885,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="KEY",
         help="pass this variable through to the command (name recorded, value never)",
+    )
+    start.add_argument(
+        "--ack-concurrent",
+        metavar="ID,ID",
+        help=(
+            "acknowledge exactly the other running Jobs `needs-ack` listed "
+            "(ids, comma-separated); stored in the new Job's record"
+        ),
     )
     start.add_argument(
         "--fresh",

@@ -23,7 +23,7 @@ A Container command `boxa-job` (Python package under the Boxa scripts tree, shel
 
 - [x] Unit tests (pytest, same layout as `scripts/mcp` tests) cover reservation atomicity, key attach/return/conflict/`--fresh`, wait timeout output shape, env baseline + `--env`.
 - [x] In-Container proof: `start` a `sleep 30 && echo X` Job from a Bash tool call that ends; a later `wait` from a new shell returns `done` with exit 0 and stdout `X`.
-- [ ] In-Container proof: a Job started by a subagent that returns immediately is still running afterwards and completes.
+- [x] In-Container proof: a Job started by a subagent that returns immediately is still running afterwards and completes. (Orchestrator verified job `20260912T083811-iausd6`: `running` with live heartbeat after the subagent returned, later `done`, exit 0, 333 s, stdout marker present.)
 - [x] Two simultaneous `start` with the same key produce one Job (one attaches).
 - [x] `wait` on an unchanged run prints ≤ 5 short lines / one compact JSON object.
 - [x] `boxa-job --help` documents every command; shellcheck clean on the front-end.

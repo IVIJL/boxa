@@ -239,6 +239,9 @@ def run_spawn(project_key: str, job_id: str, root: Optional[str] = None) -> int:
         "cwd": cwd,
         "envNames": env_names,
         "fingerprint": spec["fingerprint"],
+        # The concurrency ack the caller gave at `start` (ADR 0037): the Jobs
+        # it knowingly ran beside, kept so the decision stays traceable.
+        "ackConcurrent": list(spec.get("ackConcurrent") or []),
         "worker": {
             "pid": worker_pid,
             "startTime": procs.process_start_time(worker_pid),

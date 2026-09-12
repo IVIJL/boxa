@@ -265,9 +265,12 @@ class LifecycleTests(JobsTestCase):
 
     def test_list_shows_the_projects_jobs(self) -> None:
         first = self.start_json("--key", "l1", "--", "sh", "-c", "exit 0")
+        # One at a time: a second key started while the first Job still runs
+        # would need a concurrency ack (issue 03), which is not what this test
+        # is about.
+        self.wait_for_state(first["jobId"], {STATE_DONE})
         second = self.start_json("--key", "l2", "--", "sh", "-c", "exit 1")
-        for started in (first, second):
-            self.wait_for_state(started["jobId"], {STATE_DONE, STATE_FAILED})
+        self.wait_for_state(second["jobId"], {STATE_FAILED})
         code, out = _run_cli("list", "--json")
         self.assertEqual(code, jobs_cli.EXIT_OK)
         payload = json.loads(out)
