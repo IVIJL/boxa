@@ -504,6 +504,37 @@ class EnsureTests(RuntimeTestCase):
         self.assertFalse(second.probed)
         self.assertEqual(len(probes), 1)
 
+    def _stale_orphan(self, version: str) -> str:
+        orphan = os.path.join(
+            self.root, f"{jobs_runtime.TEMP_PREFIX}{version}-orphan"
+        )
+        os.makedirs(orphan)
+        ancient = time.time() - 2 * jobs_runtime.STALE_SNAPSHOT_SECONDS
+        os.utime(orphan, (ancient, ancient))
+        return orphan
+
+    def test_the_fast_path_of_ensure_sweeps_a_stale_snapshot(self) -> None:
+        """A normal start and `runtime refresh` go through `ensure`, not
+        `snapshot`: when the newest version is already verified, `ensure`
+        returns without entering the publish path at all, so the sweep has to
+        happen here or an interrupted publish's package copy lives forever.
+        """
+        self.publish("0.149.1")
+        self._stale_orphan("0.149.1")
+        chosen = jobs_runtime.ensure(root=self.root, prober=never_prober)
+        self.assertEqual(chosen.version, "0.149.1")
+        self.assertFalse(chosen.probed)
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_pin_short_circuit_sweeps_too(self) -> None:
+        """A pin skips the refresh entirely, so it is the only sweeper left."""
+        self.publish("0.149.1")
+        jobs_runtime.pin("0.149.1", self.root)
+        self._stale_orphan("0.149.1")
+        chosen = jobs_runtime.ensure(root=self.root, prober=never_prober)
+        self.assertEqual(chosen.source, "pin")
+        self.assertEqual(self.temp_dirs(), [])
+
     def test_a_newer_version_is_snapshotted_and_takes_over(self) -> None:
         self.publish("0.149.1")
         self.host_source("0.154.0")

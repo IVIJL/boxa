@@ -974,6 +974,12 @@ def ensure(
     Fast path: the newest found version is already the newest verified copy →
     no manifest, no copy, no probe.  A pin short-circuits even that: a
     rollback means "run this version", so a newer one is not chased.
+
+    Both of those short-circuits still sweep stale ``.snapshot-*`` dirs
+    opportunistically (:func:`sweep_stale_snapshots_if_idle`): they are the
+    paths every normal ``start`` and every ``runtime refresh`` of an
+    up-to-date runtime takes, so an interrupted publish would otherwise never
+    be collected.
     """
     root = root or versions_root()
     warnings: list[str] = []
@@ -983,6 +989,10 @@ def ensure(
     if pinned:
         entry = verified.get(pinned)
         if entry is not None and entry.binary:
+            # A pin short-circuits the refresh, so this is the only chance
+            # this call gets to collect what an interrupted publish left
+            # behind (opportunistic: one listing, never a wait).
+            sweep_stale_snapshots_if_idle(root)
             return Runtime(entry.version, entry.binary, entry.path, "pin", False, [])
         warnings.append(
             f"codex runtime: pinned version {pinned} is not a verified copy; "
@@ -1015,6 +1025,12 @@ def ensure(
     if newest_verified is not None:
         entry = verified[newest_verified]
         assert entry.binary is not None
+        # The fast path does no publishing of its own — and a normal `start`
+        # or a `runtime refresh` on an up-to-date runtime never enters
+        # `snapshot()` at all, so this is where the leftovers of an
+        # interrupted publish get collected. Opportunistic by construction:
+        # nothing to sweep or a busy publish lock costs one `listdir`.
+        sweep_stale_snapshots_if_idle(root)
         return Runtime(
             entry.version,
             entry.binary,

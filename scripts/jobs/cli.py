@@ -296,18 +296,43 @@ def _detach(proc) -> None:
         proc.returncode = 0
 
 
+def _key_bound_to(store: ProjectStore, key: str, job_id: str) -> bool:
+    """Does the key index already name this Job? Unreadable counts as taken.
+
+    Only ever used to decide whether a binding may be written over, so the
+    unreadable case has to answer "yes": something is there, and overwriting
+    what might be the new Job's own reservation is exactly the damage.
+    """
+    try:
+        return store.key_job_id(key) == job_id
+    except JobStoreError:
+        return True
+
+
 def _await_reservation(
-    store: ProjectStore, job_id: str, proc
+    store: ProjectStore, job_id: str, proc, key: str
 ) -> Optional[dict[str, Any]]:
+    """Wait for the worker's publish to be COMPLETE, not just begun.
+
+    The worker links ``record.json`` first and the key last
+    (:meth:`ProjectStore.publish_reservation`), so the key naming this jobId
+    is the single signal that the reservation exists.  Waiting on the record
+    alone would let a worker that stalls between the two links time out here
+    while its key link is already published — and the caller would then
+    restore the previous binding over it.
+    """
     deadline = time.time() + RESERVATION_TIMEOUT
-    while time.time() < deadline:
-        record = store.load_record(job_id)
-        if record is not None:
-            return record
-        if proc.poll() is not None:
+    while True:
+        if _key_bound_to(store, key, job_id):
+            try:
+                record = store.load_record(job_id)
+            except JobStoreError:
+                record = None
+            if record is not None:
+                return record
+        if proc.poll() is not None or time.time() >= deadline:
             return None
         time.sleep(0.02)
-    return store.load_record(job_id)
 
 
 def _worker_error(store: ProjectStore, job_id: str) -> str:
@@ -411,6 +436,11 @@ def _register_job(request: JobRequest) -> int:
     gc_mod.sweep_quietly(store)
 
     with store.lock():
+        # Crash-safe `--fresh`: a CLI killed after setting the old binding
+        # aside leaves a discoverable stash, not a free key. Put it back here,
+        # before the lookup, so this start attaches to (or returns) the
+        # finished Job the key already named instead of running it again.
+        restored_stash = store.restore_orphan_stash(key)
         existing_id = store.key_job_id(key)
         if existing_id and not os.path.isdir(store.job_dir(existing_id)):
             # A binding with no Job behind it: `gc --purge` removed the record
@@ -419,7 +449,28 @@ def _register_job(request: JobRequest) -> int:
             # about, so the key counts as free — dropped here, under the lock
             # that owns key decisions, and named in the output so the dangling
             # binding is not silently swept under the carpet.
-            store.release_key(key)
+            try:
+                store.release_key(key)
+            except JobStoreError as exc:
+                # The key index itself is unwritable (a read-only state
+                # volume). The promised recovery cannot happen, so it is
+                # refused with the detail — never a traceback.
+                _emit(
+                    request.json_mode,
+                    {
+                        "result": "refused",
+                        "reason": "key-index-unwritable",
+                        "key": key,
+                        "jobId": existing_id,
+                        "detail": str(exc),
+                    },
+                    [
+                        "result: refused (key-index-unwritable)",
+                        f"job: {existing_id}  key: {key}",
+                        f"detail: {exc}",
+                    ],
+                )
+                return EXIT_REFUSED
             dangling_id = existing_id
             existing_id = None
         if existing_id:
@@ -512,6 +563,8 @@ def _register_job(request: JobRequest) -> int:
             elif existing.get("fingerprint") == request.fingerprint:
                 payload = _result_payload(store, existing)
                 payload["result"] = "finished" if terminal else "attached"
+                if restored_stash:
+                    payload["restoredFreshStash"] = restored_stash
                 lines = (
                     _result_lines(payload)
                     if terminal
@@ -588,12 +641,22 @@ def _register_job(request: JobRequest) -> int:
             record = None
         else:
             spawn_error = ""
-            record = _await_reservation(store, job_id, proc)
+            record = _await_reservation(store, job_id, proc, key)
             _detach(proc)
+        key_taken_by_new = False
         if record is None:
-            # No reservation was published, so the replacement Job does not
-            # exist: the old binding goes back before the lock is dropped.
-            key_restored = store.restore_key(key, stashed)
+            if _key_bound_to(store, key, job_id):
+                # The worker published this Job's binding after all (it was
+                # only late with, or short of, a readable record): restoring
+                # the old one over it would leave a live worker running under
+                # a key that names someone else.
+                key_taken_by_new = True
+                key_restored = False
+                store.drop_key_stash(stashed)
+            else:
+                # No reservation was published, so the replacement Job does
+                # not exist: the old binding goes back before the lock drops.
+                key_restored = store.restore_key(key, stashed)
         else:
             key_restored = False
             store.drop_key_stash(stashed)
@@ -616,7 +679,13 @@ def _register_job(request: JobRequest) -> int:
             f"reason: {detail}",
             f"worker log: {store.worker_err_path(job_id)}",
         ]
-        if stashed and key_restored:
+        if key_taken_by_new:
+            payload["keyBoundTo"] = job_id
+            lines.append(
+                f"key {key} now resolves to {job_id}: its reservation was "
+                "published and is left alone"
+            )
+        elif stashed and key_restored:
             payload["keyStillBoundTo"] = replaced_id
             lines.append(f"key unchanged: it still resolves to {replaced_id}")
         elif stashed:
@@ -638,6 +707,8 @@ def _register_job(request: JobRequest) -> int:
     }
     if dangling_id:
         payload["freedDanglingKey"] = dangling_id
+    if restored_stash:
+        payload["restoredFreshStash"] = restored_stash
     payload.update(request.extra or {})
     _emit(
         request.json_mode,
@@ -1282,7 +1353,24 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             ],
         )
         return EXIT_OK
-    final = recovery.cancel_job(store, record)
+    try:
+        final = recovery.cancel_job(store, record)
+    except recovery.AlreadyFinished as exc:
+        # The Job finished while this cancel waited for the Project lock. Its
+        # real state is what the caller gets; nothing was overwritten.
+        payload = _result_payload(store, exc.record)
+        payload["result"] = "already-finished"
+        _emit(
+            args.json,
+            payload,
+            [
+                f"result: already-finished  state: {exc.state}",
+                f"job: {args.job_id}",
+                "it finished before this cancel took the lock; nothing was "
+                "cancelled",
+            ],
+        )
+        return EXIT_OK
     summary = final.get("cancel") or {}
     killed = summary.get("killed", [])
     untrackable = [entry["pid"] for entry in summary.get("untrackable", [])]

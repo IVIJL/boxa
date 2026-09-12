@@ -103,13 +103,28 @@ intended piece of work:
   that reservation never appears: a `--fresh` whose worker cannot start returns
   `worker-failed` (exit 7) and says `key unchanged`, so the old result is still
   what the key answers with.
+- The set-aside binding is discoverable and self-healing: it keeps the key's
+  own name as its prefix, names its Job in its content, and carries the owning
+  Container run and pid. A `start`/`reply` under that key restores an
+  orphaned one (key unbound, the Job's directory still there, the owning CLI
+  gone) under the Project lock before it looks the key up, and says
+  `restoredFreshStash`. So a `--fresh` whose CLI was killed mid-flight costs
+  nothing either: the next `start` answers with the finished Job instead of
+  running it again. A stash whose owner is still alive is left to that CLI.
 - Any unclear record (dead worker, foreign Container run id, unreadable
   record) refuses a retry under that key with exit 4 until `cancel` or `adopt`
   resolves it.
 - A purged record (`gc --purge`) frees its key again. If the purge could not
   free the key (it says so), the binding names a Job with no record directory;
   the next `start` under that key treats it as free, takes it, and reports
-  `freedDanglingKey`.
+  `freedDanglingKey`. If even that binding cannot be removed (a read-only
+  state volume), the `start` is refused `key-index-unwritable` (exit 5) with
+  the detail — never a traceback.
+- The worker publishes its record first and the key binding last, so a key
+  that names a Job means the whole reservation exists. `start` waits for that
+  binding, and a `start` that gives up waiting never writes a binding that
+  already names its own new Job over: it reports `worker-failed` and
+  `keyBoundTo`.
 
 A key protects against duplicate runs only. Running beside other Jobs is a
 separate decision, handled by the ack.
@@ -221,6 +236,13 @@ finalizes the record as `cancelled`; if no worker is left, or it does not
 finalize within 10 s, the CLI finalizes the record in its place. A killed
 command is therefore never recorded as `failed`.
 
+`cancel` re-reads the record once it holds the Project lock, and re-checks it
+again under the record's own lock immediately before the final write: a Job
+that finished while the cancel was waiting is reported `already-finished` with
+its real state, and a `done`, `failed`, `cancelled` or `finished-unknown`
+record is never rewritten as `cancelled`. `interrupted` is the one terminal
+state a cancel does write over — that is how an unclear key is resolved.
+
 A cancel that lands while the Job is still `reserved` stops the command from
 ever being spawned: the worker checks for the request and spawns its command
 under one gate, so a record that says `cancelled` never leaves a command
@@ -259,7 +281,10 @@ verified immutable copy under the shared `boxa-codex-versions` volume.
    is already verified) sweeps too, but only opportunistically: one cheap
    listing decides whether there is anything to sweep, and a busy publish lock
    skips it, because whoever holds that lock is in the publish path and sweeps
-   there.
+   there. That sweep sits on the runtime selection itself, which is what a
+   normal `start` and `runtime refresh` go through, and on the pin
+   short-circuit as well — otherwise a Container whose runtime is up to date
+   or pinned would never collect anything.
 
 A failed probe leaves the previous verified version in use and prints a loud
 warning (also `warnings` in `--json`) instead of breaking the next job. With no
@@ -321,6 +346,24 @@ with the Project by `boxa remove` or `boxa stop --clean`.
   so no writer merges its change into a copy another process has already
   replaced. `record.lock` is part of the record, not an artefact: it is not
   swept and holds no data.
+- The artefact sweep revalidates as well: per Job it takes that record's lock
+  and re-checks state and age immediately before the unlinks, so a Job a
+  concurrent `cancel` made active again keeps its logs (the sweep decided
+  before it held anything).
+
+## Concurrency model
+
+Three locks, and nothing long ever happens under any of them.
+
+| Lock | Held by | Guarantees |
+| --- | --- | --- |
+| Project `flock` (`<project>/lock`) | `start`/`reply` registration (key lookup, stash restore, dangling-binding recovery, the concurrency ack, the reply thread lock, the spawn and its reservation wait), `cancel`, `gc --purge` | One decision-maker for key ownership and Project-wide state: two starts cannot both see the key free, a purge cannot free a key a start is taking, and a cancel cannot land inside a record-directory removal. |
+| Per-record `flock` (`<job>/record.lock`) | every record write: the worker (both its threads), `cancel`'s final write, the lazy state refresh, gc's `gcAt` and its artefact sweep | One read-modify-write at a time, so no writer merges its change into a copy another process has already replaced and no terminal state is reverted. Re-entrant per process. |
+| Publish `flock` (versions root) | Codex runtime snapshot publish, the stale-snapshot sweep, writing *and* clearing a pin | One publisher across every Container sharing the `boxa-codex-versions` volume: one copy per version, no torn or half-cleared pin, no sweep racing a publish. |
+
+The Project lock is not the record lock's substitute: it is never held for the
+length of a sweep or a worker's life, which is exactly why every record
+carries its own.
 
 ## Environment overrides for tests
 

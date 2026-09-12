@@ -53,6 +53,7 @@ from .store import (
 
 __all__ = [
     "CANCEL_LIMITS",
+    "AlreadyFinished",
     "cancel_job",
     "live_job_pids",
     "refresh_states",
@@ -76,6 +77,22 @@ REMEMBERED_SOURCE = "record"
 # How long `cancel` waits for a live worker to finalize the record itself
 # before doing it in the worker's place.
 WORKER_FINALIZE_TIMEOUT = 10.0
+
+
+class AlreadyFinished(JobStoreError):
+    """The Job reached a clean terminal state before the cancel got the lock.
+
+    A structured outcome, not a failure: the caller is told the state the Job
+    really has. Nothing of a finished Job is ever rewritten as ``cancelled``.
+    """
+
+    def __init__(self, record: dict[str, Any]) -> None:
+        super().__init__(
+            f"job {record.get('jobId')} already finished as "
+            f"{record.get('state')} (nothing was cancelled)"
+        )
+        self.record = record
+        self.state = record.get("state")
 
 
 def _worker_identity(record: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
@@ -276,11 +293,20 @@ def cancel_job(
     """
     job_id = record["jobId"]
     with store.lock():
-        if store.load_record(job_id) is None:
+        # The record handed in was read before the lock was waited for. The
+        # worker may have finished the Job in the meantime, and a *clean*
+        # terminal state is never overwritten: `cancelled` on top of `done`
+        # would be a lie about a Job that really did complete. `interrupted`
+        # is the one terminal state a cancel may still write over — that is
+        # how ADR 0037 resolves an unclear key.
+        fresh = store.load_record(job_id)
+        if fresh is None:
             raise JobStoreError(
                 f"job {job_id} no longer exists (purged before this cancel)"
             )
-        return _cancel_locked(store, record, by)
+        if fresh.get("state") in CLEAN_TERMINAL_STATES:
+            raise AlreadyFinished(fresh)
+        return _cancel_locked(store, fresh, by)
 
 
 def _cancel_locked(
@@ -334,13 +360,22 @@ def _cancel_locked(
         "at": time.time(),
     }
     if final is None:
-        final = store.update_record(
-            job_id,
-            state=STATE_CANCELLED,
-            finishedAt=time.time(),
-            survivors=survivor_snapshot(live_job_pids(record)),
-            cancel=summary,
-        )
+        # The state check and the write are one critical section under the
+        # record's own lock: the worker may have finalized between the wait
+        # above and this write, and a clean terminal state it published must
+        # survive. Only the cancel summary is added in that case.
+        with store.record_lock(job_id):
+            current = store.load_record(job_id)
+            if current is not None and current.get("state") in CLEAN_TERMINAL_STATES:
+                final = store.update_record(job_id, cancel=summary)
+            else:
+                final = store.update_record(
+                    job_id,
+                    state=STATE_CANCELLED,
+                    finishedAt=time.time(),
+                    survivors=survivor_snapshot(live_job_pids(record)),
+                    cancel=summary,
+                )
     else:
         final = store.update_record(job_id, cancel=summary)
     return final

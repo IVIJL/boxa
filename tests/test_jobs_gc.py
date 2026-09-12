@@ -546,6 +546,80 @@ class PurgeTests(GcTestCase):
         self.assertEqual(self.store.key_job_id("raced"), job_id)
 
 
+    def test_the_bulky_sweep_re_decides_under_the_record_lock(self) -> None:
+        """The artefact sweep revalidates too, not only ``--purge``.
+
+        ``collect`` decided before anything was held. A ``cancel`` landing in
+        between makes an old ``interrupted`` Job recent activity — and its
+        logs are exactly what that cancel wants to look at, so the verdict is
+        taken again under the record's own lock, right before the unlinks.
+        """
+        job_id = self.make_job("swept-raced", STATE_INTERRUPTED, age_days=20)
+        real_lock = self.store.record_lock
+
+        def lock_then_cancel(*args, **kwargs):
+            @contextmanager
+            def wrapper():
+                with real_lock(*args, **kwargs):
+                    self.store.request_cancel(job_id, "concurrent cancel")
+                    yield
+
+            return wrapper()
+
+        with mock.patch.object(self.store, "record_lock", lock_then_cancel):
+            outcome = jobs_gc.run(self.store, older_than_days=14)
+
+        self.assertEqual(outcome.entries, [])
+        self.assertEqual(outcome.kept, 1)
+        self.assertEqual(outcome.bytes, 0)
+        self.assertIn("stdout", self.artefacts(job_id))
+        self.assertIn("stderr", self.artefacts(job_id))
+
+    def test_a_cancel_never_overwrites_a_job_that_finished_first(self) -> None:
+        """The record `cancel` was handed was read BEFORE the Project lock.
+
+        Another process holds that lock while the worker finishes the Job, so
+        by the time the cancel gets in, `done` is the truth. It is reported as
+        `already-finished` with the real state; a terminal record is never
+        rewritten as `cancelled`.
+        """
+        job_id = self.make_job("finished-first", STATE_ORPHANED, age_days=0)
+        stale = self.store.load_record(job_id)
+        self.assertEqual(stale["state"], STATE_ORPHANED)
+        script = os.path.join(self.tmp.name, "finish-under-the-lock.py")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import sys, time\n"
+                f"sys.path.insert(0, {os.path.join(_REPO_ROOT, 'scripts')!r})\n"
+                "from jobs.store import ProjectStore\n"
+                "store = ProjectStore(sys.argv[1], sys.argv[2])\n"
+                "with store.lock():\n"
+                "    print('locked', flush=True)\n"
+                "    store.update_record(\n"
+                "        sys.argv[3], state='done', exitCode=0,\n"
+                "        finishedAt=time.time(),\n"
+                "    )\n"
+                "    time.sleep(1.0)\n"
+            )
+        holder = subprocess.Popen(
+            [sys.executable, script, PROJECT_KEY, self.store.root, job_id],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+
+        with self.assertRaises(recovery.AlreadyFinished) as caught:
+            recovery.cancel_job(self.store, stale)
+        holder.wait(timeout=10)
+        holder.stdout.close()
+        self.assertEqual(caught.exception.state, STATE_DONE)
+        final = self.store.load_record(job_id)
+        self.assertEqual(final["state"], STATE_DONE)
+        self.assertEqual(final["exitCode"], 0)
+        self.assertNotIn("cancel", final)
+
+
 class AutomaticSweepTests(GcTestCase):
     def test_start_sweeps_old_artefacts_first(self) -> None:
         old = self.make_job("old", STATE_DONE, age_days=20)

@@ -45,6 +45,7 @@ from jobs import cli as jobs_cli  # noqa: E402
 from jobs import env as jobs_env  # noqa: E402
 from jobs import identity as jobs_identity  # noqa: E402
 from jobs import procs as jobs_procs  # noqa: E402
+from jobs import store as jobs_store  # noqa: E402
 from jobs.store import (  # noqa: E402
     STATE_DONE,
     STATE_FAILED,
@@ -187,6 +188,36 @@ class ReservationTests(JobsTestCase):
             os.stat(self.store.key_path("k")).st_ino,
             os.stat(self.store.record_path(job_id)).st_ino,
         )
+
+    def test_the_record_is_linked_before_the_key(self) -> None:
+        """Publish order IS the contract: record first, key last.
+
+        The key link is what the starting CLI waits for, so it has to be the
+        last thing published. Reversed, a worker that stalls between the two
+        links shows a reserved key with no record — and a CLI that times out
+        there restores the previous binding over a key the worker owns.
+        """
+        job_id = new_job_id()
+        seen: list[str] = []
+        real_link = os.link
+
+        def spy(src: str, dst: str) -> None:
+            seen.append(dst)
+            real_link(src, dst)
+
+        with mock.patch("jobs.store.os.link", spy):
+            self.store.publish_reservation("ord", self._record(job_id, "ord"))
+        self.assertEqual(
+            seen, [self.store.record_path(job_id), self.store.key_path("ord")]
+        )
+
+    def test_a_key_lost_to_another_worker_leaves_no_record(self) -> None:
+        """The loser of the key race published nothing: that Job never was."""
+        self.store.publish_reservation("dup", self._record(new_job_id(), "dup"))
+        loser = new_job_id()
+        with self.assertRaises(KeyReserved):
+            self.store.publish_reservation("dup", self._record(loser, "dup"))
+        self.assertIsNone(self.store.load_record(loser))
 
     def test_record_update_never_rewrites_the_reservation(self) -> None:
         """State changes replace the record; the reservation stays immutable."""
@@ -545,6 +576,107 @@ class KeySemanticsTests(JobsTestCase):
         again = self.start_json("--key", "fr3", "--", "sh", "-c", "exit 0")
         self.assertEqual(again["result"], "finished")
         self.assertEqual(again["jobId"], first["jobId"])
+
+    def test_a_timed_out_reservation_never_overwrites_the_new_binding(self) -> None:
+        """A late worker keeps its key: the old binding is not put back over it.
+
+        The worker publishes the record first and the key last, so a key that
+        names the new Job means the reservation exists — even if this CLI gave
+        up waiting for it. Restoring the stash there would leave a live worker
+        running under a key that answers with somebody else's Job.
+        """
+        first = self.start_json("--key", "fr4", "--", "sh", "-c", "exit 0")
+        self.wait_for_state(first["jobId"], {STATE_DONE})
+        real_await = jobs_cli._await_reservation
+
+        def times_out_anyway(store, job_id, proc, key):
+            # The worker really does publish; this CLI just does not see it.
+            real_await(store, job_id, proc, key)
+            return None
+
+        with mock.patch.object(
+            jobs_cli, "_await_reservation", times_out_anyway
+        ):
+            failed = self.start_json(
+                "--key", "fr4", "--fresh", "--", "sh", "-c", "exit 0"
+            )
+        self.assertEqual(self.last_exit, jobs_cli.EXIT_WORKER)
+        self.assertEqual(failed["result"], "worker-failed")
+        self.assertEqual(failed["keyBoundTo"], failed["jobId"])
+        self.assertNotIn("keyStillBoundTo", failed)
+        self.assertEqual(self.store.key_job_id("fr4"), failed["jobId"])
+        self.wait_for_state(failed["jobId"], {STATE_DONE})
+
+    def test_a_stash_left_by_a_dead_fresh_is_restored_not_duplicated(self) -> None:
+        """A `--fresh` whose CLI was killed mid-flight must not cost the result.
+
+        The stash is discoverable from the key and names its Job, so the next
+        `start` under that key puts it back and answers with the finished Job
+        instead of running the work a second time.
+        """
+        first = self.start_json("--key", "fr5", "--", "sh", "-c", "exit 0")
+        self.wait_for_state(first["jobId"], {STATE_DONE})
+        # A stash of a CLI that is gone: a foreign Container run's owner tag.
+        stash = (
+            self.store.key_path("fr5")
+            + jobs_store.STASH_INFIX
+            + "deadrun.4194304"
+        )
+        os.rename(self.store.key_path("fr5"), stash)
+        self.assertIsNone(self.store.key_job_id("fr5"))
+
+        again = self.start_json("--key", "fr5", "--", "sh", "-c", "exit 0")
+        self.assertEqual(self.last_exit, jobs_cli.EXIT_OK)
+        self.assertEqual(again["result"], "finished")
+        self.assertEqual(again["jobId"], first["jobId"])
+        self.assertEqual(again["restoredFreshStash"], first["jobId"])
+        self.assertEqual(self.store.key_job_id("fr5"), first["jobId"])
+        self.assertEqual(len(self.store.job_ids()), 1)
+        self.assertFalse(os.path.exists(stash))
+
+    def test_a_stash_of_a_live_start_is_left_alone(self) -> None:
+        """Only an ORPHANED stash is restored: a live `--fresh` owns its own."""
+        first = self.start_json("--key", "fr6", "--", "sh", "-c", "exit 0")
+        self.wait_for_state(first["jobId"], {STATE_DONE})
+        stash = self.store.stash_key("fr6")
+        assert stash is not None
+        self.assertIn(str(os.getpid()), os.path.basename(stash))
+        self.assertIsNone(self.store.restore_orphan_stash("fr6"))
+        self.assertTrue(os.path.exists(stash))
+        self.assertIsNone(self.store.key_job_id("fr6"))
+        # And a stash naming a Job that is gone is garbage, not a binding.
+        shutil.rmtree(self.store.job_dir(first["jobId"]))
+        dead = self.store.key_path("fr6") + jobs_store.STASH_INFIX + "deadrun.1"
+        os.rename(stash, dead)
+        self.assertIsNone(self.store.restore_orphan_stash("fr6"))
+        self.assertFalse(os.path.exists(dead))
+
+    def test_an_unwritable_key_index_refuses_instead_of_crashing(self) -> None:
+        """The dangling-binding recovery needs to write the index to happen.
+
+        A read-only keys dir makes that impossible, and the promised recovery
+        then has to be a structured refusal rather than an OSError traceback.
+        """
+        job_id = new_job_id()
+        self.store.publish_reservation(
+            "stuck",
+            {
+                "jobId": job_id,
+                "key": "stuck",
+                "state": STATE_DONE,
+                "fingerprint": "fp",
+                "worker": {"pid": 1, "startTime": 1, "containerRunId": "unknown"},
+            },
+        )
+        shutil.rmtree(self.store.job_dir(job_id))
+        os.chmod(self.store.keys_dir, 0o500)
+        self.addCleanup(os.chmod, self.store.keys_dir, 0o700)
+        payload = self.start_json("--key", "stuck", "--", "sh", "-c", "exit 0")
+        self.assertEqual(self.last_exit, jobs_cli.EXIT_REFUSED)
+        self.assertEqual(payload["result"], "refused")
+        self.assertEqual(payload["reason"], "key-index-unwritable")
+        self.assertIn("stuck", payload["detail"])
+        self.assertEqual(self.store.job_ids(), [])
 
     def test_a_key_bound_to_a_purged_job_counts_as_free(self) -> None:
         """`gc --purge` that could not free the key leaves a binding, not a Job.

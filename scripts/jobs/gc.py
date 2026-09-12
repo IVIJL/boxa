@@ -384,9 +384,10 @@ def run(
     and ``cancel`` mutates a record under it too.  Eligibility is re-checked
     under that lock (``_still_eligible``), because ``collect`` ran before it,
     and the recheck now holds for the whole removal.  The bulky-file sweep
-    takes no Project lock — it only ever touches files of Jobs that will never
-    change again — but its record write is a read-modify-write under the
-    record's own lock, so it cannot revert a concurrent writer's state.
+    takes no Project lock — it frees no keys and removes no records — but it
+    re-checks state and age under each record's own lock, the lock every
+    record writer holds for its read-modify-write, and keeps it for the
+    unlinks: a Job made active again by a concurrent cancel keeps its logs.
 
     The returned entries describe the *result*: files that were removed, bytes
     that were really freed, and ``failed`` for anything that survived.
@@ -414,7 +415,22 @@ def run(
                 done.append(_purge_record(store, entry))
     else:
         for entry in outcome.entries:
-            done.append(_delete_bulky(store, entry, at))
+            # `collect` decided before anything was held. A cancel that landed
+            # since writes a cancel request and a fresh record, which is
+            # recent activity on a Job whose artefacts are about to go — so
+            # the verdict is taken again under that record's own lock, which
+            # every record writer holds for its read-modify-write, and it then
+            # holds for the whole unlink.
+            with store.record_lock(entry.job_id):
+                if not _still_eligible(
+                    store,
+                    entry.job_id,
+                    older_than_days=older_than_days,
+                    now=now,
+                ):
+                    skipped += 1
+                    continue
+                done.append(_delete_bulky(store, entry, at))
     return outcome._replace(
         entries=done,
         kept=outcome.kept + skipped,
