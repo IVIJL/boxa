@@ -621,6 +621,59 @@ after usage falls back below it, so a Project hovering at a threshold
 warns once, not continuously.
 _Avoid_: memory pressure (PSI is a different kernel concept)
 
+### Jobs
+
+**Job**:
+A command and its whole process tree run inside a **Container**, whose
+lifetime, state, and result belong to the Container, not to the agent or tool
+call that started it. It is finished only when the tree is. A Job outlives
+the shell call, subagent, or session that started it; a waiting client can
+disconnect and a new one can find the same Job and its result. See ADR 0037.
+_Avoid_: task, background command, run, background process
+
+**Job worker**:
+The Container process that owns one **Job**: it spawns the command, records
+its identity, streams its output to files, keeps a heartbeat, and records the
+exit. A dead worker does not mean a dead command; it means the Job needs
+inspection before anyone trusts its state.
+_Avoid_: job daemon, supervisor, runner
+
+**Codex job**:
+A **Job** whose command is a non-interactive Codex run against a **Project**.
+It adds a Codex thread that later Codex jobs can continue, a required model and
+effort, and a result extracted from Codex's own event stream. It runs without
+Codex's own sandbox and approvals; the Container is the boundary, as for every
+agent inside it.
+_Avoid_: codex delegation, codex task, MCP codex call
+
+**Job key**:
+A caller-chosen identifier scoped to one **Project** naming one intended piece
+of work. Starting with a key that matches a running or finished Job of the same
+request attaches to it instead of running it again; the same key with a
+different request is a conflict. It protects against duplicate runs only; starting
+beside other running Jobs needs a **Concurrency ack**.
+_Avoid_: idempotency token, job name, request id
+
+**Concurrency ack**:
+The caller's explicit, recorded acknowledgement of the specific Jobs already
+running in a **Project** when a new Job starts. It is not a lock: it makes the
+orchestrating agent's decision to run in parallel visible and traceable.
+_Avoid_: parallel flag, force, override
+
+**Job record**:
+The small durable summary of a **Job** (key, request fingerprint, state,
+model, thread, exit, final message) kept after its bulky logs are cleaned up,
+so a **Job key** stays recognizable and a result stays findable.
+_Avoid_: job metadata, job manifest
+
+**Codex runtime**:
+The immutable, verified per-version copy of the Codex CLI that **Codex jobs**
+run from. A newly found version becomes a Codex runtime only after a
+completeness and contract check; until then Jobs keep the last verified one.
+Interactive `codex` in a **Container** runs from the shared npm install as
+before; only Jobs use the copy.
+_Avoid_: codex binary, npm-global codex, pinned codex, found version
+
 ### Host provisioning
 
 **Provisioning step**:
@@ -666,6 +719,15 @@ _Avoid_: boxa check, boxa repair, boxa heal
 ## Relationships
 
 - A **Project** has exactly one **Container** at a time.
+- A **Job** belongs to exactly one **Container** and does not survive that
+  Container's stop; after a restart it is findable and marked interrupted,
+  never silently running or done.
+- A **Job worker** owns exactly one **Job**; a **Job** may outlive its worker
+  and then needs an explicit adopt or cancel before any retry.
+- A **Codex job** belongs to at most one Codex thread at a time; a thread has
+  at most one running Job.
+- A **Job key** is unique within a **Project**; Boxa never locks a Project's
+  checkout against concurrent Jobs, the orchestrating agent owns that risk.
 - A **Container** can contain zero or more **Compose projects** and zero or
   more **Unmanaged inner containers**; both consist of **Inner containers**.
 - An **Allowlist** is shared across all of a user's **Containers**
