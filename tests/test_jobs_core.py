@@ -224,6 +224,50 @@ class EnvironmentTests(JobsTestCase):
         with open(self.store.stdout_path(job_id), "r", encoding="utf-8") as fh:
             self.assertEqual(fh.read().strip(), "s3cret")
 
+    def test_control_env_is_boxa_job_variables_without_the_marker(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"BOXA_JOB_ID": "outer-job", "SOME_TOKEN": "s3cret"}
+        ):
+            control = jobs_cli._control_env()
+        self.assertIn(jobs_identity.PROJECT_KEY_ENV, control)
+        self.assertNotIn("SOME_TOKEN", control)
+        # The marker is a Job's own ownership stamp, never inherited: a nested
+        # `boxa-job start` must not make its processes answer to the outer Job.
+        self.assertNotIn("BOXA_JOB_ID", control)
+
+    def test_the_worker_itself_does_not_inherit_the_caller(self) -> None:
+        """ADR 0037 "Worker environment" is about the worker, not just its child.
+
+        The Job's command prints its parent's (i.e. the worker's) environment,
+        which is the only way to see what the detached worker really got.
+        """
+        with mock.patch.dict(
+            os.environ, {"MY_TOKEN": "s3cret", "UNNAMED_SECRET": "leak-me"}
+        ):
+            started = self.start_json(
+                "--key",
+                "workerenv",
+                "--env",
+                "MY_TOKEN",
+                "--",
+                "sh",
+                "-c",
+                "tr '\\0' '\\n' < /proc/$PPID/environ",
+            )
+        job_id = started["jobId"]
+        self.wait_for_state(job_id, {STATE_DONE, STATE_FAILED})
+        with open(self.store.stdout_path(job_id), "r", encoding="utf-8") as fh:
+            worker_env = set(fh.read().splitlines())
+        # The baseline, the named passthrough and Boxa's own control variables.
+        self.assertIn("HOME=/home/node", worker_env)
+        self.assertIn("MY_TOKEN=s3cret", worker_env)
+        self.assertIn(f"{jobs_identity.PROJECT_KEY_ENV}={PROJECT_KEY}", worker_env)
+        self.assertTrue(
+            any(line.startswith("PYTHONPATH=") for line in worker_env), worker_env
+        )
+        # Nothing else of the caller's environment, named or not.
+        self.assertNotIn("UNNAMED_SECRET=leak-me", worker_env)
+
 
 class LifecycleTests(JobsTestCase):
     def test_done_with_exit_zero_and_stdout_captured(self) -> None:
@@ -288,6 +332,48 @@ class LifecycleTests(JobsTestCase):
         self.assertEqual(code, jobs_cli.EXIT_OK)
         self.assertIn("line5", out)
         self.assertNotIn("line1", out)
+
+    def test_a_relative_cwd_is_resolved_against_the_caller(self) -> None:
+        """The worker runs from `/`, so a relative `--cwd` must be resolved here."""
+        sub = os.path.join(self.tmp.name, "sub dir")
+        os.makedirs(sub, exist_ok=True)
+        previous = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.addCleanup(os.chdir, previous)
+        started = self.start_json(
+            "--key", "cwd", "--cwd", "sub dir", "--", "sh", "-c", "pwd"
+        )
+        job_id = started["jobId"]
+        record = self.wait_for_state(job_id, {STATE_DONE, STATE_FAILED})
+        self.assertEqual(record["state"], STATE_DONE)
+        self.assertEqual(record["cwd"], sub)
+        with open(self.store.stdout_path(job_id), encoding="utf-8") as fh:
+            self.assertEqual(fh.read().strip(), sub)
+        # The absolute path is what the request is fingerprinted by, so the
+        # same directory spelled either way is the same request.
+        attached = self.start_json(
+            "--key", "cwd", "--cwd", sub, "--", "sh", "-c", "pwd"
+        )
+        self.assertEqual(self.last_exit, jobs_cli.EXIT_OK)
+        self.assertEqual(attached["jobId"], job_id)
+
+    def test_a_cwd_that_is_not_a_directory_is_a_usage_error(self) -> None:
+        code, out = _run_cli(
+            "start",
+            "--key",
+            "badcwd",
+            "--cwd",
+            os.path.join(self.tmp.name, "no-such-dir"),
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        )
+        self.assertEqual(code, jobs_cli.EXIT_USAGE)
+        self.assertEqual(out, "")
+        # A usage error reserves nothing and starts nothing.
+        self.assertEqual(self.store.job_ids(), [])
+        self.assertEqual(os.listdir(self.store.keys_dir), [])
 
     def test_unknown_job_is_not_found(self) -> None:
         code, out = _run_cli("result", "20990101T000000-zzzzzz", "--json")

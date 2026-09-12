@@ -253,6 +253,54 @@ class KeySemanticsTests(AckTestCase):
         self.last_exit = code
         self.assertNeedsAck(json.loads(out), [other], jobs_ack.REASON_MISSING)
 
+    def test_a_needs_ack_refusal_never_frees_the_fresh_key(self) -> None:
+        """A refused `--fresh` must leave the finished Job's binding intact.
+
+        Releasing the key before the ack passed would lose the only thing that
+        makes a Job key useful: the next `start` under it would run the work
+        again instead of handing back the result that is already there.
+        """
+        done = self.start("quick", "exit 0")
+        self.assertEqual(self.last_exit, jobs_cli.EXIT_OK, done)
+        self.wait_for_state(done["jobId"], {"done"})
+        other = self.start_running("ack-a")
+
+        code, out = run_cli(
+            "start", "--json", "--key", "quick", "--fresh", "--", "sh", "-c", "exit 0"
+        )
+        self.last_exit = code
+        self.assertNeedsAck(json.loads(out), [other], jobs_ack.REASON_MISSING)
+
+        # The key still names the finished Job, and nothing new was created.
+        self.assertEqual(self.store.key_job_id("quick"), done["jobId"])
+        self.assertEqual(len(self.store.job_ids()), 2)
+
+        again = self.start("quick", "exit 0")
+        self.assertEqual(self.last_exit, jobs_cli.EXIT_OK, again)
+        self.assertEqual(again["result"], "finished")
+        self.assertEqual(again["jobId"], done["jobId"])
+
+        # With the ack given, the key really does hand over to a new run.
+        code, out = run_cli(
+            "start",
+            "--json",
+            "--key",
+            "quick",
+            "--fresh",
+            "--ack-concurrent",
+            other,
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        )
+        self.assertEqual(code, jobs_cli.EXIT_OK, out)
+        rerun = json.loads(out)
+        self.assertEqual(rerun["result"], "started")
+        self.assertNotEqual(rerun["jobId"], done["jobId"])
+        self.wait_for_state(rerun["jobId"], {"done"})
+        self.assertEqual(self.store.key_job_id("quick"), rerun["jobId"])
+
 
 class RecoveryStatesCountTests(AckTestCase):
     def test_exited_with_survivors_counts_as_running(self) -> None:

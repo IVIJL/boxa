@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import stat
 import threading
 import time
@@ -617,7 +618,10 @@ def retired_codex_delegate_notice(
                 ),
                 "  (a Container command; see docs/jobs.md and ADR 0037).",
                 "  Boxa does not remove the entry for you. Remove it with:",
-                f"    boxa mcp remove {name}",
+                # Quoted: a catalog name may legally contain whitespace or
+                # shell metacharacters, and this line is meant to be pasted
+                # into a shell exactly as printed.
+                f"    boxa mcp remove {shlex.quote(str(name))}",
             ]
         )
     return "\n".join(lines) + "\n"

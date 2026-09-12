@@ -91,6 +91,13 @@ class DetectionTests(RetiredEntryEnv):
         self.assertEqual([e["name"] for e in found], ["my-codex"])
         self.assertIn("boxa mcp remove my-codex", catalog.retired_codex_delegate_notice())
 
+    def test_a_name_needing_quoting_is_quoted_in_the_suggestion(self) -> None:
+        """The printed line is meant to be pasted into a shell as it stands."""
+        notice = catalog.retired_codex_delegate_notice(
+            entries=[{"name": "my codex; rm -rf ~"}]
+        )
+        self.assertIn("boxa mcp remove 'my codex; rm -rf ~'", notice)
+
     def test_unrelated_codex_entry_is_not_matched(self) -> None:
         # `codex` without the mcp-server argv is not the retired server.
         # (A direct add of that shape is refused as not applicable, so write

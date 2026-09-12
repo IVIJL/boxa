@@ -33,7 +33,11 @@ What this module does, in the order it does it:
     that serializes Containers sharing the volume.  A ``verified.json``
     marker is what makes a copy usable; the tree is then chmod'ed read-only
     for ``node`` — a convention the Container user could undo, not root
-    enforcement (ADR 0037 accepts that for v1).
+    enforcement (ADR 0037 accepts that for v1).  The temp dir is deleted on
+    every way out of :func:`snapshot`, interruptions included, and one an
+    interrupted attempt left behind is swept under the same lock by the next
+    attempt (:func:`sweep_stale_snapshots`): a snapshot dir is a whole package
+    copy, so leaking one is tens of megabytes on a shared volume.
 
 A failed probe is never fatal by itself: the previous verified copy stays in
 use and the failure is reported as a loud warning on ``start``/``reply``.
@@ -44,6 +48,10 @@ the mutable volume is the failure this design exists to prevent.
 Jobs run the vendor **static binary** of the copy directly, not the copy's
 ``bin/codex.js``: that is the very process ``codex.js`` spawns, and skipping
 the node wrapper removes one process from the Job's tree.
+
+The rollback pin lives in the same shared root and is written under the same
+publish lock: every Container on the volume reads it, so two ``runtime use``
+calls are two writers of one file, not one.
 
 Paths are env-overridable so the flow can be proven without a Container
 restart; the defaults are the fixed Container paths ``docker-run.sh`` mounts.
@@ -64,7 +72,9 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterator, NamedTuple, Optional
 
 from . import codex as codex_mod
+from . import procs
 from .env import baseline_env
+from .identity import UNKNOWN_RUN_ID, container_run_id
 
 __all__ = [
     "CODEX_HOST_PKG_DIR_ENV",
@@ -74,6 +84,7 @@ __all__ = [
     "DEFAULT_NPM_PKG_DIR",
     "DEFAULT_VERSIONS_DIR",
     "NoVerifiedRuntime",
+    "PinFailed",
     "Published",
     "Runtime",
     "Snapshot",
@@ -89,6 +100,7 @@ __all__ = [
     "published",
     "read_pin",
     "snapshot",
+    "sweep_stale_snapshots",
     "version_key",
     "versions_root",
 ]
@@ -123,8 +135,16 @@ PACKAGE_NAME = "package"
 PIN_NAME = "pin"
 LOCK_NAME = "publish.lock"
 TEMP_PREFIX = ".snapshot-"
+# Written into every snapshot temp dir so a later refresh can tell an
+# in-flight copy from one an interrupted process left behind.
+OWNER_NAME = "owner.json"
 
 PUBLISH_LOCK_TIMEOUT = 900.0
+
+# A snapshot temp dir this old is garbage whoever owns it: a copy plus the
+# probe cannot outlast this (the probe alone is capped at
+# `DEFAULT_PROBE_TIMEOUT`), and the dirs are big enough to matter.
+STALE_SNAPSHOT_SECONDS = 3600.0
 
 # Vendor layout of the npm package, per architecture: the platform package
 # holding the static binary and the target triple under its `vendor/`.
@@ -149,6 +169,12 @@ class NoVerifiedRuntime(codex_mod.CodexNotFound):
     def __init__(self, message: str, warnings: Optional[list[str]] = None) -> None:
         super().__init__(message)
         self.warnings = list(warnings or [])
+
+
+class PinFailed(RuntimeError):
+    """The shared runtime pin could not be written (lock busy, unwritable root)."""
+
+    reason = "pin-failed"
 
 
 class Source(NamedTuple):
@@ -344,12 +370,31 @@ def read_pin(root: Optional[str] = None) -> Optional[str]:
 
 
 def pin(version: str, root: Optional[str] = None) -> None:
+    """Write the shared pin atomically, under the publish lock.
+
+    The pin file is shared by every Container on the volume, so two
+    ``runtime use`` calls are two writers: a fixed ``pin.tmp`` would let one
+    ``os.replace`` the other's half-written file, or fail outright because the
+    other already consumed it.  Unique temp name plus the publish lock makes
+    the last writer win cleanly, and any failure is raised as
+    :class:`PinFailed` for the CLI to report as a structured refusal.
+    """
     root = root or versions_root()
-    os.makedirs(root, exist_ok=True)
-    tmp = _pin_path(root) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(f"{version}\n")
-    os.replace(tmp, _pin_path(root))
+    try:
+        with publish_lock(root):
+            fd, tmp = tempfile.mkstemp(prefix=f".{PIN_NAME}.", suffix=".tmp", dir=root)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(f"{version}\n")
+                os.replace(tmp, _pin_path(root))
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+    except (OSError, TimeoutError) as exc:
+        raise PinFailed(f"could not pin version {version}: {exc}") from exc
 
 
 def clear_pin(root: Optional[str] = None) -> None:
@@ -471,6 +516,84 @@ def _rmtree_writable(path: str) -> None:
         except OSError:
             pass
     shutil.rmtree(path, ignore_errors=True)
+
+
+def _write_owner(temp: str) -> None:
+    """Record who is filling this temp dir, so a sweep can leave it alone."""
+    pid = os.getpid()
+    try:
+        with open(os.path.join(temp, OWNER_NAME), "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "pid": pid,
+                    "startTime": procs.process_start_time(pid),
+                    "containerRunId": container_run_id(),
+                    "createdAt": time.time(),
+                },
+                fh,
+                sort_keys=True,
+            )
+            fh.write("\n")
+    except OSError:
+        pass
+
+
+def _is_stale_snapshot(path: str, *, now: float, max_age: float) -> bool:
+    """Is this ``.snapshot-*`` dir abandoned rather than in flight?
+
+    Two ways to be sure, and a pid is only one of them: the volume is shared
+    by Containers with separate pid namespaces, so a dead pid is evidence only
+    when the owner recorded *this* Container run.  Otherwise age decides.
+    """
+    owner = _read_marker(os.path.join(path, OWNER_NAME)) or {}
+    run_id = owner.get("containerRunId")
+    current = container_run_id()
+    if (
+        run_id
+        and run_id != UNKNOWN_RUN_ID
+        and run_id == current
+        and not procs.is_alive(owner.get("pid"), owner.get("startTime"))
+    ):
+        return True
+    created = owner.get("createdAt")
+    if not isinstance(created, (int, float)):
+        try:
+            created = os.stat(path).st_mtime
+        except OSError:
+            return False
+    return (now - float(created)) >= max_age
+
+
+def sweep_stale_snapshots(
+    root: Optional[str] = None, *, max_age: float = STALE_SNAPSHOT_SECONDS
+) -> list[str]:
+    """Delete ``.snapshot-*`` dirs an interrupted snapshot left behind.
+
+    A snapshot dir is a whole copy of the Codex package, so an interruption
+    between ``mkdtemp`` and the publish would otherwise leak tens of megabytes
+    per attempt, forever.  Runs under the publish lock on the next snapshot
+    attempt: the same lock the publish itself takes, so no publisher is racing
+    a sweeper.
+    """
+    root = root or versions_root()
+    now = time.time()
+    removed: list[str] = []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return removed
+    for name in names:
+        if not name.startswith(TEMP_PREFIX):
+            continue
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        if not _is_stale_snapshot(path, now=now, max_age=max_age):
+            continue
+        _rmtree_writable(path)
+        if not os.path.exists(path):
+            removed.append(name)
+    return removed
 
 
 @contextmanager
@@ -606,7 +729,18 @@ def probe(binary: str, *, model: Optional[str] = None) -> ProbeResult:
                 f"(terminal={second.terminal or 'none'}, error={second.error})",
                 first.thread_id,
             )
-        if second.thread_id and second.thread_id != first.thread_id:
+        if not second.thread_id:
+            # Thread continuity is a thing to PROVE, not to assume from a
+            # silent stream: a resume that never says `thread.started` has
+            # shown nothing about which thread it landed in (ADR 0037 § "Codex
+            # runtime": the probe verifies thread continuity).
+            return ProbeResult(
+                False,
+                "probe resume produced no `thread.started`, so thread "
+                "continuity is unproven",
+                first.thread_id,
+            )
+        if second.thread_id != first.thread_id:
             return ProbeResult(
                 False,
                 "probe resume landed in another thread "
@@ -667,8 +801,13 @@ def snapshot(
 
     try:
         os.makedirs(root, exist_ok=True)
+        with publish_lock(root):
+            # Before adding one: drop the temp dirs earlier attempts were
+            # interrupted in the middle of (see `sweep_stale_snapshots`).
+            sweep_stale_snapshots(root)
         temp = tempfile.mkdtemp(prefix=f"{TEMP_PREFIX}{source.version}-", dir=root)
-    except OSError as exc:
+        _write_owner(temp)
+    except (OSError, TimeoutError) as exc:
         # A Container started before the `boxa-codex-versions` volume existed
         # (or a root-owned fresh volume) must produce a clear refusal, not a
         # traceback.
@@ -676,8 +815,7 @@ def snapshot(
         warnings.append(f"codex runtime: {reason}")
         return Snapshot(None, reason, warnings, False)
 
-    def discard(temp: str, reason: str) -> Snapshot:
-        _rmtree_writable(temp)
+    def discard(reason: str) -> Snapshot:
         warnings.append(
             f"codex runtime: snapshot of {source.version} from "
             f"{source.name} discarded ({reason}); previous verified runtime "
@@ -685,77 +823,93 @@ def snapshot(
         )
         return Snapshot(None, reason, warnings, False)
 
-    package = os.path.join(temp, PACKAGE_NAME)
-    before = manifest(source.path)
+    # `temp` holds a whole copy of the Codex package, so it is deleted on every
+    # way out of here — the handled discards, an unexpected exception, and a
+    # KeyboardInterrupt/SIGTERM in the middle of the copy or the probe alike.
+    # Only a successful publish takes it away from us (`os.rename`).
+    renamed = False
     try:
-        copy_tree(source.path, package)
-    except (OSError, shutil.Error) as exc:
-        return discard(temp, f"copy failed: {exc}")
+        package = os.path.join(temp, PACKAGE_NAME)
+        before = manifest(source.path)
+        try:
+            copy_tree(source.path, package)
+        except (OSError, shutil.Error) as exc:
+            return discard(f"copy failed: {exc}")
 
-    after = manifest(source.path)
-    if after != before:
-        # Exactly what a concurrent `npm install -g @openai/codex` looks like.
-        return discard(temp, "source changed during the copy")
-    copied_version = package_version(package)
-    if copied_version != source.version:
-        return discard(
-            temp,
-            f"copied package.json says {copied_version}, source said "
-            f"{source.version}",
-        )
-    mismatch = _content_mismatch(source.path, package, before)
-    if mismatch is not None:
-        return discard(temp, f"content mismatch at {mismatch}")
+        after = manifest(source.path)
+        if after != before:
+            # Exactly what a concurrent `npm install -g @openai/codex` looks like.
+            return discard("source changed during the copy")
+        copied_version = package_version(package)
+        if copied_version != source.version:
+            return discard(
+                f"copied package.json says {copied_version}, source said "
+                f"{source.version}",
+            )
+        mismatch = _content_mismatch(source.path, package, before)
+        if mismatch is not None:
+            return discard(f"content mismatch at {mismatch}")
 
-    binary = package_binary(package)
-    reported = binary_answers_version(binary)
-    if reported is None:
-        return discard(temp, "copied binary does not answer --version")
+        binary = package_binary(package)
+        reported = binary_answers_version(binary)
+        if reported is None:
+            return discard("copied binary does not answer --version")
 
-    probed = False
-    if do_probe:
-        result = (prober or probe)(binary)
-        probed = True
-        if not result.ok:
-            return discard(temp, f"probe failed: {result.detail}")
-        probe_thread = result.thread_id
-    else:
-        probe_thread = None
+        probed = False
+        if do_probe:
+            result = (prober or probe)(binary)
+            probed = True
+            if not result.ok:
+                return discard(f"probe failed: {result.detail}")
+            probe_thread = result.thread_id
+        else:
+            probe_thread = None
 
-    marker = {
-        "version": source.version,
-        "reportedVersion": reported,
-        "source": source.name,
-        "sourcePath": source.path,
-        "probed": probed,
-        "probeModel": probe_model() if probed else None,
-        "probeEffort": PROBE_EFFORT if probed else None,
-        "probeThreadId": probe_thread,
-        "probedAt": time.time() if probed else None,
-        "publishedAt": time.time(),
-    }
-    final = os.path.join(root, source.version)
-    try:
-        with publish_lock(root):
-            winner = published(root).get(source.version)
-            if winner is not None and winner.verified:
-                # Another Container published this version while we probed.
-                _rmtree_writable(temp)
-                return Snapshot(winner, None, warnings, probed)
-            if os.path.exists(final):
-                _rmtree_writable(final)
-            with open(os.path.join(temp, MARKER_NAME), "w", encoding="utf-8") as fh:
-                json.dump(marker, fh, sort_keys=True)
-                fh.write("\n")
-            os.rename(temp, final)
-            _make_read_only(final)
-    except (OSError, TimeoutError) as exc:
-        return discard(temp, f"publish failed: {exc}")
+        marker = {
+            "version": source.version,
+            "reportedVersion": reported,
+            "source": source.name,
+            "sourcePath": source.path,
+            "probed": probed,
+            "probeModel": probe_model() if probed else None,
+            "probeEffort": PROBE_EFFORT if probed else None,
+            "probeThreadId": probe_thread,
+            "probedAt": time.time() if probed else None,
+            "publishedAt": time.time(),
+        }
+        final = os.path.join(root, source.version)
+        try:
+            with publish_lock(root):
+                winner = published(root).get(source.version)
+                if winner is not None and winner.verified:
+                    # Another Container published this version while we probed.
+                    return Snapshot(winner, None, warnings, probed)
+                if os.path.exists(final):
+                    _rmtree_writable(final)
+                with open(
+                    os.path.join(temp, MARKER_NAME), "w", encoding="utf-8"
+                ) as fh:
+                    json.dump(marker, fh, sort_keys=True)
+                    fh.write("\n")
+                # The owner marker says "a snapshot is in flight here"; it has
+                # no business inside a published version dir.
+                try:
+                    os.unlink(os.path.join(temp, OWNER_NAME))
+                except OSError:
+                    pass
+                os.rename(temp, final)
+                renamed = True
+                _make_read_only(final)
+        except (OSError, TimeoutError) as exc:
+            return discard(f"publish failed: {exc}")
 
-    entry = published(root).get(source.version)
-    if entry is None or not entry.verified:
-        return Snapshot(None, "published copy is not usable", warnings, probed)
-    return Snapshot(entry, None, warnings, probed)
+        entry = published(root).get(source.version)
+        if entry is None or not entry.verified:
+            return Snapshot(None, "published copy is not usable", warnings, probed)
+        return Snapshot(entry, None, warnings, probed)
+    finally:
+        if not renamed:
+            _rmtree_writable(temp)
 
 
 # ------------------------------------------------------------------ selection

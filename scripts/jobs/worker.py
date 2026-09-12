@@ -24,7 +24,10 @@ shell.
     finished, and only the survivors ending (or ``cancel``) moves it on;
 6.  obeys the **cancel request file**: when it appears, the worker kills its
     tracked tree and finalizes the record as ``cancelled``, so a killed
-    command is never recorded as a failure.
+    command is never recorded as a failure.  The cancel check and the spawn
+    are ordered against each other by one gate (``_Monitor.spawn_gate``), so a
+    cancel that arrives while the Job is still ``reserved`` stops the command
+    from ever starting instead of racing it.
 
 **Watch mode** (``adopt``) takes over a Job whose worker died. It cannot
 reparent the surviving tree and it will never learn the command's exit code,
@@ -112,6 +115,12 @@ class _Monitor(threading.Thread):
         self.thread_id: Optional[str] = None
         self.stop = threading.Event()
         self.cancel_seen = threading.Event()
+        # Orders "the monitor handles a cancel request" against "the main
+        # thread checks for one and spawns the command".  Without it a cancel
+        # that arrives while the Job is still `reserved` is handled by an empty
+        # tree scan a moment before the spawn, and the command then survives
+        # the cancel while the record goes terminal `cancelled`.
+        self.spawn_gate = threading.Lock()
         self._last_pids: set[int] = set()
 
     def _record_thread_id(self) -> None:
@@ -167,13 +176,16 @@ class _Monitor(threading.Thread):
                 self._record_thread_id()
             except Exception:  # noqa: BLE001 - bookkeeping never kills the Job
                 pass
-            if not self.cancel_seen.is_set() and self.store.cancel_requested(
-                self.job_id
-            ):
-                # The CLI asked for a cancel and already signalled what it
-                # could see; as the subreaper the worker can see more.
-                self.cancel_seen.set()
-                self.kill_tracked()
+            if not self.cancel_seen.is_set():
+                # Under the gate: either this sees the request and the main
+                # thread then refuses to spawn, or the spawn wins the gate and
+                # this scan finds the child. Never both halves in between.
+                with self.spawn_gate:
+                    if self.store.cancel_requested(self.job_id):
+                        # The CLI asked for a cancel and already signalled what
+                        # it could see; as the subreaper the worker sees more.
+                        self.cancel_seen.set()
+                        self.kill_tracked()
             self.stop.wait(HEARTBEAT_INTERVAL)
 
 
@@ -338,26 +350,46 @@ def run_spawn(project_key: str, job_id: str, root: Optional[str] = None) -> int:
         with open(out_path, "wb") as out, open(
             store.stderr_path(job_id), "wb"
         ) as err:
-            try:
-                child = subprocess.Popen(
-                    argv,
-                    cwd=cwd,
-                    env=child_env(env_names, job_id),
-                    stdin=subprocess.DEVNULL,
-                    stdout=out,
-                    stderr=err,
-                    close_fds=True,
-                )
-            except OSError as exc:
-                # Spawn failure is a failed Job, not a missing one.
+            # Cancel beats spawn, decided under the monitor's gate: a Job
+            # cancelled while it is still `reserved` must never start its
+            # command afterwards.  `cancelled` is a terminal state, and a
+            # terminal record whose command is only just starting is exactly
+            # the dishonesty ADR 0037 forbids.
+            with monitor.spawn_gate:
+                if monitor.cancel_seen.is_set() or store.cancel_requested(job_id):
+                    monitor.cancel_seen.set()
+                    child = None
+                else:
+                    try:
+                        child = subprocess.Popen(
+                            argv,
+                            cwd=cwd,
+                            env=child_env(env_names, job_id),
+                            stdin=subprocess.DEVNULL,
+                            stdout=out,
+                            stderr=err,
+                            close_fds=True,
+                        )
+                    except OSError as exc:
+                        # Spawn failure is a failed Job, not a missing one.
+                        store.update_record(
+                            job_id,
+                            state=STATE_FAILED,
+                            startedAt=_now(),
+                            finishedAt=_now(),
+                            error=f"spawn failed: {exc}",
+                        )
+                        return 1
+            if child is None:
                 store.update_record(
                     job_id,
-                    state=STATE_FAILED,
-                    startedAt=_now(),
+                    state=STATE_CANCELLED,
                     finishedAt=_now(),
-                    error=f"spawn failed: {exc}",
+                    survivors=[],
+                    cancelledBeforeSpawn=True,
                 )
-                return 1
+                store.touch_heartbeat(job_id)
+                return 0
             store.update_record(
                 job_id,
                 state=STATE_RUNNING,

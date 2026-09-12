@@ -37,6 +37,11 @@ boxa-job gc      [--older-than DAYS] [--purge] [--dry-run] [--json]
 ```
 
 - `start` reserves the key, forks a Job worker, and returns the jobId at once.
+  `--cwd` is resolved to an absolute path against the caller's cwd and has to
+  exist (the worker itself runs from `/`, so a relative path would mean
+  something else there); the absolute path is what the request is fingerprinted
+  by. A `--cwd` that is not a directory is a usage error, exit 2, and reserves
+  nothing.
 - `reply` is another turn on an existing Codex thread, as a new Job.
 - `wait` blocks in-process for one Job (default 540 s, maximum 570 s).
 - `result` gives state, exit code, output paths, and timings.
@@ -154,6 +159,11 @@ boxa-job reply <threadId> --key review-02 --model gpt-5.6 --effort high \
 - A Codex job is `done` only with a `turn.completed` event and exit 0. Exit 0
   without a terminal event, which is what a killed `codex exec` looks like, is
   `failed` with reason `no-terminal-event`, never `done`.
+- Any top-level `error` event (and any `turn.failed`) fails the Job, whatever
+  follows it in the stream: a `turn.completed` on a later line does not talk
+  the Job out of a failure Codex already reported. An `error` *item* inside
+  `item.completed` is a warning Codex kept running through, and is counted as
+  work seen rather than treated as the turn's verdict.
 
 ## Frugal waiting
 
@@ -204,6 +214,11 @@ finalizes the record as `cancelled`; if no worker is left, or it does not
 finalize within 10 s, the CLI finalizes the record in its place. A killed
 command is therefore never recorded as `failed`.
 
+A cancel that lands while the Job is still `reserved` stops the command from
+ever being spawned: the worker checks for the request and spawns its command
+under one gate, so a record that says `cancelled` never leaves a command
+starting up behind it.
+
 ## Codex runtime snapshots
 
 Interactive `codex` in a Container keeps running from the shared
@@ -225,10 +240,15 @@ verified immutable copy under the shared `boxa-codex-versions` volume.
 3. **Probe.** The copy's own binary must answer `--version`, and then a real
    run is required, not a help scan: one trivial `codex exec --json` on the
    cheapest configured model followed by a `resume` into its thread, verifying
-   `thread.started`, `turn.completed`, `-o`, and thread continuity.
+   `thread.started`, `turn.completed`, `-o`, and thread continuity. The resume
+   has to state its own `thread.started` and it has to be the same thread:
+   continuity is proven, never assumed from a silent stream.
 4. **Publish.** Only then is the copy published atomically by rename as
    `<version>/` and marked verified. A publish lock keeps two Containers from
-   racing.
+   racing. A snapshot in progress lives in a `.snapshot-*` temp dir that is
+   removed on every way out, and one an interrupted attempt left behind is
+   swept (under the publish lock) by the next refresh, so an interruption
+   cannot leak package copies onto the volume.
 
 A failed probe leaves the previous verified version in use and prints a loud
 warning (also `warnings` in `--json`) instead of breaking the next job. With no
@@ -239,7 +259,10 @@ rather than silently running from the mutable volume.
 one is in use. `runtime refresh` performs the snapshot and probe now.
 `runtime use <version>` pins a verified copy for rollback, and a pin
 short-circuits the refresh entirely; `runtime use --auto` unpins and goes back
-to the newest. Pinning an unverified version is refused (`not-verified`).
+to the newest. Pinning an unverified version is refused (`not-verified`); the
+pin is written atomically under the publish lock, because every Container on
+the volume shares it, and a pin that could not be written is refused
+(`pin-failed`, exit 5) rather than silently lost.
 
 Published copies are made read-only for `node`. That is a convention the
 Container user could undo, not root enforcement. Running jobs finish on their
@@ -266,6 +289,13 @@ with the Project by `boxa remove` or `boxa stop --clean`.
 - `gc [--older-than DAYS] [--dry-run] [--json]` runs that sweep by hand.
   `gc --purge` removes whole record directories and frees their keys. Nothing
   purges on its own.
+- gc claims exactly what it did: only a successful removal is counted and only
+  its bytes are reported as freed. Anything that could not be removed is named
+  (`failed` in `--json`, a `failed to remove:` line otherwise, and `gcFailed`
+  on the record). `--purge` removes the record directory *before* it frees the
+  key, so a failed removal leaves both alone, and it re-checks eligibility
+  under the Project lock, so a Job a concurrent `cancel` has just touched is
+  not purged as stale.
 
 ## Environment overrides for tests
 
@@ -285,4 +315,11 @@ test seams and should never be set in normal use:
 | `BOXA_JOB_PROBE_TIMEOUT` | The runtime probe timeout in seconds. |
 
 `BOXA_JOB_ID` is not an override: it is the ownership marker the worker puts
-into every Job's command environment.
+into every Job's command environment, and it is never inherited from the
+caller.
+
+These `BOXA_JOB_*` variables are also the only thing besides the fixed
+baseline and the values of the caller's `--env KEY` names that the detached
+worker's own environment carries: the worker does not inherit the shell that
+ran `boxa-job` any more than the Job's command does (ADR 0037 § "Worker
+environment").

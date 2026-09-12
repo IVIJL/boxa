@@ -11,6 +11,10 @@ are RAW captures of real ``codex exec --json`` runs in a boxa Container
 (codex-cli 0.149.1, ``gpt-5.6-luna``, effort low), kept verbatim — including
 one model reply that came back in Czech — because their value is being exactly
 what Codex emits, and an edited capture proves nothing about the real stream.
+The one exception is named as such: ``codex-error-then-completed.jsonl`` is the
+recorded ``error`` stream with the recorded ``turn.completed`` line of a good
+run appended, because the ordering it tests (a failure followed by a completed
+turn) is not something a live run can be asked for on demand.
 The CLI-level tests run a fake ``codex`` shell script that cats one of those
 fixtures (or sleeps), which is also how a ``thread-busy`` refusal is provoked
 without a live turn.
@@ -129,6 +133,21 @@ class StreamSummaryTests(unittest.TestCase):
         self.assertEqual(summary.terminal, "error")
         self.assertIn("not supported", summary.error)
 
+    def test_an_error_event_survives_a_later_turn_completed(self) -> None:
+        """A stated failure is sticky: line order must not rewrite the verdict.
+
+        The fixture is the recorded ``error`` stream with the recorded
+        ``turn.completed`` of a good run appended, i.e. exactly the shape that
+        would otherwise report a Job that Codex said failed as ``done``.
+        """
+        summary = jobs_codex.summarize_stream(
+            fixture("codex-error-then-completed.jsonl")
+        )
+        self.assertEqual(summary.terminal, "error")
+        self.assertIn("not supported", summary.error)
+        # The usage of the completed turn is still recorded: it happened.
+        self.assertEqual(summary.usage["output_tokens"], 96)
+
     def test_used_model_and_effort_are_null_when_the_stream_is_silent(self) -> None:
         """codex-cli 0.149.1 never says it: honest null beats an invented echo."""
         summary = jobs_codex.summarize_stream(fixture("codex-done.jsonl"))
@@ -186,6 +205,15 @@ class OutcomeTests(unittest.TestCase):
         )
         self.assertEqual(outcome.state, STATE_FAILED)
         self.assertEqual(outcome.reason, jobs_codex.REASON_STREAM_ERROR)
+
+    def test_error_then_turn_completed_on_exit_zero_is_still_failed(self) -> None:
+        """ADR 0037: any top-level `error` event fails the Job, order aside."""
+        outcome = jobs_codex.derive_outcome(
+            self._summary("codex-error-then-completed.jsonl"), 0
+        )
+        self.assertEqual(outcome.state, STATE_FAILED)
+        self.assertEqual(outcome.reason, jobs_codex.REASON_STREAM_ERROR)
+        self.assertIn("not supported", outcome.error)
 
     def test_nonzero_exit_without_any_event_is_failed(self) -> None:
         outcome = jobs_codex.derive_outcome(
@@ -534,6 +562,23 @@ class CodexJobTests(CodexCliTestCase):
         record = self.wait_for_state(job_id, {STATE_DONE, STATE_FAILED})
         self.assertEqual(record["state"], STATE_FAILED)
         self.assertEqual(record["codexReason"], jobs_codex.REASON_TURN_FAILED)
+        self.assertIn("not supported", record["error"])
+
+    def test_error_then_completed_stream_fails_the_whole_job(self) -> None:
+        """End to end: exit 0 plus `error` then `turn.completed` is not `done`."""
+        with mock.patch.dict(
+            os.environ,
+            {
+                jobs_codex.CODEX_BIN_ENV: self.fake_codex(
+                    "codex-error-then-completed.jsonl"
+                )
+            },
+        ):
+            job_id = self.start_codex("error-then-done")["jobId"]
+        record = self.wait_for_state(job_id, {STATE_DONE, STATE_FAILED})
+        self.assertEqual(record["state"], STATE_FAILED)
+        self.assertEqual(record["exitCode"], 0)
+        self.assertEqual(record["codexReason"], jobs_codex.REASON_STREAM_ERROR)
         self.assertIn("not supported", record["error"])
 
     def test_thread_id_lands_on_the_record_while_the_job_still_runs(self) -> None:

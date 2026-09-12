@@ -49,9 +49,10 @@ import jobs
 from . import ack as ack_mod
 from . import codex as codex_mod
 from . import gc as gc_mod
+from . import procs
 from . import recovery
 from . import runtime as runtime_mod
-from .env import passthrough_values
+from .env import baseline_env, passthrough_values
 from .identity import IdentityError, project_key
 from .store import (
     CLEAN_TERMINAL_STATES,
@@ -212,6 +213,27 @@ def _result_lines(payload: dict[str, Any]) -> list[str]:
 
 # ---------------------------------------------------------------------- start
 
+# Boxa's own control variables, forwarded to the detached worker because they
+# are what it is configured by: the Container run-id path, the Project key and
+# the documented test seams (`docs/jobs.md` § "Environment overrides for
+# tests").  Named by prefix rather than one by one so a new seam cannot be
+# added in one place and silently stop reaching the worker.
+CONTROL_ENV_PREFIX = "BOXA_JOB_"
+
+
+def _control_env() -> dict[str, str]:
+    """This process' ``BOXA_JOB_*`` variables, minus the ownership marker.
+
+    ``BOXA_JOB_ID`` is not configuration: it is the marker a worker stamps on
+    its own command's tree, so inheriting an outer Job's id would make this
+    Job's processes answer to that one's ``cancel``.
+    """
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name.startswith(CONTROL_ENV_PREFIX) and name != procs.JOB_ID_MARKER
+    }
+
 
 def _spawn_worker(
     store: ProjectStore,
@@ -219,10 +241,20 @@ def _spawn_worker(
     env_values: dict[str, str],
     watch: bool = False,
 ):
-    """Launch the detached worker: own session, own stdio, no caller cwd."""
+    """Launch the detached worker: own session, own stdio, no caller cwd.
+
+    The worker's own environment is built, not inherited (ADR 0037 "Worker
+    environment"): the fixed baseline, the values of the variables the caller
+    named with ``--env`` (which the worker passes on to the command and never
+    writes to disk), Boxa's own ``BOXA_JOB_*`` control variables, and the
+    ``PYTHONPATH`` that makes ``import jobs`` work.  Nothing else of the
+    caller's environment crosses over, so an unnamed credential in the shell
+    that ran ``boxa-job`` is not in the Job's worker either.
+    """
     package_parent = os.path.dirname(os.path.dirname(os.path.abspath(jobs.__file__)))
-    env = dict(os.environ)
-    existing = env.get("PYTHONPATH")
+    env = baseline_env()
+    env.update(_control_env())
+    existing = os.environ.get("PYTHONPATH")
     env["PYTHONPATH"] = (
         f"{package_parent}:{existing}" if existing else package_parent
     )
@@ -363,6 +395,12 @@ def _register_job(request: JobRequest) -> int:
     """The whole key lifecycle of a start/reply, under one Project lock."""
     store = _store()
     key = request.key
+    # `--fresh` over a finished Job has to hand the key on, but not before the
+    # new run is actually going to happen: a `needs-ack` or a `thread-busy`
+    # refusal that freed the key first would leave the Project with no binding
+    # for it, so a later `start` would run the work again instead of returning
+    # the result that is already there.
+    release_on_spawn = False
     # Retention, before the lock and never fatal (ADR 0037 "State and
     # retention"): the bulky artefacts of Jobs that finished more than
     # `gc_mod.DEFAULT_RETENTION_DAYS` ago go now, while nothing is held.
@@ -452,8 +490,9 @@ def _register_job(request: JobRequest) -> int:
                         ],
                     )
                     return EXIT_REFUSED
-                # Finished Job under this key: the key is free to be re-run.
-                store.release_key(key)
+                # Finished Job under this key: the key may be re-run — but the
+                # old binding stays until the new worker is about to reserve it.
+                release_on_spawn = True
             elif existing.get("fingerprint") == request.fingerprint:
                 payload = _result_payload(store, existing)
                 payload["result"] = "finished" if terminal else "attached"
@@ -515,6 +554,11 @@ def _register_job(request: JobRequest) -> int:
         if request.codex is not None:
             spec["codex"] = request.codex
         store.write_spec(job_id, spec)
+        if release_on_spawn:
+            # Still inside the same Project lock that checked the key, and
+            # only now that preflight and the ack have both passed: the
+            # worker's `link()` needs the name free to publish its reservation.
+            store.release_key(key)
         proc = _spawn_worker(store, job_id, passthrough_values(request.env_names))
         record = _await_reservation(store, job_id, proc)
         _detach(proc)
@@ -815,7 +859,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     if not positional:
         print("boxa-job start: no command given (use -- <argv>)", file=sys.stderr)
         return EXIT_USAGE
-    cwd = args.cwd or os.getcwd()
+    # Absolutized HERE, against the caller's cwd, because the detached worker
+    # runs from `/`: a relative `--cwd` that is valid for the caller would
+    # otherwise resolve somewhere else entirely (or nowhere) in the worker.
+    # The absolute path is what goes into the fingerprint, so the same
+    # directory reached by two spellings is one request.
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    if not os.path.isdir(cwd):
+        return _usage(f"--cwd is not a directory: {cwd}")
     env_names = sorted(set(args.env or []))
     return _register_job(
         JobRequest(
@@ -1367,7 +1418,25 @@ def cmd_runtime(args: argparse.Namespace) -> int:
             ],
         )
         return EXIT_REFUSED
-    runtime_mod.pin(args.version)
+    try:
+        runtime_mod.pin(args.version)
+    except runtime_mod.PinFailed as exc:
+        # The pin is shared state on a shared volume: a busy publish lock or
+        # an unwritable versions root is a refusal to report, not a traceback.
+        _emit(
+            args.json,
+            {
+                "result": "refused",
+                "reason": runtime_mod.PinFailed.reason,
+                "version": args.version,
+                "detail": str(exc),
+            },
+            [
+                f"result: refused ({runtime_mod.PinFailed.reason})",
+                str(exc),
+            ],
+        )
+        return EXIT_REFUSED
     return _runtime_rows(args.json, [])
 
 
@@ -1398,11 +1467,14 @@ def cmd_gc(args: argparse.Namespace) -> int:
     payload["result"] = "dry-run" if args.dry_run else "gc"
     verb = "would purge" if args.purge else "would remove"
     done = "purged" if args.purge else "removed"
+    # Only what really went is counted (ADR 0037: frugality never hides a
+    # problem, and neither does housekeeping).
+    succeeded = len(outcome.entries) - len(outcome.failures)
     head = (
         f"gc: {verb} {len(outcome.entries)} job(s), "
         f"{_human_bytes(outcome.bytes)}"
         if args.dry_run
-        else f"gc: {done} {len(outcome.entries)} job(s), "
+        else f"gc: {done} {succeeded} job(s), "
         f"{_human_bytes(outcome.bytes)} freed"
     )
     lines = [
@@ -1414,6 +1486,12 @@ def cmd_gc(args: argparse.Namespace) -> int:
             f"{entry.job_id}  {entry.state:<21}  key={entry.key}  "
             f"age={entry.age_seconds / 86400:.1f}d  "
             f"{_human_bytes(entry.bytes)}  {','.join(entry.files)}"
+        )
+    for entry in outcome.failures:
+        # A removal gc could not make is said out loud: the counts above are
+        # what really went, so this is the only place it appears.
+        lines.append(
+            f"failed to remove: {entry.job_id}  {'; '.join(entry.failed)}"
         )
     _emit(args.json, payload, lines)
     return EXIT_OK
@@ -1464,7 +1542,9 @@ codex jobs (the contract a delegating skill codes against):
     of it; `boxa-job log <jobId> --tail N` shows it on demand.
   * a Codex job is `done` only with a `turn.completed` event AND exit 0. Exit
     0 without a terminal event (what a killed `codex exec` looks like) is
-    `failed` with reason `no-terminal-event`, never `done`.
+    `failed` with reason `no-terminal-event`, never `done`. Any top-level
+    `error` event (or `turn.failed`) fails the Job whatever follows it in the
+    stream: a later `turn.completed` does not undo a failure Codex reported.
 
 state and retention (the Job state directory is a per-Project volume,
 removed with the Project by `boxa remove` / `boxa stop --clean`):
@@ -1477,7 +1557,10 @@ removed with the Project by `boxa remove` / `boxa stop --clean`):
     included, its descendants are still writing.
   * `gc [--older-than DAYS] [--dry-run] [--json]` does that sweep by hand;
     `gc --purge` removes whole record dirs and frees their keys. Nothing
-    purges on its own.
+    purges on its own. gc counts only what it really removed and NAMES what
+    it could not (`failed` in --json, `failed to remove:` otherwise);
+    `--purge` removes the record dir before freeing the key and re-checks
+    eligibility under the Project lock.
   * a Container restart does not clear anything: the records persist and the
     Jobs of the previous run become `interrupted` on the next call.
 
@@ -1504,6 +1587,12 @@ concurrency ack (a Job key stops duplicates, not parallel work):
   4. nothing running: no ack asked, `--ack-concurrent` refused. Same
      key+request attaches without an ack; `--fresh` is a run and needs one.
   5. running = reserved, running, exited-with-survivors, orphaned, unreadable.
+
+the worker's environment is BUILT, not inherited: the fixed baseline, the
+values of the variables named with --env, Boxa's own BOXA_JOB_* control
+variables and PYTHONPATH — an unnamed credential in the calling shell reaches
+neither the worker nor the command. --cwd is resolved against the caller's cwd
+and must exist, because the worker itself runs from /.
 
 ownership and its limits: while the worker lives it is a child subreaper, so
 the whole tree is walked through /proc parent links (a `setsid` escapee and a
@@ -1571,7 +1660,11 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--cwd",
         metavar="DIR",
-        help="working directory for the Job (default: the caller's cwd)",
+        help=(
+            "working directory for the Job (default: the caller's cwd); "
+            "resolved to an absolute path against the caller's cwd and "
+            "required to exist, since the worker itself runs from /"
+        ),
     )
     start.add_argument(
         "--codex",
@@ -1682,8 +1775,9 @@ def build_parser() -> argparse.ArgumentParser:
             "see of the Job (the tree under a live worker, otherwise the "
             "BOXA_JOB_ID marker matches and their descendants), verified by "
             "pid + start time. Reports what it killed, what it could only "
-            "remember from the record, and the two stated limits. Also the way "
-            "to resolve an unclear key."
+            "remember from the record, and the two stated limits. A cancel "
+            "that lands while the Job is still `reserved` stops its command "
+            "from ever being spawned. Also the way to resolve an unclear key."
         ),
     )
     cancel.add_argument("job_id")

@@ -48,6 +48,7 @@ from .store import (
 
 __all__ = [
     "CODEX_BIN_ENV",
+    "FAILURE_TERMINALS",
     "CodexNotFound",
     "StreamSummary",
     "binary_version",
@@ -80,6 +81,10 @@ REASON_NO_TERMINAL_EVENT = "no-terminal-event"
 REASON_TURN_FAILED = "turn-failed"
 REASON_STREAM_ERROR = "stream-error"
 REASON_NONZERO_EXIT = "nonzero-exit"
+
+# Terminal events that mean the turn failed.  Sticky in `summarize_stream`: a
+# later `turn.completed` does not talk a Job out of one of these.
+FAILURE_TERMINALS = frozenset({"error", "turn.failed"})
 
 # How much of the final message the human output prints; `--json` carries it
 # whole (it is the answer, unlike the event log).
@@ -324,6 +329,12 @@ def summarize_stream(path: str) -> StreamSummary:
     a count of events seen.  Only a *top-level* ``error`` event is an error:
     an ``item.completed`` carrying an ``error`` item is a warning Codex keeps
     running through, and treating it as a failure would misreport a good run.
+
+    A failure terminal is **sticky**: once the stream has said ``error`` or
+    ``turn.failed``, a later ``turn.completed`` does not undo it.  ADR 0037's
+    Codex contract requires any top-level ``error`` event to fail the Job, and
+    a stream that reports an error and then completes a turn must not be
+    reported as ``done`` because of the order the lines happen to be in.
     """
     state: dict[str, Any] = {
         "thread_id": None,
@@ -349,18 +360,20 @@ def summarize_stream(path: str) -> StreamSummary:
                 elif kind == "turn.started":
                     _probe_used(event, state)
                 elif kind == "turn.completed":
-                    state["terminal"] = kind
                     usage = event.get("usage")
                     state["usage"] = usage if isinstance(usage, dict) else None
                     _probe_used(event, state)
+                    # The usage is still worth recording, but a completed turn
+                    # never overwrites a failure the stream already stated.
+                    if state["terminal"] not in FAILURE_TERMINALS:
+                        state["terminal"] = kind
                 elif kind == "turn.failed":
+                    # The more specific failure: it may replace a bare `error`.
                     state["terminal"] = kind
                     state["error"] = _error_message(event) or state["error"]
                 elif kind == "error":
-                    # Terminal only if nothing better follows; `turn.failed`
-                    # usually does and overwrites it.
                     state["error"] = _error_message(event) or state["error"]
-                    if state["terminal"] is None:
+                    if state["terminal"] != "turn.failed":
                         state["terminal"] = kind
                 elif kind.startswith("item."):
                     item = event.get("item")
@@ -459,7 +472,9 @@ def derive_outcome(
         ``turn.completed`` in the stream is *evidence* that Codex finished its
         turn, not proof that the process exited cleanly;
     3.  ``turn.failed`` / a top-level ``error`` event → ``failed`` with the
-        message Codex gave;
+        message Codex gave — and that verdict is sticky, so a
+        ``turn.completed`` later in the same stream does not turn it into
+        ``done`` (see :func:`summarize_stream`);
     4.  a non-zero exit → ``failed``;
     5.  exit 0 with ``turn.completed`` → ``done``;
     6.  exit 0 without any terminal event → ``failed``

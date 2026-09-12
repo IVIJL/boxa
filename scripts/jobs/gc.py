@@ -21,6 +21,14 @@ That includes ``reserved``, ``running``, ``exited-with-survivors``,
 so, because its descendants are still alive and its files are still being
 written to.
 
+**What gc claims, it did.** Only a successful unlink counts as a removal and
+only its bytes count as freed; anything that could not be removed is named in
+``failed`` on the entry (and in ``gcFailed`` on the record), never silently
+swallowed.  ``--purge`` removes the record directory *before* it frees the key,
+so a failed removal leaves both in place instead of reporting a purge that did
+not happen, and re-checks eligibility under the Project lock, so a Job a
+concurrent ``cancel`` just touched is no longer garbage.
+
 **Age** is the youngest evidence that the Job was active: the later of
 ``finishedAt`` and the newest mtime under the record directory.  Conservative
 on purpose — a Job is only old when *everything* about it is old, so a clock
@@ -63,7 +71,13 @@ _DAY_SECONDS = 86400.0
 
 
 class GcEntry(NamedTuple):
-    """One Job gc has an opinion about."""
+    """One Job gc has an opinion about.
+
+    After a real run ``files`` and ``bytes`` are what gc *actually* removed and
+    freed, and ``failed`` names what it could not: a removal that fails must
+    never be reported as space reclaimed (the record and the output would then
+    claim artefacts are gone while they still occupy the volume).
+    """
 
     job_id: str
     key: Optional[str]
@@ -72,6 +86,7 @@ class GcEntry(NamedTuple):
     files: list[str]
     bytes: int
     purge: bool
+    failed: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -82,6 +97,7 @@ class GcEntry(NamedTuple):
             "files": list(self.files),
             "bytes": self.bytes,
             "purge": self.purge,
+            "failed": list(self.failed),
         }
 
 
@@ -95,6 +111,11 @@ class GcOutcome(NamedTuple):
     purge: bool
     older_than_days: float
 
+    @property
+    def failures(self) -> list[GcEntry]:
+        """The entries gc could not fully remove. Empty is the normal case."""
+        return [entry for entry in self.entries if entry.failed]
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "jobs": [entry.as_dict() for entry in self.entries],
@@ -104,6 +125,10 @@ class GcOutcome(NamedTuple):
             "dryRun": self.dry_run,
             "purge": self.purge,
             "olderThanDays": self.older_than_days,
+            "failed": [
+                {"jobId": entry.job_id, "files": list(entry.failed)}
+                for entry in self.failures
+            ],
         }
 
 
@@ -220,30 +245,100 @@ def collect(
     )
 
 
-def _delete_bulky(store: ProjectStore, entry: GcEntry, at: float) -> None:
+def _delete_bulky(store: ProjectStore, entry: GcEntry, at: float) -> GcEntry:
+    """Unlink this Job's bulky files; report only what really went.
+
+    A file that could not be unlinked still occupies the volume, so counting
+    it as freed would make both the record's ``gcRemoved``/``gcBytes`` and the
+    command's output claim space that was never reclaimed.
+    """
     job_dir = store.job_dir(entry.job_id)
+    removed: list[str] = []
+    failed: list[str] = []
+    freed = 0
     for name in entry.files:
+        path = os.path.join(job_dir, name)
         try:
-            os.unlink(os.path.join(job_dir, name))
+            size = os.stat(path).st_size
         except OSError:
+            size = 0
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            # Already gone: nothing to reclaim, and nothing to complain about.
             continue
+        except OSError:
+            failed.append(name)
+            continue
+        removed.append(name)
+        freed += size
+    updated = entry._replace(files=removed, bytes=freed, failed=tuple(failed))
+    if not removed and not failed:
+        return updated
+    changes: dict[str, Any] = {
+        "gcAt": at,
+        "gcRemoved": removed,
+        "gcBytes": freed,
+    }
+    if failed:
+        changes["gcFailed"] = failed
     try:
-        store.update_record(
-            entry.job_id,
-            gcAt=at,
-            gcRemoved=list(entry.files),
-            gcBytes=entry.bytes,
-        )
-    except JobStoreError:
+        store.update_record(entry.job_id, **changes)
+    except (JobStoreError, OSError):
+        # Housekeeping bookkeeping: an unwritable record dir is already
+        # reported through `failed`, and must not abort the sweep.
         pass
+    return updated
 
 
-def _purge_record(store: ProjectStore, entry: GcEntry) -> None:
-    """Remove the record dir and, with it, the key's reservation."""
+def _purge_record(store: ProjectStore, entry: GcEntry) -> GcEntry:
+    """Remove the record dir and, with it, the key's reservation.
+
+    The tree goes **first** and its errors are surfaced: freeing the key while
+    the record dir survives would report a purge that did not happen and leave
+    the key pointing at a reservation a new ``start`` could then collide with.
+    """
+    job_dir = store.job_dir(entry.job_id)
+    try:
+        shutil.rmtree(job_dir)
+    except OSError as exc:
+        return entry._replace(bytes=0, failed=(f"<record dir>: {exc}",))
+    if os.path.exists(job_dir):
+        return entry._replace(
+            bytes=0, failed=("<record dir>: still present after removal",)
+        )
     key = entry.key
-    if key and store.key_job_id(key) == entry.job_id:
-        store.release_key(key)
-    shutil.rmtree(store.job_dir(entry.job_id), ignore_errors=True)
+    try:
+        if key and store.key_job_id(key) == entry.job_id:
+            store.release_key(key)
+    except JobStoreError as exc:
+        return entry._replace(failed=(f"<key reservation>: {exc}",))
+    return entry
+
+
+def _still_eligible(
+    store: ProjectStore,
+    job_id: str,
+    *,
+    older_than_days: float,
+    now: Optional[float] = None,
+) -> bool:
+    """Re-answer "may this Job be purged?" with the record as it is NOW.
+
+    ``collect`` decided before the Project lock was taken.  A ``cancel`` that
+    landed in between writes a cancel request and a fresh record, which is
+    recent activity on a Job the sweep had already written off — so the
+    verdict is taken again under the lock, right before the deletion.
+    """
+    moment = time.time() if now is None else now
+    try:
+        record = store.load_record(job_id)
+    except JobStoreError:
+        return False
+    if record is None or record.get("state") not in TERMINAL_STATES:
+        return False
+    age = moment - _reference_time(store, record)
+    return age >= older_than_days * _DAY_SECONDS
 
 
 def run(
@@ -254,12 +349,16 @@ def run(
     dry_run: bool = False,
     now: Optional[float] = None,
 ) -> GcOutcome:
-    """Collect, then (unless ``dry_run``) delete. Returns what was decided.
+    """Collect, then (unless ``dry_run``) delete. Returns what was really done.
 
     ``--purge`` takes the Project lock: it frees key reservations, and a
     concurrent ``start`` decides under that same lock whether a key is taken.
-    The bulky-file sweep needs no lock — it only ever touches files of Jobs
-    that will never change again.
+    Eligibility is re-checked under that lock (``_still_eligible``), because
+    ``collect`` ran before it.  The bulky-file sweep needs no lock — it only
+    ever touches files of Jobs that will never change again.
+
+    The returned entries describe the *result*: files that were removed, bytes
+    that were really freed, and ``failed`` for anything that survived.
     """
     outcome = collect(
         store, older_than_days=older_than_days, purge=purge, now=now
@@ -267,14 +366,29 @@ def run(
     if dry_run:
         return outcome._replace(dry_run=True)
     at = time.time() if now is None else now
+    done: list[GcEntry] = []
+    skipped = 0
     if purge:
         with store.lock():
             for entry in outcome.entries:
-                _purge_record(store, entry)
+                if not _still_eligible(
+                    store,
+                    entry.job_id,
+                    older_than_days=older_than_days,
+                    now=now,
+                ):
+                    # Active again since `collect` looked: not garbage.
+                    skipped += 1
+                    continue
+                done.append(_purge_record(store, entry))
     else:
         for entry in outcome.entries:
-            _delete_bulky(store, entry, at)
-    return outcome
+            done.append(_delete_bulky(store, entry, at))
+    return outcome._replace(
+        entries=done,
+        kept=outcome.kept + skipped,
+        bytes=sum(entry.bytes for entry in done),
+    )
 
 
 def sweep_quietly(

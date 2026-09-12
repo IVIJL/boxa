@@ -34,7 +34,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from unittest import mock
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -237,6 +237,41 @@ class SweepTests(GcTestCase):
         self.assertEqual([entry.job_id for entry in outcome.entries], [job_id])
         self.assertEqual(self.artefacts(job_id), {"record.json"})
 
+    def test_only_successful_unlinks_are_counted_as_freed(self) -> None:
+        """gc claims exactly what it did — a failed unlink is named, not counted."""
+        job_id = self.make_job("unremovable", STATE_DONE, age_days=20)
+        job_dir = self.store.job_dir(job_id)
+        stdout_bytes = os.stat(os.path.join(job_dir, "stdout")).st_size
+        real_unlink = os.unlink
+
+        def refuse_stdout(path, *args, **kwargs):
+            if os.path.basename(str(path)) == "stdout":
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch("os.unlink", refuse_stdout):
+            code, out = run_cli("gc", "--older-than", "14", "--json")
+            record = self.store.load_record(job_id)
+            # A second sweep now finds only the file that cannot go: it says so
+            # in the human output too, and claims nothing.
+            _, human = run_cli("gc", "--older-than", "14")
+        self.assertEqual(code, jobs_cli.EXIT_OK)
+        payload = json.loads(out)
+        self.assertEqual(payload["jobs"][0]["files"], ["stderr", "heartbeat"])
+        self.assertEqual(payload["failed"], [{"jobId": job_id, "files": ["stdout"]}])
+        self.assertGreater(payload["bytes"], 0)
+        # Only what really went counts, and the file that stayed keeps its bytes.
+        self.assertEqual(payload["bytes"], payload["jobs"][0]["bytes"])
+        self.assertIn("stdout", self.artefacts(job_id))
+        self.assertEqual(
+            os.stat(os.path.join(job_dir, "stdout")).st_size, stdout_bytes
+        )
+        self.assertEqual(record["gcRemoved"], ["stderr", "heartbeat"])
+        self.assertEqual(record["gcFailed"], ["stdout"])
+        self.assertEqual(record["gcBytes"], payload["bytes"])
+        self.assertIn("gc: removed 0 job(s), 0 B freed", human)
+        self.assertIn("failed to remove", human)
+
     def test_an_already_swept_job_is_not_reported_again(self) -> None:
         self.make_job("old", STATE_DONE, age_days=20)
         first = jobs_gc.run(self.store)
@@ -308,6 +343,55 @@ class PurgeTests(GcTestCase):
     def test_negative_threshold_is_a_usage_error(self) -> None:
         code, _ = run_cli("gc", "--older-than", "-1")
         self.assertEqual(code, jobs_cli.EXIT_USAGE)
+
+    def test_a_failed_removal_keeps_the_key_and_says_so(self) -> None:
+        """rmtree first, key second: a purge that failed is not a purge.
+
+        Freeing the key while the record directory survives would report work
+        that did not happen and leave the key naming a reservation a new
+        ``start`` would then collide with.
+        """
+        job_id = self.make_job("stuck", STATE_DONE, age_days=20)
+        job_dir = self.store.job_dir(job_id)
+        os.chmod(job_dir, 0o500)
+        self.addCleanup(os.chmod, job_dir, 0o700)
+
+        code, out = run_cli("gc", "--purge", "--older-than", "14", "--json")
+        self.assertEqual(code, jobs_cli.EXIT_OK)
+        payload = json.loads(out)
+        self.assertEqual(payload["bytes"], 0)
+        self.assertEqual(len(payload["failed"]), 1)
+        self.assertEqual(payload["failed"][0]["jobId"], job_id)
+        # Nothing was reclaimed and nothing was freed.
+        self.assertTrue(os.path.exists(job_dir))
+        self.assertEqual(self.store.key_job_id("stuck"), job_id)
+
+    def test_eligibility_is_re_decided_under_the_lock(self) -> None:
+        """`collect` ran before the lock; a cancel may have landed since.
+
+        A ``cancel`` on an old ``interrupted`` Job writes a cancel request and
+        a fresh record — recent activity on a Job the sweep had already
+        written off, so the verdict has to be taken again under the lock.
+        """
+        job_id = self.make_job("raced", STATE_INTERRUPTED, age_days=20)
+        real_lock = self.store.lock
+
+        def lock_then_cancel(*args, **kwargs):
+            @contextmanager
+            def wrapper():
+                with real_lock(*args, **kwargs):
+                    self.store.request_cancel(job_id, "concurrent cancel")
+                    yield
+
+            return wrapper()
+
+        with mock.patch.object(self.store, "lock", lock_then_cancel):
+            outcome = jobs_gc.run(self.store, older_than_days=14, purge=True)
+
+        self.assertEqual(outcome.entries, [])
+        self.assertEqual(outcome.kept, 1)
+        self.assertTrue(os.path.exists(self.store.job_dir(job_id)))
+        self.assertEqual(self.store.key_job_id("raced"), job_id)
 
 
 class AutomaticSweepTests(GcTestCase):

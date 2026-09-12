@@ -46,6 +46,7 @@ from jobs import cli as jobs_cli  # noqa: E402
 from jobs import identity as jobs_identity  # noqa: E402
 from jobs import procs  # noqa: E402
 from jobs import recovery  # noqa: E402
+from jobs import worker as jobs_worker  # noqa: E402
 from jobs.store import (  # noqa: E402
     STATE_CANCELLED,
     STATE_DONE,
@@ -164,10 +165,18 @@ class OwnershipTestCase(unittest.TestCase):
         return pid
 
     def assertGone(self, pid: int, start_time=None) -> None:
+        # Without a remembered start time the question is "is anything running
+        # under this pid" (`is_running`): `is_alive` answers False for a pid
+        # with no identity by design, which would pass this assert for free.
+        def alive() -> bool:
+            if start_time is None:
+                return procs.is_running(pid)
+            return procs.is_alive(pid, start_time)
+
         deadline = time.time() + 5
-        while time.time() < deadline and procs.is_alive(pid, start_time):
+        while time.time() < deadline and alive():
             time.sleep(0.02)
-        self.assertFalse(procs.is_alive(pid, start_time), f"pid {pid} still alive")
+        self.assertFalse(alive(), f"pid {pid} still alive")
 
 
 class ProcessIdentityTests(OwnershipTestCase):
@@ -180,10 +189,68 @@ class ProcessIdentityTests(OwnershipTestCase):
         self.assertFalse(procs.is_alive(pid, real + 1))
         self.assertFalse(procs.is_alive(2 ** 22, None))
 
+    def test_a_pid_without_a_start_time_is_not_verifiably_alive(self) -> None:
+        """No start time, no identity: the answer is "unknown", never "alive".
+
+        Treating bare existence as identity would let a recycled pid — and
+        everything below it in the process tree — be attributed to a Job, and
+        then be killed for it.
+        """
+        pid = os.getpid()
+        self.assertFalse(procs.is_alive(pid, None))
+        self.assertFalse(procs.is_alive(pid))
+        # The weaker question has its own name, and answers honestly.
+        self.assertTrue(procs.is_running(pid))
+        self.assertFalse(procs.is_running(2 ** 22))
+
     def test_descendant_walk_reaches_a_grandchild(self) -> None:
         links = procs.parent_map()
         self.assertIn(os.getpid(), links)
         self.assertIn(os.getpid(), procs.descendants(links[os.getpid()], links))
+
+
+class CancelBeforeSpawnTests(OwnershipTestCase):
+    """A cancel that lands while the Job is still `reserved`."""
+
+    def test_a_cancel_seen_before_the_spawn_never_starts_the_command(self) -> None:
+        """`cancelled` is terminal, so nothing of the Job may run afterwards.
+
+        The worker's monitor can handle the cancel request after an empty tree
+        scan a moment before the spawn; without the spawn gate the command
+        then starts anyway and outlives a record that already says
+        ``cancelled``.  Provoked deterministically here by requesting the
+        cancel before the worker runs at all.
+        """
+        job_id = new_job_id()
+        marker = os.path.join(self.tmp.name, "the-command-ran")
+        self.store.write_spec(
+            job_id,
+            {
+                "jobId": job_id,
+                "key": "cancel-first",
+                "argv": ["sh", "-c", f"touch {marker}; sleep 300"],
+                "cwd": self.tmp.name,
+                "envNames": [],
+                "fingerprint": "fp",
+                "ackConcurrent": [],
+                "requestedAt": time.time(),
+            },
+        )
+        self.store.request_cancel(job_id, "test")
+
+        self.assertEqual(
+            jobs_worker.run_spawn(PROJECT_KEY, job_id, self.store.root), 0
+        )
+
+        record = self.store.load_record(job_id)
+        self.assertEqual(record["state"], STATE_CANCELLED)
+        self.assertTrue(record["cancelledBeforeSpawn"])
+        self.assertIsNone(record["exitCode"])
+        self.assertIsNone(record["startedAt"])
+        self.assertFalse(
+            os.path.exists(marker),
+            "the command ran despite a cancel recorded before the spawn",
+        )
 
 
 class SetsidEscapeeTests(OwnershipTestCase):

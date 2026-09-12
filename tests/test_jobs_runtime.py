@@ -43,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -157,6 +158,16 @@ class RuntimeTestCase(unittest.TestCase):
         make_package(self.host, version)
         return jobs_runtime.Source(jobs_runtime.SOURCE_HOST, self.host, version)
 
+    def temp_dirs(self) -> list[str]:
+        """The snapshot temp dirs currently under the versions root."""
+        try:
+            names = os.listdir(self.root)
+        except OSError:
+            return []
+        return sorted(
+            name for name in names if name.startswith(jobs_runtime.TEMP_PREFIX)
+        )
+
     def publish(self, version: str) -> jobs_runtime.Published:
         source = self.npm_source(version)
         result = jobs_runtime.snapshot(source, root=self.root, prober=ok_prober)
@@ -250,6 +261,103 @@ class SnapshotTests(RuntimeTestCase):
         self.assertIsNotNone(result.discarded)
         self.assertIn("turn.completed", result.discarded or "")
         self.assertEqual(jobs_runtime.published(self.root), {})
+
+    def test_probe_rejects_a_resume_that_never_states_its_thread(self) -> None:
+        """Thread continuity is proven, not assumed from a silent stream."""
+        source = self.npm_source("0.149.1")
+        binary = jobs_runtime.package_binary(source.path)
+        with open(binary, "w", encoding="utf-8") as fh:
+            # The first turn is a real recorded stream; the resume replies with
+            # a completed turn and no `thread.started` at all.
+            fh.write(
+                "#!/bin/bash\n"
+                'if [ "$1" = "--version" ]; then echo fake; exit 0; fi\n'
+                'prev=""; out=""\n'
+                'for arg in "$@"; do if [ "$prev" = "-o" ]; then out="$arg"; fi; '
+                'prev="$arg"; done\n'
+                '[ -n "$out" ] && printf "fake final message\\n" > "$out"\n'
+                'if [ "$2" = "resume" ]; then\n'
+                '  echo \'{"type":"turn.completed","usage":{}}\'\n'
+                "else\n"
+                f"  cat {fixture('codex-done.jsonl')!r}\n"
+                "fi\n"
+                "exit 0\n"
+            )
+        os.chmod(binary, 0o755)
+        result = jobs_runtime.snapshot(source, root=self.root)
+        self.assertIsNone(result.published)
+        self.assertIn("thread.started", result.discarded or "")
+        self.assertEqual(jobs_runtime.published(self.root), {})
+
+    def test_an_interrupted_snapshot_leaves_no_temp_dir(self) -> None:
+        """A snapshot temp dir is a whole package copy: never leak one.
+
+        An interruption in the middle of the copy or the probe is not a
+        handled return path, so only a ``finally`` can clean up after it.
+        """
+        source = self.npm_source("0.149.1")
+
+        def interrupted(src: str, dst: str) -> None:
+            jobs_runtime._copy_tree(src, dst)
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            jobs_runtime.snapshot(
+                source,
+                root=self.root,
+                prober=never_prober,
+                copy_tree=interrupted,
+            )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_a_stale_snapshot_dir_is_swept_on_the_next_attempt(self) -> None:
+        """Whatever an older interruption left behind goes on the next refresh."""
+        os.makedirs(self.root, exist_ok=True)
+        # A known Container run id: a dead pid is evidence of abandonment only
+        # for a temp dir this Container run owns (pid namespaces differ, and
+        # the versions volume is shared).
+        run_id_path = os.path.join(self.tmp.name, "run-id")
+        with open(run_id_path, "w", encoding="utf-8") as fh:
+            fh.write("run-sweep\n")
+        patcher = mock.patch.dict(
+            os.environ, {jobs_identity.RUN_ID_PATH_ENV: run_id_path}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Two leftovers: one whose owner pid of THIS Container run is dead,
+        # one with no owner marker at all and an old mtime.
+        dead = os.path.join(self.root, f"{jobs_runtime.TEMP_PREFIX}0.0.1-dead")
+        os.makedirs(dead)
+        owner = os.path.join(dead, jobs_runtime.OWNER_NAME)
+        with open(owner, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "pid": 2 ** 22,
+                    "startTime": 1,
+                    "containerRunId": jobs_identity.container_run_id(),
+                    "createdAt": time.time(),
+                },
+                fh,
+            )
+        old = os.path.join(self.root, f"{jobs_runtime.TEMP_PREFIX}0.0.2-old")
+        os.makedirs(old)
+        ancient = time.time() - 2 * jobs_runtime.STALE_SNAPSHOT_SECONDS
+        os.utime(old, (ancient, ancient))
+        # And one that is in flight right now: owned by this very process.
+        mine = os.path.join(self.root, f"{jobs_runtime.TEMP_PREFIX}0.0.3-mine")
+        os.makedirs(mine)
+        jobs_runtime._write_owner(mine)
+
+        source = self.npm_source("0.149.1")
+        result = jobs_runtime.snapshot(source, root=self.root, prober=ok_prober)
+        self.assertIsNotNone(result.published, result.discarded)
+        self.assertEqual(self.temp_dirs(), [os.path.basename(mine)])
+
+    def test_a_published_copy_carries_no_owner_marker(self) -> None:
+        entry = self.publish("0.149.1")
+        self.assertFalse(
+            os.path.exists(os.path.join(entry.path, jobs_runtime.OWNER_NAME))
+        )
 
     def test_source_changed_during_the_copy_is_discarded(self) -> None:
         """A concurrent `npm install -g @openai/codex`, simulated exactly."""
@@ -487,14 +595,41 @@ class PublishLockTests(RuntimeTestCase):
         self.assertEqual(list(entries), ["0.149.1"])
         self.assertTrue(entries["0.149.1"].verified)
         # One published copy, and no temp dir survived the race.
-        self.assertEqual(
-            [
-                name
-                for name in os.listdir(self.root)
-                if name.startswith(jobs_runtime.TEMP_PREFIX)
-            ],
-            [],
-        )
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_concurrent_pins_never_tear_the_shared_pin(self) -> None:
+        """Two `runtime use` calls are two writers of one shared file."""
+        self.publish("0.149.1")
+        self.publish("0.154.0")
+        versions = ["0.149.1", "0.154.0"]
+        errors: list[Exception] = []
+
+        def pin_repeatedly(version: str) -> None:
+            for _ in range(20):
+                try:
+                    jobs_runtime.pin(version, self.root)
+                    self.assertIn(jobs_runtime.read_pin(self.root), versions)
+                except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                    errors.append(exc)
+                    return
+
+        threads = [
+            threading.Thread(target=pin_repeatedly, args=(version,))
+            for version in versions
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertIn(jobs_runtime.read_pin(self.root), versions)
+        # No fixed `pin.tmp` and no leftover temp file of either writer.
+        leftovers = [
+            name
+            for name in os.listdir(self.root)
+            if name.endswith(".tmp") or jobs_runtime.PIN_NAME in name
+        ]
+        self.assertEqual(leftovers, [jobs_runtime.PIN_NAME])
 
 
 # ------------------------------------------------------------------- the CLI
@@ -563,6 +698,20 @@ class RuntimeCliTests(RuntimeTestCase):
         code, payload = self.run_cli(["runtime", "use", "--auto", "--json"])
         self.assertEqual(code, 0)
         self.assertIsNone(payload["pin"])
+        self.assertIsNone(jobs_runtime.read_pin(self.root))
+
+    def test_runtime_use_reports_a_pin_it_could_not_write(self) -> None:
+        """Shared state on a shared volume: a failure is a structured refusal."""
+        self.publish("0.149.1")
+        with mock.patch.object(
+            jobs_runtime,
+            "publish_lock",
+            side_effect=OSError("versions root is read-only"),
+        ):
+            code, payload = self.run_cli(["runtime", "use", "0.149.1", "--json"])
+        self.assertEqual(code, jobs_cli.EXIT_REFUSED)
+        self.assertEqual(payload["reason"], jobs_runtime.PinFailed.reason)
+        self.assertIn("read-only", payload["detail"])
         self.assertIsNone(jobs_runtime.read_pin(self.root))
 
     def test_runtime_use_refuses_an_unverified_version(self) -> None:

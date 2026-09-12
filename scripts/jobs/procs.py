@@ -36,6 +36,7 @@ from typing import Any, Iterable, Optional
 __all__ = [
     "JOB_ID_MARKER",
     "is_alive",
+    "is_running",
     "is_zombie",
     "identity_of",
     "marker_pids",
@@ -112,19 +113,35 @@ def process_comm(pid: int) -> str:
         return ""
 
 
+def is_running(pid: Optional[int]) -> bool:
+    """The weaker check: this pid exists and is not a zombie.
+
+    Deliberately NOT an identity: it says only that *something* is running
+    under this pid.  Valid for a pid observed a moment ago by a ``/proc`` scan
+    (which is where its own start time comes from anyway), never for a pid
+    remembered on a record.
+    """
+    if not pid or int(pid) in _NEVER:
+        return False
+    return process_start_time(int(pid)) is not None and not is_zombie(int(pid))
+
+
 def is_alive(pid: Optional[int], start_time: Optional[int] = None) -> bool:
     """Identity check: this pid exists *and* is still the same process.
 
-    Without a recorded start time this degrades to plain existence, which is
-    all a freshly observed pid can offer.
+    A pid alone is never an identity (ADR 0037 "Ownership by subreaper and
+    marker"), so **without a recorded start time the answer is False**: the
+    process is not verifiably alive, and an unverifiable claim must never make
+    Boxa kill a recycled pid, or attribute one and its descendants to a Job.
+    Existence alone is :func:`is_running`, which says so in its name.
     """
+    if start_time is None:
+        return False
     if not pid or int(pid) in _NEVER:
         return False
     current = process_start_time(int(pid))
     if current is None or is_zombie(int(pid)):
         return False
-    if start_time is None:
-        return True
     try:
         return current == int(start_time)
     except (TypeError, ValueError):
@@ -244,7 +261,9 @@ def tracked_pids(
     if worker_pid:
         sources.pop(int(worker_pid), None)
     # Zombies and processes that exited during the scan are not survivors.
-    return {pid: source for pid, source in sources.items() if is_alive(pid)}
+    # These pids were just read out of `/proc`, so existence is all the
+    # evidence there is to re-check — and all that is needed (`is_running`).
+    return {pid: source for pid, source in sources.items() if is_running(pid)}
 
 
 def signal_pids(pids: Iterable[int], sig: int) -> list[int]:
