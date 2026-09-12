@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"01a094e8-6fc8-77c3-bcd0-433d469d6850"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Spouštím `sleep 200`; ozvu se po dokončení."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'sleep 200'","aggregated_output":"","exit_code":null,"status":"in_progress"}}

@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"01a094e8-21fc-7641-beef-44dadd0b0235"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"PROOF04"}}
+{"type":"turn.completed","usage":{"input_tokens":20671,"cached_input_tokens":16128,"cache_write_input_tokens":0,"output_tokens":7,"reasoning_output_tokens":0}}

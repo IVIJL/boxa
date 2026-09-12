@@ -11,6 +11,8 @@ Layout, all under ``$XDG_STATE_HOME/boxa/jobs`` (default
             spec.json         # the request the worker was handed
             heartbeat         # touched by the worker while it waits
             stdout, stderr    # the command's output
+            events.jsonl      # a Codex job's stdout: its --json event stream
+            last.md           # a Codex job's final message (codex exec -o)
             worker.err        # the worker's own stderr (diagnosis only)
 
 Two writes carry the atomicity guarantees:
@@ -209,6 +211,19 @@ class ProjectStore:
 
     def worker_err_path(self, job_id: str) -> str:
         return os.path.join(self.job_dir(job_id), "worker.err")
+
+    def events_path(self, job_id: str) -> str:
+        """A Codex job's stdout: the ``codex exec --json`` event stream.
+
+        A Codex job's stdout *is* the event log, so it gets the name that says
+        so; ``boxa-job log`` tails it on demand and nothing else ever prints
+        it (ADR 0037: the result is an extract, never the log).
+        """
+        return os.path.join(self.job_dir(job_id), "events.jsonl")
+
+    def last_message_path(self, job_id: str) -> str:
+        """Where ``codex exec -o`` writes the run's final message."""
+        return os.path.join(self.job_dir(job_id), "last.md")
 
     def cancel_path(self, job_id: str) -> str:
         """The cancel REQUEST file: ``cancel`` writes it, the worker obeys it.

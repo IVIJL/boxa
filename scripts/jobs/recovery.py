@@ -34,6 +34,7 @@ import signal
 import time
 from typing import Any, Optional
 
+from . import codex
 from . import procs
 from .identity import container_run_id
 from .store import (
@@ -156,6 +157,25 @@ def _finalize_without_worker(
         )
     exit_code = record.get("exitCode")
     if exit_code is not None:
+        codex_spec = record.get("codexRequest")
+        if codex_spec:
+            # A Codex job's exit code is not the whole truth: a killed
+            # `codex exec` exits 0 with no terminal event, so the stream has
+            # to be read before this is called `done` (issue 04).
+            finished = codex.finish(
+                store.events_path(job_id),
+                store.last_message_path(job_id),
+                codex_spec,
+                exit_code,
+            )
+            return store.update_record(
+                job_id,
+                state=finished.state,
+                codex=finished.extract,
+                codexReason=finished.reason,
+                finishedAt=record.get("finishedAt") or time.time(),
+                survivors=[],
+            )
         return store.update_record(
             job_id,
             state=STATE_DONE if exit_code == 0 else STATE_FAILED,

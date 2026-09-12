@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a094e8-21fc-7641-beef-44dadd0b0235"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Vytvořím požadovaný soubor s přesným obsahem."}}
+{"type":"item.started","item":{"id":"item_1","type":"file_change","changes":[{"path":"/tmp/boxa-jobs-proof04.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"/tmp/boxa-jobs-proof04.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":33767,"cached_input_tokens":26112,"cache_write_input_tokens":0,"output_tokens":96,"reasoning_output_tokens":16}}

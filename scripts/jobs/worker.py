@@ -44,6 +44,7 @@ import threading
 import time
 from typing import Any, Optional
 
+from . import codex as codex_mod
 from . import procs
 from .env import child_env
 from .identity import container_run_id
@@ -95,14 +96,41 @@ class _Monitor(threading.Thread):
     record every two seconds.
     """
 
-    def __init__(self, store: ProjectStore, job_id: str, worker_pid: int) -> None:
+    def __init__(
+        self,
+        store: ProjectStore,
+        job_id: str,
+        worker_pid: int,
+        events_path: Optional[str] = None,
+    ) -> None:
         super().__init__(daemon=True)
         self.store = store
         self.job_id = job_id
         self.worker_pid = worker_pid
+        # Set for a Codex job: the event stream to pick the thread id out of.
+        self.events_path = events_path
+        self.thread_id: Optional[str] = None
         self.stop = threading.Event()
         self.cancel_seen = threading.Event()
         self._last_pids: set[int] = set()
+
+    def _record_thread_id(self) -> None:
+        """Publish a Codex job's thread id as soon as the stream states it.
+
+        On the record mid-run, not at the end: the caller's `reply` needs the
+        thread id of a Job that is still working, and `result` should show it
+        while the turn is in flight.
+        """
+        if self.events_path is None or self.thread_id is not None:
+            return
+        thread_id = codex_mod.thread_id_of(self.events_path)
+        if not thread_id:
+            return
+        self.thread_id = thread_id
+        record = self.store.load_record(self.job_id) or {}
+        block = dict(record.get("codex") or {})
+        block["threadId"] = thread_id
+        self.store.update_record(self.job_id, threadId=thread_id, codex=block)
 
     def tracked(self) -> dict[int, str]:
         return procs.tracked_pids(
@@ -134,6 +162,10 @@ class _Monitor(threading.Thread):
             try:
                 self._record_tree(set(self.tracked()))
             except OSError:
+                pass
+            try:
+                self._record_thread_id()
+            except Exception:  # noqa: BLE001 - bookkeeping never kills the Job
                 pass
             if not self.cancel_seen.is_set() and self.store.cancel_requested(
                 self.job_id
@@ -228,6 +260,13 @@ def run_spawn(project_key: str, job_id: str, root: Optional[str] = None) -> int:
     argv = list(spec["argv"])
     cwd = spec["cwd"]
     env_names = list(spec.get("envNames", []))
+    # A Codex job (issue 04): stdout IS the `codex exec --json` event stream,
+    # so it goes to `events.jsonl` and the outcome is derived from it rather
+    # than from the exit code alone.
+    codex_spec = spec.get("codex") or None
+    out_path = (
+        store.events_path(job_id) if codex_spec else store.stdout_path(job_id)
+    )
 
     worker_pid = os.getpid()
     record = {
@@ -257,12 +296,23 @@ def run_spawn(project_key: str, job_id: str, root: Optional[str] = None) -> int:
         "survivors": [],
         "paths": {
             "record": store.record_path(job_id),
-            "stdout": store.stdout_path(job_id),
+            "stdout": out_path,
             "stderr": store.stderr_path(job_id),
             "heartbeat": store.heartbeat_path(job_id),
             "workerStderr": store.worker_err_path(job_id),
         },
     }
+    if codex_spec:
+        record["paths"]["events"] = store.events_path(job_id)
+        record["paths"]["lastMessage"] = store.last_message_path(job_id)
+        # `codexRequest` is what was ASKED (model, effort, version, binary,
+        # parent Job); `codex` is what HAPPENED, filled in as the stream says
+        # it — starting with the thread id for a `reply` (already known) and
+        # None for a fresh thread.
+        record["codexRequest"] = dict(codex_spec)
+        record["threadId"] = codex_spec.get("threadId")
+        record["parentJobId"] = codex_spec.get("parentJobId")
+        record["codex"] = {"threadId": codex_spec.get("threadId")}
 
     try:
         store.publish_reservation(key, record)
@@ -273,14 +323,19 @@ def run_spawn(project_key: str, job_id: str, root: Optional[str] = None) -> int:
         return 3
 
     store.touch_heartbeat(job_id)
-    monitor = _Monitor(store, job_id, worker_pid)
+    monitor = _Monitor(
+        store,
+        job_id,
+        worker_pid,
+        events_path=store.events_path(job_id) if codex_spec else None,
+    )
     monitor.start()
 
     # The worker must not die with the terminal that started it.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     try:
-        with open(store.stdout_path(job_id), "wb") as out, open(
+        with open(out_path, "wb") as out, open(
             store.stderr_path(job_id), "wb"
         ) as err:
             try:
@@ -319,15 +374,52 @@ def run_spawn(project_key: str, job_id: str, root: Optional[str] = None) -> int:
         monitor.stop.set()
         monitor.join(timeout=HEARTBEAT_INTERVAL + 1.0)
 
-    store.update_record(
-        job_id,
-        state=_final_state(store, job_id, exit_code),
-        exitCode=exit_code,
-        finishedAt=_now(),
-        survivors=survivors,
-    )
+    changes: dict[str, Any] = {
+        "state": _final_state(store, job_id, exit_code),
+        "exitCode": exit_code,
+        "finishedAt": _now(),
+        "survivors": survivors,
+    }
+    if codex_spec:
+        changes.update(_codex_changes(store, job_id, codex_spec, exit_code))
+    store.update_record(job_id, **changes)
     store.touch_heartbeat(job_id)
     return 0
+
+
+def _codex_changes(
+    store: ProjectStore,
+    job_id: str,
+    codex_spec: dict[str, Any],
+    exit_code: Optional[int],
+) -> dict[str, Any]:
+    """State and result extract for a Codex job, derived from its stream.
+
+    The plain-command state is not enough here: a SIGTERM'ed ``codex exec``
+    exits 0 without a terminal event, so ``exit == 0`` alone would call a
+    killed run ``done``.  Where the exit code is unknown at all (the worker
+    died) the stream's terminal event is recorded as *evidence* on the record
+    while the state stays ``finished-unknown`` — the ADR's rule, spelled out
+    in :func:`jobs.codex.derive_outcome`.
+    """
+    result = codex_mod.finish(
+        store.events_path(job_id),
+        store.last_message_path(job_id),
+        codex_spec,
+        exit_code,
+        cancel_requested=store.cancel_requested(job_id),
+    )
+    changes: dict[str, Any] = {
+        "state": result.state,
+        "codex": result.extract,
+    }
+    if result.extract.get("threadId"):
+        changes["threadId"] = result.extract["threadId"]
+    if result.error:
+        changes["error"] = result.error
+    if result.reason:
+        changes["codexReason"] = result.reason
+    return changes
 
 
 def run_watch(project_key: str, job_id: str, root: Optional[str] = None) -> int:
@@ -359,7 +451,14 @@ def run_watch(project_key: str, job_id: str, root: Optional[str] = None) -> int:
         },
     )
     store.touch_heartbeat(job_id)
-    monitor = _Monitor(store, job_id, worker_pid)
+    monitor = _Monitor(
+        store,
+        job_id,
+        worker_pid,
+        events_path=(
+            store.events_path(job_id) if record.get("codexRequest") else None
+        ),
+    )
     monitor.start()
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     exit_code = record.get("exitCode")
@@ -370,12 +469,17 @@ def run_watch(project_key: str, job_id: str, root: Optional[str] = None) -> int:
     finally:
         monitor.stop.set()
         monitor.join(timeout=HEARTBEAT_INTERVAL + 1.0)
-    store.update_record(
-        job_id,
-        state=_final_state(store, job_id, exit_code),
-        finishedAt=_now(),
-        survivors=survivors,
-    )
+    changes: dict[str, Any] = {
+        "state": _final_state(store, job_id, exit_code),
+        "finishedAt": _now(),
+        "survivors": survivors,
+    }
+    codex_spec = record.get("codexRequest")
+    if codex_spec:
+        # No exit code was ever held here, so the terminal event lands on the
+        # record as evidence and the state stays `finished-unknown`.
+        changes.update(_codex_changes(store, job_id, codex_spec, exit_code))
+    store.update_record(job_id, **changes)
     store.touch_heartbeat(job_id)
     return 0
 
