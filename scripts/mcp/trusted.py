@@ -175,6 +175,36 @@ def path_is_socket(path: str) -> bool:
         return False
 
 
+def agent_baseline_env(
+    *, socket_probe: Callable[[str], bool] = path_is_socket
+) -> dict[str, str]:
+    """The fixed, caller-independent environment an agent-trusted child gets.
+
+    Deliberately does NOT inherit the invoking process's environment: only
+    this known-good set, plus ``DOCKER_HOST`` / ``SSH_AUTH_SOCK`` when their
+    sockets actually exist.  ADR 0037's Job worker builds its children's
+    environment from the very same baseline, so this is the single definition
+    both the MCP launcher and ``boxa-job`` use.
+    """
+    env = {
+        "HOME": AGENT_HOME,
+        "USER": "node",
+        "LOGNAME": "node",
+        "PATH": AGENT_PATH,
+        "XDG_CONFIG_HOME": f"{AGENT_HOME}/.config",
+        "XDG_CACHE_HOME": f"{AGENT_HOME}/.cache",
+        "XDG_DATA_HOME": f"{AGENT_HOME}/.local/share",
+        "XDG_STATE_HOME": f"{AGENT_HOME}/.local/state",
+        "XDG_RUNTIME_DIR": AGENT_RUNTIME,
+        "NPM_CONFIG_PREFIX": "/usr/local/share/npm-global",
+    }
+    if socket_probe(DOCKER_SOCKET):
+        env["DOCKER_HOST"] = f"unix://{DOCKER_SOCKET}"
+    if socket_probe(SSH_SOCKET):
+        env["SSH_AUTH_SOCK"] = SSH_SOCKET
+    return env
+
+
 def build_launch_plan(
     entry: dict[str, Any],
     catalog_id: str,
@@ -208,22 +238,7 @@ def build_launch_plan(
         not isinstance(value, str) for value in argv
     ):
         raise TrustedAuthorizationError("agent-trusted entry argv is malformed")
-    env = {
-        "HOME": AGENT_HOME,
-        "USER": "node",
-        "LOGNAME": "node",
-        "PATH": AGENT_PATH,
-        "XDG_CONFIG_HOME": f"{AGENT_HOME}/.config",
-        "XDG_CACHE_HOME": f"{AGENT_HOME}/.cache",
-        "XDG_DATA_HOME": f"{AGENT_HOME}/.local/share",
-        "XDG_STATE_HOME": f"{AGENT_HOME}/.local/state",
-        "XDG_RUNTIME_DIR": AGENT_RUNTIME,
-        "NPM_CONFIG_PREFIX": "/usr/local/share/npm-global",
-    }
-    if socket_probe(DOCKER_SOCKET):
-        env["DOCKER_HOST"] = f"unix://{DOCKER_SOCKET}"
-    if socket_probe(SSH_SOCKET):
-        env["SSH_AUTH_SOCK"] = SSH_SOCKET
+    env = agent_baseline_env(socket_probe=socket_probe)
     env.update({str(key): str(value) for key, value in declared_env.items()})
     return {
         "executionMode": "agent-trusted",

@@ -7,13 +7,14 @@ local PRDs, issues and handoffs; GitHub Issues is not used for Boxa work.
 
 ### Active
 
-None.
+| Feature | Artifact | Next action | Last reviewed |
+| ------- | -------- | ----------- | ------------- |
+| boxa-jobs | `boxa-jobs/KICKOFF.md` | AFK batch (Prompt A) running in-Container: issue 01 in-progress; chain 01→07, then final review, HANDOFF.md for host proofs (05/06) and 08/09. | 2026-09-12 |
 
 ### Planned
 
 | Feature | Artifact | Next action | Last reviewed |
 | ------- | -------- | ----------- | ------------- |
-| boxa-jobs | `boxa-jobs/KICKOFF.md` | Run Prompt A (`/afk-feature-workflow`) inside a Container for issues 01–07; host session (Prompt B) executes host proofs for 05/06, then 08 and 09. ADR 0037 proposed → accepted with 01. | 2026-09-12 |
 | Forge access broker | `forge-access-broker/NOTES.md` | Grill the `glab`, `gh` and Git transport threat model, then decide whether to create a PRD. | 2026-08-28 |
 | Memory-pressure livelock | `memory-pressure-livelock/PRD.md` | Grill the PRD and validate nested-cgroup feasibility before splitting it into issues. | 2026-08-28 |
 

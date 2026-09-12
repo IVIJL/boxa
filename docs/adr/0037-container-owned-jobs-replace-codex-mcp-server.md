@@ -1,6 +1,6 @@
 # ADR 0037 — Container-owned Jobs replace `codex mcp-server`
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-12
 - **Revises:** ADR 0021's `codex-delegate` catalog seed (`codex mcp-server`)
 

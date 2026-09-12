@@ -392,6 +392,13 @@ COPY lib/allow-for.sh /usr/local/share/boxa/lib/allow-for.sh
 # validates required env without logging values, and execs the MCP command.
 COPY scripts/mcp/ /usr/local/share/boxa/mcp/
 COPY scripts/mcp-run.sh /usr/local/bin/boxa-mcp-run
+# Container-owned Jobs (ADR 0037, issue 01). Same shape as boxa-mcp-run: the
+# boxa-job wrapper on PATH resolves `import jobs` from the package at the
+# fixed share dir (and `import mcp` beside it, for the shared worker
+# environment baseline), so it runs from any CWD. Agents use it to run long
+# work whose lifetime belongs to the Container, not to their shell call.
+COPY scripts/jobs/ /usr/local/share/boxa/jobs/
+COPY scripts/job.sh /usr/local/bin/boxa-job
 # Container MCP broker launcher (ADR 0014, issue 15). Runs the Python broker as
 # boxa-mcp (started from the entrypoint root phase before the node drop).
 COPY scripts/mcp-broker.sh /usr/local/bin/boxa-mcp-broker
@@ -468,6 +475,7 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/setup-chezmoi.sh \
     /usr/local/bin/stop-host-connection-allow \
     /usr/local/bin/agent-browser \
     /usr/local/bin/boxa-mcp-run \
+    /usr/local/bin/boxa-job \
     /usr/local/bin/boxa-mcp-broker \
     /usr/local/bin/mcp-broker-namespace \
     /usr/local/bin/stage-mcp-secrets \
