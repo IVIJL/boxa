@@ -20,7 +20,6 @@ None.
 
 | Feature | Artifact | Next action | Last reviewed |
 | ------- | -------- | ----------- | ------------- |
-| boxa-jobs | `boxa-jobs/HANDOFF.md` | Issues 01–07 done and final Codex review clean (11 commits fb7dbb9..575b9d0, unpushed). Host session (Prompt B): `boxa build`, restart, run host proofs for 05/06/07 from HANDOFF.md, then issues 08 and 09. | 2026-09-12 |
 | glab config seeding | `glab-config-seeding/issues/03-live-proof-docs-adr-note.md` | Issues 01+02 done, 03 docs landed; final Codex review clean apart from declined YAML hardening (recorded in issue 02). On the host: rebuild the image, then `boxa stop --clean playground && boxa` and the plain-restart test per issue 03; record redacted `glab auth status` / `glab api user` output, set 03 to `done`, archive the feature. | 2026-09-03 |
 | Keep-awake during long-running agent work | `keep-awake-long-running-agent/issues/01-long-running-agent-awake-lease.md` | Host refreshed; live container verification passed after fixing owner detection for versioned Claude binaries + test-suite state leakage (uncommitted). Review/commit the fix (`/cr`), sync the container hook, then run the recorded live WSL soak; on pass promote the issue to `done` and archive the feature. | 2026-08-29 |
 
@@ -62,8 +61,8 @@ the implementation.
   in its slice commit, runs one final whole-feature review, then archives the
   feature in a final closeout commit. Explicit invocation authorizes those
   commits, never push.
-- `ccode` uses the runtime's delegation backend (Claude → Codex MCP, Codex →
-  native Codex subagent). Issue-backed work becomes `in-progress` and stays
+- `ccode` uses the runtime's delegation backend (Claude → a `boxa-job` Codex
+  job inside the Container, ADR 0037; Codex → native Codex subagent). Issue-backed work becomes `in-progress` and stays
   Active because `ccode` does not review or commit.
 - `/cr` / `review-fix-commit` finishes issue-backed `ccode` work: after clean
   review and proof it updates the issue/dashboard, archives a completed feature,

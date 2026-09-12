@@ -20,7 +20,7 @@ Host proof (docker-run.sh mount changes, Container restart) is performed by the 
 - [x] Unit tests: manifest diff → discard; hash mismatch → discard; probe failure → previous version stays, warning emitted; `runtime use` pins; publish lock contention.
 - [x] Test: `npm install` rewriting the source during the copy (simulated by mutating files mid-copy) → copy discarded, previous runtime in use, nothing published.
 - [x] In-Container proof: first Codex job after a version change snapshots + probes once; second job reuses the copy (no probe); `runtime list` shows both versions.
-- [ ] Host proof (user): after the docker-run.sh change and a Container restart, the host package appears read-only in the Container and a Codex job runs from `boxa-codex-versions/<host version>/` while interactive `codex` still reports the npm-volume version.
+- [x] Host proof (user): after the docker-run.sh change and a Container restart, the host package appears read-only in the Container and a Codex job runs from `boxa-codex-versions/<host version>/` while interactive `codex` still reports the npm-volume version.
 - [x] shellcheck clean.
 
 ## Blocked by
@@ -170,3 +170,24 @@ runtimes are separate, which is the point of the whole slice.
 - The probe reuses `codex.start_argv`/`resume_argv`, so it exercises the exact
   argv a Job gets, and runs under the same `env.baseline_env()` a Job gets.
 - macOS verification is deferred: `.scratch/mac/boxa-jobs/README.md`.
+
+### 2026-09-12 — host proof (Prompt B, host session)
+
+Image rebuilt by the user (`a4dfbb5e5493`), `boxa stop boxa && boxa` on the WSL
+host. Host `codex` = 0.154.0 (`~/.nvm/versions/node/v24.15.0/lib/node_modules/@openai/codex`).
+
+- `docker inspect`: `boxa-codex-versions` volume at `/usr/local/share/boxa-codex-versions`
+  (rw), host package bind at `/run/boxa-codex-host-pkg` with `rw=false`.
+- Inside: `touch /run/boxa-codex-host-pkg/x` → "Read-only file system";
+  `package.json` there says 0.154.0; the versions dir is `node:node` after the
+  new entrypoint (before the rebuild it was root-owned and `boxa-job` failed
+  with PermissionError, as the handoff predicted).
+- `boxa-job runtime list` before the first job: `0.154.0 unverified sources=host-mount`,
+  `0.149.1 unverified sources=npm-volume`.
+- `./scripts/job.sh start --key host-proof --codex --model gpt-5.6-luna --effort low --json`:
+  `runtimeProbed: true`, `runtimeSource: host-mount`, `codexVersion: 0.154.0`,
+  `codexBinary: /usr/local/share/boxa-codex-versions/0.154.0/package/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex`.
+  `wait` → `state: done`, `finalMessage: "HOST"`.
+- Afterwards `runtime list` marks `* 0.154.0 verified`, the `0.154.0/` dir is
+  `dr-xr-xr-x node`, `publish.lock` present. Interactive `codex --version`
+  still prints `codex-cli 0.149.1` (npm volume).

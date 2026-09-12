@@ -288,7 +288,34 @@ class ProjectStore:
     # ---------------------------------------------------------------- layout
 
     def ensure(self) -> None:
-        os.makedirs(self.keys_dir, mode=0o700, exist_ok=True)
+        """Create the Project's state tree, or say plainly why it cannot.
+
+        The tree lives on the per-Project ``boxa-<project>-jobs`` volume, which
+        the entrypoint chowns to ``node`` at Container start (issue 06). A
+        root-owned or read-only tree (Container started from an image older
+        than that entrypoint, a stray ``docker volume``) is a setup problem
+        that every subcommand hits first, so name it instead of tracing back.
+        """
+        try:
+            os.makedirs(self.keys_dir, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise JobStoreError(self._unusable(f"cannot create {self.dir}", exc)) from exc
+        # An existing but foreign-owned tree passes makedirs(exist_ok=True) and
+        # would fail one step later, on the lock or the first record dir. Only
+        # the Project dir is checked: a read-only key index alone is a
+        # documented, softer refusal (`key-index-unwritable`) of `start`.
+        if not os.access(self.dir, os.W_OK | os.X_OK):
+            raise JobStoreError(self._unusable(f"{self.dir} is not writable", None))
+
+    @staticmethod
+    def _unusable(what: str, exc: Optional[OSError]) -> str:
+        detail = f": {exc.strerror or exc}" if exc is not None else ""
+        return (
+            f"Job state directory unusable, {what}{detail} (the boxa-<project>-jobs "
+            "volume must be writable by the Container user; the entrypoint chowns "
+            "it at start, so a Container from an older image or a hand-made volume "
+            "needs a restart on the current image)"
+        )
 
     def job_dir(self, job_id: str) -> str:
         return os.path.join(self.dir, job_id)
@@ -369,7 +396,12 @@ class ProjectStore:
         empty Project.  The lock is released before the command runs.
         """
         self.ensure()
-        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as exc:
+            raise JobStoreError(
+                self._unusable(f"cannot open the Project lock {self.lock_path}", exc)
+            ) from exc
         deadline = time.time() + timeout
         try:
             while True:

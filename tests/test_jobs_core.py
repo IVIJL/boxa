@@ -25,6 +25,7 @@ What is load-bearing here and therefore tested directly:
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -933,6 +934,49 @@ class IdentityTests(JobsTestCase):
         self.assertEqual(
             jobs_identity.container_run_id(), jobs_identity.UNKNOWN_RUN_ID
         )
+
+
+class StateDirectoryTests(JobsTestCase):
+    """An unusable state tree is a setup error with a message, not a traceback."""
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory modes")
+    def test_unwritable_state_root_is_a_named_refusal(self) -> None:
+        root = os.path.join(self.tmp.name, "ro-state")
+        os.makedirs(root)
+        os.chmod(root, 0o500)
+        self.addCleanup(os.chmod, root, 0o700)
+        store = ProjectStore(PROJECT_KEY, root)
+        with self.assertRaises(jobs_store.JobStoreError) as caught:
+            store.ensure()
+        self.assertIn("Job state directory unusable", str(caught.exception))
+        self.assertIn("boxa-<project>-jobs", str(caught.exception))
+        # Through the CLI the same failure is a one-line stderr message and the
+        # usual "unclear" exit, exactly like any other JobStoreError.
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": root}), \
+                mock.patch.object(jobs_store, "state_root", return_value=root):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code, out = _run_cli("list")
+        self.assertEqual(code, jobs_cli.EXIT_UNCLEAR)
+        self.assertEqual(out, "")
+        self.assertIn("boxa-job: Job state directory unusable", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory modes")
+    def test_existing_foreign_owned_tree_is_refused_before_the_lock(self) -> None:
+        # The tree exists (as a root-owned volume would), so makedirs(exist_ok)
+        # is happy; ensure() must still refuse, and so must the lock path.
+        root = os.path.join(self.tmp.name, "foreign-state")
+        store = ProjectStore(PROJECT_KEY, root)
+        os.makedirs(store.keys_dir)
+        os.chmod(store.dir, 0o500)
+        self.addCleanup(os.chmod, store.dir, 0o700)
+        with self.assertRaises(jobs_store.JobStoreError) as caught:
+            store.ensure()
+        self.assertIn("is not writable", str(caught.exception))
+        with self.assertRaises(jobs_store.JobStoreError):
+            with store.lock():
+                pass
 
 
 if __name__ == "__main__":

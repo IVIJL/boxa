@@ -17,8 +17,8 @@ Host proof (docker-run.sh volume, `boxa stop`/restart, `boxa remove`) is perform
 ## Acceptance criteria
 
 - [x] Unit tests: gc keeps records and active Jobs, deletes only old bulky files; `--purge` removes records; dry-run touches nothing.
-- [ ] Host proof (user): stop + start the Container → a Job that was running shows `interrupted`, its record and logs are still readable, `start` with the same key without `--fresh` returns it rather than re-running.
-- [ ] Host proof (user): `boxa remove` deletes the volume; a fresh Container starts with an empty Job list.
+- [x] Host proof (user): stop + start the Container → a Job that was running shows `interrupted`, its record and logs are still readable, `start` with the same key without `--fresh` returns it rather than re-running.
+- [x] Host proof (user): `boxa remove` deletes the volume; a fresh Container starts with an empty Job list.
 - [x] shellcheck clean.
 
 ## Blocked by
@@ -145,3 +145,31 @@ Container's own Job state. Use a throwaway Project:
 
 `boxa stop --clean <project>` removes the same volume through the same suffix
 list.
+
+### 2026-09-12 — host proof (Prompt B, host session)
+
+Rebuilt image `a4dfbb5e5493`, WSL host.
+
+**Restart interruption.** `mount | grep state/boxa/jobs` → `/dev/sdd on
+/home/node/.local/state/boxa/jobs type ext4 (rw)`; the dir is `node:node`
+(`docker inspect` shows the `boxa-boxa-jobs` volume). `./scripts/job.sh start
+--key restart-proof -- sleep 600` → `20260912T174716-dykwm3 running`. Then
+`boxa stop boxa && boxa` (run-id changed `…-47ee5767dd0b2577` →
+`…-d74e59e9f79be6b0`). Afterwards:
+
+- `list` still shows the same jobId as `interrupted`.
+- `result` → `state: interrupted`, `interruptedReason: container-restart`,
+  `exitCode: null`.
+- `log --tail 3` → "no output recorded for this Job yet" (rc 0; `sleep`
+  writes nothing, the record and log paths are readable).
+- `start --key restart-proof -- sleep 600` → returns the same record with
+  `reason: key-interrupted`, exit 4, no new run.
+- `cancel` → `state: cancelled`, `killed: none`; the key is free again.
+
+**Volume removal.** Throwaway Project `~/Projekty/throwaway-jobs-proof`:
+after `boxa <path>` the volume `boxa-throwaway-jobs-proof-jobs` exists and a
+`boxa-job start --key t -- true` shows `done`. `boxa stop` + `boxa remove
+throwaway-jobs-proof` prints `Removed volume: boxa-throwaway-jobs-proof-jobs`
+(among history/docker/gh/glab), `docker volume ls` no longer lists it. A fresh
+`boxa <path>` → `boxa-job list` → "no jobs in this Project". Throwaway Project
+removed again afterwards; only `boxa-boxa-jobs` remains.

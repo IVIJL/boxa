@@ -410,3 +410,32 @@ ran `boxa-job` any more than the Job's command does (ADR 0037 § "Worker
 environment"). Its `PYTHONPATH` is built, not merged: exactly the directory
 the `jobs` package was imported from, never the caller's value, which could
 otherwise shadow what the worker imports.
+
+## Release gate
+
+Run the acceptance script inside a Container with the real `boxa-job` on `PATH`.
+It drives real processes, state, and Codex runtime snapshots for ADR 0037.
+
+```sh
+python3 tests/jobs_gate.py short [--out FILE]
+```
+
+`short` runs scenarios 3–6 and normally finishes in under 15 minutes.
+Scenario 4 uses the documented `BOXA_JOB_CODEX_*` seams on a temporary versions root.
+It never changes the shared `boxa-codex-versions` volume.
+Scenario 5 covers a Container restart and cannot be driven from inside.
+Prove scenario 5 by hand on the host; the script records that limitation.
+
+```sh
+python3 tests/jobs_gate.py long start [--hours HOURS] [--model MODEL]
+python3 tests/jobs_gate.py long attach
+python3 tests/jobs_gate.py long report JOB_ID [--out FILE] [--measure KEY=VALUE]
+```
+
+`long start` starts the two-hour Codex job and prints its `jobId` and key.
+`long start` writes its parameters to `.scratch/tmp/jobs-gate-long.json`; `long attach` reconnects from them with the same key and prompt and must not start a second Job.
+`long report` records the finished Job and optional waiting-agent measurements.
+Results default to `.scratch/boxa-jobs/GATE-<date>.md`.
+Short-run keys use the `gate/<stamp>/` prefix and the long-run key is `gate/long/two-hour`.
+Use `--out` when the results file should be written elsewhere.
+The gate never purges its own records; they stay as evidence until you run `boxa-job gc --purge`.

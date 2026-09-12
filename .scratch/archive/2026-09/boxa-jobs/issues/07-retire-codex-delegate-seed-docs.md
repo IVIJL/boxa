@@ -127,3 +127,19 @@ The rendered text itself is proven by the tests above; what remains unproven
 from inside is only that the real `boxa` entry point reaches the step (asserted
 statically against the doctor mode block).
 
+
+### 2026-09-12 — host verification (Prompt B, host session)
+
+Run on the WSL host with the installed copy at `451e3c4` and the old
+`codex-delegate` catalog entry still present (kept on purpose until issue 09).
+
+- `boxa doctor`: prints the WARNING block ("MCP catalog entry 'codex-delegate'
+  runs 'codex mcp-server', which current Codex releases no longer provide …
+  Remove it with: boxa mcp remove codex-delegate") between the keep-awake
+  section and "Host provisioning is healthy."
+- `boxa mcp status` and `boxa mcp status --project ~/Projekty/boxa`: the same
+  block after the table; the entry itself still lists as `ready / activated`.
+- `boxa update`: "Already up to date. No changes, skipping rebuild." and no
+  codex-delegate seed offer.
+
+`boxa mcp remove codex-delegate` deliberately not run yet (interim state).
