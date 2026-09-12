@@ -8,6 +8,7 @@ Layout, all under ``$XDG_STATE_HOME/boxa/jobs`` (default
         keys/<key-hash>       # the key RESERVATION: link-published, immutable
         <jobId>/
             record.json       # the live Job record (atomic temp+rename)
+            record.lock       # flock around one record read-modify-write
             spec.json         # the request the worker was handed
             heartbeat         # touched by the worker while it waits
             stdout, stderr    # the command's output
@@ -29,7 +30,10 @@ Two writes carry the atomicity guarantees:
     :func:`os.replace`-d over ``record.json``, so a reader never sees a torn
     record.  That breaks the hard link, which is intended: ``keys/<key-hash>``
     keeps the immutable reservation (its jobId is what the index lookup
-    needs), ``record.json`` carries the live state.
+    needs), ``record.json`` carries the live state.  The merge that precedes
+    the rename is a read-modify-write and runs under ``record.lock``, so two
+    processes (the worker, ``cancel``, a lazy refresh, gc) cannot each publish
+    a copy read before the other's write.
 """
 
 from __future__ import annotations
@@ -116,10 +120,24 @@ _ID_ALPHABET = string.ascii_lowercase + string.digits
 # In-process guard for the record's read-modify-write. The Job worker updates
 # its record from two threads (the main wait and the heartbeat/tree monitor),
 # and without this one of them could merge its change into a stale copy and
-# silently revert the other's state change. Cross-process writers are still
-# last-writer-wins by design: they only ever converge on the same terminal
-# state (a cancel written twice is still a cancel).
+# silently revert the other's state change.
 _RECORD_WRITE_LOCK = threading.RLock()
+
+# Cross-process guard for the same read-modify-write. The writers are separate
+# processes — the worker finalizing, `cancel`, the lazy `refresh_states` of any
+# CLI call, and gc writing its `gcAt` — and a merge into a stale copy would
+# silently revert someone else's change (a `cancelled` record reverted to
+# `interrupted` by a gc sweep that read it a moment earlier). The Project lock
+# is the wrong instrument here: it guards registration and is never held for
+# the length of a sweep, so every record carries its own `flock`, taken inside
+# the in-process lock so the worker's two threads never race for it.
+RECORD_LOCK_NAME = "record.lock"
+
+# Nesting depth of the record lock per lock path, so a caller already holding
+# it can call `update_record` without blocking against its own `flock` (which
+# is per open file description, not per process). Only ever touched while
+# `_RECORD_WRITE_LOCK` is held, so it is this thread's depth by construction.
+_RECORD_LOCK_DEPTH: dict[str, int] = {}
 
 
 class JobStoreError(RuntimeError):
@@ -244,6 +262,9 @@ class ProjectStore:
     def cancel_requested(self, job_id: str) -> bool:
         return os.path.exists(self.cancel_path(job_id))
 
+    def record_lock_path(self, job_id: str) -> str:
+        return os.path.join(self.job_dir(job_id), RECORD_LOCK_NAME)
+
     def key_path(self, key: str) -> str:
         return os.path.join(self.keys_dir, _key_hash(key))
 
@@ -335,9 +356,69 @@ class ProjectStore:
         finally:
             os.unlink(tmp)
 
-    def update_record(self, job_id: str, **changes: Any) -> dict[str, Any]:
-        """Atomically merge ``changes`` into the live record (temp+rename)."""
+    @contextmanager
+    def record_lock(self, job_id: str, timeout: float = 30.0) -> Iterator[None]:
+        """Per-record ``flock`` around one read-modify-write.
+
+        Held for the merge only (read, update, rename), never for any work.
+        A missing Job directory is not an error here: the caller's
+        :meth:`update_record` is about to fail with a clear message instead.
+
+        Re-entrant, and it has to be: ``flock`` is per open file description,
+        so a caller that already holds this record's lock and then calls
+        :meth:`update_record` would block against itself.  The in-process
+        ``RLock`` is held for the whole body, so the nesting depth below is
+        only ever this thread's.
+        """
+        path = self.record_lock_path(job_id)
         with _RECORD_WRITE_LOCK:
+            held = _RECORD_LOCK_DEPTH.get(path, 0)
+            if held:
+                _RECORD_LOCK_DEPTH[path] = held + 1
+                try:
+                    yield
+                finally:
+                    _RECORD_LOCK_DEPTH[path] = held
+                return
+            try:
+                fd = os.open(
+                    self.record_lock_path(job_id), os.O_RDWR | os.O_CREAT, 0o600
+                )
+            except OSError:
+                yield
+                return
+            deadline = time.time() + timeout
+            try:
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                            raise
+                        if time.time() >= deadline:
+                            raise JobStoreError(
+                                "timed out waiting for the record lock of "
+                                f"{job_id}"
+                            ) from exc
+                        time.sleep(0.02)
+                _RECORD_LOCK_DEPTH[path] = 1
+                try:
+                    yield
+                finally:
+                    _RECORD_LOCK_DEPTH.pop(path, None)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def update_record(self, job_id: str, **changes: Any) -> dict[str, Any]:
+        """Atomically merge ``changes`` into the live record (temp+rename).
+
+        The merge is a read-modify-write, so it runs under the record's own
+        lock: another process must not read this record, be overtaken by this
+        write and then re-publish its stale copy on top.
+        """
+        with self.record_lock(job_id):
             record = self.load_record(job_id)
             if record is None:
                 raise JobStoreError(f"no published record for {job_id}")
@@ -374,6 +455,49 @@ class ProjectStore:
         try:
             os.unlink(self.key_path(key))
         except FileNotFoundError:
+            pass
+
+    def stash_key(self, key: str) -> Optional[str]:
+        """Move a finished Job's binding aside so a new worker can publish.
+
+        ``--fresh`` must not free the key until the replacement Job's
+        reservation actually exists: a worker that never gets to ``link()``
+        would otherwise leave the Project with the old result on disk and no
+        binding for it, so the next ``start`` would run the work again.  The
+        rename is atomic and happens under the Project lock — the lock every
+        ``start`` and every ``gc --purge`` takes to decide key ownership — so
+        no other caller ever observes the key as free, and
+        :meth:`restore_key` puts it back if the reservation does not appear.
+        """
+        path = self.key_path(key)
+        stash = f"{path}.stash.{os.getpid()}"
+        try:
+            os.rename(path, stash)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise JobStoreError(
+                f"could not set aside the reservation of key {key!r}: {exc}"
+            ) from exc
+        return stash
+
+    def restore_key(self, key: str, stash: Optional[str]) -> bool:
+        """Put a stashed binding back. False means it could not be restored."""
+        if not stash:
+            return False
+        try:
+            os.rename(stash, self.key_path(key))
+        except OSError:
+            return False
+        return True
+
+    def drop_key_stash(self, stash: Optional[str]) -> None:
+        """Forget a stashed binding: the replacement reservation is published."""
+        if not stash:
+            return
+        try:
+            os.unlink(stash)
+        except OSError:
             pass
 
     def job_ids(self) -> list[str]:

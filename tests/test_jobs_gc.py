@@ -30,6 +30,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -46,6 +48,7 @@ from jobs import gc as jobs_gc  # noqa: E402
 from jobs import identity as jobs_identity  # noqa: E402
 from jobs import procs as jobs_procs  # noqa: E402
 from jobs import recovery  # noqa: E402
+from jobs import store as jobs_store  # noqa: E402
 from jobs.store import (  # noqa: E402
     STATE_DONE,
     STATE_INTERRUPTED,
@@ -95,6 +98,28 @@ class GcTestCase(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.store = ProjectStore(PROJECT_KEY)
         self.store.ensure()
+        # Added last, so it runs BEFORE the tempdir cleanup (LIFO).
+        self.addCleanup(self._settle_real_workers)
+
+    def _settle_real_workers(self) -> None:
+        """Let any real detached worker finish before the state tree goes.
+
+        A Job outlives the call that started it by design, so a worker still
+        writing its record would race ``TemporaryDirectory.cleanup`` and fail
+        the test with "directory not empty". The fixture Jobs carry a pid that
+        is deliberately not alive, so this waits only for real ones.
+        """
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            worker_pids = [
+                (record.get("worker") or {}) for record in self.store.records()
+            ]
+            if not any(
+                jobs_procs.is_alive(worker.get("pid"), worker.get("startTime"))
+                for worker in worker_pids
+            ):
+                return
+            time.sleep(0.05)
 
     # ------------------------------------------------------------- fixtures
 
@@ -160,7 +185,17 @@ class GcTestCase(unittest.TestCase):
             os.utime(os.path.join(job_dir, name), (when, when))
 
     def artefacts(self, job_id: str) -> set[str]:
-        return set(os.listdir(self.store.job_dir(job_id)))
+        """What the Job left on disk, minus the record's own lock file.
+
+        `record.lock` is the cross-process guard of the record's
+        read-modify-write, not an artefact of the run: it holds no bytes worth
+        collecting and has to outlive the sweep that writes `gcAt`.
+        """
+        return {
+            name
+            for name in os.listdir(self.store.job_dir(job_id))
+            if name != jobs_store.RECORD_LOCK_NAME
+        }
 
 
 class SweepTests(GcTestCase):
@@ -272,6 +307,46 @@ class SweepTests(GcTestCase):
         self.assertIn("gc: removed 0 job(s), 0 B freed", human)
         self.assertIn("failed to remove", human)
 
+    def test_an_unwritable_record_is_a_failure_not_a_silent_success(self) -> None:
+        """Freed bytes with no durable `gcAt` is not a successful sweep.
+
+        The next sweep would report the same Job again, and a caller told
+        "removed 1 job" would never learn the record could not be updated.
+        """
+        job_id = self.make_job("old", STATE_DONE, age_days=20)
+
+        def refuse(*args, **kwargs):
+            raise jobs_store.JobStoreError("record dir is read-only")
+
+        with mock.patch.object(jobs_store.ProjectStore, "update_record", refuse):
+            code, out = run_cli("gc", "--older-than", "14", "--json")
+            _, human = run_cli("gc", "--older-than", "14")
+        self.assertEqual(code, jobs_cli.EXIT_OK)
+        payload = json.loads(out)
+        self.assertEqual(payload["failed"][0]["jobId"], job_id)
+        self.assertIn("record.json", payload["failed"][0]["files"][0])
+        self.assertIn("gc: removed 0 job(s)", human)
+        self.assertIsNone(self.store.load_record(job_id).get("gcAt"))
+
+    def test_a_successful_retry_clears_the_earlier_gc_failure(self) -> None:
+        job_id = self.make_job("old", STATE_DONE, age_days=20)
+        real_unlink = os.unlink
+
+        def refuse_stdout(path, *args, **kwargs):
+            if os.path.basename(str(path)) == "stdout":
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch("os.unlink", refuse_stdout):
+            jobs_gc.run(self.store, older_than_days=14)
+        self.assertEqual(self.store.load_record(job_id)["gcFailed"], ["stdout"])
+        # The obstacle is gone: the retry must not leave the old complaint on
+        # the record, naming a file that is no longer there.
+        outcome = jobs_gc.run(self.store, older_than_days=14)
+        self.assertEqual(outcome.failures, [])
+        self.assertEqual(self.store.load_record(job_id)["gcFailed"], [])
+        self.assertEqual(self.artefacts(job_id), {"record.json"})
+
     def test_an_already_swept_job_is_not_reported_again(self) -> None:
         self.make_job("old", STATE_DONE, age_days=20)
         first = jobs_gc.run(self.store)
@@ -329,6 +404,9 @@ class PurgeTests(GcTestCase):
         started = json.loads(out)
         self.assertEqual(started["result"], "started")
         self.assertNotEqual(started["jobId"], job_id)
+        # Let that worker finish before the temp state tree is removed: a
+        # detached Job outlives the call that started it by design.
+        run_cli("wait", "--timeout", "30", started["jobId"])
 
     def test_purge_never_takes_a_non_terminal_job(self) -> None:
         running = self.make_job("running", STATE_RUNNING, age_days=99)
@@ -365,6 +443,80 @@ class PurgeTests(GcTestCase):
         # Nothing was reclaimed and nothing was freed.
         self.assertTrue(os.path.exists(job_dir))
         self.assertEqual(self.store.key_job_id("stuck"), job_id)
+
+    def test_a_key_that_cannot_be_released_is_reported_not_raised(self) -> None:
+        """The Job is gone and its key is not: say so, with no traceback.
+
+        And the Project stays usable: the next ``start`` under that key finds
+        a binding with no record dir behind it and treats it as free.
+        """
+        job_id = self.make_job("dangle", STATE_DONE, age_days=20)
+        os.chmod(self.store.keys_dir, 0o500)
+        self.addCleanup(os.chmod, self.store.keys_dir, 0o700)
+
+        code, out = run_cli("gc", "--purge", "--older-than", "14", "--json")
+        self.assertEqual(code, jobs_cli.EXIT_OK)
+        payload = json.loads(out)
+        self.assertFalse(os.path.exists(self.store.job_dir(job_id)))
+        self.assertEqual(payload["failed"][0]["jobId"], job_id)
+        self.assertIn("key reservation", payload["failed"][0]["files"][0])
+        self.assertEqual(self.store.key_job_id("dangle"), job_id)
+
+        os.chmod(self.store.keys_dir, 0o700)
+        code, out = run_cli(
+            "start", "--json", "--key", "dangle", "--ack-concurrent", "", "--", "true"
+        )
+        self.assertEqual(code, jobs_cli.EXIT_OK, out)
+        started = json.loads(out)
+        self.assertEqual(started["result"], "started")
+        self.assertEqual(started["freedDanglingKey"], job_id)
+        run_cli("wait", "--timeout", "30", started["jobId"])
+
+    def test_cancel_waits_for_the_project_lock_a_purge_holds(self) -> None:
+        """Cancel mutates a record; purge deletes record dirs. They serialize.
+
+        Without the lock, a cancel could write its request file and its record
+        into a directory ``rmtree`` is walking, or publish a record that is
+        deleted right after.
+        """
+        job_id = self.make_job("locked", STATE_ORPHANED, age_days=0)
+        record = self.store.load_record(job_id)
+        script = os.path.join(self.tmp.name, "hold-project-lock.py")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import sys, time\n"
+                f"sys.path.insert(0, {os.path.join(_REPO_ROOT, 'scripts')!r})\n"
+                "from jobs.store import ProjectStore\n"
+                "store = ProjectStore(sys.argv[1], sys.argv[2])\n"
+                "with store.lock():\n"
+                "    print('locked', flush=True)\n"
+                "    time.sleep(1.0)\n"
+            )
+        holder = subprocess.Popen(
+            [sys.executable, script, PROJECT_KEY, self.store.root],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+        started = time.monotonic()
+        final = recovery.cancel_job(self.store, record)
+        elapsed = time.monotonic() - started
+        holder.wait(timeout=10)
+        holder.stdout.close()
+        self.assertGreater(elapsed, 0.5)
+        self.assertEqual(final["state"], "cancelled")
+
+    def test_cancelling_a_purged_job_is_reported_not_a_traceback(self) -> None:
+        job_id = self.make_job("vanished", STATE_ORPHANED, age_days=0)
+        record = self.store.load_record(job_id)
+        shutil.rmtree(self.store.job_dir(job_id))
+        with self.assertRaises(jobs_store.JobStoreError) as caught:
+            recovery.cancel_job(self.store, record)
+        self.assertIn("no longer exists", str(caught.exception))
+        # And through the CLI it is a plain refusal, not a crash.
+        code, _ = run_cli("cancel", job_id)
+        self.assertEqual(code, jobs_cli.EXIT_UNCLEAR)
 
     def test_eligibility_is_re_decided_under_the_lock(self) -> None:
         """`collect` ran before the lock; a cancel may have landed since.

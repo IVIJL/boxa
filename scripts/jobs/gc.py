@@ -24,10 +24,15 @@ written to.
 **What gc claims, it did.** Only a successful unlink counts as a removal and
 only its bytes count as freed; anything that could not be removed is named in
 ``failed`` on the entry (and in ``gcFailed`` on the record), never silently
-swallowed.  ``--purge`` removes the record directory *before* it frees the key,
-so a failed removal leaves both in place instead of reporting a purge that did
-not happen, and re-checks eligibility under the Project lock, so a Job a
-concurrent ``cancel`` just touched is no longer garbage.
+swallowed — including a record that could not be updated, which leaves the
+freed bytes without a durable ``gcAt``.  ``--purge`` removes the record
+directory *before* it frees the key, so a failed removal leaves both in place
+instead of reporting a purge that did not happen, and re-checks eligibility
+under the Project lock.  ``cancel`` takes that same lock for its record
+mutations, so the recheck cannot be overtaken by a cancel landing mid-removal;
+every other record update (here, in the worker, in ``cancel``) is a
+read-modify-write under the record's own ``flock``, so no writer merges its
+change into a copy another process has already replaced.
 
 **Age** is the youngest evidence that the Job was active: the later of
 ``finishedAt`` and the newest mtime under the record directory.  Conservative
@@ -42,7 +47,12 @@ import shutil
 import time
 from typing import Any, NamedTuple, Optional
 
-from .store import TERMINAL_STATES, JobStoreError, ProjectStore
+from .store import (
+    RECORD_LOCK_NAME,
+    TERMINAL_STATES,
+    JobStoreError,
+    ProjectStore,
+)
 
 __all__ = [
     "BULKY_FILES",
@@ -153,6 +163,11 @@ def _reference_time(store: ProjectStore, record: dict[str, Any]) -> float:
             # Excluded from the maximum: gc writes `gcAt` onto the record, and
             # that write must not keep postponing a later `--purge`.
             record_mtime = mtime
+            continue
+        if name == RECORD_LOCK_NAME:
+            # Bookkeeping of the record write, not activity of the Job: it is
+            # created by the first update and would otherwise make gc's own
+            # writes evidence of a young Job.
             continue
         candidates.append(mtime)
     if candidates:
@@ -272,23 +287,27 @@ def _delete_bulky(store: ProjectStore, entry: GcEntry, at: float) -> GcEntry:
             continue
         removed.append(name)
         freed += size
-    updated = entry._replace(files=removed, bytes=freed, failed=tuple(failed))
     if not removed and not failed:
-        return updated
+        return entry._replace(files=removed, bytes=freed, failed=())
     changes: dict[str, Any] = {
         "gcAt": at,
         "gcRemoved": removed,
         "gcBytes": freed,
+        # Always written, so a successful retry clears what an earlier failed
+        # sweep recorded: a stale `gcFailed` would keep naming a file that is
+        # long gone.
+        "gcFailed": failed,
     }
-    if failed:
-        changes["gcFailed"] = failed
     try:
         store.update_record(entry.job_id, **changes)
-    except (JobStoreError, OSError):
-        # Housekeeping bookkeeping: an unwritable record dir is already
-        # reported through `failed`, and must not abort the sweep.
-        pass
-    return updated
+    except (JobStoreError, OSError) as exc:
+        # The bytes really are gone, but nothing durable says so: without
+        # `gcAt` the next sweep re-reports this Job, and a caller told
+        # "success" would never learn the record is unwritable. It is this
+        # Job's failure, named on the entry — and still not fatal to the rest
+        # of the sweep.
+        failed.append(f"<{os.path.basename(store.record_path(entry.job_id))}>: {exc}")
+    return entry._replace(files=removed, bytes=freed, failed=tuple(failed))
 
 
 def _purge_record(store: ProjectStore, entry: GcEntry) -> GcEntry:
@@ -311,8 +330,17 @@ def _purge_record(store: ProjectStore, entry: GcEntry) -> GcEntry:
     try:
         if key and store.key_job_id(key) == entry.job_id:
             store.release_key(key)
-    except JobStoreError as exc:
-        return entry._replace(failed=(f"<key reservation>: {exc}",))
+    except (JobStoreError, OSError) as exc:
+        # The Job is gone and its key is not: say exactly that, with no
+        # traceback. `start` under this key finds a binding with no record
+        # directory behind it, treats it as free and says so, so the Project
+        # is usable meanwhile.
+        return entry._replace(
+            failed=(
+                f"<key reservation>: {exc} (key {key!r} still bound to the "
+                "purged job; the next `start` under it frees the binding)",
+            )
+        )
     return entry
 
 
@@ -351,11 +379,14 @@ def run(
 ) -> GcOutcome:
     """Collect, then (unless ``dry_run``) delete. Returns what was really done.
 
-    ``--purge`` takes the Project lock: it frees key reservations, and a
-    concurrent ``start`` decides under that same lock whether a key is taken.
-    Eligibility is re-checked under that lock (``_still_eligible``), because
-    ``collect`` ran before it.  The bulky-file sweep needs no lock — it only
-    ever touches files of Jobs that will never change again.
+    ``--purge`` takes the Project lock: it frees key reservations, a
+    concurrent ``start`` decides under that same lock whether a key is taken,
+    and ``cancel`` mutates a record under it too.  Eligibility is re-checked
+    under that lock (``_still_eligible``), because ``collect`` ran before it,
+    and the recheck now holds for the whole removal.  The bulky-file sweep
+    takes no Project lock — it only ever touches files of Jobs that will never
+    change again — but its record write is a read-modify-write under the
+    record's own lock, so it cannot revert a concurrent writer's state.
 
     The returned entries describe the *result*: files that were removed, bytes
     that were really freed, and ``failed`` for anything that survived.

@@ -254,10 +254,12 @@ def _spawn_worker(
     package_parent = os.path.dirname(os.path.dirname(os.path.abspath(jobs.__file__)))
     env = baseline_env()
     env.update(_control_env())
-    existing = os.environ.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        f"{package_parent}:{existing}" if existing else package_parent
-    )
+    # Exactly one entry, and it is ours: the directory this very `jobs` package
+    # was imported from, which is what `job.sh` resolves for the CLI. The
+    # caller's `PYTHONPATH` is deliberately dropped — it is the caller's
+    # environment, which the worker does not inherit, and keeping it would let
+    # a shadowing module on that path change what the worker imports.
+    env["PYTHONPATH"] = package_parent
     env.update(env_values)
     err = open(store.worker_err_path(job_id), "ab")
     try:
@@ -401,6 +403,8 @@ def _register_job(request: JobRequest) -> int:
     # for it, so a later `start` would run the work again instead of returning
     # the result that is already there.
     release_on_spawn = False
+    replaced_id: Optional[str] = None
+    dangling_id: Optional[str] = None
     # Retention, before the lock and never fatal (ADR 0037 "State and
     # retention"): the bulky artefacts of Jobs that finished more than
     # `gc_mod.DEFAULT_RETENTION_DAYS` ago go now, while nothing is held.
@@ -408,6 +412,16 @@ def _register_job(request: JobRequest) -> int:
 
     with store.lock():
         existing_id = store.key_job_id(key)
+        if existing_id and not os.path.isdir(store.job_dir(existing_id)):
+            # A binding with no Job behind it: `gc --purge` removed the record
+            # directory but could not free the key (it reports that as a
+            # failure). There is no Job to attach to and nothing to be unclear
+            # about, so the key counts as free — dropped here, under the lock
+            # that owns key decisions, and named in the output so the dangling
+            # binding is not silently swept under the carpet.
+            store.release_key(key)
+            dangling_id = existing_id
+            existing_id = None
         if existing_id:
             try:
                 existing = store.load_record(existing_id)
@@ -491,8 +505,10 @@ def _register_job(request: JobRequest) -> int:
                     )
                     return EXIT_REFUSED
                 # Finished Job under this key: the key may be re-run — but the
-                # old binding stays until the new worker is about to reserve it.
+                # old binding is only set aside for the new worker's `link()`
+                # and restored if that reservation never appears.
                 release_on_spawn = True
+                replaced_id = existing_id
             elif existing.get("fingerprint") == request.fingerprint:
                 payload = _result_payload(store, existing)
                 payload["result"] = "finished" if terminal else "attached"
@@ -554,32 +570,62 @@ def _register_job(request: JobRequest) -> int:
         if request.codex is not None:
             spec["codex"] = request.codex
         store.write_spec(job_id, spec)
+        stashed: Optional[str] = None
         if release_on_spawn:
             # Still inside the same Project lock that checked the key, and
             # only now that preflight and the ack have both passed: the
-            # worker's `link()` needs the name free to publish its reservation.
-            store.release_key(key)
-        proc = _spawn_worker(store, job_id, passthrough_values(request.env_names))
-        record = _await_reservation(store, job_id, proc)
-        _detach(proc)
+            # worker's `link()` needs the name free to publish its
+            # reservation. Set aside rather than deleted — until that
+            # reservation exists, the finished Job is still what this key
+            # means, and a worker that never starts must not cost the caller
+            # the result it already has.
+            stashed = store.stash_key(key)
+        try:
+            proc = _spawn_worker(store, job_id, passthrough_values(request.env_names))
+        except OSError as exc:
+            spawn_error = f"worker could not be spawned: {exc}"
+            proc = None
+            record = None
+        else:
+            spawn_error = ""
+            record = _await_reservation(store, job_id, proc)
+            _detach(proc)
+        if record is None:
+            # No reservation was published, so the replacement Job does not
+            # exist: the old binding goes back before the lock is dropped.
+            key_restored = store.restore_key(key, stashed)
+        else:
+            key_restored = False
+            store.drop_key_stash(stashed)
 
     if record is None:
-        detail = _worker_error(store, job_id) or "worker exited before reserving"
-        _emit(
-            request.json_mode,
-            {
-                "result": "worker-failed",
-                "key": key,
-                "jobId": job_id,
-                "reason": detail,
-            },
-            [
-                "result: worker-failed",
-                f"job: {job_id}  key: {key}",
-                f"reason: {detail}",
-                f"worker log: {store.worker_err_path(job_id)}",
-            ],
+        detail = (
+            spawn_error
+            or _worker_error(store, job_id)
+            or "worker exited before reserving"
         )
+        payload = {
+            "result": "worker-failed",
+            "key": key,
+            "jobId": job_id,
+            "reason": detail,
+        }
+        lines = [
+            "result: worker-failed",
+            f"job: {job_id}  key: {key}",
+            f"reason: {detail}",
+            f"worker log: {store.worker_err_path(job_id)}",
+        ]
+        if stashed and key_restored:
+            payload["keyStillBoundTo"] = replaced_id
+            lines.append(f"key unchanged: it still resolves to {replaced_id}")
+        elif stashed:
+            payload["keyStashed"] = stashed
+            lines.append(
+                f"WARNING: the binding of key {key} could not be restored; "
+                f"it is at {stashed}"
+            )
+        _emit(request.json_mode, payload, lines)
         return EXIT_WORKER
 
     payload = {
@@ -590,6 +636,8 @@ def _register_job(request: JobRequest) -> int:
         "fingerprint": request.fingerprint,
         "ackConcurrent": record.get("ackConcurrent") or [],
     }
+    if dangling_id:
+        payload["freedDanglingKey"] = dangling_id
     payload.update(request.extra or {})
     _emit(
         request.json_mode,
@@ -597,6 +645,14 @@ def _register_job(request: JobRequest) -> int:
         [
             f"result: started  state: {record.get('state')}",
             f"job: {job_id}  key: {key}",
+            *(
+                [
+                    f"note: key {key} was bound to purged job {dangling_id} "
+                    "with no record dir; the binding was freed"
+                ]
+                if dangling_id
+                else []
+            ),
             *(
                 [f"thread: {payload['threadId']}"]
                 if payload.get("threadId")
@@ -1392,7 +1448,22 @@ def cmd_runtime(args: argparse.Namespace) -> int:
     if args.auto:
         if args.version:
             return _usage("`runtime use` takes either a version or --auto")
-        runtime_mod.clear_pin()
+        try:
+            runtime_mod.clear_pin()
+        except runtime_mod.PinFailed as exc:
+            _emit(
+                args.json,
+                {
+                    "result": "refused",
+                    "reason": runtime_mod.PinFailed.reason,
+                    "detail": str(exc),
+                },
+                [
+                    f"result: refused ({runtime_mod.PinFailed.reason})",
+                    str(exc),
+                ],
+            )
+            return EXIT_REFUSED
         _emit(
             args.json,
             {"result": "runtime", "pin": None},

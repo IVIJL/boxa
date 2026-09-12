@@ -57,6 +57,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 from jobs import cli as jobs_cli  # noqa: E402
 from jobs import codex as jobs_codex  # noqa: E402
 from jobs import identity as jobs_identity  # noqa: E402
+from jobs import procs as jobs_procs  # noqa: E402
 from jobs import runtime as jobs_runtime  # noqa: E402
 from jobs.store import (  # noqa: E402
     STATE_CANCELLED,
@@ -384,6 +385,26 @@ exit 0
                     os.kill(int(pid), signal.SIGKILL)
                 except OSError:
                     pass
+        self._await_quiet()
+
+    def _await_quiet(self) -> None:
+        """Wait for killed or finished workers to really be gone.
+
+        A Job's worker outlives the CLI call that started it by design; if it
+        is still writing its record when ``TemporaryDirectory.cleanup`` walks
+        the state tree, the removal fails with "directory not empty".
+        """
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if not any(
+                jobs_procs.is_alive(
+                    (record.get("worker") or {}).get("pid"),
+                    (record.get("worker") or {}).get("startTime"),
+                )
+                for record in self.store.records()
+            ):
+                return
+            time.sleep(0.05)
 
     def wait_for_state(self, job_id: str, states: set[str]) -> dict:
         deadline = time.time() + JOB_TIMEOUT

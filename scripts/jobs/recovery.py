@@ -264,10 +264,31 @@ def cancel_job(
 ) -> dict[str, Any]:
     """Kill what Boxa can see of a Job and report what it could not track.
 
-    Order matters: the cancel request file is written *before* any signal, so
-    whoever finalizes the record calls the result ``cancelled`` and not
-    ``failed``.
+    Under the Project lock, because ``gc --purge`` removes whole record
+    directories under that same lock: a cancel writing its request file and
+    its record outside it could resurrect a directory mid-``rmtree``, or
+    publish a record that is deleted a moment later.  Serialized, the two
+    orders are both honest — a cancel first makes the Job recent activity,
+    which the purge's eligibility recheck then skips; a purge first leaves
+    nothing to cancel, reported as such.  Nothing long happens under the lock:
+    a cancel is signals plus at most
+    :data:`WORKER_FINALIZE_TIMEOUT` of waiting for the worker to own up.
     """
+    job_id = record["jobId"]
+    with store.lock():
+        if store.load_record(job_id) is None:
+            raise JobStoreError(
+                f"job {job_id} no longer exists (purged before this cancel)"
+            )
+        return _cancel_locked(store, record, by)
+
+
+def _cancel_locked(
+    store: ProjectStore, record: dict[str, Any], by: str
+) -> dict[str, Any]:
+    """The cancel itself. Order matters: the cancel request file is written
+    *before* any signal, so whoever finalizes the record calls the result
+    ``cancelled`` and not ``failed``."""
     job_id = record["jobId"]
     store.request_cancel(job_id, by)
     live = live_job_pids(record)

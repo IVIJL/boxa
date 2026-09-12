@@ -101,6 +101,7 @@ __all__ = [
     "read_pin",
     "snapshot",
     "sweep_stale_snapshots",
+    "sweep_stale_snapshots_if_idle",
     "version_key",
     "versions_root",
 ]
@@ -398,11 +399,23 @@ def pin(version: str, root: Optional[str] = None) -> None:
 
 
 def clear_pin(root: Optional[str] = None) -> None:
+    """Drop the shared pin, under the same lock ``pin`` writes it with.
+
+    Unpinning is the same shared-volume mutation as pinning, so it takes the
+    publish lock too, and a failure is reported rather than swallowed: a
+    ``runtime use --auto`` that silently left the old pin in place would keep
+    every Container on the rolled-back version while claiming otherwise.
+    """
     root = root or versions_root()
     try:
-        os.unlink(_pin_path(root))
-    except OSError:
-        pass
+        with publish_lock(root):
+            try:
+                os.unlink(_pin_path(root))
+            except FileNotFoundError:
+                # Nothing pinned: already the state the caller asked for.
+                pass
+    except (OSError, TimeoutError) as exc:
+        raise PinFailed(f"could not clear the version pin: {exc}") from exc
 
 
 # ------------------------------------------------------------------ manifest
@@ -594,6 +607,31 @@ def sweep_stale_snapshots(
         if not os.path.exists(path):
             removed.append(name)
     return removed
+
+
+def sweep_stale_snapshots_if_idle(
+    root: Optional[str] = None, *, max_age: float = STALE_SNAPSHOT_SECONDS
+) -> list[str]:
+    """Sweep only if there is something to sweep and nobody is publishing.
+
+    The opportunistic counterpart of :func:`sweep_stale_snapshots`, for the
+    paths that do no publishing themselves (a version that is already
+    verified).  Both preconditions are there so this can never cost a job
+    anything: no ``.snapshot-*`` dir means no work, and a busy publish lock
+    means someone else is in the publish path and will sweep there.
+    """
+    root = root or versions_root()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    if not any(name.startswith(TEMP_PREFIX) for name in names):
+        return []
+    try:
+        with publish_lock(root, timeout=0.0):
+            return sweep_stale_snapshots(root, max_age=max_age)
+    except (OSError, TimeoutError):
+        return []
 
 
 @contextmanager
@@ -797,6 +835,13 @@ def snapshot(
 
     existing = published(root).get(source.version)
     if existing is not None and existing.verified:
+        # Nothing to copy — but a publish that was killed mid-copy leaves a
+        # whole package behind, and if every later job takes this fast path
+        # that copy is never collected. One cheap `listdir` decides whether
+        # there is anything to sweep at all, and the sweep itself is skipped
+        # when the publish lock is busy: this path must never wait, and a
+        # holder of that lock is about to sweep anyway.
+        sweep_stale_snapshots_if_idle(root)
         return Snapshot(existing, None, warnings, False)
 
     try:

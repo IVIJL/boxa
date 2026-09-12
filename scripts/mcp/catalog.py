@@ -587,6 +587,22 @@ def retired_codex_delegate_entries() -> list[dict[str, Any]]:
     ]
 
 
+def _remove_token(entry: dict[str, Any]) -> str:
+    """How to name this entry on a `boxa mcp remove` command line.
+
+    The name normally, quoted; its id when the name starts with ``-``.  A
+    catalog name only has to be non-empty and unpadded, so ``--global`` is a
+    legal name, and no amount of quoting stops the CLI's own argument parser
+    from reading it as a flag.
+    """
+    name = str(entry.get("name", "?"))
+    if name.startswith("-"):
+        entry_id = entry.get("id")
+        if entry_id:
+            return str(entry_id)
+    return shlex.quote(name)
+
+
 def retired_codex_delegate_notice(
     entries: Optional[list[dict[str, Any]]] = None,
 ) -> str:
@@ -620,8 +636,12 @@ def retired_codex_delegate_notice(
                 "  Boxa does not remove the entry for you. Remove it with:",
                 # Quoted: a catalog name may legally contain whitespace or
                 # shell metacharacters, and this line is meant to be pasted
-                # into a shell exactly as printed.
-                f"    boxa mcp remove {shlex.quote(str(name))}",
+                # into a shell exactly as printed. A name that *looks* like an
+                # option (`--global`, `-h`) survives quoting unchanged and
+                # would be parsed as a flag, so such an entry is named by its
+                # id instead — ids are uuids, never option-shaped, and
+                # `mcp remove` takes either.
+                f"    boxa mcp remove {_remove_token(entry)}",
             ]
         )
     return "\n".join(lines) + "\n"

@@ -98,6 +98,24 @@ class DetectionTests(RetiredEntryEnv):
         )
         self.assertIn("boxa mcp remove 'my codex; rm -rf ~'", notice)
 
+    def test_an_option_shaped_name_is_suggested_by_id(self) -> None:
+        """Quoting does not stop `--global` from being read as a flag.
+
+        A catalog name only has to be non-empty and unpadded, so an entry can
+        legally be called `--global` or `-h`; `mcp remove` takes the entry id
+        too, and an id is never option-shaped.
+        """
+        notice = catalog.retired_codex_delegate_notice(
+            entries=[
+                {"name": "--global", "id": "22222222-2222-2222-2222-222222222222"}
+            ]
+        )
+        self.assertIn(
+            "boxa mcp remove 22222222-2222-2222-2222-222222222222", notice
+        )
+        self.assertNotIn("remove --global", notice)
+        self.assertNotIn("remove '--global'", notice)
+
     def test_unrelated_codex_entry_is_not_matched(self) -> None:
         # `codex` without the mcp-server argv is not the retired server.
         # (A direct add of that shape is refused as not applicable, so write

@@ -353,6 +353,61 @@ class SnapshotTests(RuntimeTestCase):
         self.assertIsNotNone(result.published, result.discarded)
         self.assertEqual(self.temp_dirs(), [os.path.basename(mine)])
 
+    def test_a_stale_dir_is_swept_even_when_nothing_needs_publishing(self) -> None:
+        """The fast path sweeps too, or an orphaned copy lives forever.
+
+        A verified version returns without copying anything, so a dir left by
+        a publish that was killed would never be reached again: every later
+        job takes this same fast path.
+        """
+        published = self.publish("0.149.1")
+        orphan = os.path.join(self.root, f"{jobs_runtime.TEMP_PREFIX}0.149.1-orphan")
+        os.makedirs(orphan)
+        ancient = time.time() - 2 * jobs_runtime.STALE_SNAPSHOT_SECONDS
+        os.utime(orphan, (ancient, ancient))
+
+        source = jobs_runtime.Source(jobs_runtime.SOURCE_NPM, self.npm, "0.149.1")
+        result = jobs_runtime.snapshot(source, root=self.root, prober=never_prober)
+        self.assertEqual(result.published, published)
+        self.assertFalse(result.probed)
+        self.assertEqual(self.temp_dirs(), [])
+
+    def test_the_fast_path_sweep_never_waits_for_the_publish_lock(self) -> None:
+        """Someone else is publishing: they will sweep, this job must not block."""
+        self.publish("0.149.1")
+        orphan = os.path.join(self.root, f"{jobs_runtime.TEMP_PREFIX}0.149.1-orphan")
+        os.makedirs(orphan)
+        ancient = time.time() - 2 * jobs_runtime.STALE_SNAPSHOT_SECONDS
+        os.utime(orphan, (ancient, ancient))
+        source = jobs_runtime.Source(jobs_runtime.SOURCE_NPM, self.npm, "0.149.1")
+
+        script = os.path.join(self.tmp.name, "hold-lock.py")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import sys, time\n"
+                f"sys.path.insert(0, {os.path.join(_REPO_ROOT, 'scripts')!r})\n"
+                "from jobs import runtime as rt\n"
+                "with rt.publish_lock(sys.argv[1]):\n"
+                "    print('locked', flush=True)\n"
+                "    time.sleep(30)\n"
+            )
+        holder = subprocess.Popen(
+            [sys.executable, script, self.root], stdout=subprocess.PIPE, text=True
+        )
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+
+        started = time.monotonic()
+        result = jobs_runtime.snapshot(source, root=self.root, prober=never_prober)
+        elapsed = time.monotonic() - started
+        self.assertIsNotNone(result.published)
+        self.assertLess(elapsed, 2.0)
+        # Skipped, not failed: the dir is still there for the lock holder.
+        self.assertEqual(self.temp_dirs(), [os.path.basename(orphan)])
+        holder.kill()
+        holder.wait(timeout=10)
+        holder.stdout.close()
+
     def test_a_published_copy_carries_no_owner_marker(self) -> None:
         entry = self.publish("0.149.1")
         self.assertFalse(
@@ -596,6 +651,33 @@ class PublishLockTests(RuntimeTestCase):
         self.assertTrue(entries["0.149.1"].verified)
         # One published copy, and no temp dir survived the race.
         self.assertEqual(self.temp_dirs(), [])
+
+    def test_clearing_the_pin_takes_the_publish_lock(self) -> None:
+        """Unpinning is the same shared mutation as pinning, not a free unlink."""
+        self.publish("0.149.1")
+        jobs_runtime.pin("0.149.1", self.root)
+        seen: list[bool] = []
+        real_lock = jobs_runtime.publish_lock
+
+        def watched(root: str, *args, **kwargs):
+            seen.append(True)
+            return real_lock(root, *args, **kwargs)
+
+        with mock.patch.object(jobs_runtime, "publish_lock", watched):
+            jobs_runtime.clear_pin(self.root)
+        self.assertTrue(seen)
+        self.assertIsNone(jobs_runtime.read_pin(self.root))
+
+    def test_a_pin_that_cannot_be_cleared_is_a_pin_failed_refusal(self) -> None:
+        """A swallowed failure would leave every Container on the old version."""
+        self.publish("0.149.1")
+        jobs_runtime.pin("0.149.1", self.root)
+        os.chmod(self.root, 0o500)
+        self.addCleanup(os.chmod, self.root, 0o755)
+        with self.assertRaises(jobs_runtime.PinFailed):
+            jobs_runtime.clear_pin(self.root)
+        os.chmod(self.root, 0o755)
+        self.assertEqual(jobs_runtime.read_pin(self.root), "0.149.1")
 
     def test_concurrent_pins_never_tear_the_shared_pin(self) -> None:
         """Two `runtime use` calls are two writers of one shared file."""

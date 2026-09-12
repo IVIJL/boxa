@@ -98,11 +98,18 @@ intended piece of work:
   result. Nothing runs twice.
 - Same key, different request: `conflict`, exit 6.
 - `--fresh` starts a new run only when no Job under that key is unfinished. It
-  never creates a concurrent copy of a running Job.
+  never creates a concurrent copy of a running Job. The finished Job's binding
+  is only set aside for the new worker's reservation and put straight back if
+  that reservation never appears: a `--fresh` whose worker cannot start returns
+  `worker-failed` (exit 7) and says `key unchanged`, so the old result is still
+  what the key answers with.
 - Any unclear record (dead worker, foreign Container run id, unreadable
   record) refuses a retry under that key with exit 4 until `cancel` or `adopt`
   resolves it.
-- A purged record (`gc --purge`) frees its key again.
+- A purged record (`gc --purge`) frees its key again. If the purge could not
+  free the key (it says so), the binding names a Job with no record directory;
+  the next `start` under that key treats it as free, takes it, and reports
+  `freedDanglingKey`.
 
 A key protects against duplicate runs only. Running beside other Jobs is a
 separate decision, handled by the ack.
@@ -248,7 +255,11 @@ verified immutable copy under the shared `boxa-codex-versions` volume.
    racing. A snapshot in progress lives in a `.snapshot-*` temp dir that is
    removed on every way out, and one an interrupted attempt left behind is
    swept (under the publish lock) by the next refresh, so an interruption
-   cannot leak package copies onto the volume.
+   cannot leak package copies onto the volume. The fast path (a version that
+   is already verified) sweeps too, but only opportunistically: one cheap
+   listing decides whether there is anything to sweep, and a busy publish lock
+   skips it, because whoever holds that lock is in the publish path and sweeps
+   there.
 
 A failed probe leaves the previous verified version in use and prints a loud
 warning (also `warnings` in `--json`) instead of breaking the next job. With no
@@ -260,9 +271,11 @@ one is in use. `runtime refresh` performs the snapshot and probe now.
 `runtime use <version>` pins a verified copy for rollback, and a pin
 short-circuits the refresh entirely; `runtime use --auto` unpins and goes back
 to the newest. Pinning an unverified version is refused (`not-verified`); the
-pin is written atomically under the publish lock, because every Container on
-the volume shares it, and a pin that could not be written is refused
-(`pin-failed`, exit 5) rather than silently lost.
+pin is written *and cleared* atomically under the publish lock, because every
+Container on the volume shares it, and a pin that could not be written or
+cleared is refused (`pin-failed`, exit 5) rather than silently lost — an
+unpin that quietly failed would keep every Container on the rolled-back
+version.
 
 Published copies are made read-only for `node`. That is a convention the
 Container user could undo, not root enforcement. Running jobs finish on their
@@ -292,10 +305,22 @@ with the Project by `boxa remove` or `boxa stop --clean`.
 - gc claims exactly what it did: only a successful removal is counted and only
   its bytes are reported as freed. Anything that could not be removed is named
   (`failed` in `--json`, a `failed to remove:` line otherwise, and `gcFailed`
-  on the record). `--purge` removes the record directory *before* it frees the
-  key, so a failed removal leaves both alone, and it re-checks eligibility
-  under the Project lock, so a Job a concurrent `cancel` has just touched is
-  not purged as stale.
+  on the record); a successful retry clears `gcFailed` again. A record that
+  could not be updated counts as that Job's failure too — the bytes are gone
+  but nothing durable says so, so gc does not report it as success.
+- `--purge` removes the record directory *before* it frees the key, so a
+  failed removal leaves both alone; a key that could not be released is
+  reported with the detail (never a traceback), and the dangling binding is
+  freed by the next `start` under it.
+- `--purge` and `cancel` serialize: purge re-checks eligibility under the
+  Project lock and `cancel` takes that same lock for its record mutations, so
+  a cancel cannot land inside a removal. A `cancel` for a Job that was purged
+  first says the Job no longer exists (exit 4).
+- Every record update anywhere (the worker, `cancel`, the lazy state refresh,
+  gc's own `gcAt`) is a read-modify-write under that record's `record.lock`,
+  so no writer merges its change into a copy another process has already
+  replaced. `record.lock` is part of the record, not an artefact: it is not
+  swept and holds no data.
 
 ## Environment overrides for tests
 
@@ -322,4 +347,6 @@ These `BOXA_JOB_*` variables are also the only thing besides the fixed
 baseline and the values of the caller's `--env KEY` names that the detached
 worker's own environment carries: the worker does not inherit the shell that
 ran `boxa-job` any more than the Job's command does (ADR 0037 § "Worker
-environment").
+environment"). Its `PYTHONPATH` is built, not merged: exactly the directory
+the `jobs` package was imported from, never the caller's value, which could
+otherwise shadow what the worker imports.

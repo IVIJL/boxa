@@ -28,7 +28,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -42,6 +44,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 from jobs import cli as jobs_cli  # noqa: E402
 from jobs import env as jobs_env  # noqa: E402
 from jobs import identity as jobs_identity  # noqa: E402
+from jobs import procs as jobs_procs  # noqa: E402
 from jobs.store import (  # noqa: E402
     STATE_DONE,
     STATE_FAILED,
@@ -104,6 +107,26 @@ class JobsTestCase(unittest.TestCase):
                     os.kill(int(pid), signal.SIGKILL)
                 except OSError:
                     pass
+        self._await_quiet()
+
+    def _await_quiet(self) -> None:
+        """Wait for killed or finished workers to really be gone.
+
+        A Job's worker outlives the CLI call that started it by design; if it
+        is still writing its record when ``TemporaryDirectory.cleanup`` walks
+        the state tree, the removal fails with "directory not empty".
+        """
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if not any(
+                jobs_procs.is_alive(
+                    (record.get("worker") or {}).get("pid"),
+                    (record.get("worker") or {}).get("startTime"),
+                )
+                for record in self.store.records()
+            ):
+                return
+            time.sleep(0.05)
 
     def wait_for_state(self, job_id: str, states: set[str]) -> dict:
         deadline = time.time() + JOB_TIMEOUT
@@ -176,6 +199,66 @@ class ReservationTests(JobsTestCase):
         self.assertEqual(self.store.load_record(job_id)["state"], STATE_DONE)
 
 
+_RMW_SCRIPT = """\
+import sys, time
+sys.path.insert(0, {scripts!r})
+from jobs.store import ProjectStore
+
+project_key, root, job_id = sys.argv[1], sys.argv[2], sys.argv[3]
+store = ProjectStore(project_key, root)
+# Let the other writer take the record lock first: this update must wait for
+# it and then merge into what that writer left, not into a stale copy.
+time.sleep(0.3)
+store.update_record(job_id, mine="yes")
+"""
+
+
+class RecordLockTests(JobsTestCase):
+    """The record's read-modify-write is safe across PROCESSES, not just threads.
+
+    The writers are separate processes — the worker finalizing, ``cancel``, the
+    lazy refresh of any CLI call, gc writing its ``gcAt`` — so an in-process
+    lock alone would let one of them re-publish a copy it read before another
+    process replaced it (a ``cancelled`` record reverted to ``interrupted``).
+    """
+
+    def test_a_second_process_merges_into_the_first_writers_result(self) -> None:
+        job_id = new_job_id()
+        self.store.publish_reservation(
+            "rmw",
+            {
+                "jobId": job_id,
+                "key": "rmw",
+                "state": STATE_RESERVED,
+                "fingerprint": "fp",
+                "worker": {"pid": 2 ** 22, "startTime": 1, "containerRunId": "unknown"},
+            },
+        )
+        script = os.path.join(self.tmp.name, "rmw.py")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(_RMW_SCRIPT.format(scripts=os.path.join(_REPO_ROOT, "scripts")))
+        other = subprocess.Popen(
+            [sys.executable, script, PROJECT_KEY, self.store.root, job_id]
+        )
+        self.addCleanup(other.kill)
+        # A deliberately slowed `update_record`: read, pause long enough for
+        # the other process to want the record, then write the merged copy.
+        # That pause is the whole race — unlocked, the other write lands in
+        # the middle of it and this rename erases it.
+        with self.store.record_lock(job_id):
+            record = self.store.load_record(job_id)
+            time.sleep(0.8)
+            record["state"] = STATE_DONE
+            record["exitCode"] = 0
+            self.store._atomic_write(self.store.record_path(job_id), record)
+        self.assertEqual(other.wait(timeout=30), 0)
+        record = self.store.load_record(job_id)
+        # Both writes survived: the late one did not revert the state change.
+        self.assertEqual(record["state"], STATE_DONE)
+        self.assertEqual(record["exitCode"], 0)
+        self.assertEqual(record["mine"], "yes")
+
+
 class FingerprintTests(unittest.TestCase):
     def test_fingerprint_covers_argv_cwd_and_env_names(self) -> None:
         base = fingerprint(["sh", "-c", "true"], "/w", ["A"])
@@ -241,8 +324,14 @@ class EnvironmentTests(JobsTestCase):
         The Job's command prints its parent's (i.e. the worker's) environment,
         which is the only way to see what the detached worker really got.
         """
+        caller_pythonpath = os.path.join(self.tmp.name, "caller-pythonpath")
         with mock.patch.dict(
-            os.environ, {"MY_TOKEN": "s3cret", "UNNAMED_SECRET": "leak-me"}
+            os.environ,
+            {
+                "MY_TOKEN": "s3cret",
+                "UNNAMED_SECRET": "leak-me",
+                "PYTHONPATH": caller_pythonpath,
+            },
         ):
             started = self.start_json(
                 "--key",
@@ -262,8 +351,16 @@ class EnvironmentTests(JobsTestCase):
         self.assertIn("HOME=/home/node", worker_env)
         self.assertIn("MY_TOKEN=s3cret", worker_env)
         self.assertIn(f"{jobs_identity.PROJECT_KEY_ENV}={PROJECT_KEY}", worker_env)
-        self.assertTrue(
-            any(line.startswith("PYTHONPATH=") for line in worker_env), worker_env
+        # PYTHONPATH is built, not merged: exactly the directory this `jobs`
+        # package was imported from, with no trace of the caller's own value
+        # (which could otherwise shadow what the worker imports).
+        package_parent = os.path.dirname(
+            os.path.dirname(os.path.abspath(jobs_cli.jobs.__file__))
+        )
+        self.assertIn(f"PYTHONPATH={package_parent}", worker_env)
+        self.assertNotIn(
+            caller_pythonpath,
+            "\n".join(line for line in worker_env if line.startswith("PYTHONPATH=")),
         )
         # Nothing else of the caller's environment, named or not.
         self.assertNotIn("UNNAMED_SECRET=leak-me", worker_env)
@@ -424,6 +521,55 @@ class KeySemanticsTests(JobsTestCase):
         self.assertNotEqual(second["jobId"], first["jobId"])
         self.wait_for_state(second["jobId"], {STATE_DONE})
         self.assertEqual(len(self.store.job_ids()), 2)
+
+    def test_fresh_keeps_the_old_binding_when_the_worker_cannot_spawn(self) -> None:
+        """A failed `--fresh` costs the caller nothing, least of all the result.
+
+        The old binding is only set aside for the new worker's `link()`; if no
+        reservation is ever published the key still means the finished Job, so
+        the result stays reachable by key instead of only by jobId.
+        """
+        first = self.start_json("--key", "fr3", "--", "sh", "-c", "exit 0")
+        self.wait_for_state(first["jobId"], {STATE_DONE})
+        with mock.patch.object(
+            jobs_cli.sys, "executable", os.path.join(self.tmp.name, "no-python")
+        ):
+            failed = self.start_json(
+                "--key", "fr3", "--fresh", "--", "sh", "-c", "exit 0"
+            )
+        self.assertEqual(self.last_exit, jobs_cli.EXIT_WORKER)
+        self.assertEqual(failed["result"], "worker-failed")
+        self.assertEqual(failed["keyStillBoundTo"], first["jobId"])
+        self.assertEqual(self.store.key_job_id("fr3"), first["jobId"])
+        # And the key still answers with the finished result, not a re-run.
+        again = self.start_json("--key", "fr3", "--", "sh", "-c", "exit 0")
+        self.assertEqual(again["result"], "finished")
+        self.assertEqual(again["jobId"], first["jobId"])
+
+    def test_a_key_bound_to_a_purged_job_counts_as_free(self) -> None:
+        """`gc --purge` that could not free the key leaves a binding, not a Job.
+
+        There is nothing to attach to and nothing unclear about it, so `start`
+        takes the key and names the binding it dropped.
+        """
+        job_id = new_job_id()
+        self.store.publish_reservation(
+            "gonekey",
+            {
+                "jobId": job_id,
+                "key": "gonekey",
+                "state": STATE_DONE,
+                "fingerprint": "fp",
+                "worker": {"pid": 1, "startTime": 1, "containerRunId": "unknown"},
+            },
+        )
+        shutil.rmtree(self.store.job_dir(job_id))
+        started = self.start_json("--key", "gonekey", "--", "sh", "-c", "exit 0")
+        self.assertEqual(self.last_exit, jobs_cli.EXIT_OK)
+        self.assertEqual(started["result"], "started")
+        self.assertEqual(started["freedDanglingKey"], job_id)
+        self.assertEqual(self.store.key_job_id("gonekey"), started["jobId"])
+        self.wait_for_state(started["jobId"], {STATE_DONE})
 
     def test_reservation_without_a_record_is_unclear(self) -> None:
         """A half-known key refuses a retry until cancel/adopt (issue 02)."""
