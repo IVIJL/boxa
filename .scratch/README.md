@@ -7,9 +7,7 @@ local PRDs, issues and handoffs; GitHub Issues is not used for Boxa work.
 
 ### Active
 
-| Feature | Artifact | Next action | Last reviewed |
-| ------- | -------- | ----------- | ------------- |
-| boxa-jobs | `boxa-jobs/KICKOFF.md` | AFK batch (Prompt A) running in-Container: issues 01–07 done (commits fb7dbb9..633a5d0); final Codex review running, then HANDOFF.md for host proofs (05/06) and 08/09. | 2026-09-12 |
+None.
 
 ### Planned
 
@@ -22,6 +20,7 @@ local PRDs, issues and handoffs; GitHub Issues is not used for Boxa work.
 
 | Feature | Artifact | Next action | Last reviewed |
 | ------- | -------- | ----------- | ------------- |
+| boxa-jobs | `boxa-jobs/HANDOFF.md` | Issues 01–07 done and final Codex review clean (11 commits fb7dbb9..575b9d0, unpushed). Host session (Prompt B): `boxa build`, restart, run host proofs for 05/06/07 from HANDOFF.md, then issues 08 and 09. | 2026-09-12 |
 | glab config seeding | `glab-config-seeding/issues/03-live-proof-docs-adr-note.md` | Issues 01+02 done, 03 docs landed; final Codex review clean apart from declined YAML hardening (recorded in issue 02). On the host: rebuild the image, then `boxa stop --clean playground && boxa` and the plain-restart test per issue 03; record redacted `glab auth status` / `glab api user` output, set 03 to `done`, archive the feature. | 2026-09-03 |
 | Keep-awake during long-running agent work | `keep-awake-long-running-agent/issues/01-long-running-agent-awake-lease.md` | Host refreshed; live container verification passed after fixing owner detection for versioned Claude binaries + test-suite state leakage (uncommitted). Review/commit the fix (`/cr`), sync the container hook, then run the recorded live WSL soak; on pass promote the issue to `done` and archive the feature. | 2026-08-29 |
 

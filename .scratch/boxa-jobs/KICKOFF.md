@@ -58,3 +58,8 @@ Until issue 09 lands, Codex delegation in Containers runs through the old
 `codex mcp-server` from Codex 0.149.1 pinned in the shared `boxa-npm-global`
 volume (downgraded 2026-09-12). Do not update Codex inside a Container before
 09 is done; a host `codex` update does not affect Containers.
+
+## Status 2026-09-12 (end of Prompt A)
+
+Issues 01–07 done, final review clean after five rounds; see `HANDOFF.md`
+for the host steps and the pending host proofs. Next: Prompt B.
