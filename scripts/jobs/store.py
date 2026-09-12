@@ -134,7 +134,8 @@ _RECORD_WRITE_LOCK = threading.RLock()
 # the in-process lock so the worker's two threads never race for it.
 RECORD_LOCK_NAME = "record.lock"
 
-# Name infix of a `--fresh` key stash: `keys/<key-hash>.stash.<run>.<pid>`.
+# Name infix of a `--fresh` key stash:
+# `keys/<key-hash>.stash.<run>.<pid>.<start-time>`.
 # The key hash stays the prefix so the stash is discoverable from the key
 # alone, and the owner suffix says whether the CLI that made it is still
 # running (see `_stash_owner_alive`).
@@ -200,48 +201,70 @@ def _unlink_quietly(path: str) -> None:
         pass
 
 
-def _stash_owner_tag() -> str:
-    """Owner suffix of a ``--fresh`` stash: this Container run and this pid.
-
-    Both halves are needed. The run tag tells a stash of the *previous*
-    Container run (whose pids mean nothing here) from one of this run, and the
-    pid tells a stash whose CLI is still in flight from one its CLI died on.
-    """
+def _run_tag() -> str:
     from .identity import container_run_id
 
-    run_tag = hashlib.sha256(container_run_id().encode("utf-8")).hexdigest()[:12]
-    return f"{run_tag}.{os.getpid()}"
+    return hashlib.sha256(container_run_id().encode("utf-8")).hexdigest()[:12]
+
+
+def _stash_owner_tag() -> str:
+    """Owner suffix of a ``--fresh`` stash: Container run, pid, start time.
+
+    All three are needed. The run tag tells a stash of the *previous*
+    Container run (whose pids mean nothing here) from one of this run, and the
+    pid plus its start time is the CLI's **identity** (ADR 0037 "Ownership by
+    subreaper and marker"): a pid alone is reused, and a recycled pid would
+    make the orphaned stash of a dead ``--fresh`` look owned forever.
+    """
+    from . import procs
+
+    pid = os.getpid()
+    start = procs.process_start_time(pid)
+    return f"{_run_tag()}.{pid}.{0 if start is None else start}"
 
 
 def _stash_owner_alive(name: str) -> bool:
     """Is the CLI that created this stash still running (so: hands off)?
 
-    A pid of this Container run that is still alive means a ``--fresh`` is
-    between setting the old binding aside and its worker's publish; restoring
-    it there would hand the key back under a live start.  A pid reused by an
-    unrelated process only makes this conservative: the stash is left for the
-    next caller, never deleted.
+    An owner of this Container run whose pid *and* start time still match
+    means a ``--fresh`` is between setting the old binding aside and its
+    worker's publish; restoring it there would hand the key back under a live
+    start.  Anything else — another run, an unparseable or start-time-less
+    name, a pid whose start time differs — is a dead owner, so its stash is
+    the next caller's to restore.
     """
-    parts = name.rsplit(".", 2)
-    if len(parts) != 3:
+    parts = name.rsplit(".", 3)
+    if len(parts) != 4:
+        # Written without an owner identity: no verifiable owner, so no claim.
         return False
-    run_tag, pid_text = parts[1], parts[2]
-    if run_tag != _stash_owner_tag().split(".", 1)[0]:
+    run_tag, pid_text, start_text = parts[1], parts[2], parts[3]
+    if run_tag != _run_tag():
         # Another Container run wrote it: its pids are meaningless now.
         return False
     try:
-        pid = int(pid_text)
+        pid, start = int(pid_text), int(start_text)
     except ValueError:
         return False
-    if pid == os.getpid():
-        return True
+    from . import procs
+
+    return procs.is_alive(pid, start)
+
+
+def _stash_record_time(data: dict[str, Any], path: str) -> float:
+    """How recent the Job a stash names is: which predecessor is the newest.
+
+    A stash holds the key's immutable reservation, so its own timestamps are
+    the Job's; the file's mtime is the fallback for a record too old (or too
+    hand-edited) to carry one.
+    """
+    for field in ("finishedAt", "startedAt", "reservedAt"):
+        value = data.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
+        return os.stat(path).st_mtime
     except OSError:
-        return True
-    return True
+        return 0.0
 
 
 def _read_json(path: str) -> dict[str, Any]:
@@ -313,9 +336,18 @@ class ProjectStore:
         return os.path.join(self.job_dir(job_id), "cancel")
 
     def request_cancel(self, job_id: str, by: str) -> None:
+        """Write the cancel request under the record's own lock.
+
+        The request is state of the Job as much as the record is: gc's
+        artefact sweep re-checks eligibility under that lock and keeps it for
+        its unlinks, so a request written outside it could appear inside the
+        sweep's critical section and have its Job's logs deleted under a
+        cancel that is still in flight.
+        """
         os.makedirs(self.job_dir(job_id), mode=0o700, exist_ok=True)
-        with open(self.cancel_path(job_id), "w", encoding="utf-8") as fh:
-            fh.write(json.dumps({"requestedAt": time.time(), "by": by}) + "\n")
+        with self.record_lock(job_id):
+            with open(self.cancel_path(job_id), "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"requestedAt": time.time(), "by": by}) + "\n")
 
     def cancel_requested(self, job_id: str) -> bool:
         return os.path.exists(self.cancel_path(job_id))
@@ -576,11 +608,48 @@ class ProjectStore:
         """Put a stashed binding back. False means it could not be restored."""
         if not stash:
             return False
+        return self._restore_stash_link(key, stash)
+
+    def _restore_stash_link(self, key: str, stash: str) -> bool:
+        """Link a stash back onto its key, never *over* a binding.
+
+        A ``rename`` over the key would clobber whatever appeared in the gap
+        between the absence check and the restore, and a late worker (the one
+        whose CLI gave up or died) can publish its reservation at any moment
+        — that reservation, not this stash, is then what the key means.
+        :func:`os.link` fails with ``EEXIST`` instead of overwriting, and the
+        stash is only dropped when the binding that won is a Job of its own.
+        """
         try:
-            os.rename(stash, self.key_path(key))
+            os.link(stash, self.key_path(key))
+        except FileExistsError:
+            if self._binding_supersedes(key, stash):
+                _unlink_quietly(stash)
+            return False
         except OSError:
             return False
+        _unlink_quietly(stash)
         return True
+
+    def _binding_supersedes(self, key: str, stash: str) -> bool:
+        """Does the binding that won the race make this stash garbage?
+
+        Yes when it names the stashed Job itself (the restore already
+        happened) or a Job whose directory is there (a live/newer
+        reservation).  Anything else is left on disk: a stash is the only
+        discoverable evidence of a finished Job's binding.
+        """
+        try:
+            bound = self.key_job_id(key)
+        except JobStoreError:
+            return False
+        if bound is None:
+            return False
+        try:
+            stashed = str(_read_json(stash).get("jobId") or "")
+        except (OSError, ValueError, JobStoreError):
+            return False
+        return bound == stashed or os.path.isdir(self.job_dir(bound))
 
     def restore_orphan_stash(self, key: str) -> Optional[str]:
         """Self-heal a ``--fresh`` stash whose CLI died. Returns the jobId.
@@ -596,6 +665,11 @@ class ProjectStore:
         mid-flight and will restore or drop it itself), and a stash naming a
         Job with no directory left is the only thing removed: its binding
         could only ever dangle.
+
+        With several orphan stashes of one key — a ``--fresh`` chain whose
+        CLIs all died — the **newest** one is the binding the key had last, so
+        that is the one restored; its predecessors are deleted with it, or a
+        later ``start`` would put an older result back over a newer one.
         """
         if self.key_job_id(key) is not None:
             return None
@@ -604,27 +678,32 @@ class ProjectStore:
             names = sorted(os.listdir(self.keys_dir))
         except OSError:
             return None
-        restored: Optional[str] = None
+        candidates: list[tuple[float, str, str]] = []
         for name in names:
             if not name.startswith(prefix) or _stash_owner_alive(name):
                 continue
             path = os.path.join(self.keys_dir, name)
             try:
-                job_id = str(_read_json(path).get("jobId") or "")
+                data = _read_json(path)
             except (OSError, ValueError, JobStoreError):
                 # Unreadable: not ours to guess at, and not ours to delete.
                 continue
+            job_id = str(data.get("jobId") or "")
             if not job_id or not os.path.isdir(self.job_dir(job_id)):
                 _unlink_quietly(path)
                 continue
-            if restored is not None:
-                continue
-            try:
-                os.rename(path, self.key_path(key))
-            except OSError:
-                continue
-            restored = job_id
-        return restored
+            candidates.append((_stash_record_time(data, path), job_id, path))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        _, job_id, path = candidates[-1]
+        if not self._restore_stash_link(key, path):
+            # A binding appeared in the gap: it owns the key now, and every
+            # stash stays where a later call can re-decide about it.
+            return None
+        for _time, _job, older in candidates[:-1]:
+            _unlink_quietly(older)
+        return job_id
 
     def drop_key_stash(self, stash: Optional[str]) -> None:
         """Forget a stashed binding: the replacement reservation is published."""

@@ -369,6 +369,30 @@ def _still_eligible(
     return age >= older_than_days * _DAY_SECONDS
 
 
+def _cancel_in_flight(store: ProjectStore, job_id: str) -> bool:
+    """Is there a cancel request this Job's record does not reflect yet?
+
+    ``cancel`` writes its request under the record lock *before* it kills
+    anything, so a request newer than the record's own ``finishedAt`` belongs
+    to a cancel whose record write is still to come — gc deleting the
+    artefacts under it would take away exactly what that cancel is about to
+    report on.  A request older than ``finishedAt`` is the finished cancel the
+    record already states, and keeps nothing out of retention.
+    """
+    try:
+        requested = os.stat(store.cancel_path(job_id)).st_mtime
+    except OSError:
+        return False
+    try:
+        record = store.load_record(job_id)
+    except JobStoreError:
+        return True
+    finished = (record or {}).get("finishedAt")
+    if not isinstance(finished, (int, float)) or isinstance(finished, bool):
+        return True
+    return requested > float(finished)
+
+
 def run(
     store: ProjectStore,
     *,
@@ -388,6 +412,9 @@ def run(
     re-checks state and age under each record's own lock, the lock every
     record writer holds for its read-modify-write, and keeps it for the
     unlinks: a Job made active again by a concurrent cancel keeps its logs.
+    Both levels also refuse a Job with a cancel request its record does not
+    reflect yet (:func:`_cancel_in_flight`), because a cancel writes that
+    request before its record write.
 
     The returned entries describe the *result*: files that were removed, bytes
     that were really freed, and ``failed`` for anything that survived.
@@ -408,7 +435,7 @@ def run(
                     entry.job_id,
                     older_than_days=older_than_days,
                     now=now,
-                ):
+                ) or _cancel_in_flight(store, entry.job_id):
                     # Active again since `collect` looked: not garbage.
                     skipped += 1
                     continue
@@ -427,7 +454,9 @@ def run(
                     entry.job_id,
                     older_than_days=older_than_days,
                     now=now,
-                ):
+                ) or _cancel_in_flight(store, entry.job_id):
+                    # Active again since `collect` looked — or a cancel is in
+                    # flight on it, which the unlinks must not undercut.
                     skipped += 1
                     continue
                 done.append(_delete_bulky(store, entry, at))

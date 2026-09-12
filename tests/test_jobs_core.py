@@ -651,6 +651,112 @@ class KeySemanticsTests(JobsTestCase):
         self.assertIsNone(self.store.restore_orphan_stash("fr6"))
         self.assertFalse(os.path.exists(dead))
 
+    def _dead_owner_stash(self, key: str, suffix: str) -> str:
+        """The key's current binding, set aside under a dead owner's name."""
+        stash = self.store.stash_key(key)
+        assert stash is not None
+        dead = self.store.key_path(key) + jobs_store.STASH_INFIX + suffix
+        os.rename(stash, dead)
+        return dead
+
+    def test_restoring_a_stash_never_overwrites_a_binding(self) -> None:
+        """A late worker may publish its key link while the stash is aside.
+
+        Restoration therefore *links* the stash back instead of renaming over
+        the key: the reservation that appeared in the gap wins untouched, and
+        the stash is dropped only because that binding names a Job of its own.
+        """
+        first = self.start_json("--key", "fr7", "--", "sh", "-c", "exit 0")
+        self.wait_for_state(first["jobId"], {STATE_DONE})
+        stash = self.store.stash_key("fr7")
+        assert stash is not None
+        late = new_job_id()
+        self.store.publish_reservation(
+            "fr7",
+            {
+                "jobId": late,
+                "key": "fr7",
+                "state": STATE_RESERVED,
+                "fingerprint": "fp",
+                "worker": {"pid": 1, "startTime": 1, "containerRunId": "unknown"},
+            },
+        )
+
+        self.assertFalse(self.store.restore_key("fr7", stash))
+        self.assertEqual(self.store.key_job_id("fr7"), late)
+        self.assertFalse(os.path.exists(stash))
+
+        # And the orphan-stash self-heal leaves that binding alone too.
+        orphan = (
+            self.store.key_path("fr7") + jobs_store.STASH_INFIX + "deadrun.1.1"
+        )
+        with open(orphan, "w", encoding="utf-8") as fh:
+            json.dump({"jobId": first["jobId"]}, fh)
+        self.assertIsNone(self.store.restore_orphan_stash("fr7"))
+        self.assertEqual(self.store.key_job_id("fr7"), late)
+
+    def test_a_stash_whose_pid_was_reused_is_not_treated_as_owned(self) -> None:
+        """Stash ownership is an identity: pid AND start time AND run tag.
+
+        A dead `--fresh` whose pid was handed to an unrelated process would
+        otherwise look owned forever, and its orphaned binding would never be
+        restored.
+        """
+        first = self.start_json("--key", "fr8", "--", "sh", "-c", "exit 0")
+        self.wait_for_state(first["jobId"], {STATE_DONE})
+        stash = self.store.stash_key("fr8")
+        assert stash is not None
+        # This run, this (live) pid — but not the process that made the stash.
+        other_start = (jobs_procs.process_start_time(os.getpid()) or 0) + 1
+        reused = f"{stash.rsplit('.', 1)[0]}.{other_start}"
+        os.rename(stash, reused)
+
+        self.assertFalse(jobs_store._stash_owner_alive(os.path.basename(reused)))
+        self.assertEqual(
+            self.store.restore_orphan_stash("fr8"), first["jobId"]
+        )
+        self.assertEqual(self.store.key_job_id("fr8"), first["jobId"])
+        self.assertFalse(os.path.exists(reused))
+
+    def test_the_newest_of_several_orphan_stashes_is_the_one_restored(self) -> None:
+        """A chain of dead `--fresh` calls leaves more than one stash.
+
+        The key last meant the newest of them, so that is what comes back —
+        not whichever name sorts first — and its predecessors go with it.
+        """
+        older = new_job_id()
+        newer = new_job_id()
+        for job_id, reserved_at, suffix in (
+            (older, 100.0, "deadrun.1.1"),
+            (newer, 200.0, "deadrun.2.2"),
+        ):
+            self.store.publish_reservation(
+                "fr9",
+                {
+                    "jobId": job_id,
+                    "key": "fr9",
+                    "state": STATE_DONE,
+                    "fingerprint": "fp",
+                    "reservedAt": reserved_at,
+                    "worker": {
+                        "pid": 1,
+                        "startTime": 1,
+                        "containerRunId": "unknown",
+                    },
+                },
+            )
+            self._dead_owner_stash("fr9", suffix)
+        keys_before = sorted(os.listdir(self.store.keys_dir))
+        self.assertEqual(len(keys_before), 2)
+
+        self.assertEqual(self.store.restore_orphan_stash("fr9"), newer)
+        self.assertEqual(self.store.key_job_id("fr9"), newer)
+        # Both stashes are gone: the restored one and its superseded
+        # predecessor, which must never be put back over a newer result.
+        self.assertEqual(
+            os.listdir(self.store.keys_dir), [os.path.basename(self.store.key_path("fr9"))]
+        )
+
     def test_an_unwritable_key_index_refuses_instead_of_crashing(self) -> None:
         """The dangling-binding recovery needs to write the index to happen.
 

@@ -57,6 +57,7 @@ from .identity import IdentityError, project_key
 from .store import (
     CLEAN_TERMINAL_STATES,
     RUNNING_STATES,
+    STATE_CANCELLED,
     STATE_ORPHANED,
     STATE_RUNNING,
     TERMINAL_STATES,
@@ -688,11 +689,24 @@ def _register_job(request: JobRequest) -> int:
         elif stashed and key_restored:
             payload["keyStillBoundTo"] = replaced_id
             lines.append(f"key unchanged: it still resolves to {replaced_id}")
-        elif stashed:
+        elif stashed and os.path.exists(stashed):
             payload["keyStashed"] = stashed
             lines.append(
                 f"WARNING: the binding of key {key} could not be restored; "
                 f"it is at {stashed}"
+            )
+        elif stashed:
+            # Another reservation took the key while the old binding was set
+            # aside, so the stash was superseded rather than restorable. The
+            # key still means a Job; it is just not the one it named before.
+            try:
+                superseded = store.key_job_id(key)
+            except JobStoreError:
+                superseded = None
+            payload["keyBoundTo"] = superseded
+            lines.append(
+                f"key {key} now resolves to {superseded}: the previous "
+                "binding was superseded and dropped"
             )
         _emit(request.json_mode, payload, lines)
         return EXIT_WORKER
@@ -1334,6 +1348,27 @@ def _list_extra(row: dict[str, Any]) -> str:
 # --------------------------------------------------------------- cancel/adopt
 
 
+def _emit_already_finished(
+    args: argparse.Namespace,
+    store: ProjectStore,
+    record: dict[str, Any],
+    detail: str,
+) -> int:
+    """Report a Job that finished on its own: nothing here was cancelled."""
+    payload = _result_payload(store, record)
+    payload["result"] = "already-finished"
+    _emit(
+        args.json,
+        payload,
+        [
+            f"result: already-finished  state: {record.get('state')}",
+            f"job: {args.job_id}",
+            detail,
+        ],
+    )
+    return EXIT_OK
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     """Kill what Boxa can see of a Job and state what it could not track."""
     store = _store()
@@ -1358,19 +1393,25 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     except recovery.AlreadyFinished as exc:
         # The Job finished while this cancel waited for the Project lock. Its
         # real state is what the caller gets; nothing was overwritten.
-        payload = _result_payload(store, exc.record)
-        payload["result"] = "already-finished"
-        _emit(
-            args.json,
-            payload,
-            [
-                f"result: already-finished  state: {exc.state}",
-                f"job: {args.job_id}",
-                "it finished before this cancel took the lock; nothing was "
-                "cancelled",
-            ],
+        return _emit_already_finished(
+            args,
+            store,
+            exc.record,
+            "it finished before this cancel took the lock; nothing was "
+            "cancelled",
         )
-        return EXIT_OK
+    state = final.get("state")
+    if state in CLEAN_TERMINAL_STATES and state != STATE_CANCELLED:
+        # The worker reached a clean end *after* the re-read under the lock:
+        # `cancel_job` preserved that state (it never rewrites a finished Job)
+        # and hands it back, so the caller must not be told `cancelled` for a
+        # Job that really completed.
+        return _emit_already_finished(
+            args,
+            store,
+            final,
+            "it finished while this cancel was running; nothing was cancelled",
+        )
     summary = final.get("cancel") or {}
     killed = summary.get("killed", [])
     untrackable = [entry["pid"] for entry in summary.get("untrackable", [])]

@@ -535,6 +535,36 @@ class UnclearKeyTests(OwnershipTestCase):
         self.assertNotEqual(fresh["jobId"], job_id)
         self.wait_for_state(fresh["jobId"], {STATE_DONE})
 
+    def test_a_job_that_finishes_during_the_cancel_is_already_finished(self) -> None:
+        """The Job can reach a clean end AFTER cancel's re-read under the lock.
+
+        The record keeps that state (a `done` Job is never rewritten as
+        `cancelled`), and so must the output: `result: cancelled` for a Job
+        that really completed would be a lie about what the cancel did.
+        """
+        job_id = self._publish_dead_reservation("late-finish")
+        real_live = recovery.live_job_pids
+
+        def finish_then_look(record):
+            # The clean end lands in the gap between cancel's re-read and its
+            # own final write.
+            self.store.update_record(
+                job_id, state=STATE_DONE, exitCode=0, finishedAt=time.time()
+            )
+            return real_live(record)
+
+        with mock.patch.object(recovery, "live_job_pids", finish_then_look):
+            code, out = run_cli("cancel", "--json", job_id)
+        self.assertEqual(code, jobs_cli.EXIT_OK)
+        payload = json.loads(out)
+        self.assertEqual(payload["result"], "already-finished")
+        self.assertEqual(payload["state"], STATE_DONE)
+        self.assertEqual(self.store.load_record(job_id)["state"], STATE_DONE)
+
+        code, out = run_cli("cancel", job_id)
+        self.assertEqual(code, jobs_cli.EXIT_OK)
+        self.assertIn("already-terminal", out)
+
     def test_cancel_on_a_clean_terminal_job_kills_nothing(self) -> None:
         started = self.start("finished", "echo hi")
         self.wait_for_state(started["jobId"], {STATE_DONE})

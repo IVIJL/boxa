@@ -561,7 +561,13 @@ class PurgeTests(GcTestCase):
             @contextmanager
             def wrapper():
                 with real_lock(*args, **kwargs):
-                    self.store.request_cancel(job_id, "concurrent cancel")
+                    # Written directly: `request_cancel` takes this very lock,
+                    # and the point here is a request landing inside the
+                    # sweep's critical section.
+                    with open(
+                        self.store.cancel_path(job_id), "w", encoding="utf-8"
+                    ) as fh:
+                        fh.write('{"by": "concurrent cancel"}\n')
                     yield
 
             return wrapper()
@@ -574,6 +580,35 @@ class PurgeTests(GcTestCase):
         self.assertEqual(outcome.bytes, 0)
         self.assertIn("stdout", self.artefacts(job_id))
         self.assertIn("stderr", self.artefacts(job_id))
+
+    def test_a_cancel_request_in_the_unlink_gap_keeps_the_artefacts(self) -> None:
+        """A cancel request the record does not reflect yet is not garbage.
+
+        `cancel` writes that request under the record lock now, so it cannot
+        land inside the sweep's critical section — and the sweep re-reads it
+        right before the unlinks anyway, so a request that did slip in keeps
+        the logs the cancel is about to act on.
+        """
+        job_id = self.make_job("cancel-gap", STATE_INTERRUPTED, age_days=20)
+        real_eligible = jobs_gc._still_eligible
+
+        def eligible_then_request(store, jid, **kwargs):
+            verdict = real_eligible(store, jid, **kwargs)
+            # Written directly: `request_cancel` takes the lock the sweep is
+            # holding, which is exactly what the fix relies on.
+            with open(store.cancel_path(jid), "w", encoding="utf-8") as fh:
+                fh.write('{"by": "concurrent cancel"}\n')
+            return verdict
+
+        with mock.patch.object(jobs_gc, "_still_eligible", eligible_then_request):
+            outcome = jobs_gc.run(self.store, older_than_days=14)
+
+        self.assertEqual(outcome.entries, [])
+        self.assertEqual(outcome.kept, 1)
+        self.assertEqual(outcome.bytes, 0)
+        self.assertIn("stdout", self.artefacts(job_id))
+        self.assertIn("stderr", self.artefacts(job_id))
+        self.assertIsNone(self.store.load_record(job_id).get("gcAt"))
 
     def test_a_cancel_never_overwrites_a_job_that_finished_first(self) -> None:
         """The record `cancel` was handed was read BEFORE the Project lock.
