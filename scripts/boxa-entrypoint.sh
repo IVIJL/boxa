@@ -90,6 +90,22 @@ if [ "$(id -u)" = "0" ]; then
         > /etc/boxa/identity.json
     chmod 0644 /etc/boxa/identity.json
 
+    # Container run id (ADR 0037 Jobs). A nonce that distinguishes THIS
+    # Container run from the previous one. `boxa-job` stores it in every Job
+    # record and, on the next CLI call, lazily marks every non-terminal Job
+    # carrying a different run id `interrupted` — never resuming it. That
+    # comparison is the only defence against a restart's recycled pids: pid
+    # plus start time identifies a process only WITHIN one run. Root-owned and
+    # world-readable: node reads it on every `boxa-job` call but must not be
+    # able to forge a matching id for a stale record. Rewritten on every start
+    # (the redirect truncates in place, so no orphan files accumulate).
+    mkdir -p /run/boxa
+    printf '%s-%s\n' \
+        "$(date -u +%Y%m%dT%H%M%SZ)" \
+        "$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')" \
+        > /run/boxa/run-id
+    chmod 0644 /run/boxa/run-id
+
     # Container MCP broker (ADR 0014, issue 15). Start the always-on broker as
     # the dedicated unprivileged `boxa-mcp` account BEFORE dropping PID 1 to
     # node, so MCP servers run behind a UID boundary the agent cannot cross.

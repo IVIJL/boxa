@@ -10,6 +10,13 @@ Modules:
                  agent-trusted launcher) plus caller-named passthrough.
   * ``store``  — state directory layout, Project lock, job records, the
                  link-published key reservation and the per-key index.
-  * ``worker`` — the detached worker entry point (``python3 -m jobs.worker``).
+  * ``procs``  — process identity (pid + start time), the ``/proc`` parent-link
+                 tree walk under a live worker, the ``BOXA_JOB_ID`` marker
+                 scan, and TERM-then-KILL with identity verification.
+  * ``recovery`` — what of a Job is still alive, the lazy re-derivation of
+                 stale records (``orphaned`` / ``interrupted`` /
+                 ``finished-unknown``) and ``cancel``.
+  * ``worker`` — the detached worker entry point (``python3 -m jobs.worker``),
+                 in spawn mode and in ``--watch`` (adopt) mode.
   * ``cli``    — the ``boxa-job`` command surface.
 """

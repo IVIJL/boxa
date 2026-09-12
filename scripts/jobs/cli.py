@@ -1,10 +1,17 @@
 """``boxa-job`` — the Container-owned Job CLI (ADR 0037).
 
-This slice (issue 01) implements ``start``, ``wait``, ``result``, ``list`` and
-``log`` for a plain command.  ``cancel``, ``adopt``, ``reply``, ``gc`` and
-``runtime`` are documented in ``--help`` and refuse with a clear "not yet
-available" message, so the help stays the complete command surface the ADR
-describes.
+Implemented here: ``start``, ``wait``, ``result``, ``list`` and ``log`` for a
+plain command (issue 01), plus ``cancel``, ``adopt`` and the recovery states
+(issue 02).  ``reply``, ``gc`` and ``runtime`` are documented in ``--help``
+and refuse with a clear "not yet available" message, so the help stays the
+complete command surface the ADR describes.
+
+Every command starts by re-deriving the Project's non-terminal records from
+evidence (:func:`jobs.recovery.refresh_states`): a Job from a foreign
+Container run becomes ``interrupted``, a Job whose worker died while its tree
+lives becomes ``orphaned``, and a Job whose worker and tree are both gone
+without an exit code becomes ``finished-unknown``.  The caller therefore never
+acts on a record that was only true a restart ago.
 
 Output discipline (ADR 0037 "Frugal waiting"): every command prints at most a
 handful of short lines, or one compact JSON object with ``--json``.  An
@@ -36,11 +43,15 @@ import time
 from typing import Any, Optional
 
 import jobs
+from . import recovery
 from .env import passthrough_values
 from .identity import IdentityError, project_key
 from .store import (
+    CLEAN_TERMINAL_STATES,
+    STATE_ORPHANED,
     STATE_RUNNING,
     TERMINAL_STATES,
+    UNCLEAR_STATES,
     JobStoreError,
     ProjectStore,
     fingerprint,
@@ -61,6 +72,9 @@ EXIT_STILL_RUNNING = 10
 WAIT_DEFAULT_SECONDS = 540
 WAIT_MAX_SECONDS = 570
 WAIT_POLL_SECONDS = 0.5
+# How often a blocking `wait` re-derives the Project's records. A /proc scan
+# per poll would be waste; a dead worker must still surface while waiting.
+WAIT_REFRESH_SECONDS = 15.0
 
 # How long `start` holds the registration lock waiting for the worker to
 # publish its reservation.  Bounded: a worker that cannot publish in this time
@@ -70,8 +84,6 @@ RESERVATION_TIMEOUT = 20.0
 # Commands from ADR 0037 that later slices add.  Listed in --help so the help
 # is the whole surface, and refused with a pointer rather than a stack trace.
 PENDING_COMMANDS = {
-    "cancel": "kill a Job's tree and report what could not be tracked",
-    "adopt": "take over a Job whose worker died",
     "reply": "continue a Codex job's thread (Codex jobs only)",
     "gc": "clean up bulky logs and purge Job records",
     "runtime": "list or pin the verified Codex runtime version",
@@ -95,9 +107,16 @@ def _age(seconds: Optional[float]) -> str:
     return f"{int(seconds)}s"
 
 
-def _store() -> ProjectStore:
+def _store(refresh: bool = True) -> ProjectStore:
+    """The Project's store, with its non-terminal records re-derived first.
+
+    The refresh is the only sweeper there is: no daemon, no timer, the next
+    caller pays for the truth (ADR 0037 "States and honesty").
+    """
     store = ProjectStore(project_key())
     store.ensure()
+    if refresh:
+        recovery.refresh_states(store)
     return store
 
 
@@ -122,6 +141,12 @@ def _result_payload(store: ProjectStore, record: dict[str, Any]) -> dict[str, An
             if record.get("state") in TERMINAL_STATES
             else _round(store.heartbeat_age(job_id))
         ),
+        "survivors": [
+            entry.get("pid") for entry in (record.get("survivors") or [])
+        ],
+        "interruptedReason": record.get("interruptedReason"),
+        "cancel": record.get("cancel"),
+        "adopted": bool(record.get("adopted")),
         "paths": record.get("paths", {}),
     }
 
@@ -145,6 +170,11 @@ def _result_lines(payload: dict[str, Any]) -> list[str]:
     if paths:
         lines.append(f"stdout: {paths.get('stdout')}")
         lines.append(f"stderr: {paths.get('stderr')}")
+    if payload.get("survivors"):
+        pids = " ".join(str(pid) for pid in payload["survivors"])
+        lines.append(f"survivors: {pids}")
+    if payload.get("interruptedReason"):
+        lines.append(f"reason: {payload['interruptedReason']}")
     if payload.get("error"):
         lines.append(f"error: {payload['error']}")
     return lines
@@ -153,7 +183,12 @@ def _result_lines(payload: dict[str, Any]) -> list[str]:
 # ---------------------------------------------------------------------- start
 
 
-def _spawn_worker(store: ProjectStore, job_id: str, env_values: dict[str, str]):
+def _spawn_worker(
+    store: ProjectStore,
+    job_id: str,
+    env_values: dict[str, str],
+    watch: bool = False,
+):
     """Launch the detached worker: own session, own stdio, no caller cwd."""
     package_parent = os.path.dirname(os.path.dirname(os.path.abspath(jobs.__file__)))
     env = dict(os.environ)
@@ -169,6 +204,7 @@ def _spawn_worker(store: ProjectStore, job_id: str, env_values: dict[str, str]):
                 sys.executable,
                 "-m",
                 "jobs.worker",
+                *(["--watch"] if watch else []),
                 store.project_key,
                 job_id,
                 store.root,
@@ -268,8 +304,35 @@ def cmd_start(args: argparse.Namespace) -> int:
                 return EXIT_UNCLEAR
             state = existing.get("state")
             terminal = state in TERMINAL_STATES
+            if state in UNCLEAR_STATES:
+                # Dead worker, foreign Container run, survivors left behind:
+                # the Job's fate is not established, so this key does not get
+                # a second run until `cancel` or `adopt` resolves it. Plain
+                # `start` hands back the record it found (never a duplicate
+                # run); `--fresh` is refused with the reason.
+                payload = _result_payload(store, existing)
+                if args.fresh:
+                    payload["result"] = "refused"
+                    payload["reason"] = "key-unclear"
+                    verdict = "refused (--fresh needs a resolved key)"
+                    code = EXIT_REFUSED
+                else:
+                    payload["result"] = "unclear"
+                    payload["reason"] = f"key-{state}"
+                    verdict = "unclear"
+                    code = EXIT_UNCLEAR
+                _emit(
+                    args.json,
+                    payload,
+                    [
+                        f"result: {verdict}  state: {state}",
+                        f"job: {existing_id}  key: {args.key}",
+                        "resolve it first: `boxa-job cancel` or `boxa-job adopt`",
+                    ],
+                )
+                return code
             if args.fresh:
-                if not terminal:
+                if state not in CLEAN_TERMINAL_STATES:
                     _emit(
                         args.json,
                         {
@@ -414,15 +477,37 @@ def cmd_wait(args: argparse.Namespace) -> int:
         return EXIT_UNCLEAR
     timeout = effective_timeout(args.timeout)
     deadline = time.time() + timeout
+    next_refresh = time.time() + WAIT_REFRESH_SECONDS
     while True:
         if record.get("state") in TERMINAL_STATES:
             payload = _result_payload(store, record)
             payload["result"] = "finished"
             _emit(args.json, payload, _result_lines(payload))
             return EXIT_OK
+        if record.get("state") == STATE_ORPHANED:
+            # The worker is gone and nothing will change without a decision;
+            # waiting on it would hide the problem (ADR 0037 frugality never
+            # hides a problem).
+            payload = _result_payload(store, record)
+            payload["result"] = "unclear"
+            _emit(
+                args.json,
+                payload,
+                [
+                    f"state: {STATE_ORPHANED}",
+                    f"job: {args.job_id}",
+                    "worker died, the tree is alive — `boxa-job adopt` or `cancel`",
+                ],
+            )
+            return EXIT_UNCLEAR
         if time.time() >= deadline:
             break
         time.sleep(WAIT_POLL_SECONDS)
+        if time.time() >= next_refresh:
+            # Cheap enough at this cadence, and it is what turns a died-worker
+            # Job into `orphaned` while someone is waiting for it.
+            next_refresh = time.time() + WAIT_REFRESH_SECONDS
+            recovery.refresh_states(store)
         try:
             refreshed = store.load_record(args.job_id)
         except JobStoreError:
@@ -473,6 +558,9 @@ def cmd_list(args: argparse.Namespace) -> int:
             "state": record.get("state"),
             "exitCode": record.get("exitCode"),
             "startedAt": record.get("startedAt"),
+            "survivors": [
+                entry.get("pid") for entry in (record.get("survivors") or [])
+            ],
         }
         for record in records
     ]
@@ -489,9 +577,11 @@ def cmd_list(args: argparse.Namespace) -> int:
         print("no jobs in this Project")
         return EXIT_OK
     for row in rows:
+        # The state column fits the longest state name (`exited-with-survivors`)
+        # so the distinct recovery states stay readable in a column.
         print(
-            f"{row['jobId']}  {row['state']:<8}  key={row['key']}  "
-            f"exit={row['exitCode']}"
+            f"{row['jobId']}  {row['state']:<21}  key={row['key']}  "
+            f"exit={row['exitCode']}{_list_extra(row)}"
         )
     return EXIT_OK
 
@@ -518,6 +608,127 @@ def cmd_log(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _list_extra(row: dict[str, Any]) -> str:
+    if not row.get("survivors"):
+        return ""
+    return "  survivors=" + ",".join(str(pid) for pid in row["survivors"])
+
+
+# --------------------------------------------------------------- cancel/adopt
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    """Kill what Boxa can see of a Job and state what it could not track."""
+    store = _store()
+    record = _require_record(store, args.job_id, args.json)
+    if record is None:
+        return EXIT_UNCLEAR
+    if record.get("state") in CLEAN_TERMINAL_STATES:
+        payload = _result_payload(store, record)
+        payload["result"] = "already-terminal"
+        _emit(
+            args.json,
+            payload,
+            [
+                f"result: already-terminal  state: {record.get('state')}",
+                f"job: {args.job_id}",
+                "nothing to cancel",
+            ],
+        )
+        return EXIT_OK
+    final = recovery.cancel_job(store, record)
+    summary = final.get("cancel") or {}
+    killed = summary.get("killed", [])
+    untrackable = [entry["pid"] for entry in summary.get("untrackable", [])]
+    still = summary.get("stillAlive", [])
+    payload = _result_payload(store, final)
+    payload["result"] = "cancelled"
+    payload["killed"] = killed
+    payload["untrackable"] = untrackable
+    payload["stillAlive"] = still
+    payload["limits"] = list(recovery.CANCEL_LIMITS)
+    lines = [
+        f"state: {final.get('state')}",
+        f"job: {args.job_id}",
+        "killed: " + (" ".join(str(pid) for pid in killed) or "none"),
+    ]
+    if untrackable:
+        lines.append(
+            "untrackable (alive, not killed): "
+            + " ".join(str(pid) for pid in untrackable)
+        )
+    if still:
+        lines.append(
+            "still alive after KILL: " + " ".join(str(pid) for pid in still)
+        )
+    for limit in recovery.CANCEL_LIMITS:
+        lines.append(f"limit: {limit}")
+    _emit(args.json, payload, lines)
+    return EXIT_OK
+
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    """Attach a watching worker to a Job whose worker died.
+
+    The new worker can only watch: the surviving tree does not reparent to it
+    and the command's exit status died with the original worker, so the Job
+    ends as `finished-unknown`.
+    """
+    store = _store()
+    record = _require_record(store, args.job_id, args.json)
+    if record is None:
+        return EXIT_UNCLEAR
+    if not recovery.adoptable(record):
+        state = record.get("state")
+        _emit(
+            args.json,
+            {
+                "result": "refused",
+                "reason": "nothing-alive" if state != STATE_RUNNING else "worker-alive",
+                "jobId": args.job_id,
+                "state": state,
+            },
+            [
+                f"result: refused  state: {state}",
+                f"job: {args.job_id}",
+                "adopt needs an `orphaned` Job (dead worker, live tree)",
+            ],
+        )
+        return EXIT_REFUSED
+    proc = _spawn_worker(store, args.job_id, {}, watch=True)
+    deadline = time.time() + RESERVATION_TIMEOUT
+    adopted = record
+    while time.time() < deadline:
+        refreshed = store.load_record(args.job_id)
+        if refreshed and refreshed.get("adopted"):
+            adopted = refreshed
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    _detach(proc)
+    if not adopted.get("adopted"):
+        detail = _worker_error(store, args.job_id) or "watch worker did not attach"
+        _emit(
+            args.json,
+            {"result": "worker-failed", "jobId": args.job_id, "reason": detail},
+            ["result: worker-failed", f"job: {args.job_id}", f"reason: {detail}"],
+        )
+        return EXIT_WORKER
+    payload = _result_payload(store, adopted)
+    payload["result"] = "adopted"
+    _emit(
+        args.json,
+        payload,
+        [
+            f"result: adopted  state: {adopted.get('state')}",
+            f"job: {args.job_id}",
+            "watching only — this Job ends as `finished-unknown` (no exit code)",
+        ],
+    )
+    return EXIT_OK
+
+
 def cmd_pending(args: argparse.Namespace) -> int:
     name = args.pending_command
     print(
@@ -535,15 +746,36 @@ available now:
   start    reserve a key, fork a Job worker, return the jobId at once
   wait     block in-process for a Job (default 540 s, max 570 s)
   result   state, exit code, output paths and timings of a Job
+  cancel   kill a Job's tree and report what could not be tracked
+  adopt    take over a Job whose worker died (watch only)
   list     the Jobs of this Project
   log      tail a Job's stdout/stderr on demand
 
 not yet available (documented here, refused with exit 7):
-  cancel   kill a Job's tree and report what could not be tracked
-  adopt    take over a Job whose worker died
   reply    continue a Codex job's thread (Codex jobs only)
   gc       clean up bulky logs and purge Job records
   runtime  list or pin the verified Codex runtime version
+
+states:
+  reserved               key taken, the command not spawned yet
+  running                the command is running under a live worker
+  done | failed          the command exited under a live worker AND nothing
+                         of its tree was left alive
+  exited-with-survivors  the command exited, tracked descendants are alive:
+                         the exit code is recorded, the Job is NOT finished
+  orphaned               the worker died, the tree is alive: `adopt` or `cancel`
+  finished-unknown       it ended after its worker died; no exit code ever
+  cancelled              stopped by `cancel`
+  interrupted            a foreign Container run wrote it, or the worker died
+                         before spawning: never resumed automatically
+
+ownership and its limits: while the worker lives it is a child subreaper, so
+the whole tree is walked through /proc parent links (a `setsid` escapee and a
+child with a wiped environment included). Afterwards only the BOXA_JOB_ID
+marker in /proc/*/environ is left. `cancel` therefore reports what it killed
+AND what it could only remember: a process that cleared the marker after its
+worker died, and anything started through the rootless Docker daemon, are
+outside what Boxa can see.
 
 exit codes: 0 finished/ok, 2 usage, 3 worker failed, 4 unknown or unclear Job,
 5 refused, 6 key conflict, 7 not yet available, 10 wait expired while running.
@@ -624,6 +856,36 @@ def build_parser() -> argparse.ArgumentParser:
     listing = sub.add_parser("list", help="the Jobs of this Project")
     listing.add_argument("--json", action="store_true", help="one compact JSON object")
     listing.set_defaults(func=cmd_list)
+
+    cancel = sub.add_parser(
+        "cancel",
+        help="kill a Job's tree and report what could not be tracked",
+        description=(
+            "Write the cancel request, then TERM and KILL everything Boxa can "
+            "see of the Job (the tree under a live worker, otherwise the "
+            "BOXA_JOB_ID marker matches and their descendants), verified by "
+            "pid + start time. Reports what it killed, what it could only "
+            "remember from the record, and the two stated limits. Also the way "
+            "to resolve an unclear key."
+        ),
+    )
+    cancel.add_argument("job_id")
+    cancel.add_argument("--json", action="store_true", help="one compact JSON object")
+    cancel.set_defaults(func=cmd_cancel)
+
+    adopt = sub.add_parser(
+        "adopt",
+        help="take over a Job whose worker died (watch only)",
+        description=(
+            "Attach a new worker to an `orphaned` Job. It only watches the "
+            "surviving tree and the output files: the command's exit status "
+            "died with the original worker, so the Job ends as "
+            "`finished-unknown`. Refused when nothing of the Job is alive."
+        ),
+    )
+    adopt.add_argument("job_id")
+    adopt.add_argument("--json", action="store_true", help="one compact JSON object")
+    adopt.set_defaults(func=cmd_adopt)
 
     log = sub.add_parser("log", help="tail a Job's stdout/stderr on demand")
     log.add_argument("job_id")

@@ -39,6 +39,7 @@ import json
 import os
 import random
 import string
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
@@ -50,7 +51,15 @@ __all__ = [
     "STATE_RUNNING",
     "STATE_DONE",
     "STATE_FAILED",
+    "STATE_CANCELLED",
+    "STATE_INTERRUPTED",
+    "STATE_SURVIVORS",
+    "STATE_ORPHANED",
+    "STATE_FINISHED_UNKNOWN",
     "TERMINAL_STATES",
+    "CLEAN_TERMINAL_STATES",
+    "UNCLEAR_STATES",
+    "RUNNING_STATES",
     "JobStoreError",
     "KeyReserved",
     "ProjectStore",
@@ -62,13 +71,53 @@ STATE_RESERVED = "reserved"
 STATE_RUNNING = "running"
 STATE_DONE = "done"
 STATE_FAILED = "failed"
+STATE_CANCELLED = "cancelled"
+STATE_INTERRUPTED = "interrupted"
+# Command exited, tracked descendants still alive: the exit code is recorded
+# but the Job is NOT finished (ADR 0037 "States and honesty").
+STATE_SURVIVORS = "exited-with-survivors"
+# Worker dead by identity check, command or tree still alive.
+STATE_ORPHANED = "orphaned"
+# The command ended after its worker died: no exit code will ever be known.
+STATE_FINISHED_UNKNOWN = "finished-unknown"
 
-# States this slice can reach that mean "the Job will never change again".
-# Later slices add cancelled / interrupted / exited-with-survivors /
-# orphaned / finished-unknown, which are deliberately NOT listed here.
-TERMINAL_STATES = frozenset({STATE_DONE, STATE_FAILED})
+# "The Job will never change again."
+TERMINAL_STATES = frozenset(
+    {
+        STATE_DONE,
+        STATE_FAILED,
+        STATE_CANCELLED,
+        STATE_INTERRUPTED,
+        STATE_FINISHED_UNKNOWN,
+    }
+)
+
+# Terminal AND fully understood: what `--fresh` may re-run over.
+CLEAN_TERMINAL_STATES = frozenset(
+    {STATE_DONE, STATE_FAILED, STATE_CANCELLED, STATE_FINISHED_UNKNOWN}
+)
+
+# Unclear: the Job's fate is not established (dead worker, foreign Container
+# run, survivors left behind). These refuse a retry under the same key until
+# `cancel` or `adopt` resolves them.
+UNCLEAR_STATES = frozenset(
+    {STATE_ORPHANED, STATE_INTERRUPTED, STATE_SURVIVORS}
+)
+
+# "Running" for the concurrency ack (issue 03): every non-finished state.
+RUNNING_STATES = frozenset(
+    {STATE_RESERVED, STATE_RUNNING, STATE_SURVIVORS, STATE_ORPHANED}
+)
 
 _ID_ALPHABET = string.ascii_lowercase + string.digits
+
+# In-process guard for the record's read-modify-write. The Job worker updates
+# its record from two threads (the main wait and the heartbeat/tree monitor),
+# and without this one of them could merge its change into a stale copy and
+# silently revert the other's state change. Cross-process writers are still
+# last-writer-wins by design: they only ever converge on the same terminal
+# state (a cancel written twice is still a cancel).
+_RECORD_WRITE_LOCK = threading.RLock()
 
 
 class JobStoreError(RuntimeError):
@@ -160,6 +209,25 @@ class ProjectStore:
 
     def worker_err_path(self, job_id: str) -> str:
         return os.path.join(self.job_dir(job_id), "worker.err")
+
+    def cancel_path(self, job_id: str) -> str:
+        """The cancel REQUEST file: ``cancel`` writes it, the worker obeys it.
+
+        One mechanism, no signalling protocol: ``boxa-job cancel`` creates this
+        file *before* it kills anything, so whichever process finalizes the
+        record — the live worker or the CLI itself when the worker is gone —
+        records ``cancelled`` rather than mistaking a killed command for a
+        failed one.
+        """
+        return os.path.join(self.job_dir(job_id), "cancel")
+
+    def request_cancel(self, job_id: str, by: str) -> None:
+        os.makedirs(self.job_dir(job_id), mode=0o700, exist_ok=True)
+        with open(self.cancel_path(job_id), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"requestedAt": time.time(), "by": by}) + "\n")
+
+    def cancel_requested(self, job_id: str) -> bool:
+        return os.path.exists(self.cancel_path(job_id))
 
     def key_path(self, key: str) -> str:
         return os.path.join(self.keys_dir, _key_hash(key))
@@ -254,12 +322,13 @@ class ProjectStore:
 
     def update_record(self, job_id: str, **changes: Any) -> dict[str, Any]:
         """Atomically merge ``changes`` into the live record (temp+rename)."""
-        record = self.load_record(job_id)
-        if record is None:
-            raise JobStoreError(f"no published record for {job_id}")
-        record.update(changes)
-        self._atomic_write(self.record_path(job_id), record)
-        return record
+        with _RECORD_WRITE_LOCK:
+            record = self.load_record(job_id)
+            if record is None:
+                raise JobStoreError(f"no published record for {job_id}")
+            record.update(changes)
+            self._atomic_write(self.record_path(job_id), record)
+            return record
 
     def _atomic_write(self, path: str, payload: dict[str, Any]) -> None:
         tmp = f"{path}.tmp.{os.getpid()}"
