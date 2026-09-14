@@ -71,8 +71,8 @@ boxa_ownership_classify() {
         printf 'fix-old-mapping\n'
     elif { ((owner_uid == 65534)) && ((owner_uid != container_uid)); } || \
         { ((owner_gid == 65534)) && ((owner_gid != container_uid)); } || \
-        ((owner_uid < 1 || owner_uid > 65535)) || \
-        ((owner_gid < 1 || owner_gid > 65535)); then
+        ((owner_uid < 1 || owner_uid > BOXA_SUBID_LIMIT)) || \
+        ((owner_gid < 1 || owner_gid > BOXA_SUBID_LIMIT)); then
         printf 'warn\n'
     else
         printf 'ok\n'
@@ -107,7 +107,7 @@ _boxa_ownership_find_candidates() {
         \( -uid 0 -o -gid 0 \) -print0 -prune > "$output" || return 1
     find "${base[@]}" \( "${prune[@]}" \) -o \
         \( -uid 0 -o -gid 0 \) -prune -o \
-        \( -uid 65534 -o -gid 65534 -o -uid +65535 -o -gid +65535 \) \
+        \( -uid 65534 -o -gid 65534 -o -uid +"$BOXA_SUBID_LIMIT" -o -gid +"$BOXA_SUBID_LIMIT" \) \
         -print0 -prune >> "$output"
 }
 
@@ -125,6 +125,17 @@ _boxa_ownership_bounded_count() {
     )
 }
 
+# `chown -R` crosses into nested mounts, while the scan stays on one
+# filesystem (-xdev). Walk the tree the same way the scan did so a repair
+# never rewrites owners on a filesystem mounted below the Project root, and
+# change symlinks themselves (-h) instead of whatever they point at.
+_boxa_ownership_chown_tree() {
+    local container_uid="$1" path="$2"
+
+    find "$path" -xdev -print0 \
+        | xargs -0 --no-run-if-empty chown -h "$container_uid:$container_uid" --
+}
+
 _boxa_ownership_fix_root() {
     local path="$1" container_uid="$2" purpose="$3" before count after log_file
 
@@ -137,7 +148,7 @@ _boxa_ownership_fix_root() {
         (
             local background_count
             background_count=$(find "$path" -xdev -printf '.\n' | awk 'END { print NR }')
-            if chown -R "$container_uid:$container_uid" -- "$path"; then
+            if _boxa_ownership_chown_tree "$container_uid" "$path"; then
                 after=$(stat -c '%u:%g' -- "$path")
                 printf 'boxa: Ownership repair complete: %q (%s -> %s, %s entries).\n' \
                     "$path" "$before" "$after" "$background_count"
@@ -147,7 +158,7 @@ _boxa_ownership_fix_root() {
         ) >> "$log_file" 2>&1 &
         return 0
     fi
-    chown -R "$container_uid:$container_uid" -- "$path" || return 1
+    _boxa_ownership_chown_tree "$container_uid" "$path" || return 1
     after=$(stat -c '%u:%g' -- "$path") || return 1
     printf 'boxa: Ownership repaired: %q (%s -> %s, %s entries).\n' \
         "$path" "$before" "$after" "$count"

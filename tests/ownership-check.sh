@@ -63,6 +63,10 @@ assert_eq "legacy uid 100069 needs remap" fix-old-mapping \
     "$(boxa_ownership_classify 100069 100069 1000)"
 assert_eq "nobody uid 65534 warns" warn \
     "$(boxa_ownership_classify 65534 65534 1000)"
+assert_eq "host uid 65536 (inner 65535 above the hole) is ok" ok \
+    "$(boxa_ownership_classify 65536 65536 1000)"
+assert_eq "host uid 65537 warns" warn \
+    "$(boxa_ownership_classify 65537 65537 1000)"
 assert_eq "root gid is repairable" fix-root \
     "$(boxa_ownership_classify 1000 0 1000)"
 

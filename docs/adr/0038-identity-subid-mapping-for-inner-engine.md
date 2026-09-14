@@ -29,10 +29,14 @@ node:1:(U-1)
 node:(U+1):(65536-U)
 ```
 
-The zero-length first range is omitted when `U=1`. Rootless container root
+The zero-length first range is omitted when `U=1`; when `U` is 65536 or
+higher, nothing fits above the hole and the single range `node:1:65535`
+identity-maps the whole budget below it. Rootless container root
 continues to map to `U`; inner IDs below `U` map identically, and inner IDs at
 or above `U` map one higher, so `U` maps to `U+1`. The two subordinate ranges
-contain 65535 IDs and contain neither host UID 0 nor `U`.
+contain 65535 IDs and contain neither host UID 0 nor `U`. The highest host
+ID the map can emit is 65536 (inner ID 65535 shifted above the hole), so the
+ownership check treats host owners up to 65536 as expected.
 
 The mapping belongs to the Container, independent of Project Compose files.
 The inner data-root remains `/home/node/.local/share/docker` on the existing

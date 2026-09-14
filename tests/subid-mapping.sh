@@ -54,6 +54,11 @@ done
 assert_eq "U=1 skips the zero-length first range" "node:2:65535" \
     "$(boxa_generate_subid_ranges 1 node)"
 
+assert_eq "U at the budget limit keeps one identity range below the hole" \
+    "node:1:65535" "$(boxa_generate_subid_ranges 65536 node)"
+assert_eq "U above the budget limit keeps one identity range below the hole" \
+    "node:1:65535" "$(boxa_generate_subid_ranges 70000 node)"
+
 data_root="$_TMPROOT/docker"
 mapping=$(boxa_subid_mapping_id 1000)
 assert_eq "absent data-root is empty" empty \

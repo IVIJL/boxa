@@ -10,7 +10,7 @@ BOXA_SUBID_STAMP_NAME=.boxa-subid-map
 boxa_validate_container_uid() {
     local uid="$1"
 
-    [[ "$uid" =~ ^[0-9]+$ ]] && ((uid >= 1 && uid < BOXA_SUBID_LIMIT))
+    [[ "$uid" =~ ^[0-9]+$ ]] && ((uid >= 1))
 }
 
 boxa_subid_mapping_id() {
@@ -25,6 +25,12 @@ boxa_generate_subid_ranges() {
 
     boxa_validate_container_uid "$uid" || return 1
 
+    # A U at or above the 65536-ID budget leaves no room above the hole, so
+    # the whole budget minus uid 0 sits below it as one identity range.
+    if ((uid >= BOXA_SUBID_LIMIT)); then
+        printf '%s:1:%s\n' "$user" "$((BOXA_SUBID_LIMIT - 1))"
+        return 0
+    fi
     # A zero-length first range is invalid syntax, so U=1 has only the range
     # above the hole. Production UIDs are larger, but keeping the edge valid
     # makes the generator total over every supported UID.

@@ -52,7 +52,8 @@ not participate in the mapping.
 
 Inner container root is separate from those ranges and maps to host UID `U`,
 not host root. Consequently inner UID `U` maps to `U+1`. The ranges deliberately
-contain neither host UID 0 nor `U`; for `U=1`, the empty first range is omitted.
+contain neither host UID 0 nor `U`; for `U=1`, the empty first range is omitted,
+and for `U` of 65536 or higher the single range `node:1:65535` is used.
 
 The per-Project Docker volume carries a `.boxa-subid-map` stamp. On the first
 start after upgrading from the old fixed map, Boxa detects an unstamped,
