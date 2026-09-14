@@ -20,6 +20,7 @@ None.
 
 | Feature | Artifact | Next action | Last reviewed |
 | ------- | -------- | ----------- | ------------- |
+| Dual-engine bind-mount ownership | `dual-engine-bind-mount-ownership/NOTES.md` | Issues 01+02 done (commits 287fdb2, 70763a8), Codex review clean after 3 fix rounds (b8792e3, dad149f, b8e4b21). On the host: rebuild the image, `boxa stop --clean <project> && boxa`, then run the deferred checks listed in the Comments of issues 01 and 02 (uid_map, chown 70:70 via inner engine, pg round trip, `0:0 → U:U` startup repair, < 500 ms scan on universe_media_api, `boxa doctor --fix ownership` twice). Record results, tick the criteria, archive the feature. | 2026-09-14 |
 | glab config seeding | `glab-config-seeding/issues/03-live-proof-docs-adr-note.md` | Issues 01+02 done, 03 docs landed; final Codex review clean apart from declined YAML hardening (recorded in issue 02). On the host: rebuild the image, then `boxa stop --clean playground && boxa` and the plain-restart test per issue 03; record redacted `glab auth status` / `glab api user` output, set 03 to `done`, archive the feature. | 2026-09-03 |
 | Keep-awake during long-running agent work | `keep-awake-long-running-agent/issues/01-long-running-agent-awake-lease.md` | Host refreshed; live container verification passed after fixing owner detection for versioned Claude binaries + test-suite state leakage (uncommitted). Review/commit the fix (`/cr`), sync the container hook, then run the recorded live WSL soak; on pass promote the issue to `done` and archive the feature. | 2026-08-29 |
 
