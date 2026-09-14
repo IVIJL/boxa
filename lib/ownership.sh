@@ -9,6 +9,9 @@ OWNERSHIP_BACKGROUND_THRESHOLD=20000
 # Consumed by docker-run.sh after sourcing this library.
 # shellcheck disable=SC2034
 OWNERSHIP_CONFIG_NAME=ownership.conf
+# Device number of the Project root, set by boxa_ownership_run; repairs walk
+# only entries on this filesystem.
+OWNERSHIP_ROOT_DEVICE=
 
 _ownership_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Constants and old-map arithmetic have one owner.
@@ -108,9 +111,25 @@ boxa_ownership_path_within_root() {
         [[ "$canonical_path" == "$canonical_root/"* ]]
 }
 
+# Usage: _boxa_ownership_find_candidates <root> <depth|unlimited> <U> <output>
+# The unexpected-owner predicate mirrors boxa_ownership_host_id_expected, so
+# an expected owner (U itself above the budget, host id 65536 below it) is
+# never printed and, more importantly, never pruned away with its children.
 _boxa_ownership_find_candidates() {
-    local root="$1" depth="$2" output="$3"
-    local -a base prune
+    local root="$1" depth="$2" container_uid="$3" output="$4"
+    local -a base prune unexpected
+    local expected_max
+
+    if ((container_uid < BOXA_SUBID_LIMIT)); then
+        expected_max=$BOXA_SUBID_LIMIT
+    else
+        expected_max=$((BOXA_SUBID_LIMIT - 1))
+    fi
+    unexpected=( \( \
+        \( -uid 65534 ! -uid "$container_uid" \) -o \
+        \( -gid 65534 ! -gid "$container_uid" \) -o \
+        \( -uid +"$expected_max" ! -uid "$container_uid" \) -o \
+        \( -gid +"$expected_max" ! -gid "$container_uid" \) \) )
 
     base=("$root" -xdev)
     [ "$depth" = unlimited ] || base+=(-maxdepth "$depth")
@@ -125,8 +144,7 @@ _boxa_ownership_find_candidates() {
         \( -uid 0 -o -gid 0 \) -print0 -prune > "$output" || return 1
     find "${base[@]}" \( "${prune[@]}" \) -o \
         \( -uid 0 -o -gid 0 \) -prune -o \
-        \( -uid 65534 -o -gid 65534 -o -uid +65535 -o -gid +65535 \) \
-        -print0 -prune >> "$output"
+        "${unexpected[@]}" -print0 -prune >> "$output"
 }
 
 _boxa_ownership_bounded_count() {
@@ -143,15 +161,17 @@ _boxa_ownership_bounded_count() {
     )
 }
 
-# Snapshot every entry of a subtree that lives on the same filesystem as its
-# top, NUL-separated, into <output>. `find -xdev` does not descend into a
+# Usage: _boxa_ownership_walk <path> <root-device> <output>
+# Snapshot every entry of a subtree that lives on the Project root's
+# filesystem (<root-device> = `stat -c %d` of the root), NUL-separated, into
+# <output>. The baseline is the root's device, not the candidate's, so a
+# candidate that is itself a nested mount point yields nothing. `find -xdev` does not descend into a
 # nested mount but still prints the mount point itself, whose inode belongs
 # to the other filesystem, so entries are filtered by device number. No
 # pipeline is involved, so a failing find is reported regardless of pipefail.
 _boxa_ownership_walk() {
-    local path="$1" output="$2" raw root_dev dev item
+    local path="$1" root_dev="$2" output="$3" raw dev item
 
-    root_dev=$(stat -c '%d' -- "$path") || return 1
     raw=$(mktemp) || return 1
     if ! find "$path" -xdev -printf '%D\0%p\0' > "$raw"; then
         rm -f "$raw"
@@ -172,7 +192,7 @@ _boxa_ownership_chown_tree() {
     local container_uid="$1" path="$2" paths_file
 
     paths_file=$(mktemp) || return 1
-    if ! _boxa_ownership_walk "$path" "$paths_file" || \
+    if ! _boxa_ownership_walk "$path" "$OWNERSHIP_ROOT_DEVICE" "$paths_file" || \
         ! xargs -0 --no-run-if-empty chown -h "$container_uid:$container_uid" -- \
             < "$paths_file"; then
         rm -f "$paths_file"
@@ -209,13 +229,27 @@ _boxa_ownership_fix_root() {
         "$path" "$before" "$after" "$count"
 }
 
+# Old-map id -> identity id, leaving U untouched even when U happens to lie
+# inside the old 100000+ range (a U-owned component is legitimate as is).
+_boxa_ownership_remap_old_id() {
+    local old_id="$1" container_uid="$2" new_id
+
+    if ((old_id == container_uid)); then
+        printf '%s\n' "$old_id"
+        return 0
+    fi
+    new_id=$(boxa_old_subid_to_new "$old_id" "$container_uid" 2>/dev/null) || \
+        new_id=$old_id
+    printf '%s\n' "$new_id"
+}
+
 _boxa_ownership_fix_old_mapping() {
     local path="$1" container_uid="$2" item ownership old_uid old_gid
     local new_uid new_gid before after paths_file visited=0 remapped=0 failed=0
 
     before=$(stat -c '%u:%g' -- "$path") || return 1
     paths_file=$(mktemp) || return 1
-    if ! _boxa_ownership_walk "$path" "$paths_file"; then
+    if ! _boxa_ownership_walk "$path" "$OWNERSHIP_ROOT_DEVICE" "$paths_file"; then
         rm -f "$paths_file"
         return 1
     fi
@@ -228,10 +262,8 @@ _boxa_ownership_fix_old_mapping() {
         old_gid=${ownership##*:}
         new_uid=$old_uid
         new_gid=$old_gid
-        new_uid=$(boxa_old_subid_to_new "$old_uid" "$container_uid" 2>/dev/null) || \
-            new_uid=$old_uid
-        new_gid=$(boxa_old_subid_to_new "$old_gid" "$container_uid" 2>/dev/null) || \
-            new_gid=$old_gid
+        new_uid=$(_boxa_ownership_remap_old_id "$old_uid" "$container_uid")
+        new_gid=$(_boxa_ownership_remap_old_id "$old_gid" "$container_uid")
         if ((new_uid != old_uid || new_gid != old_gid)); then
             if ! chown -h "$new_uid:$new_gid" -- "$item"; then
                 failed=1
@@ -294,9 +326,11 @@ boxa_ownership_run() {
         return 1
     }
 
+    OWNERSHIP_ROOT_DEVICE=$(stat -c '%d' -- "$root") || return 1
     paths_file=$(mktemp) || return 1
     started_ns=$(date +%s%N)
-    if ! _boxa_ownership_find_candidates "$root" "$depth" "$paths_file"; then
+    if ! _boxa_ownership_find_candidates "$root" "$depth" "$container_uid" \
+        "$paths_file"; then
         rm -f "$paths_file"
         return 1
     fi
@@ -316,6 +350,9 @@ boxa_ownership_run() {
             failed=$((failed + 1))
             continue
         }
+        # `find -xdev` still prints a nested mount point; it belongs to
+        # another filesystem and is never repaired.
+        [ "$(stat -c '%d' -- "$path" 2>/dev/null)" = "$OWNERSHIP_ROOT_DEVICE" ] || continue
         rc=0
         boxa_ownership_process_hit "$effective_mode" "$purpose" "$path" \
             "$container_uid" || rc=$?

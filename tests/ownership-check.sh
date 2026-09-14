@@ -75,6 +75,12 @@ assert_eq "host uid 65536 warns when U is above the budget" warn \
     "$(boxa_ownership_classify 65536 65536 70000)"
 assert_eq "U above the budget is ok" ok \
     "$(boxa_ownership_classify 70000 70000 70000)"
+assert_eq "old-map remap keeps a U component inside the old range" 100500 \
+    "$(_boxa_ownership_remap_old_id 100500 100500)"
+assert_eq "old-map remap still converts the peer old id" 70 \
+    "$(_boxa_ownership_remap_old_id 100069 100500)"
+assert_eq "old-map remap leaves an identity id alone" 70 \
+    "$(_boxa_ownership_remap_old_id 70 1000)"
 assert_eq "root gid is repairable" fix-root \
     "$(boxa_ownership_classify 1000 0 1000)"
 
