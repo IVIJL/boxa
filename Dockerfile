@@ -75,9 +75,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     docker-buildx-plugin docker-compose-plugin \
     docker-ce-rootless-extras
 
-# Rootless Docker: subordinate UID/GID mapping
-RUN echo "node:100000:65536" >> /etc/subuid && \
-    echo "node:100000:65536" >> /etc/subgid
+# Rootless Docker subordinate IDs are generated at Container start because
+# node's runtime UID is the host user's UID, not an image-build constant.
 
 # Rootless Docker: runtime directories and config
 RUN mkdir -p /run/user/1000 && chown node:node /run/user/1000 && \
@@ -420,6 +419,7 @@ COPY scripts/ensure-glab-config.sh /usr/local/bin/ensure-glab-config
 # by setup-chezmoi.sh when CHEZMOI_REPO=bundled — no network, no clone.
 COPY --chown=node:node dotfiles/ /usr/local/share/boxa/dotfiles/
 COPY scripts/n scripts/nx /usr/local/bin/
+COPY lib/subid.sh /usr/local/lib/boxa/subid.sh
 COPY scripts/start-rootless-docker.sh /usr/local/bin/
 COPY scripts/boxa-entrypoint.sh /usr/local/bin/
 COPY scripts/shutdown-inner-containers.sh /usr/local/bin/boxa-shutdown-inner

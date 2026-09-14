@@ -38,6 +38,35 @@ Images, Compose volumes, anonymous volumes, and bind-mounted data persist across
 `boxa stop`. Use `boxa stop --clean` or `boxa remove` when the Project's Docker
 data should be removed explicitly.
 
+## UID and GID mapping
+
+The inner daemon uses an identity subordinate-ID map with a hole at `U`, the
+actual runtime UID of the Container's `node` user. The entrypoint regenerates
+both `/etc/subuid` and `/etc/subgid` on every start; Project Compose files do
+not participate in the mapping.
+
+| Mapping | Subordinate ranges | Host owner for inner UID `N` |
+| ------- | ------------------ | ---------------------------- |
+| Old fixed map | `node:100000:65536` | `100000 + N - 1` |
+| Identity map | `node:1:(U-1)` and `node:(U+1):(65536-U)` | `N` below `U`; `N+1` at or above `U` |
+
+Inner container root is separate from those ranges and maps to host UID `U`,
+not host root. Consequently inner UID `U` maps to `U+1`. The ranges deliberately
+contain neither host UID 0 nor `U`; for `U=1`, the empty first range is omitted.
+
+The per-Project Docker volume carries a `.boxa-subid-map` stamp. On the first
+start after upgrading from the old fixed map, Boxa detects an unstamped,
+non-empty data-root and remaps UID and GID ownership throughout it before
+starting the daemon. Progress and final counts are printed, and the stamp is
+written only after success. If the walk fails, an old owner cannot be
+represented, or the stamp is unknown, the daemon refuses to start and directs
+the user to run `boxa stop --clean <project>` on the host. A fresh empty volume
+is stamped without a walk.
+
+The data-root remains `/home/node/.local/share/docker` in the
+`boxa-<project>-docker` volume. Moving it onto the Container's overlay rootfs
+would introduce nested overlayfs and has been observed to fail with `EINVAL`.
+
 ## Graceful shutdown
 
 Explicit `boxa stop` discovers running and exited inner containers before it

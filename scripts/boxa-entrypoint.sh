@@ -13,6 +13,48 @@ set -euo pipefail
 # See docs/adr/0003 for the security rationale.
 
 if [ "$(id -u)" = "0" ]; then
+    # Give the inner rootless engine the same low host IDs as the host engine.
+    # Root still maps to node's UID; the two subordinate ranges omit both 0
+    # and node's UID. Existing engine storage is migrated before node can
+    # start dockerd, and remains unstamped on failure so startup fails closed.
+    # Installed absolute path has no source-tree equivalent at runtime.
+    # shellcheck disable=SC1091
+    source /usr/local/lib/boxa/subid.sh
+    node_uid=$(id -u node)
+    if ! subid_ranges=$(boxa_generate_subid_ranges "$node_uid" node); then
+        echo "boxa: ERROR: Cannot generate the inner Docker subid map for node UID $node_uid." >&2
+        exit 1
+    fi
+    printf '%s\n' "$subid_ranges" > /etc/subuid
+    printf '%s\n' "$subid_ranges" > /etc/subgid
+
+    docker_data_root=/home/node/.local/share/docker
+    mkdir -p "$docker_data_root"
+    expected_subid_mapping=$(boxa_subid_mapping_id "$node_uid")
+    subid_data_state=$(boxa_subid_data_root_state \
+        "$docker_data_root" "$expected_subid_mapping")
+    case "$subid_data_state" in
+        empty)
+            if ! boxa_write_subid_stamp "$docker_data_root" "$expected_subid_mapping"; then
+                echo "boxa: ERROR: Cannot initialize the inner Docker subid mapping stamp." >&2
+            fi
+            ;;
+        legacy)
+            if boxa_migrate_legacy_subids "$docker_data_root" "$node_uid" && \
+                boxa_write_subid_stamp "$docker_data_root" "$expected_subid_mapping"; then
+                :
+            else
+                echo "boxa: ERROR: Inner Docker storage ownership migration failed." >&2
+                echo "boxa: Run 'boxa stop --clean ${BOXA_PROJECT_NAME:-<project>}' on the host, then start the Project again." >&2
+            fi
+            ;;
+        incompatible)
+            echo "boxa: ERROR: Inner Docker storage has an incompatible subid mapping stamp." >&2
+            echo "boxa: Run 'boxa stop --clean ${BOXA_PROJECT_NAME:-<project>}' on the host, then start the Project again." >&2
+            ;;
+        current) ;;
+    esac
+
     # Stage host gitconfig as system-wide config. Bind-mounted gitconfig
     # files trigger "Device busy" when VS Code/Cursor credential helpers
     # rewrite them; copying to /etc/gitconfig sidesteps the bind mount.

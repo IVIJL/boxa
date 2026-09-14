@@ -5,6 +5,22 @@ set -euo pipefail
 # Start rootless Docker daemon (runs as node user, no privileges needed)
 # =============================================================================
 
+# Refuse to expose old-mapped layers as nobody-owned files. The root entrypoint
+# writes this stamp only after a successful migration (or for a fresh volume).
+# Installed absolute path has no source-tree equivalent at runtime.
+# shellcheck disable=SC1091
+source /usr/local/lib/boxa/subid.sh
+docker_data_root="$HOME/.local/share/docker"
+node_uid=$(id -u)
+expected_subid_mapping=$(boxa_subid_mapping_id "$node_uid")
+subid_data_state=$(boxa_subid_data_root_state \
+    "$docker_data_root" "$expected_subid_mapping")
+if [ "$subid_data_state" != "current" ]; then
+    echo "boxa: ERROR: Inner Docker storage is not ready for the identity subid mapping." >&2
+    echo "boxa: Run 'boxa stop --clean ${BOXA_PROJECT_NAME:-<project>}' on the host, then start the Project again." >&2
+    exit 1
+fi
+
 # Ensure XDG_RUNTIME_DIR exists (may be tmpfs, gets wiped on restart)
 mkdir -p "$XDG_RUNTIME_DIR"
 
