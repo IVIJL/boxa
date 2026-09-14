@@ -57,8 +57,28 @@ ownership_config_write() {
     fi
 }
 
+# A host owner is expected when it is U itself or one of the host IDs the
+# identity map can emit: 1..65536 when U sits inside the 65536-ID budget
+# (inner 65535 shifts to 65536), 1..65535 when U is at or above it and the
+# single range below the hole is all there is.
+boxa_ownership_host_id_expected() {
+    local id="$1" container_uid="$2"
+
+    ((id == container_uid)) && return 0
+    # 65534 is `nobody` on the host, and inside the inner engine it is
+    # what every unmapped owner collapses to; the spec keeps it a warning.
+    ((id == 65534)) && return 1
+    if ((container_uid < BOXA_SUBID_LIMIT)); then
+        ((id >= 1 && id <= BOXA_SUBID_LIMIT))
+    else
+        ((id >= 1 && id < BOXA_SUBID_LIMIT))
+    fi
+}
+
 # Output: ok, fix-root, fix-old-mapping, or warn. Root wins because replacing
 # the whole subtree with U:U also removes any old-mapping owner on the peer id.
+# Expected owners are checked before the old-map range so a U that happens to
+# fall inside 100000..165534 is never "repaired" away from itself.
 boxa_ownership_classify() {
     local owner_uid="$1" owner_gid="$2" container_uid="$3"
     local old_end=$((BOXA_OLD_SUBID_START + BOXA_SUBID_LIMIT - 2))
@@ -66,16 +86,14 @@ boxa_ownership_classify() {
     boxa_validate_container_uid "$container_uid" || return 1
     if ((owner_uid == 0 || owner_gid == 0)); then
         printf 'fix-root\n'
+    elif boxa_ownership_host_id_expected "$owner_uid" "$container_uid" && \
+        boxa_ownership_host_id_expected "$owner_gid" "$container_uid"; then
+        printf 'ok\n'
     elif ((owner_uid >= BOXA_OLD_SUBID_START && owner_uid <= old_end)) || \
         ((owner_gid >= BOXA_OLD_SUBID_START && owner_gid <= old_end)); then
         printf 'fix-old-mapping\n'
-    elif { ((owner_uid == 65534)) && ((owner_uid != container_uid)); } || \
-        { ((owner_gid == 65534)) && ((owner_gid != container_uid)); } || \
-        ((owner_uid < 1 || owner_uid > BOXA_SUBID_LIMIT)) || \
-        ((owner_gid < 1 || owner_gid > BOXA_SUBID_LIMIT)); then
-        printf 'warn\n'
     else
-        printf 'ok\n'
+        printf 'warn\n'
     fi
 }
 
@@ -107,7 +125,7 @@ _boxa_ownership_find_candidates() {
         \( -uid 0 -o -gid 0 \) -print0 -prune > "$output" || return 1
     find "${base[@]}" \( "${prune[@]}" \) -o \
         \( -uid 0 -o -gid 0 \) -prune -o \
-        \( -uid 65534 -o -gid 65534 -o -uid +"$BOXA_SUBID_LIMIT" -o -gid +"$BOXA_SUBID_LIMIT" \) \
+        \( -uid 65534 -o -gid 65534 -o -uid +65535 -o -gid +65535 \) \
         -print0 -prune >> "$output"
 }
 
@@ -125,15 +143,42 @@ _boxa_ownership_bounded_count() {
     )
 }
 
+# Snapshot every entry of a subtree that lives on the same filesystem as its
+# top, NUL-separated, into <output>. `find -xdev` does not descend into a
+# nested mount but still prints the mount point itself, whose inode belongs
+# to the other filesystem, so entries are filtered by device number. No
+# pipeline is involved, so a failing find is reported regardless of pipefail.
+_boxa_ownership_walk() {
+    local path="$1" output="$2" raw root_dev dev item
+
+    root_dev=$(stat -c '%d' -- "$path") || return 1
+    raw=$(mktemp) || return 1
+    if ! find "$path" -xdev -printf '%D\0%p\0' > "$raw"; then
+        rm -f "$raw"
+        return 1
+    fi
+    while IFS= read -r -d '' dev && IFS= read -r -d '' item; do
+        [ "$dev" = "$root_dev" ] || continue
+        printf '%s\0' "$item"
+    done < "$raw" > "$output"
+    rm -f "$raw"
+}
+
 # `chown -R` crosses into nested mounts, while the scan stays on one
 # filesystem (-xdev). Walk the tree the same way the scan did so a repair
 # never rewrites owners on a filesystem mounted below the Project root, and
 # change symlinks themselves (-h) instead of whatever they point at.
 _boxa_ownership_chown_tree() {
-    local container_uid="$1" path="$2"
+    local container_uid="$1" path="$2" paths_file
 
-    find "$path" -xdev -print0 \
-        | xargs -0 --no-run-if-empty chown -h "$container_uid:$container_uid" --
+    paths_file=$(mktemp) || return 1
+    if ! _boxa_ownership_walk "$path" "$paths_file" || \
+        ! xargs -0 --no-run-if-empty chown -h "$container_uid:$container_uid" -- \
+            < "$paths_file"; then
+        rm -f "$paths_file"
+        return 1
+    fi
+    rm -f "$paths_file"
 }
 
 _boxa_ownership_fix_root() {
@@ -170,7 +215,7 @@ _boxa_ownership_fix_old_mapping() {
 
     before=$(stat -c '%u:%g' -- "$path") || return 1
     paths_file=$(mktemp) || return 1
-    if ! find "$path" -xdev -print0 > "$paths_file"; then
+    if ! _boxa_ownership_walk "$path" "$paths_file"; then
         rm -f "$paths_file"
         return 1
     fi
@@ -216,7 +261,7 @@ boxa_ownership_process_hit() {
     fi
     class=$(boxa_ownership_classify "$owner_uid" "$owner_gid" "$container_uid") || return 1
     case "$class:$mode:$purpose" in
-        ok:*) return 0 ;;
+        ok:*) return 4 ;;
         fix-root:auto:*)
             _boxa_ownership_fix_root "$path" "$container_uid" "$purpose"
             ;;
@@ -271,10 +316,13 @@ boxa_ownership_run() {
             failed=$((failed + 1))
             continue
         }
-        hits=$((hits + 1))
         rc=0
         boxa_ownership_process_hit "$effective_mode" "$purpose" "$path" \
             "$container_uid" || rc=$?
+        # 4 = the owner is expected after all (e.g. host id 65536, or U
+        # itself); the candidate scan is deliberately broader than the rule.
+        [ "$rc" != 4 ] || continue
+        hits=$((hits + 1))
         case "$rc" in
             0) fixed=$((fixed + 1)) ;;
             3) pending=$((pending + 1)) ;;

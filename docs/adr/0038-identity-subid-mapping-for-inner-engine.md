@@ -34,9 +34,11 @@ higher, nothing fits above the hole and the single range `node:1:65535`
 identity-maps the whole budget below it. Rootless container root
 continues to map to `U`; inner IDs below `U` map identically, and inner IDs at
 or above `U` map one higher, so `U` maps to `U+1`. The two subordinate ranges
-contain 65535 IDs and contain neither host UID 0 nor `U`. The highest host
-ID the map can emit is 65536 (inner ID 65535 shifted above the hole), so the
-ownership check treats host owners up to 65536 as expected.
+contain 65535 IDs and contain neither host UID 0 nor `U`. The ownership
+check treats `U` and every host ID the generated ranges can emit as expected:
+1..65536 when `U` is below 65536 (inner ID 65535 shifts to 65536), 1..65535
+otherwise. Repairs walk only the Project root's own filesystem: nested mount
+points are skipped, not just left undescended.
 
 The mapping belongs to the Container, independent of Project Compose files.
 The inner data-root remains `/home/node/.local/share/docker` on the existing

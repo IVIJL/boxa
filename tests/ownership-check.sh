@@ -67,6 +67,14 @@ assert_eq "host uid 65536 (inner 65535 above the hole) is ok" ok \
     "$(boxa_ownership_classify 65536 65536 1000)"
 assert_eq "host uid 65537 warns" warn \
     "$(boxa_ownership_classify 65537 65537 1000)"
+assert_eq "U inside the old-map range is ok, not old-mapping" ok \
+    "$(boxa_ownership_classify 100500 100500 100500)"
+assert_eq "old-map owner is still remapped when U is in the old range" fix-old-mapping \
+    "$(boxa_ownership_classify 100069 100069 100500)"
+assert_eq "host uid 65536 warns when U is above the budget" warn \
+    "$(boxa_ownership_classify 65536 65536 70000)"
+assert_eq "U above the budget is ok" ok \
+    "$(boxa_ownership_classify 70000 70000 70000)"
 assert_eq "root gid is repairable" fix-root \
     "$(boxa_ownership_classify 1000 0 1000)"
 
