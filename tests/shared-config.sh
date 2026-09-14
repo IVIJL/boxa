@@ -166,10 +166,11 @@ printf '%s\n' \
 assert_eq "static guard rejects unlisted fixture filenames" \
     $'split-unexpected.conf\nunexpected.conf' \
     "$(scan_unlisted_shared_filenames "$fixture")"
+original_manifest=("${SHARED_CONFIG_FILES[@]}")
 SHARED_CONFIG_FILES+=(unexpected.conf split-unexpected.conf)
 assert_eq "manifest additions admit fixture filenames" "" \
     "$(scan_unlisted_shared_filenames "$fixture")"
-unset 'SHARED_CONFIG_FILES[2]' 'SHARED_CONFIG_FILES[3]'
+SHARED_CONFIG_FILES=("${original_manifest[@]}")
 assert_eq "codebase shared filenames match the manifest" "" \
     "$(scan_unlisted_shared_filenames "$BOXA_DIR")"
 

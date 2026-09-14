@@ -420,6 +420,7 @@ COPY scripts/ensure-glab-config.sh /usr/local/bin/ensure-glab-config
 COPY --chown=node:node dotfiles/ /usr/local/share/boxa/dotfiles/
 COPY scripts/n scripts/nx /usr/local/bin/
 COPY lib/subid.sh /usr/local/lib/boxa/subid.sh
+COPY lib/ownership.sh /usr/local/lib/boxa/ownership.sh
 COPY scripts/start-rootless-docker.sh /usr/local/bin/
 COPY scripts/boxa-entrypoint.sh /usr/local/bin/
 COPY scripts/shutdown-inner-containers.sh /usr/local/bin/boxa-shutdown-inner

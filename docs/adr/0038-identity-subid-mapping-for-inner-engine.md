@@ -53,6 +53,20 @@ bind-mounted Project and Boxa volumes; letting the rootless engine emit low
 UIDs there gives inner processes nothing new. No privileges, capabilities, or
 host changes are added.
 
+Identity mapping cannot make host UID 0 writable by the rootless inner engine.
+The entrypoint therefore performs a depth-three, same-filesystem ownership
+scan of the Project root before dropping privilege. It prunes well-known heavy
+directories. Under the default `ownership_fix=auto`, root-owned subtrees are
+changed recursively to `U:U`; large repairs continue in the background and
+write completion to `/var/log/boxa-ownership.log`. A scan exceeding 500 ms becomes
+warn-only for that start. Owners from the former `100000+` map and unexpected
+owners are also reported, but only `boxa doctor --fix ownership` performs the
+old-map per-entry remap during its unlimited-depth scan.
+
+The policy is host-global because the entrypoint must consume it too. It lives
+in the shared, read-only-mounted `~/.config/boxa/shared/ownership.conf` as
+`ownership_fix=auto|warn|off`; a missing key defaults to `auto`.
+
 ## Consequences
 
 - Postgres UID 70 and MySQL/Redis UID 999 are written as host 70 and 999 by
@@ -64,3 +78,5 @@ host changes are added.
   ownership walk on their first start after upgrade. A failed or impossible
   migration is explicit and requires cleaning the per-Project Docker volume.
 - Nested overlayfs is not introduced; storage stays in the named volume.
+- Host-engine root writes are repaired without Compose knowledge. Host root
+  remains able to use state subsequently owned by `U`.

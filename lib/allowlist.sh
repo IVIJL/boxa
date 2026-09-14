@@ -20,7 +20,7 @@
 
 # Shared-config manifest. Only these files may live in the directory mounted
 # into Containers (ADR 0036).
-SHARED_CONFIG_FILES=(allowed-domains.conf dns-upstream.conf)
+SHARED_CONFIG_FILES=(allowed-domains.conf dns-upstream.conf ownership.conf)
 
 # Host (set by docker-run.sh callers)
 ALLOWLIST_HOST_DIR="${HOME:-/root}/.config/boxa"

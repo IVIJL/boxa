@@ -55,6 +55,26 @@ if [ "$(id -u)" = "0" ]; then
         current) ;;
     esac
 
+    # Repair host-engine root-owned Project state before dropping privilege.
+    # Old fixed-map owners are startup warnings; doctor performs that remap.
+    if [ -n "${BOXA_PROJECT_HOST_PATH:-}" ]; then
+        # Installed absolute path has no source-tree equivalent at runtime.
+        # shellcheck disable=SC1091
+        source /usr/local/lib/boxa/ownership.sh
+        ownership_mode=auto
+        if ! ownership_mode=$(ownership_config_read \
+                /etc/boxa-shared/config/ownership.conf); then
+            echo "boxa: WARNING: Invalid ownership_fix value; using auto." >&2
+            ownership_mode=auto
+        fi
+        ownership_rc=0
+        boxa_ownership_run "$BOXA_PROJECT_HOST_PATH" "$node_uid" \
+            "$ownership_mode" 3 startup || ownership_rc=$?
+        if [ "$ownership_rc" -eq 1 ]; then
+            echo "boxa: WARNING: Project ownership check failed; startup continues." >&2
+        fi
+    fi
+
     # Stage host gitconfig as system-wide config. Bind-mounted gitconfig
     # files trigger "Device busy" when VS Code/Cursor credential helpers
     # rewrite them; copying to /etc/gitconfig sidesteps the bind mount.

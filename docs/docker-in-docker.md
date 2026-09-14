@@ -67,6 +67,30 @@ The data-root remains `/home/node/.local/share/docker` in the
 `boxa-<project>-docker` volume. Moving it onto the Container's overlay rootfs
 would introduce nested overlayfs and has been observed to fail with `EINVAL`.
 
+## Bind-mount ownership repair
+
+The host engine can still write Project state as host root, which the inner
+rootless engine cannot modify. At Container startup Boxa scans the Project root
+to depth three on the same filesystem, pruning well-known heavy directories.
+The global policy is read from `~/.config/boxa/shared/ownership.conf` (mounted
+at `/etc/boxa-shared/config/ownership.conf`):
+
+```text
+ownership_fix=auto
+```
+
+`auto` (the default) changes each root-owned subtree to the Container user's
+UID and GID. Large subtrees are repaired in the background, with completion
+logged to `/var/log/boxa-ownership.log`. `warn` reports candidates and changes
+nothing; `off` skips the check. A startup scan over 500 ms automatically acts
+as `warn` for that start. Old fixed-map owners are always warn-only at startup.
+
+Run `boxa doctor --fix ownership [project|path]` on the host for an unlimited-
+depth repair, including remapping old `100000+` owners. The Project Container
+must be running. Doctor follows the same global policy, refuses a path outside
+the resolved Project root, prints a summary, and returns non-zero when `warn`
+leaves action pending.
+
 ## Graceful shutdown
 
 Explicit `boxa stop` discovers running and exited inner containers before it

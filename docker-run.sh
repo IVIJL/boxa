@@ -103,6 +103,8 @@ Maintenance:
                                    Build/rebuild the boxa image
   boxa update                    Update boxa (pull repo + rebuild image)
   boxa doctor [--fix [step…]]    Check or repair host provisioning
+  boxa doctor --fix ownership [project|path]
+                                   Repair Project bind-mount ownership
   boxa keep-awake <command>      Manage the optional host keep-awake daemon
   boxa prune [--all]             Remove build cache + dangling images (never volumes)
   boxa uninstall [--purge-ca]    Remove everything (containers, volumes, image).
@@ -304,6 +306,10 @@ Examples:
   boxa doctor
   boxa doctor --fix
   boxa doctor --fix mcp-onboarding
+  boxa doctor --fix ownership [project|path]
+
+The ownership step is Project-scoped and requires its Container to be running.
+It follows ownership_fix from ~/.config/boxa/shared/ownership.conf
 EOF
             ;;
         keep-awake)
@@ -487,6 +493,11 @@ BOXA_SHARED_CONTAINER_NAMES=(
 # Allowlist module — defines ALLOWLIST_HOST_FILE, IPSET_NAME, allowlist::* fns
 # shellcheck source=lib/allowlist.sh
 source "$BOXA_DIR/lib/allowlist.sh"
+
+# Project ownership policy is shared with the Container entrypoint.
+# shellcheck source=lib/ownership.sh
+source "$BOXA_DIR/lib/ownership.sh"
+OWNERSHIP_CONFIG_HOST_FILE="$SHARED_CONFIG_HOST_DIR/$OWNERSHIP_CONFIG_NAME"
 
 # Naming module — owns the format of container names, volumes, hostname,
 # workspace alias and traefik route hosts. See lib/naming.sh and
@@ -5050,6 +5061,79 @@ fi
 # --- boxa doctor -----------------------------------------------------------
 
 if [ "$MODE" = "doctor" ]; then
+    _doctor_ownership_project_from_cwd() {
+        local cwd name candidate best=""
+
+        cwd=$(realpath -e -- .) || return 1
+        while IFS=$'\t' read -r name candidate; do
+            [ -n "$candidate" ] || continue
+            candidate=$(realpath -e -- "$candidate" 2>/dev/null) || continue
+            if { [ "$cwd" = "$candidate" ] || [[ "$cwd" == "$candidate/"* ]]; } \
+                && ((${#candidate} > ${#best})); then
+                best=$candidate
+            fi
+        done < <(_boxa::forge_project_targets)
+        [ -n "$best" ] || best=$cwd
+        printf '%s\n' "$best"
+    }
+
+    _doctor_fix_ownership() {
+        local target="${1:-}" requested_path="" project_root container mode rc=0
+
+        if [ -z "$target" ]; then
+            requested_path=$(_doctor_ownership_project_from_cwd) || return 1
+            boxa::names_from_path "$requested_path"
+        elif [ -d "$target" ]; then
+            requested_path=$(realpath -e -- "$target") || return 1
+            boxa::names_from_path "$requested_path"
+        else
+            boxa::names_from_token "$target"
+        fi
+        container=$BOXA_CONTAINER_NAME
+        if ! docker ps --filter "name=^${container}$" --format '{{.Names}}' \
+                | grep -qxF "$container"; then
+            printf 'boxa doctor: Container %s is not running; start the Project first.\n' \
+                "$container" >&2
+            return 1
+        fi
+        project_root=$(_boxa::container_project_path "$container" 2>/dev/null || true)
+        if [ -z "$project_root" ]; then
+            printf 'boxa doctor: Cannot resolve the Project root from Container %s.\n' \
+                "$container" >&2
+            return 1
+        fi
+        if [ -n "$requested_path" ] && [ "$requested_path" != "$project_root" ]; then
+            printf 'boxa doctor: Refusing path outside Container %s Project root: %s\n' \
+                "$container" "$requested_path" >&2
+            return 1
+        fi
+        mode=auto
+        if ! mode=$(ownership_config_read "$OWNERSHIP_CONFIG_HOST_FILE"); then
+            echo "boxa doctor: WARNING: Invalid ownership_fix value; using auto." >&2
+            mode=auto
+        fi
+        printf 'Running boxa doctor --fix ownership for %s (mode: %s)...\n\n' \
+            "$project_root" "$mode"
+        docker exec -u 0 "$container" bash -c '
+            source /usr/local/lib/boxa/ownership.sh
+            boxa_ownership_run "$1" "$(id -u node)" "$2" unlimited doctor
+        ' _ "$project_root" "$mode" || rc=$?
+        return "$rc"
+    }
+
+    # Ownership is Project-scoped and takes an optional Project argument, so
+    # it bypasses ADR 0017's host-wide provisioning-step registry.
+    if [ "${DOCTOR_ARGS[0]:-}" = --fix ] \
+        && [ "${DOCTOR_ARGS[1]:-}" = ownership ]; then
+        if [ "${#DOCTOR_ARGS[@]}" -gt 3 ] || [[ "${DOCTOR_ARGS[2]:-}" == --* ]]; then
+            echo "Usage: boxa doctor --fix ownership [project|path]" >&2
+            exit 2
+        fi
+        ownership_doctor_rc=0
+        _doctor_fix_ownership "${DOCTOR_ARGS[2]:-}" || ownership_doctor_rc=$?
+        exit "$ownership_doctor_rc"
+    fi
+
     # Repeatable host-provisioning repair, independent of any repo change
     # (ADR 0017 § 3). Default: silently repair every unconditional (category-A)
     # step and REPORT every elective (category-B) step that is missing or was
