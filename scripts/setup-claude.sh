@@ -571,13 +571,18 @@ CLAUDE_WRAPPER
     echo "Claude launch wrapper ready"
 }
 
-# Every-start. npm upgrades restore this canonical path as a symlink, so replace
-# it with the Container-only wrapper after bootstrap on every Container start.
-# The wrapper invokes the package entry point directly to avoid recursion.
+# Every-start. The wrapper lives at two paths. `~/.local/bin/codex` is the
+# primary one: it precedes npm-global in PATH and survives an in-Container
+# `npm install -g @openai/codex` (Codex's own "outdated" hint), which would
+# otherwise restore the npm symlink and silently drop the MCP profile until
+# the next Container start. The canonical npm path is still replaced so
+# absolute-path callers and the boxa-mcp PATH (no ~/.local/bin) land on the
+# wrapper too; npm upgrades restore it as a symlink, so it is regenerated on
+# every Container start. The wrapper invokes the package entry point directly
+# to avoid recursion.
 repair_codex_bin() {
-    local wrapper_path="/usr/local/share/npm-global/bin/codex"
     local wrapper_tmp mcp_dev_dir
-    wrapper_tmp=$(mktemp "/usr/local/share/npm-global/bin/.codex-wrapper.XXXXXX")
+    wrapper_tmp=$(mktemp "/home/node/.local/bin/.codex-wrapper.XXXXXX")
     mcp_dev_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 
     printf '#!/bin/bash\nreadonly _MCP_DEV_DIR=%q\n' "$mcp_dev_dir" > "$wrapper_tmp"
@@ -628,7 +633,16 @@ fi
 exec "$_CODEX_NODE" "$_CODEX_ENTRY_POINT" "${launch_args[@]}"
 CODEX_WRAPPER
     chmod 0755 "$wrapper_tmp"
-    mv -f "$wrapper_tmp" "$wrapper_path"
+    # Primary path first (same filesystem: the rename is atomic), so a failure
+    # on the npm volume below never leaves PATH without the wrapper. The npm
+    # volume is a different filesystem, so its copy goes through its own temp
+    # file rather than a cross-device rename.
+    mv -f "$wrapper_tmp" "/home/node/.local/bin/codex"
+    local npm_tmp
+    npm_tmp=$(mktemp "/usr/local/share/npm-global/bin/.codex-wrapper.XXXXXX")
+    cp "/home/node/.local/bin/codex" "$npm_tmp"
+    chmod 0755 "$npm_tmp"
+    mv -f "$npm_tmp" "/usr/local/share/npm-global/bin/codex"
     echo "Codex launch wrapper ready"
 }
 

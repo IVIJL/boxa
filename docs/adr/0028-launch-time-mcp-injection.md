@@ -28,7 +28,12 @@ Container-only Agent launch wrapper occupies each agent CLI's canonical binary
 path — `~/.local/bin/claude` (the symlink `setup-claude.sh` already rewrites
 becomes a generated script) and `/usr/local/share/npm-global/bin/codex` (the
 node-owned npm symlink, regenerated each Container start so npm updates cannot
-resurrect it). Occupying the canonical path rather than shadowing via PATH
+resurrect it). Amendment 2026-09-14: an in-Container `npm install -g
+@openai/codex` (Codex's own "outdated" hint) restores the npm symlink
+mid-session and silently drops the MCP profile until the next start, so the
+Codex wrapper is now also installed at `~/.local/bin/codex`, which precedes
+npm-global in PATH and survives the upgrade; the npm path keeps its copy for
+the reasons below. Occupying the canonical path rather than shadowing via PATH
 means absolute-path callers, user skills, hooks, and the codex-delegate's
 `AGENT_PATH` resolution all land on the wrapper; only calling package
 internals bypasses it, which we accept as deliberate surgery. (The
