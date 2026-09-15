@@ -67,6 +67,11 @@ case "${1:-}" in
         fi
         ;;
     rm) ;;
+    volume)
+        case "${2:-}" in
+            ls) printf '%s\n' anon-1 anon-2 ;;
+        esac
+        ;;
 esac
 STUB
 chmod +x "$TMPROOT/bin/docker"
@@ -119,6 +124,12 @@ assert_eq "unmanaged containers are reported by name" "1" \
     "$(grep -c '^Stopping unmanaged inner containers: loose$' <<< "$output" || true)"
 assert_eq "routine Compose output is suppressed" "0" \
     "$(grep -c 'routine compose noise' <<< "$output" || true)"
+assert_eq "orphaned anonymous volumes are listed by dangling state and label" "1" \
+    "$(line_count $'volume ls -q --filter dangling=true --filter label=com.docker.volume.anonymous$')"
+assert_eq "orphaned anonymous volumes are removed in one call" "1" \
+    "$(line_count $'volume rm anon-1 anon-2$')"
+assert_eq "anonymous volume removal is reported" "1" \
+    "$(grep -c '^Removed 2 orphaned anonymous inner volume(s).$' <<< "$output" || true)"
 
 # Degraded and failure paths use a smaller scenario-driven Docker stub.
 SCENARIO_ROOT="$TMPROOT/scenarios"

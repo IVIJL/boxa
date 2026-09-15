@@ -54,6 +54,34 @@ stop_and_remove() {
     [ "$failed" = false ]
 }
 
+# Removing a container without -v leaves its anonymous volumes behind (one
+# per image VOLUME or `- /path` compose entry per removal), and they keep
+# piling up in the Project's Docker volume with nothing referencing them.
+# Reclaim the ones no container uses any more. Named volumes carry no
+# anonymous label and are never touched. The label is what the engine shipped
+# in the boxa image sets (Docker 28+); a volume created unlabeled by an older
+# engine is left alone rather than guessed at from its name. A failure here is
+# reported but does not turn a completed shutdown into a failed one.
+remove_orphaned_anonymous_volumes() {
+    local anonymous_output
+    local -a anonymous_ids=()
+
+    if ! anonymous_output="$(docker volume ls -q \
+            --filter dangling=true --filter label=com.docker.volume.anonymous)"; then
+        printf 'WARNING: orphaned anonymous inner volumes could not be listed.\n' >&2
+        return 0
+    fi
+    if [ -n "$anonymous_output" ]; then
+        mapfile -t anonymous_ids <<< "$anonymous_output"
+    fi
+    [ "${#anonymous_ids[@]}" -gt 0 ] || return 0
+    if docker volume rm "${anonymous_ids[@]}" >/dev/null 2>&1; then
+        printf 'Removed %s orphaned anonymous inner volume(s).\n' "${#anonymous_ids[@]}"
+    else
+        printf 'WARNING: some orphaned anonymous inner volumes could not be removed.\n' >&2
+    fi
+}
+
 if ! container_output="$(docker ps -aq)"; then
     printf 'ERROR: inner Docker daemon is unreachable; cleanup could not be verified.\n' >&2
     exit 1
@@ -62,7 +90,10 @@ container_ids=()
 if [ -n "$container_output" ]; then
     mapfile -t container_ids <<< "$container_output"
 fi
-[ "${#container_ids[@]}" -gt 0 ] || exit 0
+if [ "${#container_ids[@]}" -eq 0 ]; then
+    remove_orphaned_anonymous_volumes
+    exit 0
+fi
 
 for container_id in "${container_ids[@]}"; do
     if ! metadata="$(docker inspect --format \
@@ -207,5 +238,7 @@ if [ -n "$remaining_output" ]; then
         "$(tr '\n' ' ' <<< "$remaining_output" | sed 's/ $//')" >&2
     failed=true
 fi
+
+remove_orphaned_anonymous_volumes
 
 [ "$failed" = false ]

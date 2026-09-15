@@ -101,8 +101,11 @@ stops the outer Container. Each Compose project is brought down with Compose's
 dependency ordering, its configured service grace periods, and orphan removal.
 Unmanaged inner containers are gracefully stopped and removed in parallel.
 This recreates container writable layers and Compose-owned networks on the next
-`docker compose up`; it does not explicitly remove images, bind mounts, named
-volumes, or anonymous volumes.
+`docker compose up`; it does not remove images, bind mounts, or named volumes.
+Anonymous volumes that no container references any more (the ones a removed
+container leaves behind for every image `VOLUME` or bare `- /path` Compose
+entry) are removed at the end of the shutdown, so they no longer accumulate in
+the Project's Docker volume across restarts.
 
 The container also uses `boxa-entrypoint.sh` as PID 1, which traps `SIGTERM` and
 provides a deliberately simpler emergency fallback when the outer Container
