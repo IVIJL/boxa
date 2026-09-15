@@ -84,7 +84,9 @@ ownership_fix=auto
 UID and GID. Large subtrees are repaired in the background, with completion
 logged to `/var/log/boxa-ownership.log`. `warn` reports candidates and changes
 nothing; `off` skips the check. A startup scan over 500 ms automatically acts
-as `warn` for that start. Old fixed-map owners are always warn-only at startup.
+as `warn` for that start. Old fixed-map owners (`100000+`) are remapped to the identity map at startup under `auto`,
+which is what turns a Project written under the pre-ADR-0038 engine into a
+working one without a manual step.
 
 Run `boxa doctor --fix ownership [project|path]` on the host for an unlimited-
 depth repair, including remapping old `100000+` owners. The Project Container

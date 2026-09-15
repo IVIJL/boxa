@@ -132,6 +132,16 @@ if [ "$(id -u)" = "0" ]; then
         "$(stat -c '%u:%g' "$real_root/root-tree")"
     assert_eq "real old tree is remapped to uid 70" 70:70 \
         "$(stat -c '%u:%g' "$real_root/old-tree")"
+    mkdir -p "$real_root/startup-old/nested"
+    touch "$real_root/startup-old/nested/file" "$real_root/startup-old/link-target"
+    ln -s link-target "$real_root/startup-old/link"
+    chown -R 100069:100069 "$real_root/startup-old"
+    chown -h 100999:100069 "$real_root/startup-old/link"
+    boxa_ownership_run "$real_root" 1000 auto 3 startup >/dev/null
+    assert_eq "startup remaps an old tree without doctor" 70:70 \
+        "$(stat -c '%u:%g' "$real_root/startup-old/nested/file")"
+    assert_eq "startup remap shifts ids at U and changes the symlink itself" 1001:70 \
+        "$(stat -c '%u:%g' "$real_root/startup-old/link")"
     second_output=$(boxa_ownership_run "$real_root" 1000 auto unlimited doctor)
     assert_true "second real repair is a no-op" grep -q '0 hit(s)' \
         <<< "$second_output"

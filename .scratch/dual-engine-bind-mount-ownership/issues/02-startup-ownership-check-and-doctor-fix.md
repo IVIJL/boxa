@@ -45,15 +45,15 @@ Container, which this fix repairs.
 
 ## Acceptance criteria
 
-- [ ] Host engine creates `<project>/data/x` as `0:0`; next `boxa start`
+- [x] Host engine creates `<project>/data/x` as `0:0`; next `boxa start`
       logs the fix and the dir is `U:U`; a container inside boxa can write
       into it.
-- [ ] Startup overhead measured and recorded in the issue: < 500 ms on the
+- [x] Startup overhead measured and recorded in the issue: < 500 ms on the
       WSL reference Project (universe_media_api, `data/` with ~1M files under
       `pgdata`/`typesense` — the depth-limited scan must not descend into
       them).
 - [x] `ownership_fix = warn` prints hits and the fix command, changes nothing.
-- [ ] `boxa doctor --fix ownership` remaps a tree with `100069:100069`
+- [x] `boxa doctor --fix ownership` remaps a tree with `100069:100069`
       (old mapping) to `70:70` and a `0:0` tree to `U:U`; second run is a
       no-op.
 - [x] Refuses any path that does not resolve under the Project root.
@@ -103,3 +103,13 @@ boxa doctor --fix ownership <project>   # second run: must be a no-op
 
 Record the measured startup overhead (ms) and the doctor remap output here
 once run.
+- 2026-09-15 host proof (universe_media_api): startup repaired a 0:0 tree
+  to 1000:1000 (3 entries) and flagged pgdata/u3pgdata as fix-old-mapping;
+  `boxa doctor --fix ownership` remapped both (2 673 + 2 378 entries,
+  100069 -> 70:70) in 25 s. Whole Container start incl. 31 s volume
+  migration: 39 s.
+- 2026-09-15 spec change (user decision): old-map owners are remapped at
+  startup under `auto` too, not warn-only; the remap is one `find` with
+  owner filters plus one `chown` per owner pair (doctor took 25 s for 5 051
+  entries with the per-entry loop). Host proof: 3 002-entry 100069 tree
+  under data/ remapped to 70:70 during start; startup scan 17 ms.

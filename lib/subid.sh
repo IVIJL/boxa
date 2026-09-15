@@ -74,78 +74,117 @@ boxa_old_subid_to_new() {
 
 boxa_migrate_legacy_subids() {
     local data_root="$1" container_uid="$2"
-    local path ownership old_uid old_gid new_uid new_gid paths_file
-    local visited=0 remapped=0 started_at=$SECONDS unsupported_id failed=0
+    local path old_uid old_gid new_uid new_gid pair paths_file group_dir
+    local entries=0 remapped=0 groups=0 started_at=$SECONDS heartbeat_pid
+    local unsupported_id last_old_id failed=0
 
     boxa_validate_container_uid "$container_uid" || return 1
+    unsupported_id=$((BOXA_OLD_SUBID_START + BOXA_SUBID_LIMIT - 1))
+    last_old_id=$((unsupported_id - 1))
+
+    printf 'boxa: Checking inner Docker storage ownership for the identity subid map (one-time)...\n'
+    # Only entries owned by the old range change. find selects them in one
+    # pass and prints numeric owners, so the walk costs no fork per entry (a
+    # data-root with 2M entries took about an hour with one stat per entry).
+    # The temp file keeps find's exit status visible without pipefail.
     paths_file=$(mktemp) || return 1
-    if ! find "$data_root" -print0 > "$paths_file"; then
-        rm -f "$paths_file"
+    group_dir=$(mktemp -d) || { rm -f "$paths_file"; return 1; }
+    # Neither the scan nor a large chown batch prints anything by itself, so
+    # a heartbeat runs for the whole migration: it tells the user (and the
+    # host-side start, which relays these lines) that a large data-root is
+    # still being processed rather than hung.
+    (
+        while sleep 5; do
+            printf 'boxa: Ownership migration still running (%ss elapsed)...\n' \
+                "$((SECONDS - started_at))"
+        done
+    ) &
+    heartbeat_pid=$!
+    # -depth lists children before their parent, so an interrupted remap
+    # leaves the parent with its old owner and the next startup scan finds
+    # the subtree again instead of seeing a repaired directory over an
+    # unrepaired remainder.
+    if ! find "$data_root" -depth \
+            \( \( -uid +"$((BOXA_OLD_SUBID_START - 1))" -uid -"$((unsupported_id + 1))" \) \
+            -o \( -gid +"$((BOXA_OLD_SUBID_START - 1))" -gid -"$((unsupported_id + 1))" \) \) \
+            -printf '%U\0%G\0%p\0' > "$paths_file"; then
+        kill "$heartbeat_pid" 2>/dev/null
+        rm -rf "$paths_file" "$group_dir"
+        return 1
+    fi
+
+    # Group paths by their old owner pair so each distinct pair costs one
+    # chown invocation instead of one per entry. printf is a builtin, so this
+    # pass forks nothing.
+    while IFS= read -r -d '' old_uid && IFS= read -r -d '' old_gid && \
+            IFS= read -r -d '' path; do
+        entries=$((entries + 1))
+        pair="$old_uid.$old_gid"
+        if [ ! -f "$group_dir/$pair" ]; then
+            groups=$((groups + 1))
+        fi
+        # A short write (e.g. a full /tmp) would silently drop entries from
+        # the remap while the caller still stamps the data-root as current.
+        if ! printf '%s\0' "$path" >> "$group_dir/$pair"; then
+            failed=1
+            break
+        fi
+    done < "$paths_file"
+    rm -f "$paths_file"
+    if ((failed)); then
+        printf 'boxa: Cannot snapshot inner Docker storage ownership (temporary space exhausted?).\n' >&2
+        kill "$heartbeat_pid" 2>/dev/null
+        rm -rf "$group_dir"
         return 1
     fi
 
     # The old 65536-entry subordinate range could represent inner uid 65536,
     # which the new 65535-entry map cannot represent. Refuse before changing
     # anything if such an owner exists; cleanup is the only lossless fallback.
-    unsupported_id=$((BOXA_OLD_SUBID_START + BOXA_SUBID_LIMIT - 1))
-    while IFS= read -r -d '' path; do
-        if ! ownership=$(stat -c '%u:%g' -- "$path"); then
-            failed=1
-            break
-        fi
-        old_uid=${ownership%%:*}
-        old_gid=${ownership##*:}
-        if ((old_uid == unsupported_id || old_gid == unsupported_id)); then
-            printf 'boxa: Cannot migrate inner Docker storage: owner %s has no representation in the new subid map.\n' \
-                "$unsupported_id" >&2
-            failed=1
-            break
-        fi
-    done < "$paths_file"
-    if ((failed)); then
-        rm -f "$paths_file"
+    if [ -f "$group_dir/$unsupported_id.$unsupported_id" ] || \
+        compgen -G "$group_dir/$unsupported_id.*" > /dev/null || \
+        compgen -G "$group_dir/*.$unsupported_id" > /dev/null; then
+        printf 'boxa: Cannot migrate inner Docker storage: owner %s has no representation in the new subid map.\n' \
+            "$unsupported_id" >&2
+        kill "$heartbeat_pid" 2>/dev/null
+        rm -rf "$group_dir"
         return 1
     fi
+    printf 'boxa: Migrating inner Docker storage ownership to the identity subid map: %s entries in %s owner groups...\n' \
+        "$entries" "$groups"
 
-    printf 'boxa: Migrating inner Docker storage ownership to the identity subid map...\n'
-    while IFS= read -r -d '' path; do
-        if ! ownership=$(stat -c '%u:%g' -- "$path"); then
-            failed=1
-            break
-        fi
-        old_uid=${ownership%%:*}
-        old_gid=${ownership##*:}
+    for path in "$group_dir"/*; do
+        [ -f "$path" ] || continue
+        pair=${path##*/}
+        old_uid=${pair%%.*}
+        old_gid=${pair##*.}
         new_uid=$old_uid
         new_gid=$old_gid
-        if ((old_uid >= BOXA_OLD_SUBID_START && old_uid < unsupported_id)); then
+        if ((old_uid >= BOXA_OLD_SUBID_START && old_uid <= last_old_id)); then
             if ! new_uid=$(boxa_old_subid_to_new "$old_uid" "$container_uid"); then
                 failed=1
                 break
             fi
         fi
-        if ((old_gid >= BOXA_OLD_SUBID_START && old_gid < unsupported_id)); then
+        if ((old_gid >= BOXA_OLD_SUBID_START && old_gid <= last_old_id)); then
             if ! new_gid=$(boxa_old_subid_to_new "$old_gid" "$container_uid"); then
                 failed=1
                 break
             fi
         fi
-        if ((new_uid != old_uid || new_gid != old_gid)); then
-            if ! chown -h "$new_uid:$new_gid" -- "$path"; then
-                failed=1
-                break
-            fi
-            remapped=$((remapped + 1))
+        if ! xargs -0 -r chown -h "$new_uid:$new_gid" -- < "$path"; then
+            failed=1
+            break
         fi
-        visited=$((visited + 1))
-        if ((visited % 10000 == 0)); then
-            printf 'boxa: Ownership migration progress: %s entries checked, %s remapped.\n' \
-                "$visited" "$remapped"
-        fi
-    done < "$paths_file"
-    rm -f "$paths_file"
+        remapped=$((remapped + $(tr -dc '\0' < "$path" | wc -c)))
+        printf 'boxa: Ownership migration progress: %s of %s entries remapped.\n' \
+            "$remapped" "$entries"
+    done
+    kill "$heartbeat_pid" 2>/dev/null
+    rm -rf "$group_dir"
     ((failed == 0)) || return 1
-    printf 'boxa: Ownership migration complete: %s entries checked, %s remapped in %ss.\n' \
-        "$visited" "$remapped" "$((SECONDS - started_at))"
+    printf 'boxa: Ownership migration complete: %s entries remapped in %ss.\n' \
+        "$remapped" "$((SECONDS - started_at))"
 }
 
 boxa_write_subid_stamp() {

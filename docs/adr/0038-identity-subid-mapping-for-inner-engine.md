@@ -65,9 +65,11 @@ scan of the Project root before dropping privilege. It prunes well-known heavy
 directories. Under the default `ownership_fix=auto`, root-owned subtrees are
 changed recursively to `U:U`; large repairs continue in the background and
 write completion to `/var/log/boxa-ownership.log`. A scan exceeding 500 ms becomes
-warn-only for that start. Owners from the former `100000+` map and unexpected
-owners are also reported, but only `boxa doctor --fix ownership` performs the
-old-map per-entry remap during its unlimited-depth scan.
+warn-only for that start. Subtrees owned by the former `100000+` map are remapped
+to the identity map the same way (one `find` selecting old-range owners,
+one `chown` per distinct owner pair, background above the same threshold);
+unexpected owners are only reported. `boxa doctor --fix ownership` repeats
+both repairs without the depth limit.
 
 The policy is host-global because the entrypoint must consume it too. It lives
 in the shared, read-only-mounted `~/.config/boxa/shared/ownership.conf` as

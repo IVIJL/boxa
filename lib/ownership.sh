@@ -243,41 +243,111 @@ _boxa_ownership_remap_old_id() {
     printf '%s\n' "$new_id"
 }
 
-_boxa_ownership_fix_old_mapping() {
-    local path="$1" container_uid="$2" item ownership old_uid old_gid
-    local new_uid new_gid before after paths_file visited=0 remapped=0 failed=0
+# Remap every old-map owner below <path> on the Project root's filesystem.
+# One find selects only entries owned inside the old 100000+ range and prints
+# numeric owners, so no fork happens per entry; paths are grouped by old owner
+# pair and each group is one chown. Prints the per-subtree summary line.
+_boxa_ownership_remap_old_tree() {
+    local path="$1" container_uid="$2" raw group_dir dev old_uid old_gid item
+    local pair new_uid new_gid entries=0 remapped=0 failed=0 before after
+    local first_old last_old root_pair=""
 
+    first_old=$BOXA_OLD_SUBID_START
+    last_old=$((BOXA_OLD_SUBID_START + BOXA_SUBID_LIMIT - 1))
     before=$(stat -c '%u:%g' -- "$path") || return 1
-    paths_file=$(mktemp) || return 1
-    if ! _boxa_ownership_walk "$path" "$OWNERSHIP_ROOT_DEVICE" "$paths_file"; then
-        rm -f "$paths_file"
+    raw=$(mktemp) || return 1
+    group_dir=$(mktemp -d) || { rm -f "$raw"; return 1; }
+    # -depth: children before their parent, so an interrupted (background)
+    # remap leaves the parent with its old owner and the next shallow startup
+    # scan finds the subtree again.
+    if ! find "$path" -xdev -depth \
+            \( \( -uid +"$((first_old - 1))" -uid -"$((last_old + 1))" \) \
+            -o \( -gid +"$((first_old - 1))" -gid -"$((last_old + 1))" \) \) \
+            -printf '%D\0%U\0%G\0%p\0' > "$raw"; then
+        rm -rf "$raw" "$group_dir"
         return 1
     fi
-    while IFS= read -r -d '' item; do
-        if ! ownership=$(stat -c '%u:%g' -- "$item"); then
+    while IFS= read -r -d '' dev && IFS= read -r -d '' old_uid && \
+            IFS= read -r -d '' old_gid && IFS= read -r -d '' item; do
+        [ "$dev" = "$OWNERSHIP_ROOT_DEVICE" ] || continue
+        entries=$((entries + 1))
+        # The hit itself is repaired last, after every group succeeded. Groups
+        # do not preserve the -depth order across owner pairs, so this is what
+        # guarantees an interrupted remap leaves the hit with its old owner
+        # for the next shallow startup scan to find again.
+        if [ "$item" = "$path" ]; then
+            root_pair="$old_uid.$old_gid"
+            continue
+        fi
+        if ! printf '%s\0' "$item" >> "$group_dir/$old_uid.$old_gid"; then
             failed=1
             break
         fi
-        old_uid=${ownership%%:*}
-        old_gid=${ownership##*:}
-        new_uid=$old_uid
-        new_gid=$old_gid
+    done < "$raw"
+    rm -f "$raw"
+    if ((failed)); then
+        rm -rf "$group_dir"
+        return 1
+    fi
+    # Old inner uid 65536 (host 165535) has no place in the new map. Stop
+    # before touching anything so the hit keeps its old owner and stays
+    # visible to the next scan, instead of hiding an unrepaired entry.
+    if compgen -G "$group_dir/$last_old.*" > /dev/null || \
+        compgen -G "$group_dir/*.$last_old" > /dev/null || \
+        [ "${root_pair%%.*}" = "$last_old" ] || [ "${root_pair##*.}" = "$last_old" ]; then
+        printf 'boxa: Cannot remap old ownership under %q: owner %s has no representation in the identity map.\n' \
+            "$path" "$last_old" >&2
+        rm -rf "$group_dir"
+        return 1
+    fi
+    for pair in "$group_dir"/*; do
+        [ -f "$pair" ] || continue
+        old_uid=${pair##*/}
+        old_gid=${old_uid##*.}
+        old_uid=${old_uid%%.*}
+        new_uid=$(_boxa_ownership_remap_old_id "$old_uid" "$container_uid")
+        new_gid=$(_boxa_ownership_remap_old_id "$old_gid" "$container_uid")
+        if ((new_uid == old_uid && new_gid == old_gid)); then
+            continue
+        fi
+        if ! xargs -0 --no-run-if-empty chown -h "$new_uid:$new_gid" -- < "$pair"; then
+            failed=1
+            break
+        fi
+        remapped=$((remapped + $(tr -dc '\0' < "$pair" | wc -c)))
+    done
+    rm -rf "$group_dir"
+    ((failed == 0)) || return 1
+    if [ -n "$root_pair" ]; then
+        old_uid=${root_pair%%.*}
+        old_gid=${root_pair##*.}
         new_uid=$(_boxa_ownership_remap_old_id "$old_uid" "$container_uid")
         new_gid=$(_boxa_ownership_remap_old_id "$old_gid" "$container_uid")
         if ((new_uid != old_uid || new_gid != old_gid)); then
-            if ! chown -h "$new_uid:$new_gid" -- "$item"; then
-                failed=1
-                break
-            fi
+            chown -h "$new_uid:$new_gid" -- "$path" || return 1
             remapped=$((remapped + 1))
         fi
-        visited=$((visited + 1))
-    done < "$paths_file"
-    rm -f "$paths_file"
-    ((failed == 0)) || return 1
+    fi
     after=$(stat -c '%u:%g' -- "$path") || return 1
     printf 'boxa: Old ownership remapped: %q (%s -> %s, %s/%s entries changed).\n' \
-        "$path" "$before" "$after" "$remapped" "$visited"
+        "$path" "$before" "$after" "$remapped" "$entries"
+}
+
+_boxa_ownership_fix_old_mapping() {
+    local path="$1" container_uid="$2" purpose="$3" count log_file
+
+    count=$(_boxa_ownership_bounded_count "$path") || return 1
+    if [ "$purpose" = startup ] && ((count > OWNERSHIP_BACKGROUND_THRESHOLD)); then
+        log_file=/var/log/boxa-ownership.log
+        printf 'boxa: Old ownership remap queued in background: %q (more than %s entries; completion: %s).\n' \
+            "$path" "$OWNERSHIP_BACKGROUND_THRESHOLD" "$log_file"
+        (
+            _boxa_ownership_remap_old_tree "$path" "$container_uid" || \
+                printf 'boxa: ERROR: Old ownership remap failed: %q.\n' "$path" >&2
+        ) >> "$log_file" 2>&1 &
+        return 0
+    fi
+    _boxa_ownership_remap_old_tree "$path" "$container_uid"
 }
 
 # Process one snapshotted hit. Optional uid/gid arguments let unprivileged
@@ -297,8 +367,8 @@ boxa_ownership_process_hit() {
         fix-root:auto:*)
             _boxa_ownership_fix_root "$path" "$container_uid" "$purpose"
             ;;
-        fix-old-mapping:auto:doctor)
-            _boxa_ownership_fix_old_mapping "$path" "$container_uid" ;;
+        fix-old-mapping:auto:*)
+            _boxa_ownership_fix_old_mapping "$path" "$container_uid" "$purpose" ;;
         *)
             printf 'boxa: Ownership action needed: %q (owner %s:%s, %s).\n' \
                 "$path" "$owner_uid" "$owner_gid" "$class"

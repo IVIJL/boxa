@@ -92,6 +92,19 @@ if [ "$(id -u)" = "0" ]; then
         "$(stat -c '%u:%g' "$remap_root/identity")"
     assert_eq "real remap applies above-hole shift" 1001:1001 \
         "$(stat -c '%u:%g' "$remap_root/shifted")"
+    touch "$remap_root/untouched"
+    chown 100069:100069 "$remap_root/untouched"
+    mkdir "$remap_root/refused"
+    touch "$remap_root/refused/edge"
+    chown 165535:165535 "$remap_root/refused/edge"
+    if boxa_migrate_legacy_subids "$remap_root" 1000 2>/dev/null; then
+        printf 'FAIL  unrepresentable owner 165535 is refused\n'
+        fail_count=$((fail_count + 1))
+    else
+        printf 'PASS  unrepresentable owner 165535 is refused\n'
+    fi
+    assert_eq "refused migration changes nothing" 100069:100069 \
+        "$(stat -c '%u:%g' "$remap_root/untouched")"
     printf 'PASS  Real ownership remap exercised (test is root).\n'
 else
     printf 'PASS  Real ownership remap not exercised: non-root test; detection/decision and arithmetic only.\n'

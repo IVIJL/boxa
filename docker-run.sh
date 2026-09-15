@@ -3097,6 +3097,7 @@ warn_if_dns_broken() {
 # when the container died during init.
 wait_for_boxa_ready() {
     local name="$1" owner waited=0 waiting_message_shown=false
+    local last_line progress_shown=""
     while [ "$waited" -lt 120 ]; do
         if [ "$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)" != "running" ]; then
             echo "" >&2
@@ -3114,6 +3115,25 @@ wait_for_boxa_ready() {
             echo "Waiting for container init (firewall, DNS setup)..."
             waiting_message_shown=true
         fi
+        # A one-time inner Docker storage migration (ADR 0038) is legitimately
+        # long on a large data-root. While the entrypoint keeps reporting it,
+        # relay each NEW progress line and extend the wait; giving up early
+        # would exec start-rootless-docker.sh against a not-yet-stamped
+        # data-root and fail the start for no reason. Only a line not seen
+        # before resets the cap, so a final or stale migration line cannot
+        # keep a later hang waiting forever (the heartbeat is 5 s).
+        last_line=$(docker logs --tail 1 "$name" 2>&1 || true)
+        case "$last_line" in
+            "boxa: Checking inner Docker storage ownership"*|\
+            "boxa: Migrating inner Docker storage ownership"*|\
+            "boxa: Ownership migration"*)
+                if [ "$last_line" != "$progress_shown" ]; then
+                    echo "$last_line"
+                    progress_shown=$last_line
+                    waited=0
+                fi
+                ;;
+        esac
         sleep 0.5
         waited=$((waited + 1))
     done

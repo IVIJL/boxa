@@ -63,9 +63,9 @@ privileges, capabilities or host changes are added.
 
 ## Acceptance criteria
 
-- [ ] Fresh Container: `/proc/<dockerd>/uid_map` and `gid_map` show
+- [x] Fresh Container: `/proc/<dockerd>/uid_map` and `gid_map` show
       `0 U 1`, `1 1 U-1`, `U U+1 65536-U` for the actual launching uid U.
-- [ ] `docker run --rm -v <project>/tmpdir:/x alpine sh -c 'touch /x/f && chown 70:70 /x/f'`
+- [x] `docker run --rm -v <project>/tmpdir:/x alpine sh -c 'touch /x/f && chown 70:70 /x/f'`
       inside the Container yields host owner `70:70`; `999:999` likewise.
 - [ ] `postgres:16-alpine` started inside the Container on a bind-mounted
       pgdata produces `70:70` files; the same pgdata then starts under the
@@ -118,3 +118,21 @@ None — can start immediately.
   `tests/subid-mapping.sh` covers only the detection/decision logic and the
   pure range arithmetic, not an actual `chown` migration; that needs a
   rootful re-run against a real legacy `boxa-<project>-docker` volume.
+- 2026-09-15: Host proof of the legacy remap FAILED on universe_media_api:
+  the data-root has 1.97M entries (1.48M in ~74 anonymous inner volumes,
+  0.49M in image layers) and the walk forked `stat` per entry in two passes
+  (~0.9 ms each on WSL) = about an hour; `wait_for_boxa_ready` gave up after
+  60 s and start-rootless-docker.sh failed with the "not ready" message.
+  Fixed: one `find` pass selects only old-range owners (`-uid/-gid`
+  filters, numeric `-printf`), paths are grouped by old owner pair and each
+  group is one `xargs chown`. Synthetic 200k-entry tree with 1 500 hits:
+  1.0 s as root. `wait_for_boxa_ready` now relays migration progress lines
+  and does not time out while they keep coming.
+- 2026-09-15 host proof (universe_media_api, rebuilt image): real legacy
+  remap 1 497 entries of 1.97M in 31 s, stamp written, rootless dockerd up
+  in 2 s; uid_map `0 1000 1 / 1 1 999 / 1000 1001 64536`; inner chown
+  70:70 -> host 70:70, 999:999 -> 999:999, 1000:1000 -> 1001:1001.
+- 2026-09-15 final: single-pass scan with 5 s heartbeat (relayed by
+  `wait_for_boxa_ready`), unrepresentable-owner check folded into the same
+  pass. Forced re-migration of the 1.97M-entry volume: 10 s; Container start
+  with migration 20 s, without 7.8 s (same as before the feature).
